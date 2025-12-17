@@ -1,0 +1,58 @@
+version: 2
+
+project_name: accx
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: accx
+    main: ./cmd/accx
+    binary: accx
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/user/accx/internal/version.Version={{.Version}}
+      - -X github.com/user/accx/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/user/accx/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: user
+    name: accx
+  draft: true
+  prerelease: auto
