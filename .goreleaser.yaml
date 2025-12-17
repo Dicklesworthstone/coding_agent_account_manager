@@ -1,15 +1,15 @@
 version: 2
 
-project_name: accx
+project_name: caam
 
 before:
   hooks:
     - go mod tidy
 
 builds:
-  - id: accx
-    main: ./cmd/accx
-    binary: accx
+  - id: caam
+    main: ./cmd/caam
+    binary: caam
     env:
       - CGO_ENABLED=0
     goos:
@@ -19,11 +19,14 @@ builds:
     goarch:
       - amd64
       - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
     ldflags:
       - -s -w
-      - -X github.com/user/accx/internal/version.Version={{.Version}}
-      - -X github.com/user/accx/internal/version.Commit={{.ShortCommit}}
-      - -X github.com/user/accx/internal/version.Date={{.Date}}
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version={{.Version}}
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date={{.Date}}
 
 archives:
   - id: default
@@ -52,7 +55,7 @@ changelog:
 
 release:
   github:
-    owner: user
-    name: accx
-  draft: true
+    owner: Dicklesworthstone
+    name: coding_agent_account_manager
+  draft: false
   prerelease: auto

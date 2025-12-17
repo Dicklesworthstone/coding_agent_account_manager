@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -233,16 +234,38 @@ func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) er
 
 	fmt.Println("Launching Claude Code for authentication...")
 	fmt.Println("Once inside, run /login to authenticate.")
-	fmt.Println("Press Ctrl+C when done.")
 
 	cmd := exec.CommandContext(ctx, "claude")
 	cmd.Env = os.Environ()
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
+
+	// If browser profile is configured, use it for the OAuth flow
+	if prof.HasBrowserConfig() {
+		launcher := browser.NewLauncher(&browser.Config{
+			Command:    prof.BrowserCommand,
+			ProfileDir: prof.BrowserProfileDir,
+		})
+		fmt.Printf("Using browser profile: %s\n", prof.BrowserDisplayName())
+
+		// Set up URL detection and capture
+		capture := browser.NewOutputCapture(os.Stdout, os.Stderr)
+		capture.OnURL = func(url, source string) {
+			// Open detected URLs with our configured browser
+			if err := launcher.Open(url); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to open browser: %v\n", err)
+			}
+		}
+		cmd.Stdout = capture.StdoutWriter()
+		cmd.Stderr = capture.StderrWriter()
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		fmt.Println("Press Ctrl+C when done.")
+	}
+
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
 }

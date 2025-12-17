@@ -1,6 +1,7 @@
 module github.com/Dicklesworthstone/coding_agent_account_manager
 
-go 1.23
+// Keep this in sync with CI (see .github/workflows/ci.yml)
+go 1.25
 
 require (
 	github.com/charmbracelet/bubbles v0.20.0

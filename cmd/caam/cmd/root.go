@@ -506,7 +506,18 @@ func init() {
 var profileAddCmd = &cobra.Command{
 	Use:   "add <tool> <name> [--auth-mode oauth|api-key]",
 	Short: "Create a new isolated profile",
-	Args:  cobra.ExactArgs(2),
+	Long: `Create a new isolated profile for running multiple sessions simultaneously.
+
+Options:
+  --auth-mode    Authentication mode (oauth, api-key)
+  --browser      Browser command (chrome, firefox, or full path)
+  --browser-profile  Browser profile name or directory
+
+Examples:
+  caam profile add codex work
+  caam profile add claude personal --browser chrome --browser-profile "Profile 2"
+  caam profile add gemini team --browser firefox --browser-profile "work-firefox"`,
+	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tool := strings.ToLower(args[0])
 		name := args[1]
@@ -527,6 +538,27 @@ var profileAddCmd = &cobra.Command{
 			return fmt.Errorf("create profile: %w", err)
 		}
 
+		// Set browser configuration if provided
+		browserCmd, _ := cmd.Flags().GetString("browser")
+		browserProfile, _ := cmd.Flags().GetString("browser-profile")
+		browserName, _ := cmd.Flags().GetString("browser-name")
+
+		if browserCmd != "" {
+			prof.BrowserCommand = browserCmd
+		}
+		if browserProfile != "" {
+			prof.BrowserProfileDir = browserProfile
+		}
+		if browserName != "" {
+			prof.BrowserProfileName = browserName
+		}
+
+		// Save updated profile with browser config
+		if err := prof.Save(); err != nil {
+			profileStore.Delete(tool, name)
+			return fmt.Errorf("save profile: %w", err)
+		}
+
 		// Prepare profile directory structure
 		ctx := context.Background()
 		if err := prov.PrepareProfile(ctx, prof); err != nil {
@@ -537,6 +569,9 @@ var profileAddCmd = &cobra.Command{
 
 		fmt.Printf("Created profile %s/%s\n", tool, name)
 		fmt.Printf("  Path: %s\n", prof.BasePath)
+		if prof.HasBrowserConfig() {
+			fmt.Printf("  Browser: %s\n", prof.BrowserDisplayName())
+		}
 		fmt.Printf("\nNext steps:\n")
 		fmt.Printf("  caam login %s %s    # Authenticate\n", tool, name)
 		fmt.Printf("  caam exec %s %s     # Run with this profile\n", tool, name)
@@ -546,6 +581,9 @@ var profileAddCmd = &cobra.Command{
 
 func init() {
 	profileAddCmd.Flags().String("auth-mode", "oauth", "authentication mode (oauth, api-key)")
+	profileAddCmd.Flags().String("browser", "", "browser command (chrome, firefox, or full path)")
+	profileAddCmd.Flags().String("browser-profile", "", "browser profile name or directory")
+	profileAddCmd.Flags().String("browser-name", "", "human-friendly name for browser profile")
 }
 
 var profileLsCmd = &cobra.Command{
