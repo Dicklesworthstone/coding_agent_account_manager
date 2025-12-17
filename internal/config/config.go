@@ -36,11 +36,16 @@ func DefaultConfig() *Config {
 }
 
 // ConfigPath returns the path to the config file.
+// Falls back to current directory if home directory cannot be determined.
 func ConfigPath() string {
 	if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
 		return filepath.Join(xdgConfig, "caam", "config.json")
 	}
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to current directory - unusual but handles edge cases
+		return filepath.Join(".config", "caam", "config.json")
+	}
 	return filepath.Join(homeDir, ".config", "caam", "config.json")
 }
 

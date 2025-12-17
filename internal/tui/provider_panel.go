@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -119,12 +121,14 @@ func (p *ProviderPanel) View() string {
 }
 
 // capitalizeFirst capitalizes the first letter of a string.
+// Uses Unicode-aware rune handling.
 func capitalizeFirst(s string) string {
-	if len(s) == 0 {
+	if s == "" {
 		return s
 	}
-	if s[0] >= 'a' && s[0] <= 'z' {
-		return string(s[0]-32) + s[1:]
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError {
+		return s
 	}
-	return s
+	return string(unicode.ToUpper(r)) + s[size:]
 }

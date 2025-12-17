@@ -14,7 +14,7 @@ import (
 var URLPattern = regexp.MustCompile(`https?://(?:localhost|127\.0\.0\.1):[0-9]+[^\s"']*`)
 
 // URLCallback is called when a URL is detected in the output.
-// Return true to suppress the URL from being passed through.
+// Note: The return value is currently unused; all output is passed through.
 type URLCallback func(url string) bool
 
 // URLDetector wraps an io.Writer and scans for URLs in the output.

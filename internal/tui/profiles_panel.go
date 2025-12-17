@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -301,20 +302,24 @@ func formatRelativeTime(t time.Time) string {
 }
 
 // padRight pads a string to the right with spaces.
+// Uses rune count for proper Unicode handling.
 func padRight(s string, width int) string {
-	if len(s) >= width {
+	runeCount := utf8.RuneCountInString(s)
+	if runeCount >= width {
 		return s
 	}
-	return s + strings.Repeat(" ", width-len(s))
+	return s + strings.Repeat(" ", width-runeCount)
 }
 
-// truncate truncates a string to the given width.
+// truncate truncates a string to the given width in runes.
+// Uses rune handling for proper Unicode support.
 func truncate(s string, width int) string {
-	if len(s) <= width {
+	runes := []rune(s)
+	if len(runes) <= width {
 		return s
 	}
 	if width <= 3 {
-		return s[:width]
+		return string(runes[:width])
 	}
-	return s[:width-3] + "..."
+	return string(runes[:width-3]) + "..."
 }

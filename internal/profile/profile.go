@@ -116,17 +116,29 @@ func (p *Profile) IsLocked() bool {
 }
 
 // Lock creates a lock file to indicate the profile is in use.
+// Uses O_EXCL for atomic creation to prevent race conditions.
 func (p *Profile) Lock() error {
 	lockPath := p.LockPath()
 
-	// Check if already locked
-	if p.IsLocked() {
-		return fmt.Errorf("profile %s is already locked", p.Name)
+	// Use O_EXCL to atomically check and create - prevents TOCTOU race
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("profile %s is already locked", p.Name)
+		}
+		return fmt.Errorf("create lock file: %w", err)
+	}
+	defer f.Close()
+
+	// Write lock file with PID
+	content := fmt.Sprintf(`{"pid": %d, "locked_at": %q}`, os.Getpid(), time.Now().Format(time.RFC3339))
+	if _, err := f.WriteString(content); err != nil {
+		// Clean up on failure
+		os.Remove(lockPath)
+		return fmt.Errorf("write lock file: %w", err)
 	}
 
-	// Create lock file with PID
-	content := fmt.Sprintf(`{"pid": %d, "locked_at": %q}`, os.Getpid(), time.Now().Format(time.RFC3339))
-	return os.WriteFile(lockPath, []byte(content), 0600)
+	return nil
 }
 
 // Unlock removes the lock file.
@@ -269,11 +281,16 @@ func NewStore(basePath string) *Store {
 }
 
 // DefaultStorePath returns the default profiles directory.
+// Falls back to current directory if home directory cannot be determined.
 func DefaultStorePath() string {
 	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
 		return filepath.Join(xdgData, "caam", "profiles")
 	}
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to current directory - unusual but handles edge cases
+		return filepath.Join(".local", "share", "caam", "profiles")
+	}
 	return filepath.Join(homeDir, ".local", "share", "caam", "profiles")
 }
 

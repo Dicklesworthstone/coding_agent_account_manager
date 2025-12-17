@@ -138,11 +138,16 @@ func NewVault(basePath string) *Vault {
 }
 
 // DefaultVaultPath returns the default vault location.
+// Falls back to current directory if home directory cannot be determined.
 func DefaultVaultPath() string {
 	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
 		return filepath.Join(xdgData, "caam", "vault")
 	}
-	homeDir, _ := os.UserHomeDir()
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to current directory - unusual but handles edge cases
+		return filepath.Join(".local", "share", "caam", "vault")
+	}
 	return filepath.Join(homeDir, ".local", "share", "caam", "vault")
 }
 
