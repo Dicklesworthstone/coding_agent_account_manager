@@ -1,0 +1,6 @@
+{
+  "access_token": "codex_access_token_xxx",
+  "refresh_token": "codex_refresh_token_yyy",
+  "expires_at": 1893456000,
+  "token_type": "Bearer"
+}

@@ -1,0 +1,6 @@
+{
+  "accessToken": "claude_access_token_xxx",
+  "refreshToken": "claude_refresh_token_yyy",
+  "expiresAt": "2025-12-18T12:00:00Z",
+  "tokenType": "Bearer"
+}
