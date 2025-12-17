@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
@@ -25,6 +26,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tui"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
+	"golang.org/x/term"
 )
 
 var (
@@ -103,6 +105,40 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 // Execute runs the root command.
 func Execute() error {
 	return rootCmd.Execute()
+}
+
+// isTerminal returns true if stdout is a terminal.
+func isTerminal() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// getProfileHealth returns health info for a profile by parsing auth files.
+func getProfileHealth(tool, profileName string) *health.ProfileHealth {
+	// Get auth files from vault profile
+	vaultPath := vault.ProfilePath(tool, profileName)
+
+	ph := &health.ProfileHealth{}
+
+	// Try to parse expiry based on tool type
+	var expInfo *health.ExpiryInfo
+	var err error
+
+	switch tool {
+	case "claude":
+		expInfo, err = health.ParseClaudeExpiry(vaultPath)
+	case "codex":
+		// Codex auth is in auth.json at vaultPath
+		authPath := vaultPath + "/auth.json"
+		expInfo, err = health.ParseCodexExpiry(authPath)
+	case "gemini":
+		expInfo, err = health.ParseGeminiExpiry(vaultPath)
+	}
+
+	if err == nil && expInfo != nil {
+		ph.TokenExpiresAt = expInfo.ExpiresAt
+	}
+
+	return ph
 }
 
 func init() {
@@ -235,14 +271,19 @@ func init() {
 // statusCmd shows which profile is currently active.
 var statusCmd = &cobra.Command{
 	Use:   "status [tool]",
-	Short: "Show active profiles",
-	Long: `Shows which vault profile (if any) matches the current auth state for each tool.
+	Short: "Show active profiles with health status",
+	Long: `Shows which vault profile (if any) matches the current auth state for each tool,
+along with health status indicators and recommendations.
 
 Examples:
   caam status           # Show all tools
-  caam status claude    # Show just Claude`,
+  caam status claude    # Show just Claude
+  caam status --no-color  # Without colors`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		noColor, _ := cmd.Flags().GetBool("no-color")
+		formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
+
 		toolsToCheck := []string{"codex", "claude", "gemini"}
 		if len(args) > 0 {
 			tool := strings.ToLower(args[0])
@@ -252,25 +293,71 @@ Examples:
 			toolsToCheck = []string{tool}
 		}
 
+		fmt.Println("Active Profiles")
+		fmt.Println("───────────────────────────────────────────────────")
+
+		var warnings []string
+		var recommendations []string
+
 		for _, tool := range toolsToCheck {
 			fileSet := tools[tool]()
 			hasAuth := authfile.HasAuthFiles(fileSet)
 
 			if !hasAuth {
-				fmt.Printf("%s: not logged in\n", tool)
+				fmt.Printf("%-10s  (not logged in)\n", tool)
 				continue
 			}
 
 			activeProfile, err := vault.ActiveProfile(fileSet)
 			if err != nil {
-				fmt.Printf("%s: logged in (error checking profile: %v)\n", tool, err)
+				fmt.Printf("%-10s  (error: %v)\n", tool, err)
 				continue
 			}
 
-			if activeProfile != "" {
-				fmt.Printf("%s: active profile '%s'\n", tool, activeProfile)
-			} else {
-				fmt.Printf("%s: logged in (not matching any saved profile)\n", tool)
+			if activeProfile == "" {
+				fmt.Printf("%-10s  (logged in, no matching profile)\n", tool)
+				continue
+			}
+
+			// Get health info
+			ph := getProfileHealth(tool, activeProfile)
+			status := health.CalculateStatus(ph)
+			healthStr := health.FormatStatusWithReason(status, ph, formatOpts)
+
+			fmt.Printf("%-10s  %-20s  %s\n", tool, activeProfile, healthStr)
+
+			// Collect warnings
+			if status == health.StatusWarning || status == health.StatusCritical {
+				detailedStatus := health.FormatStatusWithReason(status, ph, health.FormatOptions{NoColor: true})
+				warnings = append(warnings, fmt.Sprintf("%s/%s: %s", tool, activeProfile, detailedStatus))
+			}
+
+			// Collect recommendations
+			rec := health.FormatRecommendation(tool, activeProfile, ph)
+			if rec != "" {
+				recommendations = append(recommendations, rec)
+			}
+		}
+
+		// Show warnings
+		if len(warnings) > 0 {
+			fmt.Println()
+			fmt.Println("Warnings")
+			fmt.Println("───────────────────────────────────────────────────")
+			for _, w := range warnings {
+				fmt.Printf("  %s\n", w)
+			}
+		}
+
+		// Show recommendations
+		if len(recommendations) > 0 {
+			fmt.Println()
+			fmt.Println("Recommendations")
+			fmt.Println("───────────────────────────────────────────────────")
+			for _, r := range recommendations {
+				for _, line := range strings.Split(r, "\n") {
+					fmt.Printf("  • %s\n", line)
+				}
 			}
 		}
 
@@ -278,18 +365,26 @@ Examples:
 	},
 }
 
+func init() {
+	statusCmd.Flags().Bool("no-color", false, "disable colored output")
+}
+
 // lsCmd lists all stored profiles.
 var lsCmd = &cobra.Command{
 	Use:     "ls [tool]",
 	Aliases: []string{"list"},
 	Short:   "List saved profiles",
-	Long: `Lists all profiles stored in the vault.
+	Long: `Lists all profiles stored in the vault with health status.
 
 Examples:
   caam ls           # List all profiles
-  caam ls claude    # List just Claude profiles`,
+  caam ls claude    # List just Claude profiles
+  caam ls --no-color  # Without colors (for piping)`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		noColor, _ := cmd.Flags().GetBool("no-color")
+		formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
+
 		if len(args) > 0 {
 			tool := strings.ToLower(args[0])
 			if _, ok := tools[tool]; !ok {
@@ -313,9 +408,15 @@ Examples:
 			for _, p := range profiles {
 				marker := "  "
 				if p == activeProfile {
-					marker = "* "
+					marker = "● "
 				}
-				fmt.Printf("%s%s/%s\n", marker, tool, p)
+
+				// Get health info
+				ph := getProfileHealth(tool, p)
+				status := health.CalculateStatus(ph)
+				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
+
+				fmt.Printf("%s%-20s  %s\n", marker, p, healthStr)
 			}
 			return nil
 		}
@@ -342,14 +443,24 @@ Examples:
 			for _, p := range profiles {
 				marker := "  "
 				if p == activeProfile {
-					marker = "* "
+					marker = "● "
 				}
-				fmt.Printf("  %s%s\n", marker, p)
+
+				// Get health info
+				ph := getProfileHealth(tool, p)
+				status := health.CalculateStatus(ph)
+				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
+
+				fmt.Printf("  %s%-20s  %s\n", marker, p, healthStr)
 			}
 		}
 
 		return nil
 	},
+}
+
+func init() {
+	lsCmd.Flags().Bool("no-color", false, "disable colored output")
 }
 
 // deleteCmd removes a profile from the vault.
