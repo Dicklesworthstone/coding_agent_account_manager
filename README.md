@@ -381,6 +381,22 @@ go install github.com/Dicklesworthstone/coding_agent_account_manager/cmd/caam@la
 
 ---
 
+## Acknowledgments
+
+Special thanks to **[@darvell](https://github.com/darvell)** for inspiring this project and for the feature ideas behind Smart Profile Management. His work on **[codex-pool](https://github.com/darvell/codex-pool)**—a sophisticated proxy that load-balances requests across multiple AI accounts with automatic failover—demonstrated how much intelligence can be added to account management.
+
+While codex-pool answers "which account should handle THIS request?" (real-time proxy), caam answers "which account should I USE for my work session?" (profile manager). The upcoming Smart Profile Management features adapt codex-pool's intelligence to caam's architecture:
+
+- **Proactive Token Refresh** — Refresh OAuth tokens before they expire, preventing mid-session auth failures
+- **Profile Health Scoring** — Visual indicators (🟢🟡🔴) showing token status, error history, and plan type
+- **Usage Analytics** — Track activation patterns and session durations across profiles
+- **Hot Reload** — TUI auto-refreshes when profiles are added/modified in another terminal
+- **Project-Profile Associations** — Remember which profile to use for each project directory
+
+See [`docs/SMART_PROFILE_MANAGEMENT.md`](docs/SMART_PROFILE_MANAGEMENT.md) for the full design document.
+
+---
+
 ## License
 
 MIT
