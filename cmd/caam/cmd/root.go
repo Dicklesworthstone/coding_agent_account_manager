@@ -508,6 +508,7 @@ func init() {
 	profileCmd.AddCommand(profileLsCmd)
 	profileCmd.AddCommand(profileDeleteCmd)
 	profileCmd.AddCommand(profileStatusCmd)
+	profileCmd.AddCommand(profileUnlockCmd)
 }
 
 var profileAddCmd = &cobra.Command{
@@ -718,6 +719,94 @@ var profileStatusCmd = &cobra.Command{
 
 		return nil
 	},
+}
+
+var profileUnlockCmd = &cobra.Command{
+	Use:   "unlock <tool> <name>",
+	Short: "Unlock a locked profile",
+	Long: `Forcibly removes a lock file from a profile.
+
+By default, this command will only unlock profiles where the locking process
+is no longer running (stale locks from crashed processes).
+
+Use --force to unlock even if the locking process appears to still be running.
+WARNING: Using --force on an active session can cause data corruption!
+
+Examples:
+  caam profile unlock codex work        # Unlock stale lock
+  caam profile unlock claude home -f    # Force unlock (dangerous)`,
+	Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		tool := strings.ToLower(args[0])
+		name := args[1]
+
+		prof, err := profileStore.Load(tool, name)
+		if err != nil {
+			return err
+		}
+
+		// Check if profile is locked
+		if !prof.IsLocked() {
+			fmt.Printf("Profile %s/%s is not locked\n", tool, name)
+			return nil
+		}
+
+		// Get lock info for display
+		lockInfo, err := prof.GetLockInfo()
+		if err != nil {
+			return fmt.Errorf("read lock info: %w", err)
+		}
+
+		// Check if lock is stale (process dead)
+		stale, err := prof.IsLockStale()
+		if err != nil {
+			return fmt.Errorf("check lock status: %w", err)
+		}
+
+		force, _ := cmd.Flags().GetBool("force")
+
+		if stale {
+			// Safe to unlock - process is dead
+			fmt.Printf("Lock is stale (PID %d is no longer running)\n", lockInfo.PID)
+			if err := prof.Unlock(); err != nil {
+				return fmt.Errorf("unlock failed: %w", err)
+			}
+			fmt.Printf("Unlocked %s/%s\n", tool, name)
+			return nil
+		}
+
+		// Process is still running
+		if !force {
+			fmt.Printf("Profile %s/%s is locked by PID %d (still running)\n", tool, name, lockInfo.PID)
+			fmt.Printf("Locked at: %s\n", lockInfo.LockedAt.Format("2006-01-02 15:04:05"))
+			fmt.Println()
+			fmt.Println("WARNING: The locking process appears to still be running.")
+			fmt.Println("Force-unlocking an active session can cause data corruption!")
+			fmt.Println()
+			fmt.Println("Use --force to unlock anyway (not recommended)")
+			return fmt.Errorf("refusing to unlock active profile (use --force to override)")
+		}
+
+		// Force unlock - user accepted the risk
+		fmt.Printf("WARNING: Force-unlocking profile locked by running process (PID %d)\n", lockInfo.PID)
+		fmt.Printf("Force unlock %s/%s? This may cause data corruption! [y/N]: ", tool, name)
+		var confirm string
+		fmt.Scanln(&confirm)
+		if strings.ToLower(confirm) != "y" {
+			fmt.Println("Cancelled")
+			return nil
+		}
+
+		if err := prof.Unlock(); err != nil {
+			return fmt.Errorf("unlock failed: %w", err)
+		}
+		fmt.Printf("Force-unlocked %s/%s\n", tool, name)
+		return nil
+	},
+}
+
+func init() {
+	profileUnlockCmd.Flags().BoolP("force", "f", false, "force unlock even if process is running (dangerous)")
 }
 
 // loginCmd initiates login for an isolated profile.
