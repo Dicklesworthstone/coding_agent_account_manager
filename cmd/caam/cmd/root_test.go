@@ -66,6 +66,8 @@ func TestSubcommandRegistration(t *testing.T) {
 		"version",
 		"backup",
 		"activate",
+		"export",
+		"import",
 		"status",
 		"ls",
 		"delete",

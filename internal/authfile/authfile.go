@@ -2,9 +2,9 @@
 //
 // The core insight: AI coding tools store OAuth tokens in specific files.
 // Instead of logging in/out (slow, requires browser), we can:
-//   1. Backup the auth file after logging in once
-//   2. Label it with the account name
-//   3. Restore it instantly when we need to switch
+//  1. Backup the auth file after logging in once
+//  2. Label it with the account name
+//  3. Restore it instantly when we need to switch
 //
 // This enables sub-second account switching for "all you can eat" subscriptions
 // like GPT Pro, Claude Max, and Gemini Ultra when hitting usage limits.
@@ -135,6 +135,11 @@ type Vault struct {
 // NewVault creates a new vault at the given path.
 func NewVault(basePath string) *Vault {
 	return &Vault{basePath: basePath}
+}
+
+// BasePath returns the on-disk path to the vault root directory.
+func (v *Vault) BasePath() string {
+	return v.basePath
 }
 
 // DefaultVaultPath returns the default vault location.

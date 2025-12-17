@@ -150,6 +150,8 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(backupCmd)
 	rootCmd.AddCommand(activateCmd)
+	rootCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(lsCmd)
 	rootCmd.AddCommand(deleteCmd)
