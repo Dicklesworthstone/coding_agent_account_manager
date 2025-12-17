@@ -15,6 +15,14 @@ type keyMap struct {
 	Enter  key.Binding
 	Backup key.Binding
 	Delete key.Binding
+	Edit   key.Binding
+	Login  key.Binding
+	Open   key.Binding
+	Search key.Binding
+
+	// Confirmation
+	Confirm key.Binding
+	Cancel  key.Binding
 
 	// General
 	Help key.Binding
@@ -37,8 +45,8 @@ func defaultKeyMap() keyMap {
 			key.WithHelp("←/h", "previous provider"),
 		),
 		Right: key.NewBinding(
-			key.WithKeys("right", "l"),
-			key.WithHelp("→/l", "next provider"),
+			key.WithKeys("right"),
+			key.WithHelp("→", "next provider"),
 		),
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),
@@ -55,6 +63,30 @@ func defaultKeyMap() keyMap {
 		Delete: key.NewBinding(
 			key.WithKeys("d"),
 			key.WithHelp("d", "delete profile"),
+		),
+		Edit: key.NewBinding(
+			key.WithKeys("e"),
+			key.WithHelp("e", "edit profile"),
+		),
+		Login: key.NewBinding(
+			key.WithKeys("l"),
+			key.WithHelp("l", "login/refresh"),
+		),
+		Open: key.NewBinding(
+			key.WithKeys("o"),
+			key.WithHelp("o", "open in browser"),
+		),
+		Search: key.NewBinding(
+			key.WithKeys("/"),
+			key.WithHelp("/", "search profiles"),
+		),
+		Confirm: key.NewBinding(
+			key.WithKeys("y", "enter"),
+			key.WithHelp("y/enter", "confirm"),
+		),
+		Cancel: key.NewBinding(
+			key.WithKeys("n", "esc"),
+			key.WithHelp("n/esc", "cancel"),
 		),
 		Help: key.NewBinding(
 			key.WithKeys("?"),
@@ -76,7 +108,8 @@ func (k keyMap) ShortHelp() []key.Binding {
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Left, k.Right},
-		{k.Enter, k.Backup, k.Delete},
+		{k.Enter, k.Backup, k.Delete, k.Edit},
+		{k.Login, k.Open, k.Search},
 		{k.Help, k.Quit},
 	}
 }

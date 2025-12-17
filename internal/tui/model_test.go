@@ -215,3 +215,126 @@ func TestProfilesPanelIntegration(t *testing.T) {
 		t.Fatal("expected non-nil selected profile after sync")
 	}
 }
+
+func TestDeleteProfileWithConfirmation(t *testing.T) {
+	m := New()
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "test@example.com", Provider: "claude"}},
+	}
+
+	// Try to delete
+	result, _ := m.handleDeleteProfile()
+	updated := result.(Model)
+
+	// Should be in confirmation state
+	if updated.state != stateConfirm {
+		t.Errorf("expected stateConfirm, got %v", updated.state)
+	}
+	if updated.pendingAction != confirmDelete {
+		t.Errorf("expected confirmDelete, got %v", updated.pendingAction)
+	}
+}
+
+func TestDeleteProfileCancel(t *testing.T) {
+	m := New()
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "test@example.com", Provider: "claude"}},
+	}
+
+	// Initiate delete
+	m.state = stateConfirm
+	m.pendingAction = confirmDelete
+
+	// Cancel with 'n' key
+	result, _ := m.handleConfirmKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	updated := result.(Model)
+
+	// Should be back to list state
+	if updated.state != stateList {
+		t.Errorf("expected stateList, got %v", updated.state)
+	}
+	if updated.pendingAction != confirmNone {
+		t.Errorf("expected confirmNone, got %v", updated.pendingAction)
+	}
+}
+
+func TestDeleteProfileConfirm(t *testing.T) {
+	m := New()
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "test@example.com", Provider: "claude"}},
+	}
+	m.state = stateConfirm
+	m.pendingAction = confirmDelete
+
+	// Confirm with 'y' key
+	result, _ := m.handleConfirmKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated := result.(Model)
+
+	// Should be back to list state
+	if updated.state != stateList {
+		t.Errorf("expected stateList, got %v", updated.state)
+	}
+	if updated.pendingAction != confirmNone {
+		t.Errorf("expected confirmNone, got %v", updated.pendingAction)
+	}
+}
+
+func TestHandleLoginProfile(t *testing.T) {
+	m := New()
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "test@example.com", Provider: "claude"}},
+	}
+
+	result, _ := m.handleLoginProfile()
+	updated := result.(Model)
+
+	// Should have status message
+	if updated.statusMsg == "" {
+		t.Error("expected non-empty status message")
+	}
+}
+
+func TestHandleOpenInBrowser(t *testing.T) {
+	m := New()
+
+	result, _ := m.handleOpenInBrowser()
+	updated := result.(Model)
+
+	// Should have status message
+	if updated.statusMsg == "" {
+		t.Error("expected non-empty status message")
+	}
+}
+
+func TestHandleBackupProfile(t *testing.T) {
+	m := New()
+
+	result, _ := m.handleBackupProfile()
+	updated := result.(Model)
+
+	// Should have status message
+	if updated.statusMsg == "" {
+		t.Error("expected non-empty status message")
+	}
+}
+
+func TestKeyMapBindings(t *testing.T) {
+	km := defaultKeyMap()
+
+	// Verify all bindings exist
+	if len(km.Login.Keys()) == 0 {
+		t.Error("expected Login binding to have keys")
+	}
+	if len(km.Open.Keys()) == 0 {
+		t.Error("expected Open binding to have keys")
+	}
+	if len(km.Search.Keys()) == 0 {
+		t.Error("expected Search binding to have keys")
+	}
+	if len(km.Confirm.Keys()) == 0 {
+		t.Error("expected Confirm binding to have keys")
+	}
+	if len(km.Cancel.Keys()) == 0 {
+		t.Error("expected Cancel binding to have keys")
+	}
+}

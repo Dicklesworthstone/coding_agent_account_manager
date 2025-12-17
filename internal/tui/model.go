@@ -16,7 +16,16 @@ const (
 	stateList viewState = iota
 	stateDetail
 	stateConfirm
+	stateSearch
 	stateHelp
+)
+
+// confirmAction represents the action being confirmed.
+type confirmAction int
+
+const (
+	confirmNone confirmAction = iota
+	confirmDelete
 )
 
 // Profile represents a saved auth profile for display.
@@ -51,6 +60,10 @@ type Model struct {
 
 	// Status message
 	statusMsg string
+
+	// Confirmation state
+	pendingAction confirmAction
+	searchQuery   string
 }
 
 // DefaultProviders returns the default list of provider names.
@@ -149,16 +162,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle state-specific key handling
+	switch m.state {
+	case stateConfirm:
+		return m.handleConfirmKeys(msg)
+	case stateHelp:
+		// Any key returns to list
+		m.state = stateList
+		return m, nil
+	}
+
+	// Normal list view key handling
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
 
 	case key.Matches(msg, m.keys.Help):
-		if m.state == stateHelp {
-			m.state = stateList
-		} else {
-			m.state = stateHelp
-		}
+		m.state = stateHelp
 		return m, nil
 
 	case key.Matches(msg, m.keys.Up):
@@ -197,9 +217,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Enter):
-		// TODO: Activate selected profile
-		m.statusMsg = "Profile activation not yet implemented"
-		return m, nil
+		return m.handleActivateProfile()
 
 	case key.Matches(msg, m.keys.Tab):
 		// Cycle through providers
@@ -207,8 +225,105 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selected = 0
 		m.syncProfilesPanel()
 		return m, nil
+
+	case key.Matches(msg, m.keys.Delete):
+		return m.handleDeleteProfile()
+
+	case key.Matches(msg, m.keys.Backup):
+		return m.handleBackupProfile()
+
+	case key.Matches(msg, m.keys.Login):
+		return m.handleLoginProfile()
+
+	case key.Matches(msg, m.keys.Open):
+		return m.handleOpenInBrowser()
+
+	case key.Matches(msg, m.keys.Edit):
+		return m.handleEditProfile()
+
+	case key.Matches(msg, m.keys.Search):
+		return m.handleEnterSearchMode()
 	}
 
+	return m, nil
+}
+
+// handleConfirmKeys handles keys in confirmation state.
+func (m Model) handleConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Confirm):
+		return m.executeConfirmedAction()
+	case key.Matches(msg, m.keys.Cancel):
+		m.state = stateList
+		m.pendingAction = confirmNone
+		m.statusMsg = "Cancelled"
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleActivateProfile activates the selected profile.
+func (m Model) handleActivateProfile() (tea.Model, tea.Cmd) {
+	profiles := m.currentProfiles()
+	if m.selected < 0 || m.selected >= len(profiles) {
+		m.statusMsg = "No profile selected"
+		return m, nil
+	}
+	profile := profiles[m.selected]
+	m.statusMsg = fmt.Sprintf("Activating %s... (not yet implemented)", profile.Name)
+	return m, nil
+}
+
+// handleDeleteProfile initiates profile deletion with confirmation.
+func (m Model) handleDeleteProfile() (tea.Model, tea.Cmd) {
+	profiles := m.currentProfiles()
+	if m.selected < 0 || m.selected >= len(profiles) {
+		m.statusMsg = "No profile selected"
+		return m, nil
+	}
+	profile := profiles[m.selected]
+	m.state = stateConfirm
+	m.pendingAction = confirmDelete
+	m.statusMsg = fmt.Sprintf("Delete '%s'? (y/n)", profile.Name)
+	return m, nil
+}
+
+// handleBackupProfile backs up the current auth state.
+func (m Model) handleBackupProfile() (tea.Model, tea.Cmd) {
+	m.statusMsg = fmt.Sprintf("Backup %s auth... (not yet implemented)", m.currentProvider())
+	return m, nil
+}
+
+// handleLoginProfile initiates login/refresh for the selected profile.
+func (m Model) handleLoginProfile() (tea.Model, tea.Cmd) {
+	profiles := m.currentProfiles()
+	if m.selected < 0 || m.selected >= len(profiles) {
+		m.statusMsg = "No profile selected"
+		return m, nil
+	}
+	profile := profiles[m.selected]
+	m.statusMsg = fmt.Sprintf("Login/refresh %s... (not yet implemented)", profile.Name)
+	return m, nil
+}
+
+// handleOpenInBrowser opens the account page in browser.
+func (m Model) handleOpenInBrowser() (tea.Model, tea.Cmd) {
+	m.statusMsg = fmt.Sprintf("Open %s account page... (not yet implemented)", m.currentProvider())
+	return m, nil
+}
+
+// executeConfirmedAction executes the pending confirmed action.
+func (m Model) executeConfirmedAction() (tea.Model, tea.Cmd) {
+	switch m.pendingAction {
+	case confirmDelete:
+		profiles := m.currentProfiles()
+		if m.selected >= 0 && m.selected < len(profiles) {
+			profile := profiles[m.selected]
+			m.statusMsg = fmt.Sprintf("Deleted '%s' (not yet implemented)", profile.Name)
+		}
+	}
+	m.state = stateList
+	m.pendingAction = confirmNone
 	return m, nil
 }
 
@@ -443,10 +558,14 @@ Navigation
   →/l     Next provider
   tab     Cycle providers
 
-Actions
+Profile Actions
   enter   Activate selected profile
-  b       Backup current auth
-  d       Delete profile
+  l       Login/refresh auth
+  o       Open account page in browser
+  d       Delete profile (with confirmation)
+
+Other Actions
+  b       Backup current auth state
 
 General
   ?       Toggle help
