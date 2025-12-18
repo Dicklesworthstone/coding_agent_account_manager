@@ -19,6 +19,7 @@ type SPMConfig struct {
 	Runtime   RuntimeConfig   `yaml:"runtime"`
 	Project   ProjectConfig   `yaml:"project"`
 	Stealth   StealthConfig   `yaml:"stealth"`
+	Safety    SafetyConfig    `yaml:"safety"`
 }
 
 // HealthConfig contains health and refresh settings.
@@ -80,6 +81,21 @@ type CooldownConfig struct {
 type RotationConfig struct {
 	Enabled   bool   `yaml:"enabled"`   // Master switch for rotation feature
 	Algorithm string `yaml:"algorithm"` // "smart" | "round_robin" | "random"
+}
+
+// SafetyConfig contains data safety and recovery settings.
+// Ensures users can never lose their original authentication state.
+type SafetyConfig struct {
+	// AutoBackupBeforeSwitch controls when backups are made before profile switches.
+	// "always": Backup before every switch
+	// "smart": Backup only if current state doesn't match any vault profile (default)
+	// "never": No automatic backups (not recommended)
+	AutoBackupBeforeSwitch string `yaml:"auto_backup_before_switch"`
+
+	// MaxAutoBackups limits the number of timestamped auto-backups to keep.
+	// Older backups beyond this limit are automatically rotated out.
+	// Set to 0 to keep unlimited backups.
+	MaxAutoBackups int `yaml:"max_auto_backups"`
 }
 
 // Duration is a time.Duration that supports YAML marshaling/unmarshaling
@@ -162,6 +178,10 @@ func DefaultSPMConfig() *SPMConfig {
 				Enabled:   false, // Opt-in
 				Algorithm: "smart",
 			},
+		},
+		Safety: SafetyConfig{
+			AutoBackupBeforeSwitch: "smart", // Backup if state doesn't match any profile
+			MaxAutoBackups:         5,       // Keep last 5 auto-backups
 		},
 	}
 }
@@ -288,6 +308,15 @@ func (c *SPMConfig) Validate() error {
 	validAlgorithms := map[string]bool{"smart": true, "round_robin": true, "random": true}
 	if c.Stealth.Rotation.Algorithm != "" && !validAlgorithms[c.Stealth.Rotation.Algorithm] {
 		return fmt.Errorf("stealth.rotation.algorithm must be one of: smart, round_robin, random")
+	}
+
+	// Safety validation
+	validBackupModes := map[string]bool{"always": true, "smart": true, "never": true}
+	if c.Safety.AutoBackupBeforeSwitch != "" && !validBackupModes[c.Safety.AutoBackupBeforeSwitch] {
+		return fmt.Errorf("safety.auto_backup_before_switch must be one of: always, smart, never")
+	}
+	if c.Safety.MaxAutoBackups < 0 {
+		return fmt.Errorf("safety.max_auto_backups cannot be negative")
 	}
 
 	return nil

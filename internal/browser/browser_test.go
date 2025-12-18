@@ -260,6 +260,7 @@ func TestURLDetector(t *testing.T) {
 
 		input := []byte("Visit http://localhost:8080/auth to login")
 		detector.Write(input)
+		detector.Flush()
 
 		if len(detectedURLs) != 1 {
 			t.Fatalf("detected %d URLs, want 1", len(detectedURLs))
@@ -280,6 +281,7 @@ func TestURLDetector(t *testing.T) {
 
 		input := []byte("http://localhost:3000/ or http://127.0.0.1:8080/callback")
 		detector.Write(input)
+		detector.Flush()
 
 		if len(detectedURLs) != 2 {
 			t.Errorf("detected %d URLs, want 2", len(detectedURLs))
@@ -292,6 +294,7 @@ func TestURLDetector(t *testing.T) {
 
 		input := []byte("http://localhost:8080/test")
 		n, err := detector.Write(input)
+		detector.Flush()
 
 		if err != nil {
 			t.Errorf("Write error = %v", err)
@@ -318,16 +321,37 @@ func TestURLDetector(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				detector.Write([]byte("http://localhost:8080/"))
+				detector.Write([]byte("http://localhost:8080/\n"))
 			}()
 		}
 		wg.Wait()
+		detector.Flush()
 
 		mu.Lock()
 		if count != 10 {
 			t.Errorf("count = %d, want 10", count)
 		}
 		mu.Unlock()
+	})
+
+	t.Run("partial writes", func(t *testing.T) {
+		var buf bytes.Buffer
+		var detectedURLs []string
+
+		detector := NewURLDetector(&buf, func(url string) bool {
+			detectedURLs = append(detectedURLs, url)
+			return true
+		})
+
+		detector.Write([]byte("http://local"))
+		detector.Write([]byte("host:8080/\n"))
+
+		if len(detectedURLs) != 1 {
+			t.Fatalf("detected %d URLs, want 1", len(detectedURLs))
+		}
+		if detectedURLs[0] != "http://localhost:8080/" {
+			t.Errorf("URL = %q, want http://localhost:8080/", detectedURLs[0])
+		}
 	})
 }
 
@@ -482,6 +506,7 @@ func TestOutputCapture(t *testing.T) {
 
 		writer := capture.StdoutWriter()
 		writer.Write([]byte("http://localhost:8080/oauth"))
+		capture.Flush()
 
 		urls := capture.GetURLs()
 		if len(urls) != 1 {
@@ -501,6 +526,7 @@ func TestOutputCapture(t *testing.T) {
 
 		writer := capture.StderrWriter()
 		writer.Write([]byte("Error: visit http://localhost:3000/"))
+		capture.Flush()
 
 		urls := capture.GetURLs()
 		if len(urls) != 1 {
@@ -517,6 +543,7 @@ func TestOutputCapture(t *testing.T) {
 
 		capture.StdoutWriter().Write([]byte("stdout content"))
 		capture.StderrWriter().Write([]byte("stderr content"))
+		capture.Flush()
 
 		if stdout.String() != "stdout content" {
 			t.Errorf("stdout = %q, want 'stdout content'", stdout.String())
@@ -539,6 +566,7 @@ func TestOutputCapture(t *testing.T) {
 
 		capture.StdoutWriter().Write([]byte("http://localhost:8080/"))
 		capture.StderrWriter().Write([]byte("http://127.0.0.1:3000/"))
+		capture.Flush()
 
 		if len(callbackURLs) != 2 {
 			t.Fatalf("callback called %d times, want 2", len(callbackURLs))
@@ -559,8 +587,9 @@ func TestOutputCapture(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
-				capture.StdoutWriter().Write([]byte("http://localhost:8080/"))
+				capture.StdoutWriter().Write([]byte("http://localhost:8080/\n"))
 			}
+			capture.Flush()
 		}()
 
 		// Reader goroutine
@@ -585,6 +614,7 @@ func TestOutputCapture(t *testing.T) {
 		capture := NewOutputCapture(&stdout, &stderr)
 
 		capture.StdoutWriter().Write([]byte("http://localhost:8080/"))
+		capture.Flush()
 
 		urls1 := capture.GetURLs()
 		urls2 := capture.GetURLs()
@@ -597,6 +627,24 @@ func TestOutputCapture(t *testing.T) {
 		// urls2 should be unchanged
 		if len(urls2) > 0 && urls2[0].URL == "modified" {
 			t.Error("GetURLs should return a copy, not the original slice")
+		}
+	})
+
+	t.Run("partial writes", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		capture := NewOutputCapture(&stdout, &stderr)
+
+		writer := capture.StdoutWriter()
+		writer.Write([]byte("http://local"))
+		writer.Write([]byte("host:8080/"))
+		capture.Flush()
+
+		urls := capture.GetURLs()
+		if len(urls) != 1 {
+			t.Fatalf("captured %d URLs, want 1", len(urls))
+		}
+		if urls[0].URL != "http://localhost:8080/" {
+			t.Errorf("URL = %q, want http://localhost:8080/", urls[0].URL)
 		}
 	})
 }

@@ -2,6 +2,7 @@ package browser
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -31,6 +32,23 @@ func NewURLDetector(output io.Writer, callback URLCallback) *URLDetector {
 	return &URLDetector{
 		output:   output,
 		callback: callback,
+	}
+}
+
+// Flush processes any remaining buffered data as a line.
+func (d *URLDetector) Flush() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.buffer) > 0 {
+		lineStr := string(d.buffer)
+		if d.callback != nil {
+			urls := URLPattern.FindAllString(lineStr, -1)
+			for _, url := range urls {
+				d.callback(url)
+			}
+		}
+		d.buffer = nil
 	}
 }
 
@@ -132,32 +150,45 @@ type OutputCapture struct {
 	DetectedURLs []DetectedURL
 	OnURL        func(url string, source string)
 	mu           sync.Mutex
+
+	stdoutWriter *captureWriter
+	stderrWriter *captureWriter
 }
 
 // NewOutputCapture creates a new output capture that writes to the given writers.
 func NewOutputCapture(stdout, stderr io.Writer) *OutputCapture {
-	return &OutputCapture{
+	c := &OutputCapture{
 		Stdout: stdout,
 		Stderr: stderr,
 	}
+	c.stdoutWriter = &captureWriter{capture: c, output: stdout, source: "stdout"}
+	c.stderrWriter = &captureWriter{capture: c, output: stderr, source: "stderr"}
+	return c
 }
 
 // StdoutWriter returns an io.Writer for stdout that scans for URLs.
 func (c *OutputCapture) StdoutWriter() io.Writer {
-	return &captureWriter{
-		capture: c,
-		output:  c.Stdout,
-		source:  "stdout",
-	}
+	return c.stdoutWriter
 }
 
 // StderrWriter returns an io.Writer for stderr that scans for URLs.
 func (c *OutputCapture) StderrWriter() io.Writer {
-	return &captureWriter{
-		capture: c,
-		output:  c.Stderr,
-		source:  "stderr",
-	}
+	return c.stderrWriter
+}
+
+// Flush processes any remaining buffered data in stdout/stderr writers.
+func (c *OutputCapture) Flush() {
+	c.stdoutWriter.Flush()
+	c.stderrWriter.Flush()
+}
+
+// GetURLs returns all detected URLs (thread-safe).
+func (c *OutputCapture) GetURLs() []DetectedURL {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]DetectedURL, len(c.DetectedURLs))
+	copy(result, c.DetectedURLs)
+	return result
 }
 
 // captureWriter wraps writes and scans for URLs.
@@ -207,11 +238,24 @@ func (w *captureWriter) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-// GetURLs returns all detected URLs (thread-safe).
-func (c *OutputCapture) GetURLs() []DetectedURL {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]DetectedURL, len(c.DetectedURLs))
-	copy(result, c.DetectedURLs)
-	return result
+func (w *captureWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.buffer) > 0 {
+		lineStr := string(w.buffer)
+		urls := URLPattern.FindAllString(lineStr, -1)
+		for _, url := range urls {
+			w.capture.mu.Lock()
+			w.capture.DetectedURLs = append(w.capture.DetectedURLs, DetectedURL{
+				URL:    url,
+				Source: w.source,
+			})
+			if w.capture.OnURL != nil {
+				w.capture.OnURL(url, w.source)
+			}
+			w.capture.mu.Unlock()
+		}
+		w.buffer = nil
+	}
 }

@@ -98,6 +98,14 @@ func TestDefaultSPMConfig(t *testing.T) {
 	if cfg.Stealth.Rotation.Algorithm != "smart" {
 		t.Errorf("Stealth.Rotation.Algorithm = %q, want %q", cfg.Stealth.Rotation.Algorithm, "smart")
 	}
+
+	// Check safety defaults
+	if cfg.Safety.AutoBackupBeforeSwitch != "smart" {
+		t.Errorf("Safety.AutoBackupBeforeSwitch = %q, want %q", cfg.Safety.AutoBackupBeforeSwitch, "smart")
+	}
+	if cfg.Safety.MaxAutoBackups != 5 {
+		t.Errorf("Safety.MaxAutoBackups = %d, want 5", cfg.Safety.MaxAutoBackups)
+	}
 }
 
 func TestSPMConfigPath(t *testing.T) {
@@ -411,6 +419,34 @@ stealth:
 `,
 			wantErr: "stealth.rotation.algorithm must be one of: smart, round_robin, random",
 		},
+		{
+			name: "invalid backup mode",
+			yaml: `
+version: 1
+health:
+  refresh_threshold: 10m
+  warning_threshold: 1h
+  penalty_decay_rate: 0.8
+  penalty_decay_interval: 5m
+safety:
+  auto_backup_before_switch: invalid_mode
+`,
+			wantErr: "safety.auto_backup_before_switch must be one of: always, smart, never",
+		},
+		{
+			name: "negative max auto backups",
+			yaml: `
+version: 1
+health:
+  refresh_threshold: 10m
+  warning_threshold: 1h
+  penalty_decay_rate: 0.8
+  penalty_decay_interval: 5m
+safety:
+  max_auto_backups: -5
+`,
+			wantErr: "safety.max_auto_backups cannot be negative",
+		},
 	}
 
 	for _, tc := range tests {
@@ -477,6 +513,10 @@ func TestSPMConfigSave(t *testing.T) {
 				Enabled:   true,
 				Algorithm: "round_robin",
 			},
+		},
+		Safety: SafetyConfig{
+			AutoBackupBeforeSwitch: "always",
+			MaxAutoBackups:         10,
 		},
 	}
 
@@ -547,6 +587,14 @@ func TestSPMConfigSave(t *testing.T) {
 	}
 	if loaded.Stealth.Rotation.Algorithm != "round_robin" {
 		t.Errorf("Loaded Stealth.Rotation.Algorithm = %q, want %q", loaded.Stealth.Rotation.Algorithm, "round_robin")
+	}
+
+	// Verify safety config was saved and loaded correctly
+	if loaded.Safety.AutoBackupBeforeSwitch != "always" {
+		t.Errorf("Loaded Safety.AutoBackupBeforeSwitch = %q, want %q", loaded.Safety.AutoBackupBeforeSwitch, "always")
+	}
+	if loaded.Safety.MaxAutoBackups != 10 {
+		t.Errorf("Loaded Safety.MaxAutoBackups = %d, want 10", loaded.Safety.MaxAutoBackups)
 	}
 }
 
