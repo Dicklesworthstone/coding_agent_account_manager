@@ -73,8 +73,12 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	_ = refreshIfNeeded(cmd.Context(), tool, profileName)
 
 	// Smart auto-backup before switch (based on safety config)
-	spmCfg, _ := config.LoadSPMConfig()
-	backupMode := spmCfg.Safety.AutoBackupBeforeSwitch
+	spmCfg, err := config.LoadSPMConfig()
+	if err != nil {
+		// Invalid config should not crash activation; fall back to defaults.
+		spmCfg = config.DefaultSPMConfig()
+	}
+	backupMode := strings.TrimSpace(spmCfg.Safety.AutoBackupBeforeSwitch)
 	if backupMode == "" {
 		backupMode = "smart" // Default
 	}

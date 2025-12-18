@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -341,13 +342,7 @@ func (v *Vault) RotateAutoBackups(tool string, maxBackups int) error {
 
 	// Sort by name (which includes timestamp, so oldest first)
 	// _backup_20251217_143022 sorts lexicographically by date/time
-	for i := 0; i < len(backups)-1; i++ {
-		for j := i + 1; j < len(backups); j++ {
-			if backups[j] < backups[i] {
-				backups[i], backups[j] = backups[j], backups[i]
-			}
-		}
-	}
+	sort.Strings(backups)
 
 	// Delete oldest until we're within limit
 	toDelete := len(backups) - maxBackups
