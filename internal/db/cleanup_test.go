@@ -264,3 +264,71 @@ func TestDB_CleanupStaleProfileStats(t *testing.T) {
 		t.Errorf("ProfileStatsCount after cleanup = %d, want 1", stats.ProfileStatsCount)
 	}
 }
+
+func TestDB_CleanupZeroRetention(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_cleanup_zero.db")
+
+	db, err := OpenAt(dbPath)
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	// Insert an old activity log (would normally be deleted)
+	old := time.Now().AddDate(0, 0, -100) // 100 days ago
+	oldEvent := Event{
+		Timestamp:   old,
+		Type:        EventActivate,
+		Provider:    "codex",
+		ProfileName: "old-profile",
+	}
+	if err := db.LogEvent(oldEvent); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	// Verify we have 1 entry
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.ActivityLogCount != 1 {
+		t.Fatalf("ActivityLogCount = %d, want 1", stats.ActivityLogCount)
+	}
+
+	// Run cleanup with zero retention (should skip deletion, treat as "keep forever")
+	cfg := CleanupConfig{
+		RetentionDays:          0,
+		AggregateRetentionDays: 0,
+	}
+	result, err := db.Cleanup(cfg)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	// Nothing should be deleted when retention is 0
+	if result.ActivityLogsDeleted != 0 {
+		t.Errorf("ActivityLogsDeleted = %d, want 0 (retention=0 means keep forever)", result.ActivityLogsDeleted)
+	}
+	if result.StatsEntriesDeleted != 0 {
+		t.Errorf("StatsEntriesDeleted = %d, want 0 (retention=0 means keep forever)", result.StatsEntriesDeleted)
+	}
+
+	// Verify nothing was deleted
+	stats, err = db.Stats()
+	if err != nil {
+		t.Fatalf("Stats after cleanup: %v", err)
+	}
+	if stats.ActivityLogCount != 1 {
+		t.Errorf("ActivityLogCount after cleanup = %d, want 1", stats.ActivityLogCount)
+	}
+
+	// Dry run should also return 0
+	dryResult, err := db.CleanupDryRun(cfg)
+	if err != nil {
+		t.Fatalf("CleanupDryRun: %v", err)
+	}
+	if dryResult.ActivityLogsDeleted != 0 {
+		t.Errorf("CleanupDryRun ActivityLogsDeleted = %d, want 0", dryResult.ActivityLogsDeleted)
+	}
+}

@@ -33,45 +33,50 @@ type CleanupResult struct {
 // Cleanup removes old records based on the retention configuration.
 // It deletes activity_log entries older than RetentionDays and
 // profile_stats entries for profiles with no recent activity.
+// If RetentionDays or AggregateRetentionDays is <= 0, that cleanup is skipped
+// (treated as "keep forever").
 func (d *DB) Cleanup(cfg CleanupConfig) (*CleanupResult, error) {
 	if d == nil || d.conn == nil {
 		return nil, fmt.Errorf("db is not open")
 	}
 
 	result := &CleanupResult{}
+	now := time.Now()
 
-	// Calculate cutoff dates
-	activityCutoff := time.Now().AddDate(0, 0, -cfg.RetentionDays)
-	statsCutoff := time.Now().AddDate(0, 0, -cfg.AggregateRetentionDays)
-
-	// Delete old activity logs
-	activityResult, err := d.conn.Exec(`
-		DELETE FROM activity_log
-		WHERE datetime(timestamp) < datetime(?)
-	`, formatSQLiteTime(activityCutoff))
-	if err != nil {
-		return nil, fmt.Errorf("delete old activity logs: %w", err)
+	// Delete old activity logs (skip if retention <= 0, meaning "keep forever")
+	if cfg.RetentionDays > 0 {
+		activityCutoff := now.AddDate(0, 0, -cfg.RetentionDays)
+		activityResult, err := d.conn.Exec(`
+			DELETE FROM activity_log
+			WHERE datetime(timestamp) < datetime(?)
+		`, formatSQLiteTime(activityCutoff))
+		if err != nil {
+			return nil, fmt.Errorf("delete old activity logs: %w", err)
+		}
+		deleted, _ := activityResult.RowsAffected()
+		result.ActivityLogsDeleted = int(deleted)
 	}
-	deleted, _ := activityResult.RowsAffected()
-	result.ActivityLogsDeleted = int(deleted)
 
-	// Delete stale profile_stats (profiles with no recent activity)
+	// Delete stale profile_stats (skip if aggregate retention <= 0)
 	// Only delete if last_activated is old AND there are no recent logs for this profile
-	statsResult, err := d.conn.Exec(`
-		DELETE FROM profile_stats
-		WHERE (last_activated IS NULL OR datetime(last_activated) < datetime(?))
-		  AND NOT EXISTS (
-			SELECT 1 FROM activity_log
-			WHERE activity_log.provider = profile_stats.provider
-			  AND activity_log.profile_name = profile_stats.profile_name
-			  AND datetime(activity_log.timestamp) >= datetime(?)
-		  )
-	`, formatSQLiteTime(statsCutoff), formatSQLiteTime(statsCutoff))
-	if err != nil {
-		return nil, fmt.Errorf("delete stale profile stats: %w", err)
+	if cfg.AggregateRetentionDays > 0 {
+		statsCutoff := now.AddDate(0, 0, -cfg.AggregateRetentionDays)
+		statsResult, err := d.conn.Exec(`
+			DELETE FROM profile_stats
+			WHERE (last_activated IS NULL OR datetime(last_activated) < datetime(?))
+			  AND NOT EXISTS (
+				SELECT 1 FROM activity_log
+				WHERE activity_log.provider = profile_stats.provider
+				  AND activity_log.profile_name = profile_stats.profile_name
+				  AND datetime(activity_log.timestamp) >= datetime(?)
+			  )
+		`, formatSQLiteTime(statsCutoff), formatSQLiteTime(statsCutoff))
+		if err != nil {
+			return nil, fmt.Errorf("delete stale profile stats: %w", err)
+		}
+		statsDeleted, _ := statsResult.RowsAffected()
+		result.StatsEntriesDeleted = int(statsDeleted)
 	}
-	statsDeleted, _ := statsResult.RowsAffected()
-	result.StatsEntriesDeleted = int(statsDeleted)
 
 	// Run VACUUM to reclaim space if significant deletions occurred
 	if result.ActivityLogsDeleted > 1000 || result.StatsEntriesDeleted > 100 {
@@ -87,47 +92,51 @@ func (d *DB) Cleanup(cfg CleanupConfig) (*CleanupResult, error) {
 }
 
 // CleanupDryRun returns what would be deleted without actually deleting.
+// If RetentionDays or AggregateRetentionDays is <= 0, that count is skipped (returns 0).
 func (d *DB) CleanupDryRun(cfg CleanupConfig) (*CleanupResult, error) {
 	if d == nil || d.conn == nil {
 		return nil, fmt.Errorf("db is not open")
 	}
 
 	result := &CleanupResult{}
+	now := time.Now()
 
-	// Calculate cutoff dates
-	activityCutoff := time.Now().AddDate(0, 0, -cfg.RetentionDays)
-	statsCutoff := time.Now().AddDate(0, 0, -cfg.AggregateRetentionDays)
-
-	// Count activity logs that would be deleted
-	var activityCount int
-	err := d.conn.QueryRow(`
-		SELECT COUNT(*) FROM activity_log
-		WHERE datetime(timestamp) < datetime(?)
-	`, formatSQLiteTime(activityCutoff)).Scan(&activityCount)
-	if err != nil {
-		return nil, fmt.Errorf("count old activity logs: %w", err)
+	// Count activity logs that would be deleted (skip if retention <= 0)
+	if cfg.RetentionDays > 0 {
+		activityCutoff := now.AddDate(0, 0, -cfg.RetentionDays)
+		var activityCount int
+		err := d.conn.QueryRow(`
+			SELECT COUNT(*) FROM activity_log
+			WHERE datetime(timestamp) < datetime(?)
+		`, formatSQLiteTime(activityCutoff)).Scan(&activityCount)
+		if err != nil {
+			return nil, fmt.Errorf("count old activity logs: %w", err)
+		}
+		result.ActivityLogsDeleted = activityCount
 	}
-	result.ActivityLogsDeleted = activityCount
 
-	// Count profile_stats that would be deleted
-	var statsCount int
-	err = d.conn.QueryRow(`
-		SELECT COUNT(*) FROM profile_stats
-		WHERE (last_activated IS NULL OR datetime(last_activated) < datetime(?))
-		  AND NOT EXISTS (
-			SELECT 1 FROM activity_log
-			WHERE activity_log.provider = profile_stats.provider
-			  AND activity_log.profile_name = profile_stats.profile_name
-			  AND datetime(activity_log.timestamp) >= datetime(?)
-		  )
-	`, formatSQLiteTime(statsCutoff), formatSQLiteTime(statsCutoff)).Scan(&statsCount)
-	if err != nil {
-		return nil, fmt.Errorf("count stale profile stats: %w", err)
+	// Count profile_stats that would be deleted (skip if aggregate retention <= 0)
+	if cfg.AggregateRetentionDays > 0 {
+		statsCutoff := now.AddDate(0, 0, -cfg.AggregateRetentionDays)
+		var statsCount int
+		err := d.conn.QueryRow(`
+			SELECT COUNT(*) FROM profile_stats
+			WHERE (last_activated IS NULL OR datetime(last_activated) < datetime(?))
+			  AND NOT EXISTS (
+				SELECT 1 FROM activity_log
+				WHERE activity_log.provider = profile_stats.provider
+				  AND activity_log.profile_name = profile_stats.profile_name
+				  AND datetime(activity_log.timestamp) >= datetime(?)
+			  )
+		`, formatSQLiteTime(statsCutoff), formatSQLiteTime(statsCutoff)).Scan(&statsCount)
+		if err != nil {
+			return nil, fmt.Errorf("count stale profile stats: %w", err)
+		}
+		result.StatsEntriesDeleted = statsCount
 	}
-	result.StatsEntriesDeleted = statsCount
 
 	// Would VACUUM run?
-	result.VacuumRan = activityCount > 1000 || statsCount > 100
+	result.VacuumRan = result.ActivityLogsDeleted > 1000 || result.StatsEntriesDeleted > 100
 
 	return result, nil
 }
