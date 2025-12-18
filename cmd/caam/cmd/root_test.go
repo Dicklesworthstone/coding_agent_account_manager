@@ -67,6 +67,7 @@ func TestSubcommandRegistration(t *testing.T) {
 		"backup",
 		"activate",
 		"project",
+		"refresh",
 		"export",
 		"import",
 		"status",
@@ -459,6 +460,7 @@ func TestCommandUsageStrings(t *testing.T) {
 		{pathsCmd, "paths [tool]"},
 		{clearCmd, "clear <tool>"},
 		{loginCmd, "login <tool> <profile>"},
+		{refreshCmd, "refresh [tool] [profile]"},
 	}
 
 	for _, tc := range commands {
