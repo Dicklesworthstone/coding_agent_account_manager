@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -45,7 +46,7 @@ func (d *URLDetector) Flush() {
 		if d.callback != nil {
 			urls := URLPattern.FindAllString(lineStr, -1)
 			for _, url := range urls {
-				d.callback(url)
+				d.callback(cleanURL(url))
 			}
 		}
 		d.buffer = nil
@@ -71,7 +72,7 @@ func (d *URLDetector) Write(p []byte) (n int, err error) {
 		if d.callback != nil {
 			urls := URLPattern.FindAllString(lineStr, -1)
 			for _, url := range urls {
-				d.callback(url)
+				d.callback(cleanURL(url))
 			}
 		}
 
@@ -93,7 +94,7 @@ func ScanReader(reader io.Reader, output io.Writer, callback URLCallback) error 
 		if callback != nil {
 			urls := URLPattern.FindAllString(line, -1)
 			for _, url := range urls {
-				callback(url)
+				callback(cleanURL(url))
 			}
 		}
 
@@ -103,6 +104,12 @@ func ScanReader(reader io.Reader, output io.Writer, callback URLCallback) error 
 		}
 	}
 	return scanner.Err()
+}
+
+// cleanURL removes trailing punctuation often captured by the greedy regex.
+func cleanURL(s string) string {
+	// Trim trailing punctuation marks that shouldn't be part of the URL
+	return strings.TrimRight(s, ".,;:!)]}>")
 }
 
 // BrowserHelperScript generates a shell script that can be used as BROWSER env var.
@@ -219,13 +226,14 @@ func (w *captureWriter) Write(p []byte) (n int, err error) {
 			// Scan for URLs in this line
 			urls := URLPattern.FindAllString(lineStr, -1)
 			for _, url := range urls {
+				cleaned := cleanURL(url)
 				w.capture.mu.Lock()
 				w.capture.DetectedURLs = append(w.capture.DetectedURLs, DetectedURL{
-					URL:    url,
+					URL:    cleaned,
 					Source: w.source,
 				})
 				if w.capture.OnURL != nil {
-					w.capture.OnURL(url, w.source)
+					w.capture.OnURL(cleaned, w.source)
 				}
 				w.capture.mu.Unlock()
 			}
@@ -246,13 +254,14 @@ func (w *captureWriter) Flush() {
 		lineStr := string(w.buffer)
 		urls := URLPattern.FindAllString(lineStr, -1)
 		for _, url := range urls {
+			cleaned := cleanURL(url)
 			w.capture.mu.Lock()
 			w.capture.DetectedURLs = append(w.capture.DetectedURLs, DetectedURL{
-				URL:    url,
+				URL:    cleaned,
 				Source: w.source,
 			})
 			if w.capture.OnURL != nil {
-				w.capture.OnURL(url, w.source)
+				w.capture.OnURL(cleaned, w.source)
 			}
 			w.capture.mu.Unlock()
 		}

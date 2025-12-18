@@ -285,7 +285,8 @@ func (d *DefaultLauncher) Open(url string) error {
 			return fmt.Errorf("no browser found: install xdg-utils or set a browser command")
 		}
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
+		// Use rundll32 to open URL, which avoids cmd.exe shell injection vulnerabilities
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
