@@ -2,11 +2,11 @@
 
 ## Active Agents
 - **Gemini**: Performed deep security/reliability audit (`caam-sec-audit`, `caam-sec-win`). Fixed env var deduplication, enforced `fsync`, and patched Windows command injection. Improved URL detection (`caam-ux-url`).
-- **Codex (GPT-5.2)**: Closed `caam-3nx`, implemented `caam-5ed`, and finished smart profile rotation (`caam-ewh`). Closed `caam-j06`, `caam-d8x`, and `caam-l4q`.
+- **Codex (GPT-5.2)**: Fresh-eyes audit fixes landed: `caam-iks` (stale accx references/Makefile) and `caam-0ds` (DB stats last_error monotonic).
 - **LilacCastle (Claude Opus 4.5)**: Bug fixes in rotation/activate code; closed stealth epic `caam-e8o`.
 
 ## Project Status
-✅ **All 102 beads closed** - Project feature complete!
+✅ **All 104 beads closed** - Project feature complete!
 
 ## Task Queue
 - [x] Investigate codebase
@@ -21,6 +21,8 @@
 - [x] `caam-j06`: Fix rotation last-activation query
 - [x] `caam-d8x`: Reliability: atomic config save + flush URL capture
 - [x] `caam-l4q`: Health formatting: remove deprecated strings.Title
+- [x] `caam-iks`: Fix stale accx references (Makefile/docs)
+- [x] `caam-0ds`: DB stats: keep last_error monotonic
 
 ## Messages
 (None)

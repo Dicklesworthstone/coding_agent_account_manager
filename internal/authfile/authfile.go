@@ -132,7 +132,7 @@ func GeminiAuthFiles() AuthFileSet {
 
 // Vault manages stored auth file backups.
 type Vault struct {
-	basePath string // ~/.local/share/accx/vault
+	basePath string // ~/.local/share/caam/vault
 }
 
 const originalProfileName = "_original"

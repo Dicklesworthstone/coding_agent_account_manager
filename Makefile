@@ -1,23 +1,23 @@
-.PHONY: build test clean install lint fmt tidy run
+.PHONY: build test test-race clean install lint fmt tidy run tui help dev-setup release-snapshot
 
 # Binary name
-BINARY=accx
+BINARY=caam
 
 # Build variables
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS=-ldflags "-s -w \
-	-X github.com/user/accx/internal/version.Version=$(VERSION) \
-	-X github.com/user/accx/internal/version.Commit=$(COMMIT) \
-	-X github.com/user/accx/internal/version.Date=$(DATE)"
+	-X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=$(VERSION) \
+	-X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=$(COMMIT) \
+	-X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=$(DATE)"
 
 # Default target
 all: build
 
 # Build the binary
 build:
-	go build $(LDFLAGS) -o $(BINARY) ./cmd/accx
+	go build $(LDFLAGS) -o $(BINARY) ./cmd/caam
 
 # Run tests
 test:
@@ -42,7 +42,7 @@ tidy:
 
 # Install to GOPATH/bin
 install:
-	go install $(LDFLAGS) ./cmd/accx
+	go install $(LDFLAGS) ./cmd/caam
 
 # Clean build artifacts
 clean:
@@ -55,7 +55,7 @@ run: build
 
 # Run the TUI
 tui: build
-	./$(BINARY) tui
+	./$(BINARY)
 
 # Build for all platforms (requires goreleaser)
 release-snapshot:

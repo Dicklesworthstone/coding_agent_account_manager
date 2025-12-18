@@ -3,7 +3,7 @@
 This guide outlines the best practices for Go development within this project, modeled after high-quality TUI applications.
 
 ## 1. Project Structure
-- **cmd/**: Contains the main applications. Each subdirectory should be a main package (e.g., `cmd/accx/main.go`).
+- **cmd/**: Contains the main applications. Each subdirectory should be a main package (e.g., `cmd/caam/main.go`).
 - **pkg/**: Library code that can be imported by other projects.
 - **internal/**: Private library code that should not be imported by outside projects. Use this for core logic specific to the application.
 - **internal/ui/**: User Interface components (Bubble Tea models, views).

@@ -301,7 +301,7 @@ func updateProfileStats(tx *sql.Tx, eventType, provider, profile, ts string, dur
 			 VALUES (?, ?, 1, ?)
 			 ON CONFLICT(provider, profile_name) DO UPDATE SET
 			   total_activations = total_activations + 1,
-			   last_activated = MAX(last_activated, excluded.last_activated)`,
+			   last_activated = MAX(COALESCE(last_activated, excluded.last_activated), excluded.last_activated)`,
 			provider,
 			profile,
 			ts,
@@ -315,7 +315,7 @@ func updateProfileStats(tx *sql.Tx, eventType, provider, profile, ts string, dur
 			 VALUES (?, ?, 1, ?)
 			 ON CONFLICT(provider, profile_name) DO UPDATE SET
 			   total_errors = total_errors + 1,
-			   last_error = excluded.last_error`,
+			   last_error = MAX(COALESCE(last_error, excluded.last_error), excluded.last_error)`,
 			provider,
 			profile,
 			ts,

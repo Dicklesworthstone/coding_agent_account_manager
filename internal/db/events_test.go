@@ -1,6 +1,7 @@
 package db
 
 import (
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -172,5 +173,51 @@ func TestDB_LastActivation_UsesStatsAndFallsBackToActivityLog(t *testing.T) {
 	}
 	if !empty.IsZero() {
 		t.Fatalf("LastActivation(empty) = %s, want zero", empty.Format(time.RFC3339Nano))
+	}
+}
+
+func TestDB_ProfileStats_LastErrorIsMonotonic(t *testing.T) {
+	tmpDir := t.TempDir()
+	d, err := OpenAt(filepath.Join(tmpDir, "caam.db"))
+	if err != nil {
+		t.Fatalf("OpenAt() error = %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	now := time.Now().UTC().Truncate(time.Second)
+	newer := now.Add(-10 * time.Minute)
+	older := now.Add(-2 * time.Hour)
+
+	if err := d.LogEvent(Event{
+		Type:        EventError,
+		Provider:    "codex",
+		ProfileName: "work",
+		Timestamp:   newer,
+	}); err != nil {
+		t.Fatalf("LogEvent(newer error) error = %v", err)
+	}
+
+	// Insert an older error after a newer one; LastError should not move backwards.
+	if err := d.LogEvent(Event{
+		Type:        EventError,
+		Provider:    "codex",
+		ProfileName: "work",
+		Timestamp:   older,
+	}); err != nil {
+		t.Fatalf("LogEvent(older error) error = %v", err)
+	}
+
+	stats, err := d.GetStats("codex", "work")
+	if err != nil {
+		t.Fatalf("GetStats() error = %v", err)
+	}
+	if stats == nil {
+		t.Fatalf("GetStats() = nil, want stats")
+	}
+	if stats.TotalErrors != 2 {
+		t.Fatalf("TotalErrors = %d, want 2", stats.TotalErrors)
+	}
+	if !stats.LastError.Equal(newer) {
+		t.Fatalf("LastError = %s, want %s", stats.LastError.Format(time.RFC3339Nano), newer.Format(time.RFC3339Nano))
 	}
 }
