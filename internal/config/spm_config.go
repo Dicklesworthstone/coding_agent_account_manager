@@ -32,10 +32,10 @@ type HealthConfig struct {
 
 // AnalyticsConfig contains activity tracking settings.
 type AnalyticsConfig struct {
-	Enabled                 bool `yaml:"enabled"`
-	RetentionDays           int  `yaml:"retention_days"`           // Keep detailed logs
-	AggregateRetentionDays  int  `yaml:"aggregate_retention_days"` // Keep aggregates longer
-	CleanupOnStartup        bool `yaml:"cleanup_on_startup"`
+	Enabled                bool `yaml:"enabled"`
+	RetentionDays          int  `yaml:"retention_days"`           // Keep detailed logs
+	AggregateRetentionDays int  `yaml:"aggregate_retention_days"` // Keep aggregates longer
+	CleanupOnStartup       bool `yaml:"cleanup_on_startup"`
 }
 
 // RuntimeConfig contains runtime behavior settings.

@@ -339,8 +339,8 @@ analytics:
 			wantErr: "aggregate_retention_days should be >= retention_days",
 		},
 		{
-			name: "version 0",
-			yaml: `version: 0`,
+			name:    "version 0",
+			yaml:    `version: 0`,
 			wantErr: "version must be >= 1",
 		},
 		{

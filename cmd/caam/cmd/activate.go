@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
@@ -71,13 +72,45 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	// Step 1: Refresh if needed
 	_ = refreshIfNeeded(cmd.Context(), tool, profileName)
 
-	// Optionally backup current state first
+	// Smart auto-backup before switch (based on safety config)
+	spmCfg, _ := config.LoadSPMConfig()
+	backupMode := spmCfg.Safety.AutoBackupBeforeSwitch
+	if backupMode == "" {
+		backupMode = "smart" // Default
+	}
+
+	// Check if --backup-current flag overrides config
 	backupFirst, _ := cmd.Flags().GetBool("backup-current")
 	if backupFirst {
+		backupMode = "always"
+	}
+
+	if backupMode != "never" {
+		shouldBackup := false
 		currentProfile, _ := vault.ActiveProfile(fileSet)
-		if currentProfile != "" && currentProfile != profileName {
-			if err := vault.Backup(fileSet, currentProfile); err != nil {
-				fmt.Printf("Warning: could not backup current profile: %v\n", err)
+
+		switch backupMode {
+		case "always":
+			// Always backup if there are auth files and we're switching to a different profile
+			shouldBackup = currentProfile != profileName
+		case "smart":
+			// Backup only if current state doesn't match any vault profile (would be lost)
+			shouldBackup = currentProfile == "" && authfile.HasAuthFiles(fileSet)
+		}
+
+		if shouldBackup {
+			backupName, err := vault.BackupCurrent(fileSet)
+			if err != nil {
+				fmt.Printf("Warning: could not auto-backup current state: %v\n", err)
+			} else if backupName != "" {
+				fmt.Printf("Auto-backed up current state to %s\n", backupName)
+
+				// Rotate old backups if limit is set
+				if spmCfg.Safety.MaxAutoBackups > 0 {
+					if err := vault.RotateAutoBackups(tool, spmCfg.Safety.MaxAutoBackups); err != nil {
+						fmt.Printf("Warning: could not rotate old backups: %v\n", err)
+					}
+				}
 			}
 		}
 	}

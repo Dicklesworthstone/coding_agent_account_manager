@@ -293,6 +293,73 @@ func (v *Vault) HasOriginalBackup(tool string) (bool, error) {
 	return true, nil
 }
 
+// BackupCurrent creates a timestamped backup of the current auth state.
+// Returns the backup profile name (e.g., "_backup_20251217_143022") if created,
+// or empty string if there was nothing to back up.
+func (v *Vault) BackupCurrent(fileSet AuthFileSet) (string, error) {
+	// Only back up when at least one required auth file exists.
+	if !HasAuthFiles(fileSet) {
+		return "", nil
+	}
+
+	// Generate timestamped backup name
+	timestamp := time.Now().Format("20060102_150405")
+	backupName := "_backup_" + timestamp
+
+	if err := v.Backup(fileSet, backupName); err != nil {
+		return "", fmt.Errorf("backup current: %w", err)
+	}
+
+	return backupName, nil
+}
+
+// RotateAutoBackups removes old auto-backup profiles to stay within the limit.
+// Backups are sorted by timestamp (oldest first) and oldest are deleted.
+// A maxBackups of 0 means unlimited (no rotation).
+func (v *Vault) RotateAutoBackups(tool string, maxBackups int) error {
+	if maxBackups <= 0 {
+		return nil // Unlimited
+	}
+
+	profiles, err := v.List(tool)
+	if err != nil {
+		return fmt.Errorf("list profiles: %w", err)
+	}
+
+	// Filter to auto-backup profiles only
+	var backups []string
+	for _, p := range profiles {
+		if strings.HasPrefix(p, "_backup_") {
+			backups = append(backups, p)
+		}
+	}
+
+	// Already within limit?
+	if len(backups) <= maxBackups {
+		return nil
+	}
+
+	// Sort by name (which includes timestamp, so oldest first)
+	// _backup_20251217_143022 sorts lexicographically by date/time
+	for i := 0; i < len(backups)-1; i++ {
+		for j := i + 1; j < len(backups); j++ {
+			if backups[j] < backups[i] {
+				backups[i], backups[j] = backups[j], backups[i]
+			}
+		}
+	}
+
+	// Delete oldest until we're within limit
+	toDelete := len(backups) - maxBackups
+	for i := 0; i < toDelete; i++ {
+		if err := v.DeleteForce(tool, backups[i]); err != nil {
+			return fmt.Errorf("delete old backup %s: %w", backups[i], err)
+		}
+	}
+
+	return nil
+}
+
 // BackupOriginal creates the system-managed `_original` profile for a tool if
 // needed. This is intended to preserve a user's pre-caam auth state.
 //

@@ -1034,3 +1034,210 @@ func TestBackupRestore_RoundTrip(t *testing.T) {
 		t.Errorf("ActiveProfile() = %q, want %q", profile, "roundtrip")
 	}
 }
+
+func TestVaultBackupCurrent(t *testing.T) {
+	t.Run("creates timestamped backup", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, "auth.json")
+		content := []byte(`{"token":"current"}`)
+		if err := os.WriteFile(authFile, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "testtool",
+			Files: []AuthFileSpec{
+				{Tool: "testtool", Path: authFile, Required: true},
+			},
+		}
+
+		backupName, err := v.BackupCurrent(fileSet)
+		if err != nil {
+			t.Fatalf("BackupCurrent() error = %v", err)
+		}
+
+		// Check backup name format
+		if backupName == "" {
+			t.Fatal("BackupCurrent() returned empty name")
+		}
+		if len(backupName) < 8 || backupName[:8] != "_backup_" {
+			t.Errorf("backup name %q doesn't start with _backup_", backupName)
+		}
+
+		// Verify backup content
+		backupPath := v.BackupPath("testtool", backupName, "auth.json")
+		got, err := os.ReadFile(backupPath)
+		if err != nil {
+			t.Fatalf("ReadFile() error = %v", err)
+		}
+		if string(got) != string(content) {
+			t.Errorf("backup content = %q, want %q", got, content)
+		}
+	})
+
+	t.Run("no-op when no auth files", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "testtool",
+			Files: []AuthFileSpec{
+				{Tool: "testtool", Path: "/nonexistent/auth.json", Required: true},
+			},
+		}
+
+		backupName, err := v.BackupCurrent(fileSet)
+		if err != nil {
+			t.Fatalf("BackupCurrent() error = %v", err)
+		}
+		if backupName != "" {
+			t.Errorf("BackupCurrent() = %q, want empty string when no auth files", backupName)
+		}
+	})
+}
+
+func TestVaultRotateAutoBackups(t *testing.T) {
+	t.Run("deletes oldest when over limit", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		v := NewVault(tmpDir)
+
+		// Create 5 backup profiles
+		backups := []string{
+			"_backup_20251201_100000",
+			"_backup_20251202_100000",
+			"_backup_20251203_100000",
+			"_backup_20251204_100000",
+			"_backup_20251205_100000",
+		}
+		for _, name := range backups {
+			profileDir := v.ProfilePath("testtool", name)
+			if err := os.MkdirAll(profileDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Rotate to keep only 3
+		if err := v.RotateAutoBackups("testtool", 3); err != nil {
+			t.Fatalf("RotateAutoBackups() error = %v", err)
+		}
+
+		// Check remaining profiles
+		profiles, _ := v.List("testtool")
+		if len(profiles) != 3 {
+			t.Errorf("after rotation: %d profiles, want 3", len(profiles))
+		}
+
+		// Oldest 2 should be deleted
+		for _, name := range backups[:2] {
+			profileDir := v.ProfilePath("testtool", name)
+			if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
+				t.Errorf("profile %s should have been deleted", name)
+			}
+		}
+
+		// Newest 3 should remain
+		for _, name := range backups[2:] {
+			profileDir := v.ProfilePath("testtool", name)
+			if _, err := os.Stat(profileDir); os.IsNotExist(err) {
+				t.Errorf("profile %s should still exist", name)
+			}
+		}
+	})
+
+	t.Run("no-op when within limit", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		v := NewVault(tmpDir)
+
+		// Create 2 backup profiles
+		backups := []string{"_backup_20251201_100000", "_backup_20251202_100000"}
+		for _, name := range backups {
+			profileDir := v.ProfilePath("testtool", name)
+			if err := os.MkdirAll(profileDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Rotate with limit of 5 (more than we have)
+		if err := v.RotateAutoBackups("testtool", 5); err != nil {
+			t.Fatalf("RotateAutoBackups() error = %v", err)
+		}
+
+		// All should remain
+		profiles, _ := v.List("testtool")
+		if len(profiles) != 2 {
+			t.Errorf("after rotation: %d profiles, want 2", len(profiles))
+		}
+	})
+
+	t.Run("no-op when maxBackups is 0", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		v := NewVault(tmpDir)
+
+		// Create many backups
+		for i := 0; i < 10; i++ {
+			profileDir := v.ProfilePath("testtool", "_backup_2025120"+string(rune('0'+i))+"_100000")
+			if err := os.MkdirAll(profileDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Rotate with 0 means unlimited
+		if err := v.RotateAutoBackups("testtool", 0); err != nil {
+			t.Fatalf("RotateAutoBackups() error = %v", err)
+		}
+
+		// All should remain (0 = unlimited)
+		profiles, _ := v.List("testtool")
+		if len(profiles) != 10 {
+			t.Errorf("after rotation: %d profiles, want 10 (unlimited)", len(profiles))
+		}
+	})
+
+	t.Run("only rotates _backup_ profiles", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		v := NewVault(tmpDir)
+
+		// Create mix of profiles
+		profiles := []string{
+			"_backup_20251201_100000",
+			"_backup_20251202_100000",
+			"_backup_20251203_100000",
+			"_original",
+			"work",
+			"personal",
+		}
+		for _, name := range profiles {
+			profileDir := v.ProfilePath("testtool", name)
+			if err := os.MkdirAll(profileDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Rotate to keep only 1 backup
+		if err := v.RotateAutoBackups("testtool", 1); err != nil {
+			t.Fatalf("RotateAutoBackups() error = %v", err)
+		}
+
+		// Should have: 1 backup + _original + work + personal = 4
+		remaining, _ := v.List("testtool")
+		if len(remaining) != 4 {
+			t.Errorf("after rotation: %d profiles, want 4", len(remaining))
+		}
+
+		// _original, work, personal should still exist
+		for _, name := range []string{"_original", "work", "personal"} {
+			profileDir := v.ProfilePath("testtool", name)
+			if _, err := os.Stat(profileDir); os.IsNotExist(err) {
+				t.Errorf("non-backup profile %s should still exist", name)
+			}
+		}
+	})
+}
