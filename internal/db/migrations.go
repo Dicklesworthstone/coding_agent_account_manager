@@ -42,6 +42,23 @@ CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_activity_provider ON activity_log(provider, profile_name);
 `,
 	},
+	{
+		Version: 2,
+		Name:    "limit_events",
+		Up: `
+CREATE TABLE IF NOT EXISTS limit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    profile_name TEXT NOT NULL,
+    hit_at DATETIME NOT NULL,
+    cooldown_until DATETIME NOT NULL,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_limit_events_provider_profile ON limit_events(provider, profile_name);
+CREATE INDEX IF NOT EXISTS idx_limit_events_cooldown_until ON limit_events(cooldown_until);
+`,
+	},
 }
 
 func RunMigrations(db *sql.DB) error {

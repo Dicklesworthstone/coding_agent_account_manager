@@ -11,6 +11,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/stealth"
@@ -39,6 +40,7 @@ After activating, just run the tool normally - it will use the new account.`,
 
 func init() {
 	activateCmd.Flags().Bool("backup-current", false, "backup current auth before switching")
+	activateCmd.Flags().Bool("force", false, "activate even if the profile is in cooldown")
 }
 
 func runActivate(cmd *cobra.Command, args []string) error {
@@ -72,15 +74,64 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Backed up original %s auth to %s\n", tool, "_original")
 	}
 
-	// Step 1: Refresh if needed
-	_ = refreshIfNeeded(cmd.Context(), tool, profileName)
-
-	// Smart auto-backup before switch (based on safety config)
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
 		// Invalid config should not crash activation; fall back to defaults.
 		spmCfg = config.DefaultSPMConfig()
 	}
+
+	// Stealth: enforce per-profile cooldowns (opt-in).
+	if spmCfg.Stealth.Cooldown.Enabled {
+		force, _ := cmd.Flags().GetBool("force")
+
+		db, err := caamdb.Open()
+		if err != nil {
+			fmt.Printf("Warning: could not open database for cooldown check: %v\n", err)
+		} else {
+			defer db.Close()
+
+			now := time.Now().UTC()
+			ev, err := db.ActiveCooldown(tool, profileName, now)
+			if err != nil {
+				fmt.Printf("Warning: could not check cooldowns: %v\n", err)
+			} else if ev != nil {
+				remaining := time.Until(ev.CooldownUntil)
+				if remaining < 0 {
+					remaining = 0
+				}
+				hitAgo := now.Sub(ev.HitAt)
+				if hitAgo < 0 {
+					hitAgo = 0
+				}
+
+				fmt.Printf("Warning: %s/%s is in cooldown\n", tool, profileName)
+				fmt.Printf("  Limit hit: %s ago\n", formatDurationShort(hitAgo))
+				fmt.Printf("  Cooldown remaining: %s\n", formatDurationShort(remaining))
+
+				if !force {
+					if !isTerminal() {
+						return fmt.Errorf("%s/%s is in cooldown (%s remaining); re-run with --force to activate anyway", tool, profileName, formatDurationShort(remaining))
+					}
+
+					ok, err := confirmProceed(cmd.InOrStdin(), cmd.OutOrStdout())
+					if err != nil {
+						return fmt.Errorf("confirm proceed: %w", err)
+					}
+					if !ok {
+						fmt.Println("Cancelled")
+						return nil
+					}
+				} else {
+					fmt.Println("Proceeding due to --force...")
+				}
+			}
+		}
+	}
+
+	// Step 1: Refresh if needed
+	_ = refreshIfNeeded(cmd.Context(), tool, profileName)
+
+	// Smart auto-backup before switch (based on safety config)
 	backupMode := strings.TrimSpace(spmCfg.Safety.AutoBackupBeforeSwitch)
 	if backupMode == "" {
 		backupMode = "smart" // Default

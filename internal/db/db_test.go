@@ -22,7 +22,7 @@ func TestOpenAt_CreatesDBAndRunsMigrations(t *testing.T) {
 	}
 
 	// Migration-created tables should exist.
-	for _, table := range []string{"schema_version", "activity_log", "profile_stats"} {
+	for _, table := range []string{"schema_version", "activity_log", "profile_stats", "limit_events"} {
 		var name string
 		if err := d.Conn().QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name); err != nil {
 			t.Fatalf("table %s missing: %v", table, err)
@@ -38,8 +38,8 @@ func TestOpenAt_CreatesDBAndRunsMigrations(t *testing.T) {
 	if err := d.Conn().QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema_version error = %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("schema_version max = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("schema_version max = %d, want 2", version)
 	}
 }
 

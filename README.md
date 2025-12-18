@@ -214,6 +214,17 @@ carol@gmail.com
 
 **Aliases:** `caam switch` and `caam use` work like `caam activate`
 
+### Stealth Mode (Optional)
+
+| Command | Description |
+|---------|-------------|
+| `caam cooldown set <provider/profile> [--minutes N]` | Record a limit hit and enforce a cooldown for that profile |
+| `caam cooldown list` | List active cooldowns |
+| `caam cooldown clear <provider/profile>` | Clear cooldowns for a specific profile |
+| `caam cooldown clear --all` | Clear all cooldowns |
+
+When `stealth.cooldown.enabled` is true, `caam activate` warns (and can block) if the target profile is still in cooldown. Use `caam activate <tool> <profile> --force` to override.
+
 ### Profile Isolation (Advanced)
 
 | Command | Description |
