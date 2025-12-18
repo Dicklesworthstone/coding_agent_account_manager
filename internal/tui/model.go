@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/signals"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -76,6 +78,12 @@ type Model struct {
 	watcher   *watcher.Watcher
 	badges    map[string]profileBadge
 
+	// Signal handling
+	signals *signals.Handler
+
+	// Runtime configuration
+	runtime config.RuntimeConfig
+
 	// Project context
 	cwd            string
 	projectStore   *project.Store
@@ -103,6 +111,7 @@ func NewWithProviders(providers []string) Model {
 	if len(providers) > 0 {
 		profilesPanel.SetProvider(providers[0])
 	}
+	defaultRuntime := config.DefaultSPMConfig().Runtime
 	return Model{
 		providers:      providers,
 		activeProvider: 0,
@@ -117,6 +126,7 @@ func NewWithProviders(providers []string) Model {
 		usagePanel:     NewUsagePanel(),
 		vaultPath:      authfile.DefaultVaultPath(),
 		badges:         make(map[string]profileBadge),
+		runtime:        defaultRuntime,
 		cwd:            cwd,
 		projectStore:   project.NewStore(""),
 	}
@@ -124,12 +134,16 @@ func NewWithProviders(providers []string) Model {
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(
+	cmds := []tea.Cmd{
 		tea.EnterAltScreen,
 		m.loadProfiles,
-		m.initWatcher(),
 		m.loadProjectContext(),
-	)
+		m.initSignals(),
+	}
+	if m.runtime.FileWatching {
+		cmds = append(cmds, m.initWatcher())
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m Model) loadProjectContext() tea.Cmd {
@@ -149,6 +163,13 @@ func (m Model) initWatcher() tea.Cmd {
 	}
 }
 
+func (m Model) initSignals() tea.Cmd {
+	return func() tea.Msg {
+		h, err := signals.New()
+		return signalsReadyMsg{handler: h, err: err}
+	}
+}
+
 func (m Model) watchProfiles() tea.Cmd {
 	if m.watcher == nil {
 		return nil
@@ -165,6 +186,22 @@ func (m Model) watchProfiles() tea.Cmd {
 				return nil
 			}
 			return errMsg{err: err}
+		}
+	}
+}
+
+func (m Model) watchSignals() tea.Cmd {
+	if m.signals == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		select {
+		case <-m.signals.Reload():
+			return reloadRequestedMsg{}
+		case <-m.signals.DumpStats():
+			return dumpStatsMsg{}
+		case sig := <-m.signals.Shutdown():
+			return shutdownRequestedMsg{sig: sig}
 		}
 	}
 }
@@ -307,6 +344,41 @@ type errMsg struct {
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case signalsReadyMsg:
+		if msg.err != nil {
+			// Not fatal: leave the TUI usable even if signals are unavailable.
+			m.statusMsg = "Signal handling unavailable"
+			return m, nil
+		}
+		m.signals = msg.handler
+		return m, m.watchSignals()
+
+	case reloadRequestedMsg:
+		if !m.runtime.ReloadOnSIGHUP {
+			m.statusMsg = "Reload requested (ignored; runtime.reload_on_sighup=false)"
+			return m, m.watchSignals()
+		}
+
+		m.statusMsg = "Reload requested"
+		cmds := []tea.Cmd{m.loadProfiles, m.loadProjectContext(), m.watchSignals()}
+		if m.usagePanel != nil && m.usagePanel.Visible() {
+			m.usagePanel.SetLoading(true)
+			cmds = append(cmds, m.loadUsageStats())
+		}
+		return m, tea.Batch(cmds...)
+
+	case dumpStatsMsg:
+		if err := signals.AppendLogLine("", m.dumpStatsLine()); err != nil {
+			m.statusMsg = fmt.Sprintf("Failed to write stats: %v", err)
+		} else {
+			m.statusMsg = "Stats written to log"
+		}
+		return m, m.watchSignals()
+
+	case shutdownRequestedMsg:
+		m.statusMsg = fmt.Sprintf("Shutdown requested (%v)", msg.sig)
+		return m, tea.Quit
+
 	case projectContextLoadedMsg:
 		if msg.err != nil {
 			m.statusMsg = msg.err.Error()
@@ -1063,12 +1135,68 @@ Press any key to return...
 	return m.styles.Help.Render(help)
 }
 
+func (m Model) dumpStatsLine() string {
+	totalProfiles := 0
+	for _, ps := range m.profiles {
+		totalProfiles += len(ps)
+	}
+
+	activeProvider := ""
+	if m.activeProvider >= 0 && m.activeProvider < len(m.providers) {
+		activeProvider = m.providers[m.activeProvider]
+	}
+
+	usageVisible := false
+	if m.usagePanel != nil {
+		usageVisible = m.usagePanel.Visible()
+	}
+
+	return fmt.Sprintf(
+		"tui_stats provider=%s selected=%d total_profiles=%d view_state=%d width=%d height=%d cwd=%q usage_visible=%t",
+		activeProvider,
+		m.selected,
+		totalProfiles,
+		m.state,
+		m.width,
+		m.height,
+		m.cwd,
+		usageVisible,
+	)
+}
+
 // Run starts the TUI application.
 func Run() error {
-	p := tea.NewProgram(New(), tea.WithAltScreen())
+	spmCfg, err := config.LoadSPMConfig()
+	if err != nil {
+		// Keep the TUI usable even with a broken config file.
+		spmCfg = config.DefaultSPMConfig()
+	}
+
+	m := New()
+	m.runtime = spmCfg.Runtime
+
+	pidPath := signals.DefaultPIDFilePath()
+	pidWritten := false
+	if spmCfg.Runtime.PIDFile {
+		if err := signals.WritePIDFile(pidPath, os.Getpid()); err != nil {
+			return fmt.Errorf("write pid file: %w", err)
+		}
+		pidWritten = true
+	}
+
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	finalModel, err := p.Run()
-	if m, ok := finalModel.(Model); ok && m.watcher != nil {
-		_ = m.watcher.Close()
+
+	if fm, ok := finalModel.(Model); ok {
+		if fm.watcher != nil {
+			_ = fm.watcher.Close()
+		}
+		if fm.signals != nil {
+			_ = fm.signals.Close()
+		}
+	}
+	if pidWritten {
+		_ = signals.RemovePIDFile(pidPath)
 	}
 	return err
 }

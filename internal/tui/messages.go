@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"os"
+
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/signals"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 )
 
@@ -27,6 +30,19 @@ type projectContextLoadedMsg struct {
 type usageStatsLoadedMsg struct {
 	stats []ProfileUsage
 	err   error
+}
+
+type signalsReadyMsg struct {
+	handler *signals.Handler
+	err     error
+}
+
+type reloadRequestedMsg struct{}
+
+type dumpStatsMsg struct{}
+
+type shutdownRequestedMsg struct {
+	sig os.Signal
 }
 
 func eventTypeVerb(t watcher.EventType) string {
