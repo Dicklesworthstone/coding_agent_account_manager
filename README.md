@@ -295,7 +295,7 @@ caam exec codex personal@gmail.com -- "review PR #123"
 │   │   ├── alice@gmail.com/
 │   │   │   ├── .claude.json        # Backed up auth
 │   │   │   ├── auth.json           # From ~/.config/claude-code/
-│   │   │   └── meta.json           # Timestamp, source paths
+│   │   │   └── meta.json           # Timestamp, original paths
 │   │   └── bob@gmail.com/
 │   │       └── ...
 │   ├── codex/

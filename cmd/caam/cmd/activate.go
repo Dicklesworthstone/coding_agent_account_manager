@@ -35,9 +35,6 @@ After activating, just run the tool normally - it will use the new account.`,
 
 func init() {
 	activateCmd.Flags().Bool("backup-current", false, "backup current auth before switching")
-	// Add to root in init() or let root.go do it?
-	// root.go does rootCmd.AddCommand(activateCmd).
-	// Since both are in package cmd, it works.
 }
 
 func runActivate(cmd *cobra.Command, args []string) error {
@@ -64,12 +61,15 @@ func runActivate(cmd *cobra.Command, args []string) error {
 
 	fileSet := getFileSet()
 
-	// Step 1: Refresh if needed
-	ctx := cmd.Context()
-	if err := refreshIfNeeded(ctx, tool, profileName); err != nil {
-		// Log debug? For now just print if verbose?
-		// Logic handles printing "failed".
+	// Safety: on first activate, preserve the user's pre-caam auth state.
+	if did, err := vault.BackupOriginal(fileSet); err != nil {
+		return fmt.Errorf("backup original auth: %w", err)
+	} else if did {
+		fmt.Printf("Backed up original %s auth to %s\n", tool, "_original")
 	}
+
+	// Step 1: Refresh if needed
+	_ = refreshIfNeeded(cmd.Context(), tool, profileName)
 
 	// Optionally backup current state first
 	backupFirst, _ := cmd.Flags().GetBool("backup-current")

@@ -422,6 +422,130 @@ func TestVaultListAll(t *testing.T) {
 	})
 }
 
+func TestVaultBackup_SystemProfilesAreImmutable(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authFile := filepath.Join(authDir, "auth.json")
+	if err := os.WriteFile(authFile, []byte(`{"token":"v1"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(vaultDir)
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: authFile, Required: true},
+		},
+	}
+
+	if err := v.Backup(fileSet, "_system"); err != nil {
+		t.Fatalf("Backup() error = %v", err)
+	}
+
+	// Change source and ensure overwrite is refused.
+	if err := os.WriteFile(authFile, []byte(`{"token":"v2"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "_system"); err == nil {
+		t.Fatal("Backup() should refuse overwriting system profiles")
+	}
+}
+
+func TestVaultBackupOriginal(t *testing.T) {
+	t.Run("creates _original when current auth is not backed up", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, "auth.json")
+		original := []byte(`{"token":"original"}`)
+		if err := os.WriteFile(authFile, original, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "testtool",
+			Files: []AuthFileSpec{
+				{Tool: "testtool", Path: authFile, Required: true},
+			},
+		}
+
+		did, err := v.BackupOriginal(fileSet)
+		if err != nil {
+			t.Fatalf("BackupOriginal() error = %v", err)
+		}
+		if !did {
+			t.Fatal("BackupOriginal() did = false, want true")
+		}
+
+		backupPath := v.BackupPath("testtool", "_original", "auth.json")
+		got, err := os.ReadFile(backupPath)
+		if err != nil {
+			t.Fatalf("ReadFile() error = %v", err)
+		}
+		if string(got) != string(original) {
+			t.Fatalf("backup content mismatch: got %q want %q", got, original)
+		}
+
+		// Idempotent: second call is a no-op.
+		did, err = v.BackupOriginal(fileSet)
+		if err != nil {
+			t.Fatalf("BackupOriginal() second call error = %v", err)
+		}
+		if did {
+			t.Fatal("BackupOriginal() second call did = true, want false")
+		}
+	})
+
+	t.Run("skips when current auth already matches a vault profile", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, "auth.json")
+		content := []byte(`{"token":"already-backed-up"}`)
+		if err := os.WriteFile(authFile, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "testtool",
+			Files: []AuthFileSpec{
+				{Tool: "testtool", Path: authFile, Required: true},
+			},
+		}
+
+		if err := v.Backup(fileSet, "work"); err != nil {
+			t.Fatalf("Backup() error = %v", err)
+		}
+
+		did, err := v.BackupOriginal(fileSet)
+		if err != nil {
+			t.Fatalf("BackupOriginal() error = %v", err)
+		}
+		if did {
+			t.Fatal("BackupOriginal() did = true, want false")
+		}
+
+		if _, err := os.Stat(v.ProfilePath("testtool", "_original")); !os.IsNotExist(err) {
+			t.Fatalf("_original should not be created; stat err=%v", err)
+		}
+	})
+}
+
 func TestVaultDelete(t *testing.T) {
 	t.Run("deletes profile directory", func(t *testing.T) {
 		tmpDir := t.TempDir()

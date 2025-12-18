@@ -134,6 +134,8 @@ type Vault struct {
 	basePath string // ~/.local/share/accx/vault
 }
 
+const originalProfileName = "_original"
+
 // IsSystemProfile reports whether a profile name is reserved for system-managed
 // profiles (created automatically by caam safety features).
 //
@@ -187,12 +189,30 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		return err
 	}
 
+	tool := strings.TrimSpace(fileSet.Tool)
+	profile = strings.TrimSpace(profile)
+
+	// System profiles are immutable safety artifacts; never overwrite them.
+	if IsSystemProfile(profile) {
+		st, err := os.Stat(profileDir)
+		if err == nil {
+			if st.IsDir() {
+				return fmt.Errorf("%w: refusing to overwrite %s/%s", errProtectedSystemProfile, tool, profile)
+			}
+			return fmt.Errorf("profile path exists and is not a directory: %s", profileDir)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("stat profile dir: %w", err)
+		}
+	}
+
 	// Create profile directory
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
 	}
 
 	backedUp := 0
+	var originalPaths []string
 	for _, spec := range fileSet.Files {
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			if spec.Required {
@@ -209,32 +229,38 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 			return fmt.Errorf("backup %s: %w", spec.Path, err)
 		}
 		backedUp++
+		originalPaths = append(originalPaths, spec.Path)
 	}
 
 	if backedUp == 0 {
-		return fmt.Errorf("no auth files found to backup for %s", fileSet.Tool)
+		return fmt.Errorf("no auth files found to backup for %s", tool)
 	}
 
 	// Write metadata
 	metaPath := filepath.Join(profileDir, "meta.json")
 	meta := struct {
-		Tool       string `json:"tool"`
-		Profile    string `json:"profile"`
-		BackedUpAt string `json:"backed_up_at"`
-		Files      int    `json:"files"`
-		Type       string `json:"type,omitempty"`       // user|system
-		CreatedBy  string `json:"created_by,omitempty"` // user|auto
+		Tool          string   `json:"tool"`
+		Profile       string   `json:"profile"`
+		BackedUpAt    string   `json:"backed_up_at"`
+		Files         int      `json:"files"`
+		Type          string   `json:"type,omitempty"`       // user|system
+		CreatedBy     string   `json:"created_by,omitempty"` // user|auto|first-activate
+		OriginalPaths []string `json:"original_paths,omitempty"`
 	}{
-		Tool:       fileSet.Tool,
-		Profile:    profile,
-		BackedUpAt: time.Now().Format(time.RFC3339),
-		Files:      backedUp,
-		Type:       "user",
-		CreatedBy:  "user",
+		Tool:          tool,
+		Profile:       profile,
+		BackedUpAt:    time.Now().Format(time.RFC3339),
+		Files:         backedUp,
+		Type:          "user",
+		CreatedBy:     "user",
+		OriginalPaths: originalPaths,
 	}
 	if IsSystemProfile(profile) {
 		meta.Type = "system"
 		meta.CreatedBy = "auto"
+		if profile == originalProfileName {
+			meta.CreatedBy = "first-activate"
+		}
 	}
 	raw, err := json.Marshal(meta)
 	if err != nil {
@@ -245,6 +271,64 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	}
 
 	return nil
+}
+
+// HasOriginalBackup reports whether the system-managed `_original` profile exists
+// for the given tool.
+func (v *Vault) HasOriginalBackup(tool string) (bool, error) {
+	profileDir, err := v.safeProfileDir(tool, originalProfileName)
+	if err != nil {
+		return false, err
+	}
+	st, err := os.Stat(profileDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat original profile dir: %w", err)
+	}
+	if !st.IsDir() {
+		return false, fmt.Errorf("original profile path is not a directory: %s", profileDir)
+	}
+	return true, nil
+}
+
+// BackupOriginal creates the system-managed `_original` profile for a tool if
+// needed. This is intended to preserve a user's pre-caam auth state.
+//
+// Behavior:
+// - No-op if `_original` already exists
+// - No-op if no current auth files exist
+// - No-op if current auth already matches an existing vault profile
+// - Otherwise backups current auth as `_original`
+//
+// It returns true if a backup was created.
+func (v *Vault) BackupOriginal(fileSet AuthFileSet) (bool, error) {
+	exists, err := v.HasOriginalBackup(fileSet.Tool)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		return false, nil
+	}
+
+	// Only back up when at least one required auth file exists.
+	if !HasAuthFiles(fileSet) {
+		return false, nil
+	}
+
+	active, err := v.ActiveProfile(fileSet)
+	if err != nil {
+		return false, fmt.Errorf("detect active profile: %w", err)
+	}
+	if active != "" {
+		return false, nil
+	}
+
+	if err := v.Backup(fileSet, originalProfileName); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Restore copies backed-up auth files to their original locations.
