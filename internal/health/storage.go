@@ -183,8 +183,8 @@ func (s *Storage) DeleteProfile(provider, name string) error {
 	return s.Save(store)
 }
 
-// RecordError increments the error count for a profile.
-func (s *Storage) RecordError(provider, name string) error {
+// RecordError increments the error count for a profile and applies a penalty.
+func (s *Storage) RecordError(provider, name string, errCause error) error {
 	store, err := s.Load()
 	if err != nil {
 		return err
@@ -200,9 +200,9 @@ func (s *Storage) RecordError(provider, name string) error {
 	health.ErrorCount1h++
 	health.LastError = time.Now()
 
-	// Apply penalty for errors (inspired by codex-pool)
-	health.Penalty += 0.5
-	health.PenaltyUpdatedAt = time.Now()
+	// Apply penalty for errors
+	penaltyAmount := PenaltyForError(errCause)
+	health.AddPenalty(penaltyAmount, time.Now())
 
 	return s.Save(store)
 }
@@ -267,8 +267,7 @@ func (s *Storage) SetPlanType(provider, name, planType string) error {
 
 // DecayPenalties applies penalty decay to all profiles.
 // Call this periodically (e.g., every 5 minutes).
-// Decay rate of 0.8 means 20% reduction per call (inspired by codex-pool).
-func (s *Storage) DecayPenalties(decayRate float64) error {
+func (s *Storage) DecayPenalties() error {
 	store, err := s.Load()
 	if err != nil {
 		return err
@@ -278,12 +277,9 @@ func (s *Storage) DecayPenalties(decayRate float64) error {
 	modified := false
 
 	for _, health := range store.Profiles {
-		if health.Penalty > 0 {
-			health.Penalty *= decayRate
-			if health.Penalty < 0.01 {
-				health.Penalty = 0
-			}
-			health.PenaltyUpdatedAt = now
+		oldPenalty := health.Penalty
+		health.DecayPenalty(now)
+		if health.Penalty != oldPenalty {
 			modified = true
 		}
 	}

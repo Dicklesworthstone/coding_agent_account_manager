@@ -1,6 +1,7 @@
 package health
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,36 +98,52 @@ func TestStorage_UpdateProfile(t *testing.T) {
 
 func TestStorage_RecordError(t *testing.T) {
 	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "health.json")
-	storage := NewStorage(path)
+	healthPath := filepath.Join(tmpDir, "health.json")
+	storage := NewStorage(healthPath)
 
-	// Record first error
-	if err := storage.RecordError("codex", "work"); err != nil {
+	// Record an error
+	errCause := errors.New("401 Unauthorized")
+	if err := storage.RecordError("codex", "work", errCause); err != nil {
 		t.Fatalf("RecordError failed: %v", err)
 	}
 
-	profile, err := storage.GetProfile("codex", "work")
+	// Verify
+	health, err := storage.GetProfile("codex", "work")
 	if err != nil {
 		t.Fatalf("GetProfile failed: %v", err)
 	}
-	if profile.ErrorCount1h != 1 {
-		t.Errorf("expected error count 1, got %d", profile.ErrorCount1h)
+	if health.ErrorCount1h != 1 {
+		t.Errorf("expected 1 error, got %d", health.ErrorCount1h)
 	}
-	if profile.LastError.IsZero() {
-		t.Error("LastError not set")
+	if health.Penalty != 1.0 {
+		t.Errorf("expected penalty 1.0, got %f", health.Penalty)
 	}
 
-	// Record second error
-	if err := storage.RecordError("codex", "work"); err != nil {
+	// Record another error
+	if err := storage.RecordError("codex", "work", errors.New("429 Too Many Requests")); err != nil {
 		t.Fatalf("RecordError failed: %v", err)
 	}
 
-	profile, err = storage.GetProfile("codex", "work")
-	if err != nil {
-		t.Fatalf("GetProfile failed: %v", err)
+	health, _ = storage.GetProfile("codex", "work")
+	if health.ErrorCount1h != 2 {
+		t.Errorf("expected 2 errors, got %d", health.ErrorCount1h)
 	}
-	if profile.ErrorCount1h != 2 {
-		t.Errorf("expected error count 2, got %d", profile.ErrorCount1h)
+	if health.Penalty != 1.5 { // 1.0 + 0.5
+		t.Errorf("expected penalty 1.5, got %f", health.Penalty)
+	}
+
+	// Clear errors
+	if err := storage.ClearErrors("codex", "work"); err != nil {
+		t.Fatalf("ClearErrors failed: %v", err)
+	}
+
+	health, _ = storage.GetProfile("codex", "work")
+	if health.ErrorCount1h != 0 {
+		t.Errorf("expected 0 errors, got %d", health.ErrorCount1h)
+	}
+	// Penalty should persist!
+	if health.Penalty != 1.5 {
+		t.Errorf("expected penalty 1.5 to persist, got %f", health.Penalty)
 	}
 }
 
