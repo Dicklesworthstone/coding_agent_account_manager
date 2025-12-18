@@ -1172,6 +1172,11 @@ func Run() error {
 		spmCfg = config.DefaultSPMConfig()
 	}
 
+	// Run cleanup on startup if configured
+	if spmCfg.Analytics.CleanupOnStartup {
+		runStartupCleanup(spmCfg)
+	}
+
 	m := New()
 	m.runtime = spmCfg.Runtime
 
@@ -1199,6 +1204,22 @@ func Run() error {
 		_ = signals.RemovePIDFile(pidPath)
 	}
 	return err
+}
+
+// runStartupCleanup runs database cleanup using the configured retention settings.
+// Errors are silently ignored to avoid blocking TUI startup.
+func runStartupCleanup(spmCfg *config.SPMConfig) {
+	db, err := caamdb.Open()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	cfg := caamdb.CleanupConfig{
+		RetentionDays:          spmCfg.Analytics.RetentionDays,
+		AggregateRetentionDays: spmCfg.Analytics.AggregateRetentionDays,
+	}
+	_, _ = db.Cleanup(cfg)
 }
 
 type profileBadge struct {
