@@ -287,7 +287,8 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 
 		if len(results) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "    ✓ All profiles up to date\n")
+			fmt.Fprintln(cmd.OutOrStdout(), "    ✓ All profiles up to date")
+			fmt.Fprintln(cmd.OutOrStdout())
 			continue
 		}
 
@@ -544,7 +545,8 @@ func runSyncTest(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "Testing connection to %s (%s)...\n", m.Name, m.Address)
 		testMachine(m)
 	} else {
-		fmt.Fprintln(cmd.OutOrStdout(), "Testing all machines...\n")
+		fmt.Fprintln(cmd.OutOrStdout(), "Testing all machines...")
+		fmt.Fprintln(cmd.OutOrStdout())
 		passed := 0
 		for _, m := range machines {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s):\n", m.Name, m.Address)
