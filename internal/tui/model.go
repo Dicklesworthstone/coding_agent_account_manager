@@ -1194,6 +1194,11 @@ func (m Model) View() string {
 		return m.usagePanel.View()
 	}
 
+	if m.syncPanel != nil && m.syncPanel.Visible() {
+		m.syncPanel.SetSize(m.width, m.height)
+		return m.syncPanel.View()
+	}
+
 	switch m.state {
 	case stateHelp:
 		return m.helpView()
