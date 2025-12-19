@@ -247,10 +247,29 @@ func (c *SPMConfig) Save() error {
 	header := []byte("# caam Smart Profile Management configuration\n# Documentation: https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/main/docs/SMART_PROFILE_MANAGEMENT.md\n\n")
 	data = append(header, data...)
 
-	// Atomic write: write to temp file then rename
+	// Atomic write: write to temp file, fsync, then rename
 	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("write temp file: %w", err)
+	}
+
+	// Sync to disk before rename to ensure durability
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, configPath); err != nil {
