@@ -45,9 +45,10 @@ type Styles struct {
 	Help lipgloss.Style
 
 	// Dialog styles
-	Dialog       lipgloss.Style
-	DialogTitle  lipgloss.Style
-	DialogButton lipgloss.Style
+	Dialog             lipgloss.Style
+	DialogTitle        lipgloss.Style
+	DialogButton       lipgloss.Style
+	DialogButtonActive lipgloss.Style
 }
 
 // DefaultStyles returns the default style configuration.
@@ -120,5 +121,13 @@ func DefaultStyles() Styles {
 			Padding(0, 2).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorGray),
+
+		DialogButtonActive: lipgloss.NewStyle().
+			Padding(0, 2).
+			Bold(true).
+			Foreground(colorWhite).
+			Background(colorPurple).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorPurple),
 	}
 }
