@@ -555,20 +555,26 @@ func TestContainsPath(t *testing.T) {
 		filename string
 		want     bool
 	}{
+		// Positive cases - exact filename match
 		{".claude.json", ".claude.json", true},
 		{"/home/user/.claude.json", ".claude.json", true},
-		{"~/.claude.json", ".claude.json", true},
 		{"auth.json", "auth.json", true},
 		{"/path/to/auth.json", "auth.json", true},
 		{"settings.json", "settings.json", true},
 		{"/home/user/.gemini/settings.json", "settings.json", true},
 
-		// Negative cases
+		// Negative cases - should not match
 		{".claude.json", "auth.json", false},
 		{"auth.json", ".claude.json", false},
 		{"", ".claude.json", false},
-		{".claude.json", "", true}, // Empty string is substring of any string
+		{".claude.json", "", false},       // Empty filename should not match
 		{"short", "longfilename", false},
+
+		// False positive prevention - these should NOT match
+		{"/path/to/auth.json.backup", "auth.json", false},  // Backup file
+		{"/path/to/auth.json.tmp", "auth.json", false},     // Temp file
+		{"/path/to/not.claude.json", ".claude.json", false}, // Different prefix
+		{"/path/to/.claude.json.bak", ".claude.json", false}, // Backup suffix
 	}
 
 	for _, tt := range tests {

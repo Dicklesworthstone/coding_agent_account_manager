@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -238,23 +239,20 @@ func (e *GeminiFreshnessExtractor) Extract(provider, profile string, authFiles m
 	}, nil
 }
 
-// containsPath checks if a path string contains the given filename.
+// containsPath checks if the path ends with the given filename.
+// It properly handles path separators to avoid false positives like
+// matching "auth.json.backup" when looking for "auth.json".
 func containsPath(path, filename string) bool {
-	// Simple check: does the path end with the filename or contain it?
 	if len(path) < len(filename) {
 		return false
 	}
-	// Check if path ends with filename
-	if path[len(path)-len(filename):] == filename {
-		return true
+	if filename == "" {
+		return false
 	}
-	// Check if filename appears anywhere in path
-	for i := 0; i <= len(path)-len(filename); i++ {
-		if path[i:i+len(filename)] == filename {
-			return true
-		}
-	}
-	return false
+
+	// Use filepath.Base to get the actual filename from the path
+	base := filepath.Base(path)
+	return base == filename
 }
 
 // ExtractFreshnessFromFiles reads auth files from disk and extracts freshness.

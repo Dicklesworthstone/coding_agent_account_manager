@@ -321,6 +321,12 @@ func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p Profile
 	localFresh, localErr := s.getLocalFreshness(p)
 	remoteFresh, remoteErr := s.getRemoteFreshness(client, p)
 
+	// Check if errors are "not found" vs other errors
+	localNotFound := localErr != nil && os.IsNotExist(localErr)
+	remoteNotFound := remoteErr != nil && os.IsNotExist(remoteErr)
+	localOtherErr := localErr != nil && !os.IsNotExist(localErr)
+	remoteOtherErr := remoteErr != nil && !os.IsNotExist(remoteErr)
+
 	op := &SyncOperation{
 		Provider:        p.Provider,
 		Profile:         p.Profile,
@@ -330,16 +336,29 @@ func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p Profile
 	}
 
 	switch {
-	case localErr != nil && remoteErr != nil:
-		// Neither exists or both have errors
+	case localOtherErr && remoteOtherErr:
+		// Both have non-"not found" errors
 		return nil, fmt.Errorf("local error: %v, remote error: %v", localErr, remoteErr)
 
-	case localFresh == nil && remoteFresh != nil:
+	case localOtherErr:
+		// Local has a real error (not "not found"), can't sync
+		return nil, fmt.Errorf("local error: %v", localErr)
+
+	case remoteOtherErr:
+		// Remote has a real error (not "not found"), can't sync
+		return nil, fmt.Errorf("remote error: %v", remoteErr)
+
+	case localNotFound && remoteNotFound:
+		// Neither exists
+		op.Direction = SyncSkip
+		return op, nil
+
+	case localNotFound && remoteFresh != nil:
 		// Only exists on remote: pull
 		op.Direction = SyncPull
 		return op, nil
 
-	case localFresh != nil && remoteFresh == nil:
+	case localFresh != nil && remoteNotFound:
 		// Only exists locally: push
 		op.Direction = SyncPush
 		return op, nil
