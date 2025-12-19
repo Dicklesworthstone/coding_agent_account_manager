@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,5 +58,146 @@ func TestFormatTimeAgo(t *testing.T) {
 				t.Errorf("formatTimeAgo() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+// TestSyncCommands tests that all sync subcommands are registered.
+func TestSyncCommands(t *testing.T) {
+	subcommands := []string{
+		"init",
+		"status",
+		"add",
+		"remove",
+		"test",
+		"enable",
+		"disable",
+		"log",
+		"discover",
+		"queue",
+		"edit",
+	}
+
+	for _, name := range subcommands {
+		t.Run(name, func(t *testing.T) {
+			found := false
+			for _, cmd := range syncCmd.Commands() {
+				if cmd.Name() == name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("subcommand %q not found", name)
+			}
+		})
+	}
+}
+
+// TestSyncCmdFlags tests that all expected flags are present.
+func TestSyncCmdFlags(t *testing.T) {
+	flags := []string{
+		"machine",
+		"provider",
+		"profile",
+		"dry-run",
+		"force",
+		"json",
+	}
+
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if syncCmd.Flags().Lookup(flag) == nil {
+				t.Errorf("flag --%s not found", flag)
+			}
+		})
+	}
+}
+
+// TestSyncInitCmdFlags tests sync init command flags.
+func TestSyncInitCmdFlags(t *testing.T) {
+	flags := []string{
+		"discover",
+		"csv",
+	}
+
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if syncInitCmd.Flags().Lookup(flag) == nil {
+				t.Errorf("flag --%s not found", flag)
+			}
+		})
+	}
+}
+
+// TestSyncAddCmdFlags tests sync add command flags.
+func TestSyncAddCmdFlags(t *testing.T) {
+	flags := []string{
+		"key",
+		"user",
+		"remote-path",
+		"test",
+	}
+
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if syncAddCmd.Flags().Lookup(flag) == nil {
+				t.Errorf("flag --%s not found", flag)
+			}
+		})
+	}
+}
+
+// TestSyncLogCmdFlags tests sync log command flags.
+func TestSyncLogCmdFlags(t *testing.T) {
+	flags := []string{
+		"limit",
+		"machine",
+		"provider",
+		"errors",
+		"json",
+	}
+
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if syncLogCmd.Flags().Lookup(flag) == nil {
+				t.Errorf("flag --%s not found", flag)
+			}
+		})
+	}
+}
+
+// TestSyncQueueCmdFlags tests sync queue command flags.
+func TestSyncQueueCmdFlags(t *testing.T) {
+	flags := []string{
+		"clear",
+		"process",
+		"json",
+	}
+
+	for _, flag := range flags {
+		t.Run(flag, func(t *testing.T) {
+			if syncQueueCmd.Flags().Lookup(flag) == nil {
+				t.Errorf("flag --%s not found", flag)
+			}
+		})
+	}
+}
+
+// TestSyncStatusJSONOutput tests the JSON output helper.
+func TestSyncStatusJSONOutput(t *testing.T) {
+	state := sync.NewSyncState(t.TempDir())
+
+	var buf bytes.Buffer
+	err := runSyncStatusJSON(state, &buf)
+	if err != nil {
+		t.Fatalf("runSyncStatusJSON: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "auto_sync") {
+		t.Errorf("JSON output missing auto_sync field")
+	}
+	if !strings.Contains(output, "machines") {
+		t.Errorf("JSON output missing machines field")
 	}
 }

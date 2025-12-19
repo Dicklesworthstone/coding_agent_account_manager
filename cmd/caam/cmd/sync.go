@@ -1,7 +1,11 @@
 package cmd
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -163,10 +167,30 @@ var syncEditCmd = &cobra.Command{
 	RunE:  runSyncEdit,
 }
 
+// syncInitCmd provides first-time setup wizard.
+var syncInitCmd = &cobra.Command{
+	Use:   "init",
+	Short: "First-time sync setup wizard",
+	Long: `Interactive wizard for setting up multi-machine sync.
+
+This wizard helps you:
+  1. Discover machines from ~/.ssh/config
+  2. Add machines to your sync pool
+  3. Test connectivity to machines
+  4. Enable or disable auto-sync
+
+Examples:
+  caam sync init              # Interactive setup
+  caam sync init --discover   # Auto-discover from SSH config
+  caam sync init --csv        # Create CSV template only`,
+	RunE: runSyncInit,
+}
+
 func init() {
 	rootCmd.AddCommand(syncCmd)
 
 	// Add subcommands
+	syncCmd.AddCommand(syncInitCmd)
 	syncCmd.AddCommand(syncStatusCmd)
 	syncCmd.AddCommand(syncAddCmd)
 	syncCmd.AddCommand(syncRemoveCmd)
@@ -205,9 +229,16 @@ func init() {
 	syncLogCmd.Flags().Bool("errors", false, "show only errors")
 	syncLogCmd.Flags().Bool("json", false, "output as JSON")
 
+	// Init command flags
+	syncInitCmd.Flags().Bool("discover", false, "auto-discover from SSH config")
+	syncInitCmd.Flags().Bool("csv", false, "create CSV template only")
+
 	// Discover command flags
 	syncDiscoverCmd.Flags().Bool("add", false, "add discovered machines to pool")
 	syncDiscoverCmd.Flags().Bool("test", false, "test connectivity to discovered")
+
+	// Status command flags
+	syncStatusCmd.Flags().Bool("json", false, "output as JSON")
 
 	// Queue command flags
 	syncQueueCmd.Flags().Bool("clear", false, "clear all pending retries")
@@ -328,6 +359,12 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	out := cmd.OutOrStdout()
+
+	// Handle JSON output
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	if jsonOutput {
+		return runSyncStatusJSON(state, out)
+	}
 
 	fmt.Fprintln(out, "Sync Status")
 	fmt.Fprintln(out, strings.Repeat("─", 50))
@@ -758,9 +795,7 @@ func runSyncQueue(cmd *cobra.Command, args []string) error {
 	}
 
 	if process {
-		// TODO: Implement queue processing
-		fmt.Fprintln(cmd.OutOrStdout(), "Queue processing not yet implemented.")
-		return nil
+		return runSyncQueueProcess(state, cmd.OutOrStdout())
 	}
 
 	// Show queue
@@ -826,6 +861,353 @@ func runSyncEdit(cmd *cobra.Command, args []string) error {
 	c.Stderr = os.Stderr
 
 	return c.Run()
+}
+
+// runSyncInit implements the first-time setup wizard.
+func runSyncInit(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
+	reader := bufio.NewReader(os.Stdin)
+
+	csvOnly, _ := cmd.Flags().GetBool("csv")
+	autoDiscover, _ := cmd.Flags().GetBool("discover")
+
+	// CSV-only mode
+	if csvOnly {
+		csvPath := sync.CSVPath()
+		created, err := sync.EnsureCSVFile()
+		if err != nil {
+			return fmt.Errorf("create CSV: %w", err)
+		}
+		if created {
+			fmt.Fprintf(out, "Created %s\n", csvPath)
+			fmt.Fprintln(out, "Edit this file to add your machines, then run 'caam sync init' again.")
+		} else {
+			fmt.Fprintf(out, "CSV file already exists: %s\n", csvPath)
+		}
+		return nil
+	}
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Welcome to CAAM Sync Setup!")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "This will help you set up syncing between your machines.")
+	fmt.Fprintln(out, "")
+
+	// Load state
+	state, err := loadSyncState()
+	if err != nil {
+		return err
+	}
+
+	// Step 1: Create sync pool
+	fmt.Fprintln(out, "Step 1: Create your sync pool")
+	fmt.Fprintln(out, "")
+
+	// Discover machines from SSH config
+	discovered, err := sync.DiscoverFromSSHConfig()
+	if err != nil {
+		discovered = nil // Non-fatal
+	}
+
+	var selectedMachines []*sync.Machine
+
+	if len(discovered) > 0 {
+		fmt.Fprintln(out, "  Discovered hosts from ~/.ssh/config:")
+		for i, m := range discovered {
+			fmt.Fprintf(out, "    [%d] %s (%s)\n", i+1, m.Name, m.Address)
+		}
+		fmt.Fprintln(out, "    [a] Add all discovered hosts")
+		fmt.Fprintln(out, "    [m] Manually add a machine")
+		fmt.Fprintln(out, "    [s] Skip for now")
+		fmt.Fprintln(out, "")
+
+		if autoDiscover {
+			selectedMachines = discovered
+			fmt.Fprintln(out, "  Auto-selecting all discovered hosts...")
+		} else {
+			fmt.Fprint(out, "  Choice: ")
+			choice, _ := reader.ReadString('\n')
+			choice = strings.TrimSpace(strings.ToLower(choice))
+
+			switch choice {
+			case "a":
+				selectedMachines = discovered
+			case "m":
+				m, err := promptForMachine(reader, out)
+				if err != nil {
+					fmt.Fprintf(out, "  Error: %v\n", err)
+				} else if m != nil {
+					selectedMachines = append(selectedMachines, m)
+				}
+			case "s":
+				// Skip
+			default:
+				// Try to parse as number
+				var idx int
+				if _, err := fmt.Sscanf(choice, "%d", &idx); err == nil && idx > 0 && idx <= len(discovered) {
+					selectedMachines = append(selectedMachines, discovered[idx-1])
+				}
+			}
+		}
+	} else {
+		fmt.Fprintln(out, "  No hosts found in ~/.ssh/config")
+		fmt.Fprintln(out, "")
+		fmt.Fprint(out, "  Would you like to add a machine manually? (y/N): ")
+		choice, _ := reader.ReadString('\n')
+		if strings.TrimSpace(strings.ToLower(choice)) == "y" {
+			m, err := promptForMachine(reader, out)
+			if err != nil {
+				fmt.Fprintf(out, "  Error: %v\n", err)
+			} else if m != nil {
+				selectedMachines = append(selectedMachines, m)
+			}
+		}
+	}
+
+	// Add selected machines to pool
+	for _, m := range selectedMachines {
+		if err := state.Pool.AddMachine(m); err != nil {
+			// Ignore duplicate errors
+			if !strings.Contains(err.Error(), "already exists") {
+				fmt.Fprintf(out, "  Warning: could not add %s: %v\n", m.Name, err)
+			}
+		}
+	}
+
+	fmt.Fprintln(out, "")
+
+	// Step 2: Test connectivity
+	if len(selectedMachines) > 0 {
+		fmt.Fprintln(out, "Step 2: Test connectivity")
+		fmt.Fprintln(out, "")
+
+		pool := sync.NewConnectionPool(sync.DefaultConnectOptions())
+		defer pool.CloseAll()
+
+		var online, offline int
+		for _, m := range selectedMachines {
+			fmt.Fprintf(out, "  Testing %s...", m.Name)
+			start := time.Now()
+
+			client, err := pool.Get(m)
+			latency := time.Since(start)
+
+			if err != nil {
+				fmt.Fprintf(out, " ✗ Failed: %v\n", err)
+				m.SetError(err.Error())
+				offline++
+			} else {
+				fmt.Fprintf(out, " ✓ OK (%dms)\n", latency.Milliseconds())
+				m.SetOnline()
+				_ = client // Keep connection for potential later use
+				online++
+			}
+		}
+
+		fmt.Fprintln(out, "")
+		if offline > 0 {
+			fmt.Fprintf(out, "  %d machine(s) failed. Continue anyway? (Y/n): ", offline)
+			choice, _ := reader.ReadString('\n')
+			if strings.TrimSpace(strings.ToLower(choice)) == "n" {
+				fmt.Fprintln(out, "  Aborted.")
+				return nil
+			}
+		}
+	}
+
+	// Step 3: Auto-sync
+	fmt.Fprintln(out, "Step 3: Enable auto-sync?")
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "  Auto-sync automatically pushes fresh tokens when you backup or refresh.")
+	fmt.Fprintln(out, "")
+	fmt.Fprint(out, "  Enable auto-sync? (y/N): ")
+	choice, _ := reader.ReadString('\n')
+	if strings.TrimSpace(strings.ToLower(choice)) == "y" {
+		state.Pool.AutoSync = true
+		state.Pool.Enabled = true
+	}
+
+	// Save state
+	if err := state.Save(); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+
+	// Also save to CSV
+	machines := state.Pool.ListMachines()
+	if len(machines) > 0 {
+		if err := sync.SaveToCSV(machines); err != nil {
+			fmt.Fprintf(out, "Warning: could not save to CSV: %v\n", err)
+		}
+	}
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Setup complete!")
+
+	online := len(state.Pool.OnlineMachines())
+	offline := len(state.Pool.OfflineMachines())
+	autoSyncStr := "disabled"
+	if state.Pool.AutoSync {
+		autoSyncStr = "enabled"
+	}
+	fmt.Fprintf(out, "  Machines in pool: %d (%d online, %d offline)\n", state.Pool.MachineCount(), online, offline)
+	fmt.Fprintf(out, "  Auto-sync: %s\n", autoSyncStr)
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Run 'caam sync' to sync now, or it will happen automatically.")
+
+	return nil
+}
+
+// promptForMachine prompts the user to enter machine details.
+func promptForMachine(reader *bufio.Reader, out io.Writer) (*sync.Machine, error) {
+	fmt.Fprint(out, "    Machine name: ")
+	name, _ := reader.ReadString('\n')
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, nil
+	}
+
+	fmt.Fprint(out, "    Address (IP or hostname): ")
+	address, _ := reader.ReadString('\n')
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil, fmt.Errorf("address required")
+	}
+
+	// Parse address for user@host:port format
+	sshUser := ""
+	if strings.Contains(address, "@") {
+		parts := strings.SplitN(address, "@", 2)
+		sshUser = parts[0]
+		address = parts[1]
+	}
+
+	port := sync.DefaultSSHPort
+	if strings.Contains(address, ":") {
+		parts := strings.Split(address, ":")
+		address = parts[0]
+		if len(parts) > 1 {
+			fmt.Sscanf(parts[1], "%d", &port)
+		}
+	}
+
+	m := sync.NewMachine(name, address)
+	m.Port = port
+	m.SSHUser = sshUser
+	m.Source = sync.SourceManual
+
+	fmt.Fprint(out, "    SSH key path (optional, press Enter to skip): ")
+	keyPath, _ := reader.ReadString('\n')
+	keyPath = strings.TrimSpace(keyPath)
+	if keyPath != "" {
+		m.SSHKeyPath = keyPath
+	}
+
+	return m, nil
+}
+
+// runSyncStatusJSON outputs sync status as JSON.
+func runSyncStatusJSON(state *sync.SyncState, out io.Writer) error {
+	type machineJSON struct {
+		Name     string     `json:"name"`
+		Address  string     `json:"address"`
+		Status   string     `json:"status"`
+		LastSync *time.Time `json:"last_sync,omitempty"`
+	}
+
+	type statusJSON struct {
+		LocalMachine string        `json:"local_machine,omitempty"`
+		AutoSync     bool          `json:"auto_sync"`
+		LastFullSync *time.Time    `json:"last_full_sync,omitempty"`
+		Machines     []machineJSON `json:"machines"`
+		QueuePending int           `json:"queue_pending"`
+		HistoryCount int           `json:"history_count"`
+	}
+
+	output := statusJSON{
+		AutoSync: state.Pool.AutoSync,
+	}
+
+	if state.Identity != nil {
+		output.LocalMachine = state.Identity.Hostname
+	}
+
+	if !state.Pool.LastFullSync.IsZero() {
+		t := state.Pool.LastFullSync
+		output.LastFullSync = &t
+	}
+
+	for _, m := range state.Pool.ListMachines() {
+		mj := machineJSON{
+			Name:    m.Name,
+			Address: m.Address,
+			Status:  m.Status,
+		}
+		if !m.LastSync.IsZero() {
+			t := m.LastSync
+			mj.LastSync = &t
+		}
+		output.Machines = append(output.Machines, mj)
+	}
+
+	if state.Queue != nil {
+		output.QueuePending = len(state.Queue.Entries)
+	}
+	if state.History != nil {
+		output.HistoryCount = len(state.History.Entries)
+	}
+
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(output)
+}
+
+// runSyncQueueProcess processes pending queue entries.
+func runSyncQueueProcess(state *sync.SyncState, out io.Writer) error {
+	if state.Queue == nil || len(state.Queue.Entries) == 0 {
+		fmt.Fprintln(out, "Sync queue is empty.")
+		return nil
+	}
+
+	ctx := context.Background()
+	syncer, err := sync.NewSyncer(sync.DefaultSyncerConfig())
+	if err != nil {
+		return fmt.Errorf("create syncer: %w", err)
+	}
+	defer syncer.Close()
+
+	fmt.Fprintln(out, "Processing pending retries...")
+	fmt.Fprintln(out, "")
+
+	processed := 0
+	for _, entry := range state.Queue.Entries {
+		profile := fmt.Sprintf("%s/%s", entry.Provider, entry.Profile)
+		fmt.Fprintf(out, "  Retrying %s on %s...", profile, entry.Machine)
+
+		results, err := syncer.SyncProfile(ctx, entry.Provider, entry.Profile)
+		if err != nil {
+			fmt.Fprintf(out, " ✗ %v\n", err)
+			continue
+		}
+
+		success := true
+		for _, r := range results {
+			if !r.Success {
+				success = false
+				break
+			}
+		}
+
+		if success {
+			fmt.Fprintln(out, " ✓ OK")
+			processed++
+		} else {
+			fmt.Fprintln(out, " ✗ Failed")
+		}
+	}
+
+	fmt.Fprintln(out, "")
+	fmt.Fprintf(out, "Processed %d/%d queue entries\n", processed, len(state.Queue.Entries))
+	return nil
 }
 
 // Helper functions
