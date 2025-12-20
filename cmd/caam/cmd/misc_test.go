@@ -520,8 +520,8 @@ func TestCollectSessionsWithFilter(t *testing.T) {
 
 // TestRunDoctorChecks tests full doctor check execution.
 func TestRunDoctorChecks(t *testing.T) {
-	// Run without fix
-	report := runDoctorChecks(false)
+	// Run without fix or validate
+	report := runDoctorChecks(false, false)
 
 	if report == nil {
 		t.Fatal("Expected non-nil report")
@@ -559,7 +559,7 @@ func TestRunDoctorChecksWithFix(t *testing.T) {
 	defer os.Setenv("XDG_DATA_HOME", oldXDG)
 
 	// Run with fix
-	report := runDoctorChecks(true)
+	report := runDoctorChecks(true, false)
 
 	if report == nil {
 		t.Fatal("Expected non-nil report")

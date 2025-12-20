@@ -2,10 +2,11 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	osexec "os/exec"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,6 +16,10 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 )
 
 // CheckResult represents the result of a single diagnostic check.
@@ -27,18 +32,19 @@ type CheckResult struct {
 
 // DoctorReport contains all diagnostic check results.
 type DoctorReport struct {
-	Timestamp   string        `json:"timestamp"`
-	OverallOK   bool          `json:"overall_ok"`
-	PassCount   int           `json:"pass_count"`
-	WarnCount   int           `json:"warn_count"`
-	FailCount   int           `json:"fail_count"`
-	FixedCount  int           `json:"fixed_count"`
-	CLITools    []CheckResult `json:"cli_tools"`
-	Directories []CheckResult `json:"directories"`
-	Config      []CheckResult `json:"config"`
-	Profiles    []CheckResult `json:"profiles"`
-	Locks       []CheckResult `json:"locks"`
-	AuthFiles   []CheckResult `json:"auth_files"`
+	Timestamp       string        `json:"timestamp"`
+	OverallOK       bool          `json:"overall_ok"`
+	PassCount       int           `json:"pass_count"`
+	WarnCount       int           `json:"warn_count"`
+	FailCount       int           `json:"fail_count"`
+	FixedCount      int           `json:"fixed_count"`
+	CLITools        []CheckResult `json:"cli_tools"`
+	Directories     []CheckResult `json:"directories"`
+	Config          []CheckResult `json:"config"`
+	Profiles        []CheckResult `json:"profiles"`
+	Locks           []CheckResult `json:"locks"`
+	AuthFiles       []CheckResult `json:"auth_files"`
+	TokenValidation []CheckResult `json:"token_validation,omitempty"`
 }
 
 var doctorCmd = &cobra.Command{
@@ -53,15 +59,18 @@ Checks performed:
   - Profiles: Are all isolated profiles valid? Any broken symlinks?
   - Locks: Are there any stale lock files from crashed processes?
   - Auth files: Do auth files exist for each provider?
+  - Token validation (with --validate): Are auth tokens actually valid?
 
 Flags:
-  --fix   Attempt to fix issues (create directories, clean stale locks)
-  --json  Output results in JSON format for scripting`,
+  --fix       Attempt to fix issues (create directories, clean stale locks)
+  --json      Output results in JSON format for scripting
+  --validate  Validate that auth tokens actually work (passive check, no API calls)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fix, _ := cmd.Flags().GetBool("fix")
 		jsonOutput, _ := cmd.Flags().GetBool("json")
+		validate, _ := cmd.Flags().GetBool("validate")
 
-		report := runDoctorChecks(fix)
+		report := runDoctorChecks(fix, validate)
 
 		if jsonOutput {
 			data, err := json.MarshalIndent(report, "", "  ")
@@ -72,7 +81,7 @@ Flags:
 			return nil
 		}
 
-		printDoctorReport(report)
+		printDoctorReport(report, validate)
 
 		if !report.OverallOK {
 			return fmt.Errorf("found %d issues (%d warnings, %d failures)",
@@ -86,9 +95,10 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 	doctorCmd.Flags().Bool("fix", false, "attempt to fix issues")
 	doctorCmd.Flags().Bool("json", false, "output in JSON format")
+	doctorCmd.Flags().Bool("validate", false, "validate that auth tokens actually work")
 }
 
-func runDoctorChecks(fix bool) *DoctorReport {
+func runDoctorChecks(fix bool, validate bool) *DoctorReport {
 	report := &DoctorReport{
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
@@ -111,12 +121,18 @@ func runDoctorChecks(fix bool) *DoctorReport {
 	// Check auth files
 	report.AuthFiles = checkAuthFiles()
 
+	// Check token validation (if requested)
+	if validate {
+		report.TokenValidation = checkTokenValidation()
+	}
+
 	// Calculate totals
 	allChecks := append(report.CLITools, report.Directories...)
 	allChecks = append(allChecks, report.Config...)
 	allChecks = append(allChecks, report.Profiles...)
 	allChecks = append(allChecks, report.Locks...)
 	allChecks = append(allChecks, report.AuthFiles...)
+	allChecks = append(allChecks, report.TokenValidation...)
 
 	for _, check := range allChecks {
 		switch check.Status {
@@ -524,7 +540,103 @@ func checkAuthFiles() []CheckResult {
 	return results
 }
 
-func printDoctorReport(report *DoctorReport) {
+// checkTokenValidation validates auth tokens for all profiles.
+// This performs passive validation (no API calls) by checking token format and expiry.
+func checkTokenValidation() []CheckResult {
+	var results []CheckResult
+	ctx := context.Background()
+
+	// Build provider registry for validation
+	reg := provider.NewRegistry()
+	reg.Register(claude.New())
+	reg.Register(codex.New())
+	reg.Register(gemini.New())
+
+	// Get all profiles and validate tokens
+	allProfiles, err := profileStore.ListAll()
+	if err != nil {
+		results = append(results, CheckResult{
+			Name:    "token validation",
+			Status:  "warn",
+			Message: "could not list profiles",
+			Details: err.Error(),
+		})
+		return results
+	}
+
+	if len(allProfiles) == 0 {
+		results = append(results, CheckResult{
+			Name:    "token validation",
+			Status:  "pass",
+			Message: "no profiles to validate",
+		})
+		return results
+	}
+
+	for providerID, profiles := range allProfiles {
+		prov, ok := reg.Get(providerID)
+		if !ok {
+			continue
+		}
+
+		for _, prof := range profiles {
+			name := fmt.Sprintf("%s/%s", providerID, prof.Name)
+
+			// Perform passive validation (no API calls)
+			result, err := prov.ValidateToken(ctx, prof, true)
+			if err != nil {
+				results = append(results, CheckResult{
+					Name:    name,
+					Status:  "warn",
+					Message: "validation error",
+					Details: err.Error(),
+				})
+				continue
+			}
+
+			if result.Valid {
+				msg := "valid"
+				if !result.ExpiresAt.IsZero() {
+					msg = fmt.Sprintf("valid (expires %s)", formatExpiryDuration(result.ExpiresAt))
+				}
+				results = append(results, CheckResult{
+					Name:    name,
+					Status:  "pass",
+					Message: msg,
+				})
+			} else {
+				results = append(results, CheckResult{
+					Name:    name,
+					Status:  "fail",
+					Message: "invalid token",
+					Details: result.Error,
+				})
+			}
+		}
+	}
+
+	return results
+}
+
+// formatExpiryDuration formats an expiry time relative to now.
+func formatExpiryDuration(t time.Time) string {
+	now := time.Now()
+	diff := t.Sub(now)
+
+	if diff < 0 {
+		return "expired"
+	}
+
+	if diff < time.Hour {
+		return fmt.Sprintf("in %d minutes", int(diff.Minutes()))
+	}
+	if diff < 24*time.Hour {
+		return fmt.Sprintf("in %d hours", int(diff.Hours()))
+	}
+	return fmt.Sprintf("in %d days", int(diff.Hours()/24))
+}
+
+func printDoctorReport(report *DoctorReport, validate bool) {
 	fmt.Println("caam doctor")
 	fmt.Println()
 
@@ -569,6 +681,15 @@ func printDoctorReport(report *DoctorReport) {
 		printCheck(check)
 	}
 	fmt.Println()
+
+	// Token Validation (only if --validate was used)
+	if validate && len(report.TokenValidation) > 0 {
+		fmt.Println("Validating tokens...")
+		for _, check := range report.TokenValidation {
+			printCheck(check)
+		}
+		fmt.Println()
+	}
 
 	// Summary
 	fmt.Printf("Summary: %d passed", report.PassCount)
