@@ -73,6 +73,10 @@ func (m *mockProvider) ImportAuth(_ context.Context, _ string, _ *profile.Profil
 	return nil, nil
 }
 
+func (m *mockProvider) ValidateToken(_ context.Context, _ *profile.Profile, _ bool) (*provider.ValidationResult, error) {
+	return &provider.ValidationResult{Provider: m.id, Valid: true, Method: "passive"}, nil
+}
+
 // =============================================================================
 // NewRunner Tests
 // =============================================================================

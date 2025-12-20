@@ -4,6 +4,7 @@ package provider
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
@@ -39,6 +40,15 @@ func (p *testProvider) DetectExistingAuth() (*AuthDetection, error) {
 }
 func (p *testProvider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
 	return nil, nil
+}
+func (p *testProvider) ValidateToken(ctx context.Context, prof *profile.Profile, passive bool) (*ValidationResult, error) {
+	return &ValidationResult{
+		Provider:  p.id,
+		Profile:   prof.Name,
+		Valid:     true,
+		Method:    "passive",
+		CheckedAt: time.Now(),
+	}, nil
 }
 
 func TestAuthModeConstants(t *testing.T) {

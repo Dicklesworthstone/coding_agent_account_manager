@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	osexec "os/exec"
@@ -16,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/discovery"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
 
 var initCmd = &cobra.Command{
@@ -69,29 +71,47 @@ func runInitWizard(cmd *cobra.Command, args []string) error {
 	// Phase 2: Detect tools
 	detectTools(false)
 
-	// Phase 3: Discover existing auth sessions
-	scanResult := discovery.Scan()
-	printDiscoveryResults(scanResult)
+	// Phase 3: NEW - Provider-based auth detection
+	providerDetections := detectProviderAuth()
+	printProviderDetectionResults(providerDetections)
 
-	// Phase 4: Save discovered sessions as profiles
-	savedCount := 0
-	if len(scanResult.Found) > 0 {
-		savedCount = saveDiscoveredSessions(scanResult.Found, quick)
+	// Phase 4: NEW - Import detected auth as profiles
+	importedCount := 0
+	hasDetectedAuth := false
+	for _, d := range providerDetections {
+		if d.Error == nil && d.Detection != nil && d.Detection.Found {
+			hasDetectedAuth = true
+			break
+		}
+	}
+	if hasDetectedAuth {
+		importedCount = importDetectedAuth(providerDetections, quick)
 	}
 
-	// Phase 5: Browser configuration (optional)
+	// Phase 5: Fallback - Also run legacy discovery for any sessions not covered
+	scanResult := discovery.Scan()
+	legacySavedCount := 0
+	if len(scanResult.Found) > 0 && importedCount == 0 {
+		// Only show legacy discovery if new import didn't find anything
+		printDiscoveryResults(scanResult)
+		legacySavedCount = saveDiscoveredSessions(scanResult.Found, quick)
+	}
+
+	totalSaved := importedCount + legacySavedCount
+
+	// Phase 6: Browser configuration (optional)
 	browserConfigured := false
 	if !quick {
 		browserConfigured = setupBrowserConfiguration()
 	}
 
-	// Phase 6: Shell integration (optional)
+	// Phase 7: Shell integration (optional)
 	if !noShell && (quick || promptYesNo("Set up shell integration for seamless usage?", true)) {
 		setupShellIntegration()
 	}
 
-	// Phase 7: Print summary
-	printSetupSummary(scanResult, savedCount, browserConfigured)
+	// Phase 8: Print summary
+	printSetupSummaryV2(providerDetections, totalSaved, browserConfigured)
 
 	return nil
 }
@@ -498,6 +518,50 @@ func printSetupSummary(result *discovery.ScanResult, savedCount int, browserConf
 	fmt.Println()
 }
 
+func printSetupSummaryV2(detections []ProviderAuthDetection, savedCount int, browserConfigured bool) {
+	fmt.Println()
+	fmt.Println("============================================================")
+	fmt.Println("  Setup Complete!")
+	fmt.Println("============================================================")
+	fmt.Println()
+
+	if savedCount > 0 {
+		fmt.Printf("  Created %d profile(s).\n", savedCount)
+	}
+
+	if browserConfigured {
+		fmt.Println("  Browser profiles configured for OAuth logins.")
+	}
+	fmt.Println()
+
+	fmt.Println("  Quick commands:")
+	fmt.Println("    caam ls          - List all profiles")
+	fmt.Println("    caam status      - Show current status")
+	fmt.Println("    caam run <tool>/<profile>  - Run with a profile")
+	fmt.Println()
+	fmt.Println("  Example:")
+	fmt.Println("    caam run claude/default -- --help")
+	fmt.Println()
+
+	// Show providers without auth
+	missingAuth := []string{}
+	for _, d := range detections {
+		if d.Error != nil || !d.Detection.Found {
+			missingAuth = append(missingAuth, d.DisplayName)
+		}
+	}
+
+	if len(missingAuth) > 0 {
+		fmt.Println("  To add more accounts:")
+		fmt.Println("    1. Log in to the AI tool (claude, codex, or gemini)")
+		fmt.Println("    2. Run: caam auth import <tool>")
+		fmt.Println()
+	}
+
+	fmt.Println("  Happy coding!")
+	fmt.Println()
+}
+
 // createDirectories creates the necessary data directories.
 func createDirectories(quiet bool) error {
 	if !quiet {
@@ -623,4 +687,175 @@ func promptYesNo(prompt string, defaultYes bool) bool {
 		return defaultYes
 	}
 	return input == "y" || input == "yes"
+}
+
+// ProviderAuthDetection holds detection results for a single provider.
+type ProviderAuthDetection struct {
+	ProviderID  string
+	DisplayName string
+	Detection   *provider.AuthDetection
+	Error       error
+}
+
+// detectProviderAuth uses the new provider-based detection system.
+func detectProviderAuth() []ProviderAuthDetection {
+	var results []ProviderAuthDetection
+
+	for _, prov := range registry.All() {
+		detection, err := prov.DetectExistingAuth()
+		results = append(results, ProviderAuthDetection{
+			ProviderID:  prov.ID(),
+			DisplayName: prov.DisplayName(),
+			Detection:   detection,
+			Error:       err,
+		})
+	}
+
+	return results
+}
+
+// printProviderDetectionResults shows detection results with detailed info.
+func printProviderDetectionResults(detections []ProviderAuthDetection) {
+	fmt.Println()
+	fmt.Println("Checking for existing auth credentials...")
+	fmt.Println()
+
+	foundCount := 0
+	for _, d := range detections {
+		if d.Error != nil {
+			fmt.Printf("  [!] %s: error checking (%v)\n", d.DisplayName, d.Error)
+			continue
+		}
+
+		if !d.Detection.Found {
+			fmt.Printf("  [--] %s: no existing auth detected\n", d.DisplayName)
+			continue
+		}
+
+		foundCount++
+		if d.Detection.Primary != nil {
+			loc := d.Detection.Primary
+			status := "valid"
+			if !loc.IsValid {
+				status = loc.ValidationError
+			}
+			modTime := ""
+			if !loc.LastModified.IsZero() {
+				modTime = fmt.Sprintf(" (modified %s)", formatTimeAgo(loc.LastModified))
+			}
+			fmt.Printf("  [OK] %s: %s%s\n", d.DisplayName, shortenHomePath(loc.Path), modTime)
+			fmt.Printf("       Status: %s\n", status)
+		}
+
+		if d.Detection.Warning != "" {
+			fmt.Printf("       Warning: %s\n", d.Detection.Warning)
+		}
+	}
+	fmt.Println()
+
+	if foundCount == 0 {
+		fmt.Println("  No existing auth credentials found.")
+		fmt.Println()
+		fmt.Println("  To get started:")
+		fmt.Println("    1. Log in to your AI tool (claude, codex, or gemini)")
+		fmt.Println("    2. Run: caam profile create <tool> <name>")
+		fmt.Println()
+	}
+}
+
+// importDetectedAuth imports detected auth credentials into profiles.
+func importDetectedAuth(detections []ProviderAuthDetection, autoSave bool) int {
+	fmt.Println("------------------------------------------------------------")
+	fmt.Println("  IMPORT: Create Profiles from Detected Auth")
+	fmt.Println("------------------------------------------------------------")
+	fmt.Println()
+	fmt.Println("  Import detected credentials to create profiles that you")
+	fmt.Println("  can switch between without re-authenticating.")
+	fmt.Println()
+
+	ctx := context.Background()
+	importedCount := 0
+
+	for _, d := range detections {
+		if d.Error != nil || !d.Detection.Found || d.Detection.Primary == nil {
+			continue
+		}
+
+		prov, ok := registry.Get(d.ProviderID)
+		if !ok {
+			continue
+		}
+
+		loc := d.Detection.Primary
+
+		// Check if profile already exists
+		defaultName := "default"
+		if profileStore.Exists(d.ProviderID, defaultName) {
+			fmt.Printf("  [--] %s: profile 'default' already exists, skipping\n", d.DisplayName)
+			continue
+		}
+
+		var profileName string
+		if autoSave {
+			profileName = defaultName
+			fmt.Printf("  Importing %s auth as '%s'...\n", d.DisplayName, profileName)
+		} else {
+			if !promptYesNo(fmt.Sprintf("  Import %s auth as a profile?", d.DisplayName), true) {
+				fmt.Println("  Skipped.")
+				continue
+			}
+			profileName = promptWithDefault(fmt.Sprintf("  Profile name [%s]:", defaultName), defaultName)
+			if profileName == "" {
+				fmt.Println("  Skipped.")
+				continue
+			}
+		}
+
+		// Create profile
+		prof, err := profileStore.Create(d.ProviderID, profileName, "oauth")
+		if err != nil {
+			fmt.Printf("  [!] Error creating profile: %v\n", err)
+			continue
+		}
+
+		// Save profile
+		if err := prof.Save(); err != nil {
+			profileStore.Delete(d.ProviderID, profileName)
+			fmt.Printf("  [!] Error saving profile: %v\n", err)
+			continue
+		}
+
+		// Prepare profile directory
+		if err := prov.PrepareProfile(ctx, prof); err != nil {
+			profileStore.Delete(d.ProviderID, profileName)
+			fmt.Printf("  [!] Error preparing profile: %v\n", err)
+			continue
+		}
+
+		// Import auth
+		_, err = prov.ImportAuth(ctx, loc.Path, prof)
+		if err != nil {
+			profileStore.Delete(d.ProviderID, profileName)
+			fmt.Printf("  [!] Error importing auth: %v\n", err)
+			continue
+		}
+
+		fmt.Printf("  [OK] Created %s/%s\n", d.ProviderID, profileName)
+		importedCount++
+	}
+
+	fmt.Println()
+	return importedCount
+}
+
+// shortenHomePath replaces home directory with ~.
+func shortenHomePath(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
 }

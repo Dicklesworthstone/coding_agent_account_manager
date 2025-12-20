@@ -21,6 +21,7 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -1383,6 +1384,18 @@ Examples:
 		cloned, err := profileStore.Clone(tool, sourceName, targetName, opts)
 		if err != nil {
 			return err
+		}
+
+		// Set up passthrough symlinks for the cloned profile
+		// This allows dev tools (git, ssh, etc.) to work with the isolated profile
+		passMgr, err := passthrough.NewManager()
+		if err != nil {
+			// Non-fatal: profile is cloned, just warn about passthrough
+			fmt.Fprintf(os.Stderr, "warning: could not setup passthroughs: %v\n", err)
+		} else {
+			if err := passMgr.SetupPassthroughs(cloned.HomePath()); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: passthrough setup failed: %v\n", err)
+			}
 		}
 
 		fmt.Printf("Cloned %s/%s → %s/%s\n", tool, sourceName, tool, targetName)
