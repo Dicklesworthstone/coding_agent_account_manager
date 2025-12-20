@@ -184,6 +184,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			// Generate unique name
 			profileName = fmt.Sprintf("%s_%s", profileName, time.Now().Format("150405"))
 			fmt.Printf("Profile name already exists, using: %s\n", profileName)
+			break
 		}
 	}
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
@@ -21,6 +22,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// providerAccountURLs maps provider names to their account management URLs.
+var providerAccountURLs = map[string]string{
+	"claude": "https://console.anthropic.com/",
+	"codex":  "https://platform.openai.com/",
+	"gemini": "https://aistudio.google.com/",
+}
 
 // viewState represents the current view/mode of the TUI.
 type viewState int
@@ -1155,7 +1163,21 @@ func (m Model) doRefreshProfile(provider, profile string) tea.Cmd {
 
 // handleOpenInBrowser opens the account page in browser.
 func (m Model) handleOpenInBrowser() (tea.Model, tea.Cmd) {
-	m.statusMsg = fmt.Sprintf("Open %s account page... (not yet implemented)", m.currentProvider())
+	provider := m.currentProvider()
+	url, ok := providerAccountURLs[provider]
+	if !ok {
+		m.statusMsg = fmt.Sprintf("No account URL for %s", provider)
+		return m, nil
+	}
+
+	launcher := &browser.DefaultLauncher{}
+	if err := launcher.Open(url); err != nil {
+		// If browser launch fails, show the URL so user can copy it
+		m.statusMsg = fmt.Sprintf("Open in browser: %s", url)
+		return m, nil
+	}
+
+	m.statusMsg = fmt.Sprintf("Opened %s account page in browser", strings.ToUpper(provider[:1])+provider[1:])
 	return m, nil
 }
 

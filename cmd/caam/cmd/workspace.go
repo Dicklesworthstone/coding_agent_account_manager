@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -170,8 +171,14 @@ func runWorkspaceCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Created workspace '%s':\n", workspaceName)
-	for tool, profile := range profiles {
-		fmt.Printf("  %s: %s\n", tool, profile)
+	// Sort tools for consistent output order
+	sortedTools := make([]string, 0, len(profiles))
+	for tool := range profiles {
+		sortedTools = append(sortedTools, tool)
+	}
+	sort.Strings(sortedTools)
+	for _, tool := range sortedTools {
+		fmt.Printf("  %s: %s\n", tool, profiles[tool])
 	}
 
 	return nil
@@ -216,7 +223,8 @@ func runWorkspaceList(cmd *cobra.Command, args []string) error {
 			Current  bool              `json:"current"`
 			Profiles map[string]string `json:"profiles"`
 		}
-		var output []workspaceInfo
+		// Initialize as empty slice (not nil) to output [] instead of null
+		output := make([]workspaceInfo, 0, len(workspaces))
 		for _, name := range workspaces {
 			output = append(output, workspaceInfo{
 				Name:     name,
@@ -248,8 +256,14 @@ func runWorkspaceList(cmd *cobra.Command, args []string) error {
 			marker = "* "
 		}
 		fmt.Printf("%s%s\n", marker, name)
-		for tool, profile := range profiles {
-			fmt.Printf("    %s: %s\n", tool, profile)
+		// Sort tools for consistent output order
+		sortedTools := make([]string, 0, len(profiles))
+		for tool := range profiles {
+			sortedTools = append(sortedTools, tool)
+		}
+		sort.Strings(sortedTools)
+		for _, tool := range sortedTools {
+			fmt.Printf("    %s: %s\n", tool, profiles[tool])
 		}
 	}
 
@@ -273,9 +287,17 @@ func switchWorkspace(cfg *config.Config, workspaceName string) error {
 
 	fmt.Printf("Switching to workspace '%s'\n", workspaceName)
 
+	// Sort tools for consistent activation order
+	sortedTools := make([]string, 0, len(profiles))
+	for tool := range profiles {
+		sortedTools = append(sortedTools, tool)
+	}
+	sort.Strings(sortedTools)
+
 	// Activate each profile in the workspace
 	var activated []string
-	for tool, profile := range profiles {
+	for _, tool := range sortedTools {
+		profile := profiles[tool]
 		getFileSet, ok := tools[tool]
 		if !ok {
 			fmt.Printf("  Warning: unknown tool '%s', skipping\n", tool)
