@@ -484,7 +484,8 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 // pushProfile pushes a local profile to the remote machine.
 func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error {
 	localPath := filepath.Join(s.vaultPath, provider, profile)
-	remotePath := filepath.Join(s.remoteVaultPath, provider, profile)
+	// Use posixJoin for remote paths since SFTP always uses forward slashes
+	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
 
 	// Read local files
 	files, err := s.readLocalProfileFiles(localPath)
@@ -494,7 +495,7 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error 
 
 	// Write to remote
 	for filename, data := range files {
-		remoteFilePath := filepath.Join(remotePath, filename)
+		remoteFilePath := posixJoin(remotePath, filename)
 		if err := client.WriteFile(remoteFilePath, data, 0600); err != nil {
 			return fmt.Errorf("write remote file %s: %w", filename, err)
 		}
@@ -506,7 +507,8 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error 
 // pullProfile pulls a remote profile to the local machine.
 func (s *Syncer) pullProfile(client *SSHClient, provider, profile string) error {
 	localPath := filepath.Join(s.vaultPath, provider, profile)
-	remotePath := filepath.Join(s.remoteVaultPath, provider, profile)
+	// Use posixJoin for remote paths since SFTP always uses forward slashes
+	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
 
 	// List remote files
 	remoteFiles, err := client.ListDir(remotePath)
@@ -525,7 +527,7 @@ func (s *Syncer) pullProfile(client *SSHClient, provider, profile string) error 
 			continue
 		}
 
-		remoteFilePath := filepath.Join(remotePath, fi.Name())
+		remoteFilePath := posixJoin(remotePath, fi.Name())
 		data, err := client.ReadFile(remoteFilePath)
 		if err != nil {
 			return fmt.Errorf("read remote file %s: %w", fi.Name(), err)
@@ -649,7 +651,8 @@ func (s *Syncer) getLocalFreshness(p ProfileRef) (*TokenFreshness, error) {
 
 // getRemoteFreshness gets the freshness of a remote profile.
 func (s *Syncer) getRemoteFreshness(client *SSHClient, p ProfileRef) (*TokenFreshness, error) {
-	remotePath := filepath.Join(s.remoteVaultPath, p.Provider, p.Profile)
+	// Use posixJoin for remote paths since SFTP always uses forward slashes
+	remotePath := posixJoin(s.remoteVaultPath, p.Provider, p.Profile)
 
 	// Check if remote directory exists
 	exists, err := client.FileExists(remotePath)
@@ -673,7 +676,7 @@ func (s *Syncer) getRemoteFreshness(client *SSHClient, p ProfileRef) (*TokenFres
 			continue
 		}
 
-		filePath := filepath.Join(remotePath, fi.Name())
+		filePath := posixJoin(remotePath, fi.Name())
 		data, err := client.ReadFile(filePath)
 		if err != nil {
 			continue // Skip files we can't read
@@ -732,7 +735,8 @@ func (s *Syncer) listRemoteProfiles(client *SSHClient) ([]ProfileRef, error) {
 	providers := []string{"claude", "codex", "gemini"}
 
 	for _, provider := range providers {
-		providerPath := filepath.Join(s.remoteVaultPath, provider)
+		// Use posixJoin for remote paths since SFTP always uses forward slashes
+		providerPath := posixJoin(s.remoteVaultPath, provider)
 
 		entries, err := client.ListDir(providerPath)
 		if err != nil {

@@ -355,9 +355,9 @@ func (c *SSHClient) WriteFile(remotePath string, data []byte, mode os.FileMode) 
 	}
 
 	// Atomic write: temp file + rename
-	dir := filepath.Dir(remotePath)
+	dir := posixDir(remotePath)
 	tmpName := fmt.Sprintf(".caam_tmp_%s", randomString(8))
-	tmpPath := filepath.Join(dir, tmpName)
+	tmpPath := posixJoin(dir, tmpName)
 
 	// Ensure directory exists
 	if err := c.MkdirAll(dir); err != nil {
@@ -668,12 +668,13 @@ func TestMachineConnectivity(m *Machine, opts ConnectOptions) *ConnectivityResul
 		result.CAAMFound = true
 
 		// Count profiles (basic check)
-		vaultDir := filepath.Join(filepath.Dir(caamDataDir), "vault")
+		// Use posixJoin for remote paths since SFTP always uses forward slashes
+		vaultDir := posixJoin(posixDir(caamDataDir), "vault")
 		if entries, err := client.ListDir(vaultDir); err == nil {
 			for _, e := range entries {
 				if e.IsDir() {
 					// Count profiles in each provider
-					providerDir := filepath.Join(vaultDir, e.Name())
+					providerDir := posixJoin(vaultDir, e.Name())
 					if profiles, err := client.ListDir(providerDir); err == nil {
 						result.ProfileCount += len(profiles)
 					}
