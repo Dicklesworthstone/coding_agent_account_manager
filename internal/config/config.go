@@ -48,6 +48,13 @@ type Config struct {
 	// Favorites maps providers to their favorite profile names (in priority order).
 	// Example: {"claude": ["work", "personal"]}
 	Favorites map[string][]string `json:"favorites,omitempty"`
+
+	// Workspaces maps workspace names to provider-profile mappings.
+	// Example: {"work": {"claude": "work-claude", "codex": "work-codex"}}
+	Workspaces map[string]map[string]string `json:"workspaces,omitempty"`
+
+	// CurrentWorkspace is the name of the currently active workspace.
+	CurrentWorkspace string `json:"current_workspace,omitempty"`
 }
 
 // DefaultConfig returns the default configuration.
@@ -302,6 +309,68 @@ func (c *Config) IsFavorite(provider, profile string) bool {
 		}
 	}
 	return false
+}
+
+// CreateWorkspace creates or updates a workspace with the given profile mappings.
+func (c *Config) CreateWorkspace(name string, profiles map[string]string) {
+	if c.Workspaces == nil {
+		c.Workspaces = make(map[string]map[string]string)
+	}
+	c.Workspaces[name] = profiles
+}
+
+// DeleteWorkspace removes a workspace.
+func (c *Config) DeleteWorkspace(name string) bool {
+	if c.Workspaces == nil {
+		return false
+	}
+	if _, exists := c.Workspaces[name]; !exists {
+		return false
+	}
+	delete(c.Workspaces, name)
+	// Clear current workspace if it was deleted
+	if c.CurrentWorkspace == name {
+		c.CurrentWorkspace = ""
+	}
+	return true
+}
+
+// GetWorkspace returns the profile mappings for a workspace.
+func (c *Config) GetWorkspace(name string) map[string]string {
+	if c.Workspaces == nil {
+		return nil
+	}
+	return c.Workspaces[name]
+}
+
+// ListWorkspaces returns all workspace names.
+func (c *Config) ListWorkspaces() []string {
+	if c.Workspaces == nil {
+		return nil
+	}
+	names := make([]string, 0, len(c.Workspaces))
+	for name := range c.Workspaces {
+		names = append(names, name)
+	}
+	// Sort for consistent ordering
+	for i := 0; i < len(names)-1; i++ {
+		for j := i + 1; j < len(names); j++ {
+			if names[j] < names[i] {
+				names[i], names[j] = names[j], names[i]
+			}
+		}
+	}
+	return names
+}
+
+// SetCurrentWorkspace sets the active workspace.
+func (c *Config) SetCurrentWorkspace(name string) {
+	c.CurrentWorkspace = name
+}
+
+// GetCurrentWorkspace returns the name of the active workspace.
+func (c *Config) GetCurrentWorkspace() string {
+	return c.CurrentWorkspace
 }
 
 // FuzzyMatch finds profiles that match the given query using fuzzy matching.
