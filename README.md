@@ -215,19 +215,34 @@ carol@gmail.com
 
 **Aliases:** `caam switch` and `caam use` work like `caam activate`
 
-### Stealth Mode (Optional)
+### Smart Profile Management
 
 | Command | Description |
 |---------|-------------|
-| `caam cooldown set <provider/profile> [--minutes N]` | Record a limit hit and enforce a cooldown for that profile |
-| `caam cooldown list` | List active cooldowns |
-| `caam cooldown clear <provider/profile>` | Clear cooldowns for a specific profile |
-| `caam cooldown clear --all` | Clear all cooldowns |
-| `caam activate <tool> --auto` | Auto-select a profile using the configured rotation algorithm |
+| `caam activate <tool> --auto` | Auto-select the best profile using rotation algorithm |
+| `caam next <tool>` | Preview which profile rotation would select (dry-run) |
+| `caam run <tool> [-- args]` | Wrap CLI execution with automatic failover on rate limits |
+| `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
+| `caam cooldown list` | List active cooldowns with remaining time |
+| `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
+| `caam cooldown clear --all` | Clear all active cooldowns |
+| `caam project set <tool> <profile>` | Associate current directory with a profile |
+| `caam project get [tool]` | Show project associations for current directory |
 
-When `stealth.cooldown.enabled` is true, `caam activate` warns (and can block) if the target profile is still in cooldown. Use `caam activate <tool> <profile> --force` to override.
+**Options for `caam run`:**
+- `--max-retries N` — Maximum retry attempts on rate limit (default: 1)
+- `--cooldown DURATION` — Cooldown duration after rate limit (default: 60m)
+- `--algorithm NAME` — Rotation algorithm: smart, round_robin, random
+- `--quiet` — Suppress profile switch notifications
 
-When `stealth.rotation.enabled` is true, `caam activate <tool>` can fall back to rotation if there’s no default profile, and it will try to pick an alternative profile if the default is in cooldown.
+**Options for `caam activate`:**
+- `--auto` — Use rotation algorithm to pick best profile
+- `--backup-current` — Backup current auth before switching
+- `--force` — Activate even if profile is in cooldown
+
+When `stealth.cooldown.enabled` is true in config, `caam activate` warns if the target profile is in cooldown and prompts for confirmation. Use `--force` to bypass.
+
+When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically falls back to rotation if the default profile is in cooldown.
 
 ### Uninstall Notes
 
@@ -247,6 +262,144 @@ When `stealth.rotation.enabled` is true, `caam activate <tool>` can fall back to
 | `caam profile status <tool> <email>` | Show isolated profile status |
 | `caam login <tool> <email>` | Run login flow for isolated profile |
 | `caam exec <tool> <email> [-- args]` | Run CLI with isolated profile |
+
+---
+
+## Smart Profile Management
+
+When you have multiple accounts across multiple providers, manually tracking which account has headroom, which one just hit a limit, and which one you used recently becomes tedious. Smart Profile Management automates this decision-making so you can focus on coding instead of account juggling.
+
+### Profile Health Scoring
+
+Each profile displays a health indicator showing its current state at a glance:
+
+| Icon | Status | Meaning |
+|------|--------|---------|
+| 🟢 | Healthy | Token valid for >1 hour, no recent errors |
+| 🟡 | Warning | Token expiring within 1 hour, or minor issues |
+| 🔴 | Critical | Token expired, or repeated errors in the last hour |
+| ⚪ | Unknown | No health data available yet |
+
+Health scoring combines multiple factors:
+- **Token expiry**: How long until the OAuth token expires
+- **Error history**: Recent authentication or rate limit errors
+- **Penalty score**: Accumulated issues with automatic decay over time
+- **Plan type**: Enterprise/Pro plans get slight scoring boosts
+
+The penalty system uses **exponential decay** (20% reduction every 5 minutes) so temporary issues don't permanently mark a profile as unhealthy. After about 30 minutes of no errors, a profile's penalty score returns to near zero.
+
+### Smart Rotation Algorithms
+
+When you run `caam activate claude --auto`, the rotation system picks the best profile for you. Three algorithms are available:
+
+**Smart (Default)**: Multi-factor scoring that considers:
+- Cooldown state (profiles in cooldown are excluded)
+- Health status (prefers healthy profiles)
+- Recency (avoids profiles used in the last 30 minutes)
+- Plan type (slight preference for higher-tier plans)
+- Random jitter (breaks ties unpredictably)
+
+**Round Robin**: Simple sequential rotation through profiles, skipping any in cooldown. Predictable and even distribution.
+
+**Random**: Purely random selection among non-cooldown profiles. Least predictable but may cluster usage.
+
+Configure the algorithm in `~/.caam/config.yaml`:
+
+```yaml
+stealth:
+  rotation:
+    enabled: true
+    algorithm: smart  # smart | round_robin | random
+```
+
+### Cooldown Tracking
+
+When an account hits a rate limit, you can mark it as "in cooldown" so rotation algorithms skip it:
+
+```bash
+# Mark current Claude profile as rate-limited (default: 60 min cooldown)
+caam cooldown set claude
+
+# Or specify a profile and duration
+caam cooldown set claude/work@company.com --minutes 120
+
+# View active cooldowns
+caam cooldown list
+
+# Clear a cooldown early
+caam cooldown clear claude/work@company.com
+```
+
+When cooldown enforcement is enabled (`stealth.cooldown.enabled: true`), attempting to activate a profile in cooldown will warn you and prompt for confirmation. This prevents accidentally switching back to an account that just hit limits.
+
+### Automatic Failover with `caam run`
+
+The `caam run` command wraps your AI CLI execution and automatically handles rate limits:
+
+```bash
+# Instead of running claude directly:
+caam run claude -- "explain this code"
+
+# If Claude hits a rate limit mid-session:
+# 1. Current profile goes into cooldown
+# 2. Next best profile is automatically selected
+# 3. Command is re-executed with new account
+```
+
+For seamless integration, add shell aliases:
+
+```bash
+alias claude='caam run claude --'
+alias codex='caam run codex --'
+alias gemini='caam run gemini --'
+```
+
+Now you can use `claude "explain this code"` and rate limits are handled transparently.
+
+Configuration options:
+```bash
+caam run claude --max-retries 2 --cooldown 90m --algorithm smart -- "your prompt"
+```
+
+### Project-Profile Associations
+
+Link specific profiles to project directories so you don't have to remember which account to use where:
+
+```bash
+# In your work project directory
+cd ~/projects/work-app
+caam project set claude work@company.com
+
+# Now whenever you're in this directory (or subdirectories)
+caam activate claude  # Automatically uses work@company.com
+
+# The TUI also shows the project association
+caam tui
+# Status bar shows: Project: ~/projects/work-app → work@company.com
+```
+
+Associations cascade: if you set an association on `/home/user/projects`, it applies to all subdirectories unless a more specific association exists.
+
+In the TUI, press `p` to set the current profile as the default for your current directory.
+
+### Preview Rotation Selection
+
+Before committing to a rotation selection, preview what the algorithm would pick:
+
+```bash
+$ caam next claude
+Recommended: bob@gmail.com
+  + Healthy token (expires in 4h 32m)
+  + Not used recently (2h ago)
+
+Alternatives:
+  alice@gmail.com - Used recently (15m ago)
+
+In cooldown:
+  carol@gmail.com - In cooldown (45m remaining)
+```
+
+This is useful for understanding why rotation is making certain choices, or for scripting conditional logic around account selection.
 
 ---
 
@@ -305,6 +458,46 @@ caam login codex personal@gmail.com    # Opens browser for personal account
 # Run simultaneously in different terminals
 caam exec codex work@company.com -- "implement auth system"
 caam exec codex personal@gmail.com -- "review PR #123"
+```
+
+### Smart Rotation Workflow
+
+```bash
+# Let rotation pick the best profile automatically
+caam activate claude --auto
+# Using rotation: claude/bob@gmail.com
+# Recommended: bob@gmail.com
+#   + Healthy token (expires in 4h 32m)
+#   + Not used recently (2h ago)
+
+# Hit a rate limit during your session? Mark it
+caam cooldown set claude
+# Recorded cooldown for claude/bob@gmail.com until 14:30 (58m remaining)
+
+# Next activation automatically picks another profile
+caam activate claude --auto
+# Using rotation: claude/alice@gmail.com
+# Recommended: alice@gmail.com
+#   + Healthy status
+# In cooldown:
+#   bob@gmail.com - In cooldown (57m remaining)
+```
+
+### Zero-Friction Mode with `caam run`
+
+```bash
+# Add aliases to your .bashrc/.zshrc
+alias claude='caam run claude --'
+alias codex='caam run codex --'
+
+# Now just use the tool normally
+claude "explain this authentication flow"
+
+# If you hit a rate limit mid-session, caam automatically:
+# 1. Marks current profile as in cooldown
+# 2. Selects next best profile via rotation
+# 3. Re-runs your command with the new profile
+# All transparent - you just see the output
 ```
 
 ---
@@ -412,10 +605,13 @@ go install github.com/Dicklesworthstone/coding_agent_account_manager/cmd/caam@la
 
 Special thanks to **[@darvell](https://github.com/darvell)** for inspiring this project and for the feature ideas behind Smart Profile Management. His work on **[codex-pool](https://github.com/darvell/codex-pool)**—a sophisticated proxy that load-balances requests across multiple AI accounts with automatic failover—demonstrated how much intelligence can be added to account management.
 
-While codex-pool answers "which account should handle THIS request?" (real-time proxy), caam answers "which account should I USE for my work session?" (profile manager). The upcoming Smart Profile Management features adapt codex-pool's intelligence to caam's architecture:
+While codex-pool answers "which account should handle THIS request?" (real-time proxy), caam answers "which account should I USE for my work session?" (profile manager). The Smart Profile Management features adapt codex-pool's intelligence to caam's architecture:
 
-- **Proactive Token Refresh** — Refresh OAuth tokens before they expire, preventing mid-session auth failures
-- **Profile Health Scoring** — Visual indicators (🟢🟡🔴) showing token status, error history, and plan type
+- **Proactive Token Refresh** — Automatically refreshes OAuth tokens before they expire, preventing mid-session auth failures
+- **Profile Health Scoring** — Visual indicators (🟢🟡🔴) showing token status, error history, penalty decay, and plan type
+- **Smart Rotation** — Multi-factor algorithm picks the best available profile based on health, cooldown, recency, and usage patterns
+- **Cooldown Tracking** — Database-backed tracking of rate limit hits with configurable cooldown windows
+- **Automatic Failover** — The `caam run` wrapper detects rate limits and seamlessly switches to another account
 - **Usage Analytics** — Track activation patterns and session durations across profiles
 - **Hot Reload** — TUI auto-refreshes when profiles are added/modified in another terminal
 - **Project-Profile Associations** — Remember which profile to use for each project directory
