@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/spf13/cobra"
 )
 
@@ -450,6 +452,61 @@ func TestValidToolNames(t *testing.T) {
 		if _, ok := tools[tool]; ok {
 			t.Errorf("Expected tool %q to be invalid", tool)
 		}
+	}
+}
+
+// TestFormatAllCooldownWarning tests the cooldown warning formatting.
+func TestFormatAllCooldownWarning(t *testing.T) {
+	tests := []struct {
+		name        string
+		tool        string
+		remaining   time.Duration
+		nextProfile string
+		noColor     bool
+		want        string
+	}{
+		{
+			name:        "under 1 minute no color",
+			tool:        "codex",
+			remaining:   30 * time.Second,
+			nextProfile: "work",
+			noColor:     true,
+			want:        "codex: ⚠️  ALL profiles in cooldown (next available: work in <1m)",
+		},
+		{
+			name:        "minutes only no color",
+			tool:        "claude",
+			remaining:   15 * time.Minute,
+			nextProfile: "personal",
+			noColor:     true,
+			want:        "claude: ⚠️  ALL profiles in cooldown (next available: personal in 15m)",
+		},
+		{
+			name:        "hours and minutes no color",
+			tool:        "gemini",
+			remaining:   2*time.Hour + 30*time.Minute,
+			nextProfile: "test",
+			noColor:     true,
+			want:        "gemini: ⚠️  ALL profiles in cooldown (next available: test in 2h 30m)",
+		},
+		{
+			name:        "with color",
+			tool:        "codex",
+			remaining:   1 * time.Hour,
+			nextProfile: "work",
+			noColor:     false,
+			want:        "\033[33mcodex: ⚠️  ALL profiles in cooldown (next available: work in 1h 0m)\033[0m",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := health.FormatOptions{NoColor: tc.noColor}
+			got := formatAllCooldownWarning(tc.tool, tc.remaining, tc.nextProfile, opts)
+			if got != tc.want {
+				t.Errorf("formatAllCooldownWarning() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
