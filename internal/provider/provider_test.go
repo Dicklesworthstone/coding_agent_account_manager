@@ -314,3 +314,111 @@ func TestProviderInterfaceMethods(t *testing.T) {
 		t.Errorf("SupportedAuthModes() = %v, want [oauth]", modes)
 	}
 }
+
+// ProviderMeta tests
+
+func TestGetProviderMeta(t *testing.T) {
+	tests := []struct {
+		id          string
+		wantOK      bool
+		wantURL     string
+		wantDisplay string
+	}{
+		{"codex", true, "https://platform.openai.com/account", "Codex (OpenAI)"},
+		{"claude", true, "https://console.anthropic.com/", "Claude (Anthropic)"},
+		{"gemini", true, "https://aistudio.google.com/", "Gemini (Google)"},
+		{"unknown", false, "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			meta, ok := GetProviderMeta(tt.id)
+			if ok != tt.wantOK {
+				t.Errorf("GetProviderMeta(%q) ok = %v, want %v", tt.id, ok, tt.wantOK)
+			}
+			if ok {
+				if meta.AccountURL != tt.wantURL {
+					t.Errorf("AccountURL = %q, want %q", meta.AccountURL, tt.wantURL)
+				}
+				if meta.DisplayName != tt.wantDisplay {
+					t.Errorf("DisplayName = %q, want %q", meta.DisplayName, tt.wantDisplay)
+				}
+				if meta.ID != tt.id {
+					t.Errorf("ID = %q, want %q", meta.ID, tt.id)
+				}
+			}
+		})
+	}
+}
+
+func TestAllProviderMeta(t *testing.T) {
+	all := AllProviderMeta()
+
+	if len(all) != 3 {
+		t.Errorf("AllProviderMeta() len = %d, want 3", len(all))
+	}
+
+	// Verify all known providers are present
+	ids := make(map[string]bool)
+	for _, meta := range all {
+		ids[meta.ID] = true
+		// Verify each has required fields
+		if meta.AccountURL == "" {
+			t.Errorf("provider %q has empty AccountURL", meta.ID)
+		}
+		if meta.DisplayName == "" {
+			t.Errorf("provider %q has empty DisplayName", meta.ID)
+		}
+		if meta.Description == "" {
+			t.Errorf("provider %q has empty Description", meta.ID)
+		}
+	}
+
+	for _, expected := range []string{"codex", "claude", "gemini"} {
+		if !ids[expected] {
+			t.Errorf("AllProviderMeta() missing %q", expected)
+		}
+	}
+}
+
+func TestKnownProviderIDs(t *testing.T) {
+	ids := KnownProviderIDs()
+
+	if len(ids) != 3 {
+		t.Errorf("KnownProviderIDs() len = %d, want 3", len(ids))
+	}
+
+	// Verify all expected IDs are present
+	idMap := make(map[string]bool)
+	for _, id := range ids {
+		idMap[id] = true
+	}
+
+	for _, expected := range []string{"codex", "claude", "gemini"} {
+		if !idMap[expected] {
+			t.Errorf("KnownProviderIDs() missing %q", expected)
+		}
+	}
+}
+
+func TestProviderMetaStruct(t *testing.T) {
+	meta := ProviderMeta{
+		ID:          "test",
+		DisplayName: "Test Provider",
+		AccountURL:  "https://test.example.com/account",
+		Description: "Test account page",
+	}
+
+	if meta.ID != "test" {
+		t.Errorf("ID = %q, want %q", meta.ID, "test")
+	}
+	if meta.DisplayName != "Test Provider" {
+		t.Errorf("DisplayName = %q, want %q", meta.DisplayName, "Test Provider")
+	}
+	if meta.AccountURL != "https://test.example.com/account" {
+		t.Errorf("AccountURL = %q, want %q", meta.AccountURL, "https://test.example.com/account")
+	}
+	if meta.Description != "Test account page" {
+		t.Errorf("Description = %q, want %q", meta.Description, "Test account page")
+	}
+}

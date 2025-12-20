@@ -128,3 +128,60 @@ func (r *Registry) IDs() []string {
 	}
 	return result
 }
+
+// ProviderMeta holds static metadata about a provider.
+// This is separate from the Provider interface to allow access without
+// instantiating a provider (e.g., for TUI display, open command).
+type ProviderMeta struct {
+	ID          string // Provider identifier (e.g., "codex", "claude", "gemini")
+	DisplayName string // Human-friendly name
+	AccountURL  string // URL to the provider's account/console page
+	Description string // Short description of the account page
+}
+
+// providerMetaRegistry holds static metadata for all known providers.
+var providerMetaRegistry = map[string]ProviderMeta{
+	"codex": {
+		ID:          "codex",
+		DisplayName: "Codex (OpenAI)",
+		AccountURL:  "https://platform.openai.com/account",
+		Description: "OpenAI Platform account settings",
+	},
+	"claude": {
+		ID:          "claude",
+		DisplayName: "Claude (Anthropic)",
+		AccountURL:  "https://console.anthropic.com/",
+		Description: "Anthropic Console dashboard",
+	},
+	"gemini": {
+		ID:          "gemini",
+		DisplayName: "Gemini (Google)",
+		AccountURL:  "https://aistudio.google.com/",
+		Description: "Google AI Studio dashboard",
+	},
+}
+
+// GetProviderMeta returns metadata for a provider by ID.
+// Returns the metadata and true if found, or zero value and false if not.
+func GetProviderMeta(id string) (ProviderMeta, bool) {
+	meta, ok := providerMetaRegistry[id]
+	return meta, ok
+}
+
+// AllProviderMeta returns metadata for all known providers.
+func AllProviderMeta() []ProviderMeta {
+	result := make([]ProviderMeta, 0, len(providerMetaRegistry))
+	for _, meta := range providerMetaRegistry {
+		result = append(result, meta)
+	}
+	return result
+}
+
+// KnownProviderIDs returns the IDs of all known providers.
+func KnownProviderIDs() []string {
+	result := make([]string, 0, len(providerMetaRegistry))
+	for id := range providerMetaRegistry {
+		result = append(result, id)
+	}
+	return result
+}

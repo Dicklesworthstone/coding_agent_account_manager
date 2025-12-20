@@ -8,26 +8,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
-
-// providerAccountURLs maps provider IDs to their account management URLs.
-var providerAccountURLs = map[string]struct {
-	URL         string
-	Description string
-}{
-	"codex": {
-		URL:         "https://platform.openai.com/account",
-		Description: "OpenAI Platform account settings",
-	},
-	"claude": {
-		URL:         "https://console.anthropic.com/",
-		Description: "Anthropic Console dashboard",
-	},
-	"gemini": {
-		URL:         "https://aistudio.google.com/",
-		Description: "Google AI Studio dashboard",
-	},
-}
 
 var openCmd = &cobra.Command{
 	Use:   "open <tool> [profile]",
@@ -53,15 +35,15 @@ Examples:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tool := strings.ToLower(args[0])
 
-		// Validate provider
-		urlInfo, ok := providerAccountURLs[tool]
+		// Validate provider using centralized metadata
+		meta, ok := provider.GetProviderMeta(tool)
 		if !ok {
 			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini)", tool)
 		}
 
 		// Allow custom URL override
 		customURL, _ := cmd.Flags().GetString("url")
-		url := urlInfo.URL
+		url := meta.AccountURL
 		if customURL != "" {
 			url = customURL
 		}
@@ -82,15 +64,15 @@ Examples:
 					Command:    prof.BrowserCommand,
 					ProfileDir: prof.BrowserProfileDir,
 				})
-				fmt.Printf("Opening %s in browser profile: %s\n", urlInfo.Description, prof.BrowserDisplayName())
+				fmt.Printf("Opening %s in browser profile: %s\n", meta.Description, prof.BrowserDisplayName())
 			} else {
 				launcher = &browser.DefaultLauncher{}
-				fmt.Printf("Opening %s in default browser (profile has no browser config)\n", urlInfo.Description)
+				fmt.Printf("Opening %s in default browser (profile has no browser config)\n", meta.Description)
 			}
 		} else {
 			// No profile - use default browser
 			launcher = &browser.DefaultLauncher{}
-			fmt.Printf("Opening %s in default browser\n", urlInfo.Description)
+			fmt.Printf("Opening %s in default browser\n", meta.Description)
 		}
 
 		fmt.Printf("  URL: %s\n", url)
