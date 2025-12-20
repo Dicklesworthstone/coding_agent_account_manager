@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -279,7 +278,7 @@ func outputHuman(results []ValidationOutput) error {
 	fmt.Printf("Summary: %d valid, %d invalid (method: %s)\n", validCount, invalidCount, results[0].Method)
 
 	if invalidCount > 0 {
-		os.Exit(1)
+		return fmt.Errorf("%d invalid token(s) found", invalidCount)
 	}
 	return nil
 }
