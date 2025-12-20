@@ -269,12 +269,14 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 **All 119 beads closed** - Project feature complete!
 
 ## Active Agents
-- **Gemini**: Performed deep security/reliability audit (`caam-sec-audit`, `caam-sec-win`). Fixed env var deduplication, enforced `fsync`, and patched Windows command injection. Improved URL detection (`caam-ux-url`). Extended `fsync` hardening to project store and PID files (`caam-hard-sync`).
+- **BrownCastle (Claude Opus 4.5)**: TUI health wiring (`caam-lkk1`, `caam-04fh`, `caam-f8zj`), cooldown TTL status display (`caam-gy7z`, `caam-w5op`), history command filtering (`caam-ttwt`). Closed EPICs: `caam-8d1v`, `caam-gplk`, `caam-y0ia`, `caam-uwxz`.
+- **BrownSnow (Claude Opus 4.5)**: Implemented major "Zero Friction UX" features: `caam-0031` (TUI refresh wiring), `caam-q9f` (caam wrap with rate limit detection and auto-retry), `caam-k9z` (shell integration with `caam shell init`). New packages: `internal/ratelimit`, `internal/wrap`.
+- **OrangeCastle (Claude Opus 4.5)**: E2E rotation/cooldown tests (`caam-sztt`), claiming refresh.go core tests (`caam-i312`).
+- **BlueCat (Claude Opus 4.5)**: E2E test harness (`caam-ldjp`), backup workflow tests (`caam-ffz1`), bundle tests (`caam-esb1`), sync tests (`caam-bhcz`), history command (`caam-559h`). Closed EPIC `caam-gux`.
+- **Gemini**: Performed deep security/reliability audit (`caam-sec-audit`, `caam-sec-win`). Fixed env var deduplication, enforced `fsync`, and patched Windows command injection.
 - **Codex (GPT-5.2)**: Fresh-eyes audit fixes landed: `caam-iks` (stale accx references/Makefile) and `caam-0ds` (DB stats last_error monotonic).
 - **LilacCastle (Claude Opus 4.5)**: Bug fixes in rotation/activate code; closed stealth epic `caam-e8o`.
-- **WhiteDog (Claude Opus 4.5)**: Joined project to monitor and assist with maintenance. Verified recent security commit (SSH host key hardening, zip bomb protection, queue processing fixes).
-- **PinkSnow (Claude Opus 4.5)**: Removing caam binary from git history. Project maintenance.
-- **PurpleCreek (Claude Opus 4.5)**: Fresh eyes code audit - explored 30+ core files across rotation, stealth, health, sync, exec, profile, authfile, db, config, TUI, and provider packages. Verified all 144+ tests pass. No bugs found - codebase demonstrates excellent practices: atomic writes with fsync, path traversal prevention, stale lock cleanup, proper error handling.
+- **PurpleCreek (Claude Opus 4.5)**: Fresh eyes code audit - verified 144+ tests pass, no bugs found.
 
 ## Completed Work
 - [x] Investigate codebase
@@ -291,6 +293,12 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 - [x] `caam-l4q`: Health formatting: remove deprecated strings.Title
 - [x] `caam-iks`: Fix stale accx references (Makefile/docs)
 - [x] `caam-0ds`: DB stats: keep last_error monotonic
+- [x] `caam-0031`: TUI: Wire login/refresh action to refresh.Refresh()
+- [x] `caam-q9f`: caam wrap: Auto rate limit detection and profile rotation (new packages: internal/ratelimit, internal/wrap)
+- [x] `caam-k9z`: Shell integration: caam shell init command for bash/zsh/fish
+- [x] `caam-gy7z`: CLI cooldown TTL display in status output
+- [x] `caam-w5op`: CLI warning when all profiles in cooldown
+- [x] `caam-ttwt`: History command filtering and JSON output
 
 ## Messages
 (None)
