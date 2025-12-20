@@ -270,7 +270,7 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 
 ## Active Agents
 - **BrownCastle (Claude Opus 4.5)**: TUI health wiring (`caam-lkk1`, `caam-04fh`, `caam-f8zj`), cooldown TTL status display (`caam-gy7z`, `caam-w5op`), history command filtering (`caam-ttwt`). Closed EPICs: `caam-8d1v`, `caam-gplk`, `caam-y0ia`, `caam-uwxz`.
-- **BrownSnow (Claude Opus 4.5)**: Implemented major "Zero Friction UX" features: `caam-0031` (TUI refresh wiring), `caam-q9f` (caam wrap with rate limit detection and auto-retry), `caam-k9z` (shell integration with `caam shell init`). New packages: `internal/ratelimit`, `internal/wrap`.
+- **BrownSnow (Claude Opus 4.5)**: Implemented major "Zero Friction UX" features: `caam-0031` (TUI refresh wiring), `caam-q9f` (caam wrap with rate limit detection and auto-retry), `caam-k9z` (shell integration with `caam shell init`), `caam-bxq` (enhanced init wizard with auth discovery). New packages: `internal/ratelimit`, `internal/wrap`, `internal/discovery`.
 - **OrangeCastle (Claude Opus 4.5)**: E2E rotation/cooldown tests (`caam-sztt`), claiming refresh.go core tests (`caam-i312`).
 - **BlueCat (Claude Opus 4.5)**: E2E test harness (`caam-ldjp`), backup workflow tests (`caam-ffz1`), bundle tests (`caam-esb1`), sync tests (`caam-bhcz`), history command (`caam-559h`). Closed EPIC `caam-gux`.
 - **Gemini**: Performed deep security/reliability audit (`caam-sec-audit`, `caam-sec-win`). Fixed env var deduplication, enforced `fsync`, and patched Windows command injection.
@@ -296,6 +296,7 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 - [x] `caam-0031`: TUI: Wire login/refresh action to refresh.Refresh()
 - [x] `caam-q9f`: caam wrap: Auto rate limit detection and profile rotation (new packages: internal/ratelimit, internal/wrap)
 - [x] `caam-k9z`: Shell integration: caam shell init command for bash/zsh/fish
+- [x] `caam-bxq`: Enhanced init wizard with auth discovery (new package: internal/discovery)
 - [x] `caam-gy7z`: CLI cooldown TTL display in status output
 - [x] `caam-w5op`: CLI warning when all profiles in cooldown
 - [x] `caam-ttwt`: History command filtering and JSON output
