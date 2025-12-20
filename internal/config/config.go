@@ -58,6 +58,9 @@ type Config struct {
 
 	// Wrap configures retry and backoff behavior for the wrap command.
 	Wrap WrapConfig `json:"wrap,omitempty"`
+
+	// Backup configures automatic backup scheduling.
+	Backup BackupConfig `json:"backup,omitempty"`
 }
 
 // DefaultConfig returns the default configuration.
@@ -67,6 +70,7 @@ func DefaultConfig() *Config {
 		DefaultProfiles: make(map[string]string),
 		AutoLock:        true,
 		Wrap:            DefaultWrapConfig(),
+		Backup:          DefaultBackupConfig(),
 	}
 }
 
