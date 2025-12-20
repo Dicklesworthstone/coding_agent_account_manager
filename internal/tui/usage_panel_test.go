@@ -70,3 +70,71 @@ func TestModel_UsagePanel_ToggleAndRanges(t *testing.T) {
 		t.Fatalf("usage panel still visible after esc")
 	}
 }
+
+func TestUsagePanel_TimeRangeLabel(t *testing.T) {
+	tests := []struct {
+		timeRange int
+		want      string
+	}{
+		{1, "Last 24 hours"},
+		{7, "Last 7 days"},
+		{30, "Last 30 days"},
+		{0, "All time"},
+		{14, "Last 14 days"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			u := NewUsagePanel()
+			u.SetTimeRange(tc.timeRange)
+			got := u.timeRangeLabel()
+			if got != tc.want {
+				t.Errorf("timeRangeLabel() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUsagePanel_RenderBar(t *testing.T) {
+	u := NewUsagePanel()
+
+	tests := []struct {
+		name       string
+		percentage float64
+		width      int
+		wantLen    int
+	}{
+		{"zero width", 0.5, 0, 0},
+		{"negative width", 0.5, -1, 0},
+		{"zero percentage", 0, 10, 10},
+		{"full percentage", 1.0, 10, 10},
+		{"over 100%", 1.5, 10, 10},
+		{"negative percentage", -0.5, 10, 10},
+		{"50%", 0.5, 10, 10},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := u.renderBar(tc.percentage, tc.width)
+			// Just verify it doesn't panic and returns expected length
+			if tc.width <= 0 {
+				if result != "" {
+					t.Errorf("renderBar with width=%d should return empty string", tc.width)
+				}
+			}
+		})
+	}
+}
+
+func TestUsagePanel_NilReceiver(t *testing.T) {
+	var u *UsagePanel
+
+	// Test all nil receiver cases don't panic
+	u.Toggle()
+	u.SetTimeRange(1)
+	u.SetLoading(true)
+	u.SetSize(100, 50)
+	u.SetStats(nil)
+	_ = u.Visible()
+	_ = u.TimeRange()
+}

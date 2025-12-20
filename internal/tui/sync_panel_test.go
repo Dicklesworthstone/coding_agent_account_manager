@@ -86,3 +86,61 @@ func TestSyncPanel_SetLoading(t *testing.T) {
 		t.Fatalf("View() should not show loading after SetLoading(false)")
 	}
 }
+
+func TestSyncPanel_SetSyncing(t *testing.T) {
+	p := NewSyncPanel()
+	p.SetSyncing(true)
+	// Should not panic
+
+	// Test nil receiver
+	var nilPanel *SyncPanel
+	nilPanel.SetSyncing(true)
+	// Should not panic
+}
+
+func TestSyncPanel_SetState(t *testing.T) {
+	p := NewSyncPanel()
+	p.SetSize(120, 40)
+
+	// Set nil state
+	p.SetState(nil)
+	if p.State() != nil {
+		t.Fatal("State should be nil after SetState(nil)")
+	}
+
+	// Test nil receiver
+	var nilPanel *SyncPanel
+	nilPanel.SetState(nil)
+	// Should not panic
+}
+
+func TestSyncPanel_State(t *testing.T) {
+	p := NewSyncPanel()
+	if p.State() != nil {
+		t.Fatal("State should be nil initially")
+	}
+
+	// Test nil receiver
+	var nilPanel *SyncPanel
+	if nilPanel.State() != nil {
+		t.Fatal("State on nil receiver should return nil")
+	}
+}
+
+func TestSyncPanel_SelectedMachine(t *testing.T) {
+	p := NewSyncPanel()
+
+	// No machines - should return nil
+	if m := p.SelectedMachine(); m != nil {
+		t.Fatal("SelectedMachine should return nil with no machines")
+	}
+
+	// Test nil receiver
+	var nilPanel *SyncPanel
+	if m := nilPanel.SelectedMachine(); m != nil {
+		t.Fatal("SelectedMachine on nil receiver should return nil")
+	}
+}
+
+// Note: TestGetStatusIcon, TestFormatTimeAgo, TestTruncateString, TestToMachineInfo
+// are defined in sync_test.go
