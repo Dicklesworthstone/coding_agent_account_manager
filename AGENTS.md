@@ -261,3 +261,51 @@ bv --robot-label-health | jq '.results.labels[] | select(.health_level == "criti
 **Performance:** Phase 1 instant, Phase 2 async (500ms timeout). Prefer `--robot-plan` over `--robot-insights` when speed matters. Results cached by data hash.
 
 Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cycles, and parallel tracks deterministically.
+
+---
+
+## Agent Activity Log
+
+### 2025-12-20: BrownSnow Code Audit
+
+**Scope:** Comprehensive review of codebase for bugs, security issues, inefficiencies, and reliability problems.
+
+**Packages Audited:**
+- `internal/wrap` - Stream wrapping and tee functionality
+- `internal/ratelimit` - Rate limit detection
+- `internal/discovery` - Provider/profile discovery
+- `internal/daemon` - Background daemon management
+- `internal/refresh` - OAuth token refresh
+- `internal/rotation` - Profile rotation algorithms
+- `internal/sync` - Profile pool synchronization
+- `cmd/caam/cmd` - CLI command implementations
+
+**Findings:**
+
+1. **Minor Inefficiency - `internal/wrap/wrap.go`**: The `teeWriter` checks for partial buffer writes on each call. While technically correct for the io.Writer contract, this is unlikely to occur with typical destinations. Not a bug, just overly defensive.
+
+2. **Minor Issue - `internal/daemon/daemon.go`**: PID file write uses `os.WriteFile` directly rather than the atomic temp-file + fsync + rename pattern. This is a minor reliability concern if the process crashes mid-write, but the daemon code already handles stale PID detection, so the impact is minimal.
+
+3. **Security - Good Practices Observed:**
+   - `cmd/caam/cmd/shell.go`: Proper shell quoting with `shellescape.Quote()` prevents command injection
+   - `internal/refresh/url_guard.go`: Enforces HTTPS for OAuth endpoints, proper URL validation
+   - `internal/rotation/rotation.go`: No injection vectors in scoring algorithms
+   - `internal/sync/pool.go`: Proper mutex usage and atomic saves
+
+**Conclusion:** No critical bugs or security vulnerabilities found. Codebase follows Go best practices with proper error handling, mutex protection, and input validation.
+
+### 2025-12-20: TealMeadow - Profile Tags Feature (caam-g2yz.2)
+
+Implemented complete profile tagging system:
+- Added `Tags` field to Profile struct with validation (lowercase alphanumeric + hyphens, max 32 chars, max 10 tags)
+- Created `caam tag` command with subcommands: add, remove, list, clear, all
+- Added `--tag` filter to `caam ls` command
+- Full test coverage in `internal/profile/profile_test.go`
+
+### 2025-12-20: Path Construction Bug Fixes
+
+Fixed two instances of incorrect path construction using string concatenation instead of `filepath.Join`:
+- `internal/warnings/warnings.go:139`: `vaultPath + "/auth.json"` → `filepath.Join(vaultPath, "auth.json")`
+- `cmd/caam/cmd/root.go:210`: Same pattern fixed
+
+These fixes ensure cross-platform compatibility (Windows path separators).
