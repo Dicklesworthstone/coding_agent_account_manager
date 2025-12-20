@@ -54,6 +54,7 @@ type Daemon struct {
 	vault       *authfile.Vault
 	healthStore *health.Storage
 	logger      *log.Logger
+	logFile     *os.File // Log file handle for cleanup
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -81,10 +82,12 @@ func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemo
 	}
 
 	logger := log.New(os.Stdout, "[caam-daemon] ", log.LstdFlags)
+	var logFile *os.File
 	if cfg.LogPath != "" {
 		f, err := os.OpenFile(cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err == nil {
 			logger = log.New(f, "[caam-daemon] ", log.LstdFlags)
+			logFile = f
 		}
 	}
 
@@ -93,6 +96,7 @@ func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemo
 		vault:       vault,
 		healthStore: healthStore,
 		logger:      logger,
+		logFile:     logFile,
 	}
 }
 
@@ -158,6 +162,12 @@ func (d *Daemon) Stop() error {
 		d.logger.Println("Daemon stopped gracefully")
 	case <-time.After(10 * time.Second):
 		d.logger.Println("Daemon stop timed out")
+	}
+
+	// Close log file if we opened one
+	if d.logFile != nil {
+		d.logFile.Close()
+		d.logFile = nil
 	}
 
 	return nil
@@ -371,6 +381,10 @@ func ReadPIDFile() (int, error) {
 
 // IsProcessRunning checks if a process with the given PID is running.
 func IsProcessRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
@@ -378,7 +392,17 @@ func IsProcessRunning(pid int) bool {
 
 	// On Unix, FindProcess always succeeds. We need to send signal 0 to check.
 	err = proc.Signal(syscall.Signal(0))
-	return err == nil
+	if err == nil {
+		return true
+	}
+
+	// EPERM means the process exists but we can't signal it (different user).
+	// Only ESRCH means the process doesn't exist.
+	if errors.Is(err, syscall.EPERM) {
+		return true
+	}
+
+	return false
 }
 
 // GetDaemonStatus returns the current daemon status.
