@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/discovery"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
@@ -77,13 +79,19 @@ func runInitWizard(cmd *cobra.Command, args []string) error {
 		savedCount = saveDiscoveredSessions(scanResult.Found, quick)
 	}
 
-	// Phase 5: Shell integration (optional)
+	// Phase 5: Browser configuration (optional)
+	browserConfigured := false
+	if !quick {
+		browserConfigured = setupBrowserConfiguration()
+	}
+
+	// Phase 6: Shell integration (optional)
 	if !noShell && (quick || promptYesNo("Set up shell integration for seamless usage?", true)) {
 		setupShellIntegration()
 	}
 
-	// Phase 6: Print summary
-	printSetupSummary(scanResult, savedCount)
+	// Phase 7: Print summary
+	printSetupSummary(scanResult, savedCount, browserConfigured)
 
 	return nil
 }
@@ -320,7 +328,141 @@ func appendToShellRC(rcFile, line string) error {
 	return err
 }
 
-func printSetupSummary(result *discovery.ScanResult, savedCount int) {
+func setupBrowserConfiguration() bool {
+	browsers := browser.DetectBrowsers()
+	if len(browsers) == 0 {
+		return false
+	}
+
+	fmt.Println()
+	fmt.Println("------------------------------------------------------------")
+	fmt.Println("  STEP 2: Browser Profile Configuration (Optional)")
+	fmt.Println("------------------------------------------------------------")
+	fmt.Println()
+	fmt.Println("  Configure browser profiles to automatically use the right")
+	fmt.Println("  account during OAuth login (Google, GitHub, etc.).")
+	fmt.Println()
+
+	// Show detected browsers
+	fmt.Println("  Detected browsers:")
+	for i, b := range browsers {
+		profileCount := len(b.Profiles)
+		fmt.Printf("    [%d] %s (%d profile(s))\n", i+1, b.Name, profileCount)
+	}
+	fmt.Println("    [0] Skip browser configuration")
+	fmt.Println()
+
+	if !promptYesNo("Would you like to configure browser profiles?", false) {
+		fmt.Println("  Skipping browser configuration.")
+		fmt.Println()
+		return false
+	}
+
+	fmt.Println()
+
+	// Let user select a browser
+	browserIdx := promptNumber("  Select browser number:", 0, len(browsers))
+	if browserIdx == 0 {
+		fmt.Println("  Skipping browser configuration.")
+		fmt.Println()
+		return false
+	}
+
+	selectedBrowser := browsers[browserIdx-1]
+
+	// Show profiles for selected browser
+	if len(selectedBrowser.Profiles) == 0 {
+		fmt.Printf("  No profiles found in %s.\n", selectedBrowser.Name)
+		fmt.Println()
+		return false
+	}
+
+	fmt.Println()
+	fmt.Printf("  Profiles in %s:\n", selectedBrowser.Name)
+	for i, p := range selectedBrowser.Profiles {
+		displayName := p.Name
+		if p.Email != "" {
+			displayName = fmt.Sprintf("%s (%s)", p.Name, p.Email)
+		}
+		if p.IsDefault {
+			displayName += " [default]"
+		}
+		fmt.Printf("    [%d] %s\n", i+1, displayName)
+	}
+	fmt.Println("    [0] Cancel")
+	fmt.Println()
+
+	profileIdx := promptNumber("  Select profile number:", 0, len(selectedBrowser.Profiles))
+	if profileIdx == 0 {
+		fmt.Println("  Cancelled.")
+		fmt.Println()
+		return false
+	}
+
+	selectedProfile := selectedBrowser.Profiles[profileIdx-1]
+
+	// Save to global config
+	fmt.Println()
+	fmt.Printf("  Browser: %s\n", selectedBrowser.Name)
+	fmt.Printf("  Profile: %s\n", selectedProfile.Name)
+	if selectedProfile.Email != "" {
+		fmt.Printf("  Account: %s\n", selectedProfile.Email)
+	}
+	fmt.Println()
+
+	fmt.Printf("  [OK] Configured %s with profile '%s'\n", selectedBrowser.Name, selectedProfile.Name)
+	fmt.Println()
+	fmt.Println("  This will be used during OAuth logins to automatically")
+	fmt.Println("  open the correct browser profile.")
+	fmt.Println()
+
+	// Store in global config
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Printf("  Warning: could not load config: %v\n", err)
+		return false
+	}
+
+	cfg.BrowserCommand = selectedBrowser.Command
+	cfg.BrowserProfileDir = selectedProfile.ID
+	cfg.BrowserProfileName = selectedProfile.Name
+
+	if err := cfg.Save(); err != nil {
+		fmt.Printf("  Warning: could not save browser config: %v\n", err)
+		return false
+	}
+
+	return true
+}
+
+// promptNumber prompts for a number in range [min, max].
+func promptNumber(prompt string, min, max int) int {
+	for {
+		fmt.Print(prompt + " ")
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "" {
+			return min
+		}
+
+		var num int
+		if _, err := fmt.Sscanf(input, "%d", &num); err != nil {
+			fmt.Printf("  Please enter a number between %d and %d.\n", min, max)
+			continue
+		}
+
+		if num < min || num > max {
+			fmt.Printf("  Please enter a number between %d and %d.\n", min, max)
+			continue
+		}
+
+		return num
+	}
+}
+
+func printSetupSummary(result *discovery.ScanResult, savedCount int, browserConfigured bool) {
 	fmt.Println()
 	fmt.Println("============================================================")
 	fmt.Println("  Setup Complete!")
@@ -329,8 +471,12 @@ func printSetupSummary(result *discovery.ScanResult, savedCount int) {
 
 	if savedCount > 0 {
 		fmt.Printf("  Saved %d profile(s) to vault.\n", savedCount)
-		fmt.Println()
 	}
+
+	if browserConfigured {
+		fmt.Println("  Browser profiles configured for OAuth logins.")
+	}
+	fmt.Println()
 
 	fmt.Println("  Quick commands:")
 	fmt.Println("    caam status      - Show current profiles and status")

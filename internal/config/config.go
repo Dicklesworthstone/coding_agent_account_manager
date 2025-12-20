@@ -22,8 +22,23 @@ type Config struct {
 	// AutoLock enables automatic profile locking during exec.
 	AutoLock bool `json:"auto_lock"`
 
-	// BrowserProfile specifies a browser profile for OAuth flows.
+	// BrowserProfile specifies a browser profile for OAuth flows (deprecated).
 	BrowserProfile string `json:"browser_profile,omitempty"`
+
+	// BrowserCommand is the browser executable to use for OAuth flows.
+	// Examples: "google-chrome", "firefox", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+	// If empty, uses system default browser.
+	BrowserCommand string `json:"browser_command,omitempty"`
+
+	// BrowserProfileDir is the browser profile directory or name.
+	// For Chrome: "Profile 1", "Default", or full path to profile directory.
+	// For Firefox: profile name as shown in about:profiles.
+	// If empty, uses browser's default profile.
+	BrowserProfileDir string `json:"browser_profile_dir,omitempty"`
+
+	// BrowserProfileName is a human-friendly label for the browser profile.
+	// Used for display purposes only.
+	BrowserProfileName string `json:"browser_profile_name,omitempty"`
 }
 
 // DefaultConfig returns the default configuration.
