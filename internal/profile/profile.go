@@ -37,6 +37,10 @@ type Profile struct {
 	// AccountLabel is a human-friendly label (e.g., email address).
 	AccountLabel string `json:"account_label,omitempty"`
 
+	// Description is free-form notes about the profile's purpose.
+	// Examples: "Client X project", "Free tier for testing", "Team shared account"
+	Description string `json:"description,omitempty"`
+
 	// CreatedAt is when this profile was created.
 	CreatedAt time.Time `json:"created_at"`
 

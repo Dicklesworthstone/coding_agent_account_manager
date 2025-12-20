@@ -21,6 +21,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -368,6 +369,181 @@ func (p *Provider) ValidateProfile(ctx context.Context, prof *profile.Profile) e
 	}
 
 	return nil
+}
+
+// xdgConfigHome returns the XDG config directory.
+func xdgConfigHome() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return xdg
+	}
+	homeDir, _ := os.UserHomeDir()
+	return filepath.Join(homeDir, ".config")
+}
+
+// DetectExistingAuth detects existing Gemini authentication files in standard locations.
+// Locations checked:
+// - ~/.gemini/settings.json (main settings with OAuth state)
+// - ~/.gemini/oauth_credentials.json (OAuth credentials cache)
+// - ~/.gemini/.env (API key)
+// - ~/.config/gcloud/application_default_credentials.json (Vertex AI ADC)
+func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
+	detection := &provider.AuthDetection{
+		Provider:  p.ID(),
+		Locations: []provider.AuthLocation{},
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("get home dir: %w", err)
+	}
+
+	// Define locations to check
+	locations := []struct {
+		path        string
+		description string
+		validator   func(data []byte) (bool, string) // Custom validator
+	}{
+		{
+			path:        filepath.Join(homeDir, ".gemini", "settings.json"),
+			description: "Gemini CLI settings with Google OAuth state",
+			validator: func(data []byte) (bool, string) {
+				var parsed map[string]interface{}
+				if err := json.Unmarshal(data, &parsed); err != nil {
+					return false, fmt.Sprintf("invalid JSON: %v", err)
+				}
+				// Check for OAuth-related fields
+				if _, ok := parsed["oauth"]; ok {
+					return true, ""
+				}
+				if _, ok := parsed["credentials"]; ok {
+					return true, ""
+				}
+				// Accept any valid JSON settings file
+				return true, ""
+			},
+		},
+		{
+			path:        filepath.Join(homeDir, ".gemini", "oauth_credentials.json"),
+			description: "Gemini CLI OAuth credentials cache",
+			validator: func(data []byte) (bool, string) {
+				var parsed map[string]interface{}
+				if err := json.Unmarshal(data, &parsed); err != nil {
+					return false, fmt.Sprintf("invalid JSON: %v", err)
+				}
+				// Check for token fields
+				if _, ok := parsed["access_token"]; ok {
+					return true, ""
+				}
+				if _, ok := parsed["refresh_token"]; ok {
+					return true, ""
+				}
+				return false, "missing expected OAuth fields"
+			},
+		},
+		{
+			path:        filepath.Join(homeDir, ".gemini", ".env"),
+			description: "Gemini API key (.env file)",
+			validator: func(data []byte) (bool, string) {
+				content := string(data)
+				if len(content) > 0 {
+					// Check if it contains GEMINI_API_KEY
+					if contains(content, "GEMINI_API_KEY") {
+						return true, ""
+					}
+					return false, "missing GEMINI_API_KEY"
+				}
+				return false, "empty file"
+			},
+		},
+		{
+			path:        filepath.Join(xdgConfigHome(), "gcloud", "application_default_credentials.json"),
+			description: "Google Cloud Application Default Credentials (Vertex AI)",
+			validator: func(data []byte) (bool, string) {
+				var parsed map[string]interface{}
+				if err := json.Unmarshal(data, &parsed); err != nil {
+					return false, fmt.Sprintf("invalid JSON: %v", err)
+				}
+				// Check for ADC fields
+				if _, ok := parsed["client_id"]; ok {
+					return true, ""
+				}
+				if _, ok := parsed["type"]; ok {
+					return true, ""
+				}
+				return false, "missing expected ADC fields"
+			},
+		},
+	}
+
+	var mostRecent *provider.AuthLocation
+
+	for _, loc := range locations {
+		authLoc := provider.AuthLocation{
+			Path:        loc.path,
+			Description: loc.description,
+		}
+
+		info, err := os.Stat(loc.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				authLoc.Exists = false
+			} else {
+				authLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
+			}
+			detection.Locations = append(detection.Locations, authLoc)
+			continue
+		}
+
+		authLoc.Exists = true
+		authLoc.LastModified = info.ModTime()
+		authLoc.FileSize = info.Size()
+
+		// Read and validate
+		data, err := os.ReadFile(loc.path)
+		if err != nil {
+			authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
+		} else {
+			valid, validationErr := loc.validator(data)
+			authLoc.IsValid = valid
+			authLoc.ValidationError = validationErr
+		}
+
+		detection.Locations = append(detection.Locations, authLoc)
+
+		// Track most recent valid auth
+		if authLoc.Exists && authLoc.IsValid {
+			detection.Found = true
+			if mostRecent == nil || authLoc.LastModified.After(mostRecent.LastModified) {
+				locCopy := authLoc // Copy to avoid pointer issues
+				mostRecent = &locCopy
+			}
+		}
+	}
+
+	detection.Primary = mostRecent
+
+	// Set warning if multiple valid auth files found
+	validCount := 0
+	for _, loc := range detection.Locations {
+		if loc.Exists && loc.IsValid {
+			validCount++
+		}
+	}
+	if validCount > 1 {
+		detection.Warning = "multiple auth sources found; using most recent"
+	}
+
+	return detection, nil
+}
+
+// contains checks if s contains substr (simple implementation to avoid importing strings).
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 // Ensure Provider implements the interface.
