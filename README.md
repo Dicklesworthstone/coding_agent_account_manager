@@ -20,7 +20,7 @@ caam activate claude bob@gmail.com      # Switch instantly
 
 ## The Problem
 
-You're paying $100-200/month for fixed-cost AI coding subscriptions (Claude Max, GPT Pro, Gemini Ultra). These plans have usage limits—not billing caps, but rate limits that reset over time. When you hit them mid-flow, the official way to switch accounts:
+You're paying $200-275/month for fixed-cost AI coding subscriptions (Claude Max, GPT Pro, Gemini Ultra). These plans have usage limits—not billing caps, but rate limits that reset over time. When you hit them mid-flow, the official way to switch accounts:
 
 ```
 /login → browser opens → sign out of Google → sign into different Google →
@@ -126,7 +126,7 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### Claude Code (Claude Max)
 
-**Subscription:** Claude Max ($100/month for 5x usage)
+**Subscription:** Claude Max ($200/month)
 
 **Auth Files:**
 - `~/.claude.json` — Main authentication token
@@ -149,7 +149,7 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### Gemini CLI (Google One AI Premium)
 
-**Subscription:** Google One AI Premium ($20/month)
+**Subscription:** Gemini Ultra (~$275/month)
 
 **Auth Files:**
 - `~/.gemini/settings.json`
@@ -345,7 +345,7 @@ caam exec codex personal@gmail.com -- "review PR #123"
 
 **Q: Does this work with API keys / pay-per-token plans?**
 
-No. This tool is specifically designed for **fixed-cost subscription plans** like Claude Max ($100/month), GPT Pro ($200/month), and Gemini Ultra ($20/month). These plans authenticate via OAuth browser flows and store tokens locally. If you're using API keys with usage-based billing, you don't need account switching—you'd just use different API keys.
+No. This tool is specifically designed for **fixed-cost subscription plans** like Claude Max ($200/month), GPT Pro ($200/month), and Gemini Ultra (~$275/month). These plans authenticate via OAuth browser flows and store tokens locally. If you're using API keys with usage-based billing, you don't need account switching—you'd just use different API keys.
 
 **Q: Is this against terms of service?**
 
