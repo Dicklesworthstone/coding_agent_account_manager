@@ -711,6 +711,18 @@ func (f *failWriter) Write(p []byte) (n int, err error) {
 }
 
 // =============================================================================
+// ScanReader Edge Cases
+// =============================================================================
+
+func TestScanReader_WriteError(t *testing.T) {
+	input := strings.NewReader("line 1\nline 2\n")
+	err := ScanReader(input, &failWriter{}, nil)
+	if err == nil {
+		t.Error("Expected error when output writer fails")
+	}
+}
+
+// =============================================================================
 // DetectedURL Tests
 // =============================================================================
 
