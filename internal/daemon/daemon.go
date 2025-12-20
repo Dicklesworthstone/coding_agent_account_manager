@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
@@ -56,6 +57,9 @@ type Daemon struct {
 	logger      *log.Logger
 	logFile     *os.File // Log file handle for cleanup
 
+	// backupScheduler handles automatic backups (may be nil if disabled)
+	backupScheduler *BackupScheduler
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -73,6 +77,13 @@ type Stats struct {
 	RefreshCount    int64
 	RefreshErrors   int64
 	ProfilesChecked int64
+
+	// Backup stats
+	LastBackup      time.Time
+	NextBackup      time.Time
+	BackupCount     int64
+	BackupErrors    int64
+	BackupEnabled   bool
 }
 
 // New creates a new daemon instance.
@@ -91,13 +102,24 @@ func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemo
 		}
 	}
 
-	return &Daemon{
+	d := &Daemon{
 		config:      cfg,
 		vault:       vault,
 		healthStore: healthStore,
 		logger:      logger,
 		logFile:     logFile,
 	}
+
+	// Initialize backup scheduler from global config
+	globalCfg, err := config.Load()
+	if err == nil && globalCfg.Backup.IsEnabled() {
+		d.backupScheduler = NewBackupScheduler(&globalCfg.Backup, vault.BasePath(), logger)
+		if loadErr := d.backupScheduler.LoadState(); loadErr != nil {
+			logger.Printf("Warning: failed to load backup state: %v", loadErr)
+		}
+	}
+
+	return d
 }
 
 // Start begins the daemon's main loop.
@@ -184,13 +206,26 @@ func (d *Daemon) IsRunning() bool {
 func (d *Daemon) GetStats() Stats {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.stats
+
+	stats := d.stats
+
+	// Add backup stats if scheduler is enabled
+	if d.backupScheduler != nil {
+		stats.BackupEnabled = true
+		state := d.backupScheduler.GetState()
+		stats.LastBackup = state.LastBackup
+		stats.BackupCount = state.BackupCount
+		stats.NextBackup = d.backupScheduler.NextBackupTime()
+	}
+
+	return stats
 }
 
 // runLoop is the main daemon loop.
 func (d *Daemon) runLoop() {
 	// Do an initial check immediately
 	d.checkAndRefresh()
+	d.checkAndBackup()
 
 	ticker := time.NewTicker(d.config.CheckInterval)
 	defer ticker.Stop()
@@ -201,7 +236,38 @@ func (d *Daemon) runLoop() {
 			return
 		case <-ticker.C:
 			d.checkAndRefresh()
+			d.checkAndBackup()
 		}
+	}
+}
+
+// checkAndBackup creates a backup if one is due.
+func (d *Daemon) checkAndBackup() {
+	if d.backupScheduler == nil {
+		return
+	}
+
+	if !d.backupScheduler.ShouldBackup() {
+		if d.config.Verbose {
+			next := d.backupScheduler.NextBackupTime()
+			if !next.IsZero() {
+				d.logger.Printf("Next backup scheduled for %v", next.Format(time.RFC3339))
+			}
+		}
+		return
+	}
+
+	backupPath, err := d.backupScheduler.CreateBackup()
+	if err != nil {
+		d.mu.Lock()
+		d.stats.BackupErrors++
+		d.mu.Unlock()
+		d.logger.Printf("Backup failed: %v", err)
+		return
+	}
+
+	if backupPath != "" {
+		d.logger.Printf("Backup created: %s", backupPath)
 	}
 }
 
