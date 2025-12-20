@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -158,6 +160,59 @@ func getProfileHealth(tool, profileName string) *health.ProfileHealth {
 	return ph
 }
 
+// getCooldownString returns a formatted string showing cooldown remaining time.
+// Returns empty string if no active cooldown or if db is unavailable.
+func getCooldownString(provider, profile string, opts health.FormatOptions) string {
+	db, err := caamdb.Open()
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+
+	now := time.Now()
+	cooldown, err := db.ActiveCooldown(provider, profile, now)
+	if err != nil || cooldown == nil {
+		return ""
+	}
+
+	remaining := cooldown.CooldownUntil.Sub(now)
+	if remaining <= 0 {
+		return ""
+	}
+
+	// Format remaining time
+	var timeStr string
+	if remaining >= time.Hour {
+		hours := int(remaining.Hours())
+		mins := int(remaining.Minutes()) % 60
+		timeStr = fmt.Sprintf("%dh %dm", hours, mins)
+	} else {
+		mins := int(remaining.Minutes())
+		if mins < 1 {
+			timeStr = "<1m"
+		} else {
+			timeStr = fmt.Sprintf("%dm", mins)
+		}
+	}
+
+	// Format with color based on remaining time
+	var cooldownStr string
+	if opts.NoColor {
+		cooldownStr = fmt.Sprintf("(cooldown: %s remaining)", timeStr)
+	} else if remaining >= time.Hour {
+		// Red for > 1hr
+		cooldownStr = fmt.Sprintf("\033[31m(cooldown: %s remaining)\033[0m", timeStr)
+	} else if remaining >= 30*time.Minute {
+		// Yellow for 30min - 1hr
+		cooldownStr = fmt.Sprintf("\033[33m(cooldown: %s remaining)\033[0m", timeStr)
+	} else {
+		// Green for < 30min (almost done)
+		cooldownStr = fmt.Sprintf("\033[32m(cooldown: %s remaining)\033[0m", timeStr)
+	}
+
+	return cooldownStr
+}
+
 func init() {
 	// Core commands (auth file swapping - PRIMARY)
 	rootCmd.AddCommand(versionCmd)
@@ -289,6 +344,12 @@ Examples:
 			ph := getProfileHealth(tool, activeProfile)
 			status := health.CalculateStatus(ph)
 			healthStr := health.FormatStatusWithReason(status, ph, formatOpts)
+
+			// Check for active cooldown and append remaining time
+			cooldownStr := getCooldownString(tool, activeProfile, formatOpts)
+			if cooldownStr != "" {
+				healthStr = healthStr + " " + cooldownStr
+			}
 
 			fmt.Printf("%-10s  %-20s  %s\n", tool, activeProfile, healthStr)
 
