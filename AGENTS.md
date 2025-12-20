@@ -266,7 +266,7 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 
 ## Project Status
 
-**22 beads open** - Core features complete, remaining work is mostly test coverage EPICs and polish.
+**2 beads open** - Core features complete, remaining work is profile tags and auto-backup scheduling.
 
 ## Active Agents
 - **BrownCastle (Claude Opus 4.5)**: TUI health wiring (`caam-lkk1`, `caam-04fh`, `caam-f8zj`), cooldown TTL status display (`caam-gy7z`, `caam-w5op`), history command filtering (`caam-ttwt`), CLI --json audit (`caam-z7j7`). Closed EPICs: `caam-8d1v`, `caam-gplk`, `caam-y0ia`, `caam-uwxz`.
@@ -277,6 +277,7 @@ Use bv instead of parsing beads.jsonl—it computes PageRank, critical paths, cy
 - **Codex (GPT-5.2)**: Fresh-eyes audit fixes landed: `caam-iks` (stale accx references/Makefile) and `caam-0ds` (DB stats last_error monotonic).
 - **LilacCastle (Claude Opus 4.5)**: Bug fixes in rotation/activate code; closed stealth epic `caam-e8o`.
 - **PurpleCreek (Claude Opus 4.5)**: Fresh eyes code audit - verified 144+ tests pass, no bugs found.
+- **TealMeadow (Claude Opus 4.5)**: Implementing profile tags (`caam-g2yz.2`). Added Tags field to Profile struct, `caam tag` commands (add/remove/list/clear/all), `--tag` filter to `caam ls`. Fixed path construction bugs in warnings.go and root.go.
 
 ## Completed Work
 - [x] Investigate codebase
