@@ -10,6 +10,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -355,6 +356,29 @@ Examples:
 	},
 }
 
+// statusOutput is the JSON output structure for status command.
+type statusOutput struct {
+	Tools           []statusTool `json:"tools"`
+	Warnings        []string     `json:"warnings,omitempty"`
+	Recommendations []string     `json:"recommendations,omitempty"`
+}
+
+type statusTool struct {
+	Tool          string        `json:"tool"`
+	LoggedIn      bool          `json:"logged_in"`
+	ActiveProfile string        `json:"active_profile,omitempty"`
+	Error         string        `json:"error,omitempty"`
+	Health        *statusHealth `json:"health,omitempty"`
+}
+
+type statusHealth struct {
+	Status            string `json:"status"`
+	Reason            string `json:"reason,omitempty"`
+	ExpiresAt         string `json:"expires_at,omitempty"`
+	ErrorCount        int    `json:"error_count"`
+	CooldownRemaining string `json:"cooldown_remaining,omitempty"`
+}
+
 // statusCmd shows which profile is currently active.
 var statusCmd = &cobra.Command{
 	Use:   "status [tool]",
@@ -365,50 +389,106 @@ along with health status indicators and recommendations.
 Examples:
   caam status           # Show all tools
   caam status claude    # Show just Claude
-  caam status --no-color  # Without colors`,
+  caam status --no-color  # Without colors
+  caam status --json      # Output as JSON`,
 	Args: cobra.MaximumNArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		noColor, _ := cmd.Flags().GetBool("no-color")
-		formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
+	RunE: runStatus,
+}
 
-		toolsToCheck := []string{"codex", "claude", "gemini"}
-		if len(args) > 0 {
-			tool := strings.ToLower(args[0])
-			if _, ok := tools[tool]; !ok {
-				return fmt.Errorf("unknown tool: %s", tool)
-			}
-			toolsToCheck = []string{tool}
+func init() {
+	statusCmd.Flags().Bool("no-color", false, "disable colored output")
+	statusCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+func runStatus(cmd *cobra.Command, args []string) error {
+	noColor, _ := cmd.Flags().GetBool("no-color")
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
+
+	toolsToCheck := []string{"codex", "claude", "gemini"}
+	if len(args) > 0 {
+		tool := strings.ToLower(args[0])
+		if _, ok := tools[tool]; !ok {
+			return fmt.Errorf("unknown tool: %s", tool)
 		}
+		toolsToCheck = []string{tool}
+	}
 
+	var output statusOutput
+	var warnings []string
+	var recommendations []string
+
+	if !jsonOutput {
 		fmt.Println("Active Profiles")
 		fmt.Println("───────────────────────────────────────────────────")
+	}
 
-		var warnings []string
-		var recommendations []string
+	for _, tool := range toolsToCheck {
+		fileSet := tools[tool]()
+		hasAuth := authfile.HasAuthFiles(fileSet)
 
-		for _, tool := range toolsToCheck {
-			fileSet := tools[tool]()
-			hasAuth := authfile.HasAuthFiles(fileSet)
-
-			if !hasAuth {
+		if !hasAuth {
+			if jsonOutput {
+				output.Tools = append(output.Tools, statusTool{
+					Tool:     tool,
+					LoggedIn: false,
+				})
+			} else {
 				fmt.Printf("%-10s  (not logged in)\n", tool)
-				continue
 			}
+			continue
+		}
 
-			activeProfile, err := vault.ActiveProfile(fileSet)
-			if err != nil {
+		activeProfile, err := vault.ActiveProfile(fileSet)
+		if err != nil {
+			if jsonOutput {
+				output.Tools = append(output.Tools, statusTool{
+					Tool:     tool,
+					LoggedIn: true,
+					Error:    err.Error(),
+				})
+			} else {
 				fmt.Printf("%-10s  (error: %v)\n", tool, err)
-				continue
 			}
+			continue
+		}
 
-			if activeProfile == "" {
+		if activeProfile == "" {
+			if jsonOutput {
+				output.Tools = append(output.Tools, statusTool{
+					Tool:     tool,
+					LoggedIn: true,
+				})
+			} else {
 				fmt.Printf("%-10s  (logged in, no matching profile)\n", tool)
-				continue
 			}
+			continue
+		}
 
-			// Get health info
-			ph := getProfileHealth(tool, activeProfile)
-			status := health.CalculateStatus(ph)
+		// Get health info
+		ph := getProfileHealth(tool, activeProfile)
+		status := health.CalculateStatus(ph)
+
+		if jsonOutput {
+			st := statusTool{
+				Tool:          tool,
+				LoggedIn:      true,
+				ActiveProfile: activeProfile,
+				Health: &statusHealth{
+					Status:     status.String(),
+					ErrorCount: ph.ErrorCount1h,
+				},
+			}
+			if !ph.TokenExpiresAt.IsZero() {
+				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+			}
+			// Get cooldown info
+			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})
+			if cooldownStr != "" {
+				st.Health.CooldownRemaining = cooldownStr
+			}
+			output.Tools = append(output.Tools, st)
+		} else {
 			healthStr := health.FormatStatusWithReason(status, ph, formatOpts)
 
 			// Check for active cooldown and append remaining time
@@ -418,55 +498,79 @@ Examples:
 			}
 
 			fmt.Printf("%-10s  %-20s  %s\n", tool, activeProfile, healthStr)
-
-			// Collect warnings
-			if status == health.StatusWarning || status == health.StatusCritical {
-				detailedStatus := health.FormatStatusWithReason(status, ph, health.FormatOptions{NoColor: true})
-				warnings = append(warnings, fmt.Sprintf("%s/%s: %s", tool, activeProfile, detailedStatus))
-			}
-
-			// Collect recommendations
-			rec := health.FormatRecommendation(tool, activeProfile, ph)
-			if rec != "" {
-				recommendations = append(recommendations, rec)
-			}
-
-			// Check if ALL profiles for this tool are in cooldown
-			allCooldown, nextAvail, nextProfile := checkAllProfilesCooldown(tool)
-			if allCooldown {
-				warning := formatAllCooldownWarning(tool, nextAvail, nextProfile, formatOpts)
-				warnings = append(warnings, warning)
-			}
 		}
 
-		// Show warnings
-		if len(warnings) > 0 {
-			fmt.Println()
-			fmt.Println("Warnings")
-			fmt.Println("───────────────────────────────────────────────────")
-			for _, w := range warnings {
-				fmt.Printf("  %s\n", w)
-			}
+		// Collect warnings
+		if status == health.StatusWarning || status == health.StatusCritical {
+			detailedStatus := health.FormatStatusWithReason(status, ph, health.FormatOptions{NoColor: true})
+			warnings = append(warnings, fmt.Sprintf("%s/%s: %s", tool, activeProfile, detailedStatus))
 		}
 
-		// Show recommendations
-		if len(recommendations) > 0 {
-			fmt.Println()
-			fmt.Println("Recommendations")
-			fmt.Println("───────────────────────────────────────────────────")
-			for _, r := range recommendations {
-				for _, line := range strings.Split(r, "\n") {
-					fmt.Printf("  • %s\n", line)
-				}
-			}
+		// Collect recommendations
+		rec := health.FormatRecommendation(tool, activeProfile, ph)
+		if rec != "" {
+			recommendations = append(recommendations, rec)
 		}
 
-		return nil
-	},
+		// Check if ALL profiles for this tool are in cooldown
+		allCooldown, nextAvail, nextProfile := checkAllProfilesCooldown(tool)
+		if allCooldown {
+			warning := formatAllCooldownWarning(tool, nextAvail, nextProfile, health.FormatOptions{NoColor: true})
+			warnings = append(warnings, warning)
+		}
+	}
+
+	if jsonOutput {
+		output.Warnings = warnings
+		output.Recommendations = recommendations
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(output)
+	}
+
+	// Show warnings
+	if len(warnings) > 0 {
+		fmt.Println()
+		fmt.Println("Warnings")
+		fmt.Println("───────────────────────────────────────────────────")
+		for _, w := range warnings {
+			fmt.Printf("  %s\n", w)
+		}
+	}
+
+	// Show recommendations
+	if len(recommendations) > 0 {
+		fmt.Println()
+		fmt.Println("Recommendations")
+		fmt.Println("───────────────────────────────────────────────────")
+		for _, r := range recommendations {
+			for _, line := range strings.Split(r, "\n") {
+				fmt.Printf("  • %s\n", line)
+			}
+		}
+	}
+
+	return nil
 }
 
-func init() {
-	statusCmd.Flags().Bool("no-color", false, "disable colored output")
+// lsOutput is the JSON output structure for ls command.
+type lsOutput struct {
+	Profiles []lsProfile `json:"profiles"`
+	Count    int         `json:"count"`
+}
+
+type lsProfile struct {
+	Tool   string   `json:"tool"`
+	Name   string   `json:"name"`
+	Active bool     `json:"active"`
+	System bool     `json:"system"`
+	Health lsHealth `json:"health"`
+}
+
+type lsHealth struct {
+	Status     string `json:"status"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+	ErrorCount int    `json:"error_count"`
 }
 
 // lsCmd lists all stored profiles.
@@ -479,98 +583,167 @@ var lsCmd = &cobra.Command{
 Examples:
   caam ls           # List all profiles
   caam ls claude    # List just Claude profiles
-  caam ls --no-color  # Without colors (for piping)`,
+  caam ls --no-color  # Without colors (for piping)
+  caam ls --json      # Output as JSON`,
 	Args: cobra.MaximumNArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		noColor, _ := cmd.Flags().GetBool("no-color")
-		formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
-
-		if len(args) > 0 {
-			tool := strings.ToLower(args[0])
-			if _, ok := tools[tool]; !ok {
-				return fmt.Errorf("unknown tool: %s", tool)
-			}
-
-			profiles, err := vault.List(tool)
-			if err != nil {
-				return err
-			}
-
-			if len(profiles) == 0 {
-				fmt.Printf("No profiles saved for %s\n", tool)
-				return nil
-			}
-
-			// Check which is active
-			fileSet := tools[tool]()
-			activeProfile, _ := vault.ActiveProfile(fileSet)
-
-			for _, p := range profiles {
-				marker := "  "
-				if p == activeProfile {
-					marker = "● "
-				}
-
-				tag := ""
-				if authfile.IsSystemProfile(p) {
-					tag = "[system]"
-				}
-
-				// Get health info
-				ph := getProfileHealth(tool, p)
-				status := health.CalculateStatus(ph)
-				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-
-				fmt.Printf("%s%-20s  %-8s  %s\n", marker, p, tag, healthStr)
-			}
-			return nil
-		}
-
-		// List all
-		allProfiles, err := vault.ListAll()
-		if err != nil {
-			return err
-		}
-
-		if len(allProfiles) == 0 {
-			fmt.Println("No profiles saved yet.")
-			fmt.Println("\nTo save your first profile:")
-			fmt.Println("  1. Login using the tool's command (codex login, /login in claude)")
-			fmt.Println("  2. Run: caam backup <tool> <profile-name>")
-			return nil
-		}
-
-		for tool, profiles := range allProfiles {
-			fileSet := tools[tool]()
-			activeProfile, _ := vault.ActiveProfile(fileSet)
-
-			fmt.Printf("%s:\n", tool)
-			for _, p := range profiles {
-				marker := "  "
-				if p == activeProfile {
-					marker = "● "
-				}
-
-				tag := ""
-				if authfile.IsSystemProfile(p) {
-					tag = "[system]"
-				}
-
-				// Get health info
-				ph := getProfileHealth(tool, p)
-				status := health.CalculateStatus(ph)
-				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-
-				fmt.Printf("  %s%-20s  %-8s  %s\n", marker, p, tag, healthStr)
-			}
-		}
-
-		return nil
-	},
+	RunE: runLs,
 }
 
 func init() {
 	lsCmd.Flags().Bool("no-color", false, "disable colored output")
+	lsCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+func runLs(cmd *cobra.Command, args []string) error {
+	noColor, _ := cmd.Flags().GetBool("no-color")
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
+
+	// Collect profiles for JSON output
+	var output lsOutput
+
+	if len(args) > 0 {
+		tool := strings.ToLower(args[0])
+		if _, ok := tools[tool]; !ok {
+			return fmt.Errorf("unknown tool: %s", tool)
+		}
+
+		profiles, err := vault.List(tool)
+		if err != nil {
+			return err
+		}
+
+		if len(profiles) == 0 {
+			if jsonOutput {
+				output.Profiles = []lsProfile{}
+				output.Count = 0
+				return encodeLsJSON(cmd, output)
+			}
+			fmt.Printf("No profiles saved for %s\n", tool)
+			return nil
+		}
+
+		// Check which is active
+		fileSet := tools[tool]()
+		activeProfile, _ := vault.ActiveProfile(fileSet)
+
+		for _, p := range profiles {
+			ph := getProfileHealth(tool, p)
+			status := health.CalculateStatus(ph)
+
+			if jsonOutput {
+				lp := lsProfile{
+					Tool:   tool,
+					Name:   p,
+					Active: p == activeProfile,
+					System: authfile.IsSystemProfile(p),
+					Health: lsHealth{
+						Status:     status.String(),
+						ErrorCount: ph.ErrorCount1h,
+					},
+				}
+				if !ph.TokenExpiresAt.IsZero() {
+					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+				}
+				output.Profiles = append(output.Profiles, lp)
+			} else {
+				marker := "  "
+				if p == activeProfile {
+					marker = "● "
+				}
+
+				tag := ""
+				if authfile.IsSystemProfile(p) {
+					tag = "[system]"
+				}
+
+				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
+				fmt.Printf("%s%-20s  %-8s  %s\n", marker, p, tag, healthStr)
+			}
+		}
+
+		if jsonOutput {
+			output.Count = len(output.Profiles)
+			return encodeLsJSON(cmd, output)
+		}
+		return nil
+	}
+
+	// List all
+	allProfiles, err := vault.ListAll()
+	if err != nil {
+		return err
+	}
+
+	if len(allProfiles) == 0 {
+		if jsonOutput {
+			output.Profiles = []lsProfile{}
+			output.Count = 0
+			return encodeLsJSON(cmd, output)
+		}
+		fmt.Println("No profiles saved yet.")
+		fmt.Println("\nTo save your first profile:")
+		fmt.Println("  1. Login using the tool's command (codex login, /login in claude)")
+		fmt.Println("  2. Run: caam backup <tool> <profile-name>")
+		return nil
+	}
+
+	for tool, profiles := range allProfiles {
+		fileSet := tools[tool]()
+		activeProfile, _ := vault.ActiveProfile(fileSet)
+
+		if !jsonOutput {
+			fmt.Printf("%s:\n", tool)
+		}
+
+		for _, p := range profiles {
+			ph := getProfileHealth(tool, p)
+			status := health.CalculateStatus(ph)
+
+			if jsonOutput {
+				lp := lsProfile{
+					Tool:   tool,
+					Name:   p,
+					Active: p == activeProfile,
+					System: authfile.IsSystemProfile(p),
+					Health: lsHealth{
+						Status:     status.String(),
+						ErrorCount: ph.ErrorCount1h,
+					},
+				}
+				if !ph.TokenExpiresAt.IsZero() {
+					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+				}
+				output.Profiles = append(output.Profiles, lp)
+			} else {
+				marker := "  "
+				if p == activeProfile {
+					marker = "● "
+				}
+
+				tag := ""
+				if authfile.IsSystemProfile(p) {
+					tag = "[system]"
+				}
+
+				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
+				fmt.Printf("  %s%-20s  %-8s  %s\n", marker, p, tag, healthStr)
+			}
+		}
+	}
+
+	if jsonOutput {
+		output.Count = len(output.Profiles)
+		return encodeLsJSON(cmd, output)
+	}
+
+	return nil
+}
+
+func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
+	enc := json.NewEncoder(cmd.OutOrStdout())
+	enc.SetIndent("", "  ")
+	return enc.Encode(output)
 }
 
 // deleteCmd removes a profile from the vault.
