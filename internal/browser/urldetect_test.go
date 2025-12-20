@@ -371,7 +371,7 @@ func TestScanReader_MultipleURLsPerLine(t *testing.T) {
 // BrowserHelperScript Tests
 // =============================================================================
 
-func TestBrowserHelperScript(t *testing.T) {
+func TestBrowserHelperScript_Content(t *testing.T) {
 	script := BrowserHelperScript("/usr/bin/caam", "work-profile")
 
 	if !strings.Contains(script, "/usr/bin/caam") {
@@ -401,7 +401,7 @@ func TestBrowserHelperScript_SpecialChars(t *testing.T) {
 // WriteBrowserHelper Tests
 // =============================================================================
 
-func TestWriteBrowserHelper(t *testing.T) {
+func TestWriteBrowserHelper_Content(t *testing.T) {
 	path, err := WriteBrowserHelper("/usr/bin/caam", "test-profile")
 	if err != nil {
 		t.Fatalf("WriteBrowserHelper error: %v", err)
