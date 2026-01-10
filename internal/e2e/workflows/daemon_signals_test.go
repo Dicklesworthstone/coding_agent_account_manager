@@ -83,9 +83,10 @@ daemon:
 	
 	// Relaxed check: verify process exists
 	proc, err := os.FindProcess(pid)
-	if err == nil {
-		proc.Signal(syscall.Signal(0))
-	}
+	require.NoError(t, err)
+	// Check if process exists by sending signal 0
+	require.NoError(t, proc.Signal(syscall.Signal(0)), "PID from file should be running")
+	
 	h.LogInfo("PID check", "cmd_pid", cmd.Process.Pid, "file_pid", pid)
 	
 	h.EndStep("Start")

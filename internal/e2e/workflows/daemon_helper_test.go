@@ -1,10 +1,13 @@
 package workflows
 
 import (
+	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/cmd/caam/cmd"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 // TestDaemonHelper is used to run the daemon in a subprocess.
@@ -25,9 +28,22 @@ func TestDaemonHelper(t *testing.T) {
 	// No, the caller calls the test binary.
 	
 	// We can set os.Args manually.
-	// But we must preserve the 0th arg (program name) and overwrite the rest.
-	// IMPORTANT: The test runner adds flags like -test.run which might confuse cobra if not cleared.
-	os.Args = []string{"caam", "daemon", "start", "--fg", "--verbose"}
+	if extraArgs := os.Getenv("CAAM_DAEMON_ARGS"); extraArgs != "" {
+		// Simple splitting by space (doesn't handle quotes but enough for our tests)
+		parts := strings.Split(extraArgs, " ")
+		os.Args = append([]string{"caam", "daemon", "start", "--fg", "--verbose"}, parts...)
+	} else {
+		os.Args = []string{"caam", "daemon", "start", "--fg", "--verbose"}
+	}
+	
+	if os.Getenv("MOCK_REFRESH_CLAUDE") == "1" {
+		refresh.RefreshClaudeToken = func(ctx context.Context, refreshToken string) (*refresh.TokenResponse, error) {
+			return &refresh.TokenResponse{
+				AccessToken: "new-mock-access-token",
+				ExpiresIn:   3600,
+			}, nil
+		}
+	}
 	
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
