@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -70,10 +71,11 @@ func getPool() (*authpool.AuthPool, error) {
 	vault := authfile.NewVault(authfile.DefaultVaultPath())
 	pool := authpool.NewAuthPool(authpool.WithVault(vault))
 
-	// Load persisted state
+	// Load persisted state (errors logged but not fatal - state file may not exist)
 	opts := authpool.PersistOptions{}
 	if err := pool.Load(opts); err != nil {
-		// No persisted state is OK
+		// Load returns nil for file-not-exist, so any error here is a real problem
+		fmt.Fprintf(os.Stderr, "Warning: failed to load pool state: %v\n", err)
 	}
 
 	// Load profiles from vault

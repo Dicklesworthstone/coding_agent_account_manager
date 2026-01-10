@@ -22,7 +22,7 @@ const (
 )
 
 // RefreshCodexToken refreshes the OAuth token for OpenAI Codex.
-func RefreshCodexToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenResponse, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is empty")
 	}

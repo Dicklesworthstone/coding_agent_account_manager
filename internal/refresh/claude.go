@@ -29,7 +29,7 @@ type TokenResponse struct {
 }
 
 // RefreshClaudeToken refreshes the OAuth token for Claude Code.
-func RefreshClaudeToken(ctx context.Context, refreshToken string) (*TokenResponse, error) {
+var RefreshClaudeToken = func(ctx context.Context, refreshToken string) (*TokenResponse, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is empty")
 	}

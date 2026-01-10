@@ -39,7 +39,7 @@ type GoogleTokenResponse struct {
 }
 
 // RefreshGeminiToken refreshes the OAuth token for Google Gemini.
-func RefreshGeminiToken(ctx context.Context, clientID, clientSecret, refreshToken string) (*GoogleTokenResponse, error) {
+var RefreshGeminiToken = func(ctx context.Context, clientID, clientSecret, refreshToken string) (*GoogleTokenResponse, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is empty")
 	}
