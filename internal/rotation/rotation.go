@@ -54,6 +54,15 @@ type Result struct {
 	Algorithm    Algorithm      // Which algorithm was used
 }
 
+// UsageInfo represents real-time rate limit usage for a profile.
+type UsageInfo struct {
+	ProfileName      string
+	PrimaryPercent   int     // Primary window usage (0-100)
+	SecondaryPercent int     // Secondary window usage (0-100)
+	AvailScore       int     // Availability score (0-100, higher is better)
+	Error            string  // Error message if fetch failed
+}
+
 // Selector performs profile selection based on configured algorithm.
 type Selector struct {
 	algorithm   Algorithm
@@ -61,6 +70,7 @@ type Selector struct {
 	db          *caamdb.DB
 	rng         *rand.Rand
 	avoidRecent time.Duration // Don't select profiles used within this duration
+	usageData   map[string]*UsageInfo // Real-time usage data by profile name
 }
 
 // NewSelector creates a new profile selector.
@@ -82,6 +92,11 @@ func (s *Selector) SetRNG(rng *rand.Rand) {
 // SetAvoidRecent sets how long to avoid recently-used profiles.
 func (s *Selector) SetAvoidRecent(d time.Duration) {
 	s.avoidRecent = d
+}
+
+// SetUsageData sets real-time usage data for consideration in smart selection.
+func (s *Selector) SetUsageData(usage map[string]*UsageInfo) {
+	s.usageData = usage
 }
 
 // Select chooses a profile from the given list using the configured algorithm.
@@ -366,7 +381,49 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 			})
 		}
 
-		// Factor 4: Small random jitter to break ties
+		// Factor 4: Real-time rate limit usage (if available)
+		if s.usageData != nil {
+			if usage, ok := s.usageData[p]; ok && usage.Error == "" {
+				// Use availability score (0-100, higher is better)
+				// Convert to bonus: 100 avail = +100 bonus, 0 avail = -100 penalty
+				usageBonus := float64(usage.AvailScore) - 50 // Center around 0
+				score.Score += usageBonus
+
+				if usage.PrimaryPercent >= 80 {
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("Primary limit %d%% used (near limit)", usage.PrimaryPercent),
+						Positive: false,
+					})
+				} else if usage.PrimaryPercent <= 30 {
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("Primary limit %d%% used (plenty available)", usage.PrimaryPercent),
+						Positive: true,
+					})
+				} else {
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("Primary limit %d%% used", usage.PrimaryPercent),
+						Positive: true,
+					})
+				}
+
+				if usage.SecondaryPercent >= 80 {
+					score.Score -= 30 // Extra penalty for high secondary usage
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("Secondary limit %d%% used (near limit)", usage.SecondaryPercent),
+						Positive: false,
+					})
+				}
+			} else if usage != nil && usage.Error != "" {
+				// Fetching failed - slight penalty but don't disqualify
+				score.Score -= 10
+				score.Reasons = append(score.Reasons, Reason{
+					Text:     "Usage data unavailable",
+					Positive: false,
+				})
+			}
+		}
+
+		// Factor 5: Small random jitter to break ties
 		jitter := s.rng.Float64() * 5
 		score.Score += jitter
 

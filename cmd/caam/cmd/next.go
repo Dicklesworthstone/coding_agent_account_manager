@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -39,6 +41,7 @@ func init() {
 	nextCmd.Flags().BoolP("quiet", "q", false, "minimal output")
 	nextCmd.Flags().Bool("force", false, "activate even if profile is in cooldown")
 	nextCmd.Flags().String("algorithm", "", "override rotation algorithm (smart, round_robin, random)")
+	nextCmd.Flags().Bool("usage-aware", false, "fetch real-time rate limits to inform selection")
 	rootCmd.AddCommand(nextCmd)
 }
 
@@ -48,6 +51,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	force, _ := cmd.Flags().GetBool("force")
 	algoOverride, _ := cmd.Flags().GetString("algorithm")
+	usageAware, _ := cmd.Flags().GetBool("usage-aware")
 
 	// Validate tool
 	getFileSet, ok := tools[tool]
@@ -116,8 +120,17 @@ func runNext(cmd *cobra.Command, args []string) error {
 		defer db.Close()
 	}
 
+	// Fetch usage data if --usage-aware is set
+	var usageData map[string]*rotation.UsageInfo
+	if usageAware && (tool == "claude" || tool == "codex") {
+		if !quiet {
+			fmt.Printf("Fetching real-time usage data for %d profiles...\n", len(profiles))
+		}
+		usageData = fetchUsageDataForProfiles(tool, profiles)
+	}
+
 	// Select next profile using rotation
-	selection, err := selectProfileWithRotation(tool, profiles, currentProfile, spmCfg, db)
+	selection, err := selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
 	if err != nil {
 		return err
 	}
@@ -126,7 +139,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	// use round_robin to force rotation to a different profile.
 	if selection.Selected == currentProfile && len(profiles) > 1 {
 		spmCfg.Stealth.Rotation.Algorithm = "round_robin"
-		selection, err = selectProfileWithRotation(tool, profiles, currentProfile, spmCfg, db)
+		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
 		if err != nil {
 			return err
 		}
@@ -199,4 +212,71 @@ func pluralize(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// fetchUsageDataForProfiles fetches real-time usage data for all profiles.
+func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotation.UsageInfo {
+	vaultDir := authfile.DefaultVaultPath()
+	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
+	if err != nil || len(credentials) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fetcher := usage.NewMultiProfileFetcher()
+	results := fetcher.FetchAllProfiles(ctx, tool, credentials)
+
+	usageData := make(map[string]*rotation.UsageInfo)
+	for _, r := range results {
+		if r.Usage == nil {
+			continue
+		}
+
+		info := &rotation.UsageInfo{
+			ProfileName: r.ProfileName,
+			AvailScore:  r.Usage.AvailabilityScore(),
+			Error:       r.Usage.Error,
+		}
+
+		if r.Usage.PrimaryWindow != nil {
+			info.PrimaryPercent = r.Usage.PrimaryWindow.UsedPercent
+		}
+		if r.Usage.SecondaryWindow != nil {
+			info.SecondaryPercent = r.Usage.SecondaryWindow.UsedPercent
+		}
+
+		usageData[r.ProfileName] = info
+	}
+
+	return usageData
+}
+
+// selectProfileWithRotationAndUsage selects a profile using rotation with optional usage data.
+func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo) (*rotation.Result, error) {
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
+	}
+
+	algorithm := rotation.AlgorithmSmart
+	if spmCfg != nil {
+		if a := strings.TrimSpace(spmCfg.Stealth.Rotation.Algorithm); a != "" {
+			algorithm = rotation.Algorithm(a)
+		}
+	}
+
+	selector := rotation.NewSelector(algorithm, healthStore, db)
+
+	// Set usage data if available
+	if usageData != nil {
+		selector.SetUsageData(usageData)
+	}
+
+	result, err := selector.Select(tool, profiles, currentProfile)
+	if err != nil {
+		return nil, fmt.Errorf("rotation select: %w", err)
+	}
+
+	return result, nil
 }
