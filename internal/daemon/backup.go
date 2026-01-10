@@ -264,13 +264,14 @@ func (s *BackupScheduler) RotateBackups() error {
 	}
 
 	// Filter to caam backup files only
+	// VaultExporter creates files with pattern: caam_export_YYYY-MM-DD_HHMM.zip
 	var backups []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, "caam-backup-") && strings.HasSuffix(name, ".tar.gz") {
+		if strings.HasPrefix(name, "caam_export_") && strings.HasSuffix(name, ".zip") {
 			backups = append(backups, name)
 		}
 	}
@@ -314,13 +315,14 @@ func (s *BackupScheduler) ListBackups() ([]BackupInfo, error) {
 		return nil, fmt.Errorf("list backups: %w", err)
 	}
 
+	// VaultExporter creates files with pattern: caam_export_YYYY-MM-DD_HHMM.zip
 	var backups []BackupInfo
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, "caam-backup-") || !strings.HasSuffix(name, ".tar.gz") {
+		if !strings.HasPrefix(name, "caam_export_") || !strings.HasSuffix(name, ".zip") {
 			continue
 		}
 

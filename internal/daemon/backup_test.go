@@ -192,7 +192,7 @@ func TestBackupScheduler_RotateBackups(t *testing.T) {
 
 	// Create test backup files
 	for i := 1; i <= 7; i++ {
-		name := filepath.Join(backupDir, "caam-backup-2025010"+string(rune('0'+i))+"-120000.tar.gz")
+		name := filepath.Join(backupDir, "caam_export_2025-01-0"+string(rune('0'+i))+"_1200.zip")
 		if err := os.WriteFile(name, []byte("test"), 0600); err != nil {
 			t.Fatalf("failed to create test backup: %v", err)
 		}
@@ -223,7 +223,7 @@ func TestBackupScheduler_RotateBackups(t *testing.T) {
 
 	// Verify oldest backups were deleted
 	for _, b := range backups {
-		if b.Name == "caam-backup-20250101-120000.tar.gz" || b.Name == "caam-backup-20250102-120000.tar.gz" {
+		if b.Name == "caam_export_2025-01-01_1200.zip" || b.Name == "caam_export_2025-01-02_1200.zip" {
 			t.Errorf("backup %s should have been deleted", b.Name)
 		}
 	}
@@ -235,10 +235,11 @@ func TestBackupScheduler_ListBackups(t *testing.T) {
 	os.MkdirAll(backupDir, 0700)
 
 	// Create test backup files with different timestamps
+	// Pattern matches VaultExporter output: caam_export_YYYY-MM-DD_HHMM.zip
 	names := []string{
-		"caam-backup-20250115-120000.tar.gz",
-		"caam-backup-20250110-120000.tar.gz",
-		"caam-backup-20250120-120000.tar.gz",
+		"caam_export_2025-01-15_1200.zip",
+		"caam_export_2025-01-10_1200.zip",
+		"caam_export_2025-01-20_1200.zip",
 	}
 	for i, name := range names {
 		path := filepath.Join(backupDir, name)
