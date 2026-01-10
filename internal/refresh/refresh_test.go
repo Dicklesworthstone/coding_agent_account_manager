@@ -270,6 +270,216 @@ func TestGetRefreshToken_NonStringToken(t *testing.T) {
 }
 
 // =============================================================================
+// readNestedStringField Tests
+// =============================================================================
+
+func TestReadNestedStringField_ValidNested(t *testing.T) {
+	m := map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"refresh_token": "nested-token",
+			"access_token":  "nested-access",
+		},
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token", "refreshToken")
+	if result != "nested-token" {
+		t.Errorf("readNestedStringField = %q, want %q", result, "nested-token")
+	}
+}
+
+func TestReadNestedStringField_CamelCaseFallback(t *testing.T) {
+	m := map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"refreshToken": "camel-token",
+		},
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token", "refreshToken")
+	if result != "camel-token" {
+		t.Errorf("readNestedStringField = %q, want %q", result, "camel-token")
+	}
+}
+
+func TestReadNestedStringField_NilMap(t *testing.T) {
+	result := readNestedStringField(nil, "tokens", "refresh_token")
+	if result != "" {
+		t.Errorf("readNestedStringField(nil) = %q, want empty", result)
+	}
+}
+
+func TestReadNestedStringField_MissingNestedKey(t *testing.T) {
+	m := map[string]interface{}{
+		"other": map[string]interface{}{
+			"refresh_token": "token",
+		},
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token")
+	if result != "" {
+		t.Errorf("readNestedStringField = %q, want empty (nested key missing)", result)
+	}
+}
+
+func TestReadNestedStringField_NotAMap(t *testing.T) {
+	m := map[string]interface{}{
+		"tokens": "not a map",
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token")
+	if result != "" {
+		t.Errorf("readNestedStringField = %q, want empty (not a map)", result)
+	}
+}
+
+func TestReadNestedStringField_KeyNotString(t *testing.T) {
+	m := map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"refresh_token": 12345, // Not a string
+		},
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token")
+	if result != "" {
+		t.Errorf("readNestedStringField = %q, want empty (not a string)", result)
+	}
+}
+
+func TestReadNestedStringField_EmptyValue(t *testing.T) {
+	m := map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"refresh_token": "",
+		},
+	}
+
+	result := readNestedStringField(m, "tokens", "refresh_token")
+	if result != "" {
+		t.Errorf("readNestedStringField = %q, want empty", result)
+	}
+}
+
+// =============================================================================
+// readStringField Tests
+// =============================================================================
+
+func TestReadStringField_FirstKeyMatch(t *testing.T) {
+	m := map[string]interface{}{
+		"key1": "value1",
+		"key2": "value2",
+	}
+
+	result := readStringField(m, "key1", "key2")
+	if result != "value1" {
+		t.Errorf("readStringField = %q, want %q", result, "value1")
+	}
+}
+
+func TestReadStringField_SecondKeyMatch(t *testing.T) {
+	m := map[string]interface{}{
+		"key2": "value2",
+	}
+
+	result := readStringField(m, "key1", "key2")
+	if result != "value2" {
+		t.Errorf("readStringField = %q, want %q", result, "value2")
+	}
+}
+
+func TestReadStringField_NilMap(t *testing.T) {
+	result := readStringField(nil, "key1")
+	if result != "" {
+		t.Errorf("readStringField(nil) = %q, want empty", result)
+	}
+}
+
+func TestReadStringField_NoMatch(t *testing.T) {
+	m := map[string]interface{}{
+		"other": "value",
+	}
+
+	result := readStringField(m, "key1", "key2")
+	if result != "" {
+		t.Errorf("readStringField = %q, want empty (no match)", result)
+	}
+}
+
+func TestReadStringField_NotString(t *testing.T) {
+	m := map[string]interface{}{
+		"key1": 123,
+	}
+
+	result := readStringField(m, "key1")
+	if result != "" {
+		t.Errorf("readStringField = %q, want empty (not a string)", result)
+	}
+}
+
+// =============================================================================
+// getRefreshTokenFromJSON Nested Token Tests
+// =============================================================================
+
+func TestGetRefreshToken_NestedTokensField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+
+	content := map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"refresh_token": "nested-refresh-token",
+		},
+	}
+	writeJSON(t, path, content)
+
+	token, err := getRefreshTokenFromJSON(path)
+	if err != nil {
+		t.Fatalf("getRefreshTokenFromJSON error: %v", err)
+	}
+	if token != "nested-refresh-token" {
+		t.Errorf("token = %q, want %q", token, "nested-refresh-token")
+	}
+}
+
+func TestGetRefreshToken_ClaudeAiOauth(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credentials.json")
+
+	content := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"refreshToken": "claude-oauth-refresh",
+		},
+	}
+	writeJSON(t, path, content)
+
+	token, err := getRefreshTokenFromJSON(path)
+	if err != nil {
+		t.Fatalf("getRefreshTokenFromJSON error: %v", err)
+	}
+	if token != "claude-oauth-refresh" {
+		t.Errorf("token = %q, want %q", token, "claude-oauth-refresh")
+	}
+}
+
+func TestGetRefreshToken_TopLevelPreferred(t *testing.T) {
+	// When token exists at top level and nested, top level should be preferred
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+
+	content := map[string]interface{}{
+		"refresh_token": "top-level-token",
+		"tokens": map[string]interface{}{
+			"refresh_token": "nested-token",
+		},
+	}
+	writeJSON(t, path, content)
+
+	token, err := getRefreshTokenFromJSON(path)
+	if err != nil {
+		t.Fatalf("getRefreshTokenFromJSON error: %v", err)
+	}
+	if token != "top-level-token" {
+		t.Errorf("token = %q, want %q (top level should be preferred)", token, "top-level-token")
+	}
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 

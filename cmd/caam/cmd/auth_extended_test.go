@@ -17,20 +17,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Helper to capture stdout/stderr
+// captureStdout captures stdout from a function that prints to os.Stdout.
+// It safely restores stdout even if the function panics.
 func captureStdout(t *testing.T, f func() error) (string, error) {
+	t.Helper()
+
 	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
+
 	os.Stdout = w
-	
-	err := f()
-	
-	w.Close()
-	os.Stdout = oldStdout
-	
+
+	// Run function with deferred cleanup to handle panics
+	var runErr error
+	func() {
+		defer func() {
+			w.Close()
+			os.Stdout = oldStdout
+		}()
+		runErr = f()
+	}()
+
+	// Read captured output (safe now - stdout is restored)
 	var buf bytes.Buffer
 	_, _ = io.Copy(&buf, r)
-	return strings.TrimSpace(buf.String()), err
+	r.Close()
+
+	return strings.TrimSpace(buf.String()), runErr
 }
 
 // MockProvider implements provider.Provider for testing.

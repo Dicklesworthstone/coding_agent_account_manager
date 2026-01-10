@@ -168,3 +168,265 @@ func TestUpdateGeminiAuth(t *testing.T) {
 		t.Fatalf("expiry is empty")
 	}
 }
+
+// =============================================================================
+// RefreshGeminiToken Error Path Tests
+// =============================================================================
+
+func TestRefreshGeminiToken_EmptyRefreshToken(t *testing.T) {
+	_, err := RefreshGeminiToken(context.Background(), "client", "secret", "")
+	if err == nil {
+		t.Error("RefreshGeminiToken should error on empty refresh token")
+	}
+}
+
+func TestRefreshGeminiToken_HTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte("Unauthorized"))
+	}))
+	defer server.Close()
+
+	oldURL := GeminiTokenURL
+	GeminiTokenURL = server.URL
+	defer func() { GeminiTokenURL = oldURL }()
+
+	_, err := RefreshGeminiToken(context.Background(), "client", "secret", "token")
+	if err == nil {
+		t.Error("RefreshGeminiToken should error on HTTP 401")
+	}
+}
+
+func TestRefreshGeminiToken_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("not valid json"))
+	}))
+	defer server.Close()
+
+	oldURL := GeminiTokenURL
+	GeminiTokenURL = server.URL
+	defer func() { GeminiTokenURL = oldURL }()
+
+	_, err := RefreshGeminiToken(context.Background(), "client", "secret", "token")
+	if err == nil {
+		t.Error("RefreshGeminiToken should error on invalid JSON response")
+	}
+}
+
+// =============================================================================
+// ReadADC Error Path Tests
+// =============================================================================
+
+func TestReadADC_MissingFile(t *testing.T) {
+	_, err := ReadADC("/nonexistent/path/adc.json")
+	if err == nil {
+		t.Error("ReadADC should error on missing file")
+	}
+}
+
+func TestReadADC_InvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "adc.json")
+
+	if err := os.WriteFile(path, []byte("not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadADC(path)
+	if err == nil {
+		t.Error("ReadADC should error on invalid JSON")
+	}
+}
+
+func TestReadADC_IncompleteCredentials(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "adc.json")
+
+	adc := ADC{
+		ClientID: "test-client",
+		// Missing client_secret and refresh_token
+	}
+	data, _ := json.Marshal(adc)
+	os.WriteFile(path, data, 0600)
+
+	_, err := ReadADC(path)
+	if err == nil {
+		t.Error("ReadADC should error on incomplete credentials")
+	}
+}
+
+// =============================================================================
+// UpdateGeminiAuth Error Path Tests
+// =============================================================================
+
+func TestUpdateGeminiAuth_MissingFile(t *testing.T) {
+	resp := &GoogleTokenResponse{AccessToken: "token"}
+	err := UpdateGeminiAuth("/nonexistent/path/settings.json", resp)
+	if err == nil {
+		t.Error("UpdateGeminiAuth should error on missing file")
+	}
+}
+
+func TestUpdateGeminiAuth_InvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+
+	if err := os.WriteFile(path, []byte("not valid json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := &GoogleTokenResponse{AccessToken: "token"}
+	err := UpdateGeminiAuth(path, resp)
+	if err == nil {
+		t.Error("UpdateGeminiAuth should error on invalid JSON")
+	}
+}
+
+func TestUpdateGeminiAuth_CamelCaseFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+
+	original := map[string]any{
+		"accessToken": "old-access",
+		"expiresAt":   "2020-01-01T00:00:00Z",
+	}
+	raw, _ := json.Marshal(original)
+	os.WriteFile(path, raw, 0600)
+
+	resp := &GoogleTokenResponse{
+		AccessToken: "new-access",
+		ExpiresIn:   3600,
+	}
+
+	if err := UpdateGeminiAuth(path, resp); err != nil {
+		t.Fatalf("UpdateGeminiAuth failed: %v", err)
+	}
+
+	updatedRaw, _ := os.ReadFile(path)
+	var updated map[string]any
+	json.Unmarshal(updatedRaw, &updated)
+
+	if updated["accessToken"] != "new-access" {
+		t.Errorf("accessToken not updated: %v", updated["accessToken"])
+	}
+	if _, ok := updated["expiresAt"]; !ok {
+		t.Error("expiresAt should be preserved")
+	}
+}
+
+func TestUpdateGeminiAuth_ExpiresAtFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+
+	original := map[string]any{
+		"access_token": "old-access",
+		"expires_at":   "2020-01-01T00:00:00Z",
+	}
+	raw, _ := json.Marshal(original)
+	os.WriteFile(path, raw, 0600)
+
+	resp := &GoogleTokenResponse{
+		AccessToken: "new-access",
+		ExpiresIn:   3600,
+	}
+
+	if err := UpdateGeminiAuth(path, resp); err != nil {
+		t.Fatalf("UpdateGeminiAuth failed: %v", err)
+	}
+
+	updatedRaw, _ := os.ReadFile(path)
+	var updated map[string]any
+	json.Unmarshal(updatedRaw, &updated)
+
+	if updated["expires_at"] == "2020-01-01T00:00:00Z" {
+		t.Error("expires_at should be updated to new value")
+	}
+}
+
+func TestUpdateGeminiAuth_NoExpiresIn(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+
+	original := map[string]any{
+		"access_token": "old-access",
+		"expiry":       "2020-01-01T00:00:00Z",
+	}
+	raw, _ := json.Marshal(original)
+	os.WriteFile(path, raw, 0600)
+
+	resp := &GoogleTokenResponse{
+		AccessToken: "new-access",
+		// ExpiresIn is 0
+	}
+
+	if err := UpdateGeminiAuth(path, resp); err != nil {
+		t.Fatalf("UpdateGeminiAuth failed: %v", err)
+	}
+
+	updatedRaw, _ := os.ReadFile(path)
+	var updated map[string]any
+	json.Unmarshal(updatedRaw, &updated)
+
+	// expiry should remain unchanged when ExpiresIn is 0
+	if updated["expiry"] != "2020-01-01T00:00:00Z" {
+		t.Errorf("expiry should remain unchanged when ExpiresIn is 0: %v", updated["expiry"])
+	}
+}
+
+func TestUpdateGeminiAuth_NewFileFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+
+	// No existing access_token field
+	original := map[string]any{
+		"other_field": "value",
+	}
+	raw, _ := json.Marshal(original)
+	os.WriteFile(path, raw, 0600)
+
+	resp := &GoogleTokenResponse{
+		AccessToken: "new-access",
+		ExpiresIn:   3600,
+	}
+
+	if err := UpdateGeminiAuth(path, resp); err != nil {
+		t.Fatalf("UpdateGeminiAuth failed: %v", err)
+	}
+
+	updatedRaw, _ := os.ReadFile(path)
+	var updated map[string]any
+	json.Unmarshal(updatedRaw, &updated)
+
+	// Should default to snake_case for new fields
+	if updated["access_token"] != "new-access" {
+		t.Errorf("access_token not set: %v", updated["access_token"])
+	}
+	// Should default to expiry for new field
+	if _, ok := updated["expiry"]; !ok {
+		t.Error("expiry should be set for new file")
+	}
+}
+
+// =============================================================================
+// UpdateGeminiHealth Tests
+// =============================================================================
+
+func TestUpdateGeminiHealth_NoExpiresIn(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "health.json")
+	store := health.NewStorage(storePath)
+
+	resp := &GoogleTokenResponse{
+		// ExpiresIn is 0
+	}
+
+	if err := UpdateGeminiHealth(store, "gemini", "default", resp); err != nil {
+		t.Fatalf("UpdateGeminiHealth failed: %v", err)
+	}
+
+	h, _ := store.GetProfile("gemini", "default")
+	if h == nil {
+		t.Fatal("health profile not created")
+	}
+	// TokenExpiresAt should be zero/unchanged when ExpiresIn is 0
+}
