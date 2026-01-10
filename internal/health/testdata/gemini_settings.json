@@ -1,6 +1,6 @@
 {
   "access_token": "gemini_access_token_xxx",
   "refresh_token": "gemini_refresh_token_yyy",
-  "expiry": "2025-12-31T14:00:00Z",
+  "expiry": "2027-12-31T14:00:00Z",
   "token_type": "Bearer"
 }
