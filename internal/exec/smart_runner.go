@@ -249,7 +249,7 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.notifyHandoff(r.currentProfile, nextProfile)
 
 	// 3. Mark current profile as in cooldown (if authPool is available)
-	cooldownDuration := 30 * time.Minute
+	cooldownDuration := 60 * time.Minute
 	if r.authPool != nil {
 		r.authPool.SetCooldown(r.loginHandler.Provider(), r.currentProfile, cooldownDuration)
 	}
@@ -305,6 +305,8 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		Message: fmt.Sprintf("Switched to %s. Continue working.", nextProfile),
 	})
 
+	// Reset detector state so we don't immediately trigger again
+	r.detector.Reset()
 	r.setState(Running)
 }
 
@@ -314,6 +316,7 @@ func (r *SmartRunner) rollback(fileSet authfile.AuthFileSet) {
 		fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
 	}
 	r.currentProfile = r.previousProfile
+	r.detector.Reset()
 	r.setState(Running)
 }
 
@@ -325,7 +328,7 @@ func (r *SmartRunner) failWithManual(format string, args ...interface{}) {
 		Level:   notify.Warning,
 		Title:   "Auto-handoff failed",
 		Message: msg,
-		Action:  "Please manually switch: caam activate " + r.currentProfile, // Suggest current (backup) or previous?
+		Action:  "Run 'caam ls' to see available profiles, then 'caam activate <profile>'",
 	})
 	
 	fmt.Fprintf(os.Stderr, "\n[caam] Auto-handoff failed: %s\n", msg)
@@ -350,14 +353,23 @@ func (r *SmartRunner) setState(s HandoffState) {
 }
 
 func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller) {
+	// Create an observing writer to handle split packets and buffering
+	// Use a local flag to prevent repeated dispatching within this loop context
+	dispatched := false
+	
+	writer := ratelimit.NewObservingWriter(r.detector, func(line string) {
+		// This callback is triggered when a complete line is processed
+		if !dispatched && r.detector.Detected() {
+			dispatched = true
+			go r.handleRateLimit(ctx)
+		}
+	})
+
 	for {
 		// Poll for output (ReadOutput is non-blocking with timeout)
 		output, err := ctrl.ReadOutput()
 		if err != nil {
 			break
-		}
-		if output != "" {
-			fmt.Printf("DEBUG: PTY output: %q\n", output)
 		}
 		
 		if output != "" {
@@ -366,11 +378,17 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller) {
 			r.mu.Lock()
 			state := r.state
 			r.mu.Unlock()
-			
+
 			if state == Running {
-				if r.detector.Check(output) {
-					fmt.Fprintf(os.Stderr, "DEBUG: Rate limit detected in: %q\n", output)
-					go r.handleRateLimit(ctx)
+				// If detector was reset (e.g. after successful handoff), allow new dispatch
+				if !r.detector.Detected() {
+					dispatched = false
+				}
+
+				// Only write to observer if we haven't dispatched yet
+				// This avoids processing output during the handoff transition
+				if !dispatched {
+					writer.Write([]byte(output))
 				}
 			} else if state == LoggingIn {
 				// Check for login completion and signal handleRateLimit
