@@ -322,13 +322,12 @@ func setupTestVault(t *testing.T, tmpDir string) {
 }
 
 // createFakeAuthFiles creates fake auth files for testing.
+// IMPORTANT: Always use tmpDir to avoid corrupting real auth files.
 func createFakeAuthFiles(t *testing.T, tmpDir, tool string) {
 	t.Helper()
 
-	homeDir := os.Getenv("HOME")
-	if homeDir == "" {
-		homeDir = tmpDir
-	}
+	// Always use tmpDir - never write to real home directory
+	homeDir := tmpDir
 
 	switch tool {
 	case "codex":
