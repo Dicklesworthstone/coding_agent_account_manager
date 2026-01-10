@@ -175,7 +175,10 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	// Initialize auth pool
 	pool := authpool.NewAuthPool(authpool.WithVault(vaultInst))
 	ctx := context.Background()
-	_ = pool.LoadFromVault(ctx)
+	if loadErr := pool.LoadFromVault(ctx); loadErr != nil {
+		// Non-fatal: pool can still work without pre-loaded data
+		fmt.Fprintf(cmd.OutOrStderr(), "Warning: could not load auth pool: %v\n", loadErr)
+	}
 
 	// Fetch real-time usage data (unless --no-fetch)
 	var usageResults []usage.ProfileUsage
@@ -523,15 +526,15 @@ func precheckOutputTable(w io.Writer, result *PrecheckResult) error {
 				fmt.Fprintf(w, "    ... and %d more\n", len(result.Backups)-3)
 				break
 			}
-			status := ""
+			statusStr := ""
 			if backup.HealthStatus != "" {
-				status = fmt.Sprintf(" [%s]", backup.HealthStatus)
+				statusStr = fmt.Sprintf(" [%s]", backup.HealthStatus)
 			}
-			usage := ""
+			usageStr := ""
 			if backup.UsagePercent > 0 {
-				usage = fmt.Sprintf(" %d%%", backup.UsagePercent)
+				usageStr = fmt.Sprintf(" %d%%", backup.UsagePercent)
 			}
-			fmt.Fprintf(w, "    %d. %s%s%s\n", i+1, backup.Name, status, usage)
+			fmt.Fprintf(w, "    %d. %s%s%s\n", i+1, backup.Name, statusStr, usageStr)
 		}
 		fmt.Fprintln(w)
 	}

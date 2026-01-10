@@ -249,20 +249,21 @@ func TestPrecheckResult_Table(t *testing.T) {
 
 func TestRenderUsageBar(t *testing.T) {
 	testCases := []struct {
+		name     string
 		percent  int
 		width    int
 		expected string
 	}{
-		{0, 10, "[----------]"},
-		{50, 10, "[#####-----]"},
-		{100, 10, "[##########]"},
-		{-10, 10, "[----------]"}, // Clamped to 0
-		{150, 10, "[##########]"}, // Clamped to 100
-		{25, 20, "[#####---------------]"},
+		{"0_percent", 0, 10, "[----------]"},
+		{"50_percent", 50, 10, "[#####-----]"},
+		{"100_percent", 100, 10, "[##########]"},
+		{"negative_clamped", -10, 10, "[----------]"},
+		{"over100_clamped", 150, 10, "[##########]"},
+		{"25_percent_wide", 25, 20, "[#####---------------]"},
 	}
 
 	for _, tc := range testCases {
-		t.Run(string(rune(tc.percent)), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			result := renderUsageBar(tc.percent, tc.width)
 			assert.Equal(t, tc.expected, result)
 		})
