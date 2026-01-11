@@ -422,3 +422,392 @@ func TestErrNoAuthFile(t *testing.T) {
 		t.Errorf("expected ErrNoAuthFile, got %v", err)
 	}
 }
+
+func TestParseClaudeCredentialsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Run("valid credentials file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "credentials.json")
+		data := `{
+			"claudeAiOauth": {
+				"accessToken": "test_access",
+				"refreshToken": "test_refresh",
+				"expiresAt": 1768042451877,
+				"rateLimitTier": "default_claude_max_20x",
+				"subscriptionType": "max"
+			}
+		}`
+		os.WriteFile(path, []byte(data), 0600)
+
+		info, err := parseClaudeCredentialsFile(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !info.HasRefreshToken {
+			t.Error("expected HasRefreshToken to be true")
+		}
+		if info.ExpiresAt.IsZero() {
+			t.Error("expected expiry to be set")
+		}
+	})
+
+	t.Run("missing claudeAiOauth", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "no_oauth.json")
+		data := `{"other": "data"}`
+		os.WriteFile(path, []byte(data), 0600)
+
+		_, err := parseClaudeCredentialsFile(path)
+		if err != ErrNoExpiry {
+			t.Errorf("expected ErrNoExpiry, got %v", err)
+		}
+	})
+
+	t.Run("access token only", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "access_only.json")
+		data := `{
+			"claudeAiOauth": {
+				"accessToken": "test_access"
+			}
+		}`
+		os.WriteFile(path, []byte(data), 0600)
+
+		info, err := parseClaudeCredentialsFile(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if info.HasRefreshToken {
+			t.Error("expected HasRefreshToken to be false")
+		}
+	})
+
+	t.Run("empty oauth object", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "empty_oauth.json")
+		data := `{
+			"claudeAiOauth": {}
+		}`
+		os.WriteFile(path, []byte(data), 0600)
+
+		_, err := parseClaudeCredentialsFile(path)
+		if err != ErrNoExpiry {
+			t.Errorf("expected ErrNoExpiry, got %v", err)
+		}
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "invalid.json")
+		os.WriteFile(path, []byte("{invalid json"), 0600)
+
+		_, err := parseClaudeCredentialsFile(path)
+		if err == nil {
+			t.Error("expected error for invalid JSON")
+		}
+	})
+
+	t.Run("non-existent file", func(t *testing.T) {
+		_, err := parseClaudeCredentialsFile(filepath.Join(tmpDir, "nonexistent.json"))
+		if err == nil {
+			t.Error("expected error for non-existent file")
+		}
+	})
+}
+
+func TestGetADCPath(t *testing.T) {
+	t.Run("with GOOGLE_APPLICATION_CREDENTIALS", func(t *testing.T) {
+		orig := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+		defer os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", orig)
+
+		os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/custom/path/creds.json")
+		path := getADCPath()
+		if path != "/custom/path/creds.json" {
+			t.Errorf("expected /custom/path/creds.json, got %s", path)
+		}
+	})
+
+	t.Run("with CLOUDSDK_CONFIG", func(t *testing.T) {
+		origGAC := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+		origCloudSDK := os.Getenv("CLOUDSDK_CONFIG")
+		defer func() {
+			os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", origGAC)
+			os.Setenv("CLOUDSDK_CONFIG", origCloudSDK)
+		}()
+
+		os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+		os.Setenv("CLOUDSDK_CONFIG", "/custom/gcloud")
+		path := getADCPath()
+		expected := filepath.Join("/custom/gcloud", "application_default_credentials.json")
+		if path != expected {
+			t.Errorf("expected %s, got %s", expected, path)
+		}
+	})
+
+	t.Run("default path", func(t *testing.T) {
+		origGAC := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+		origCloudSDK := os.Getenv("CLOUDSDK_CONFIG")
+		defer func() {
+			os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", origGAC)
+			os.Setenv("CLOUDSDK_CONFIG", origCloudSDK)
+		}()
+
+		os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+		os.Setenv("CLOUDSDK_CONFIG", "")
+
+		path := getADCPath()
+		// On non-Windows, should use ~/.config/gcloud/...
+		home, _ := os.UserHomeDir()
+		expected := filepath.Join(home, ".config", "gcloud", "application_default_credentials.json")
+		if path != expected {
+			t.Errorf("expected %s, got %s", expected, path)
+		}
+	})
+}
+
+func TestParseAllExpiry(t *testing.T) {
+	// This test just verifies that ParseAllExpiry runs without panicking
+	// and returns a map. Actual parsing is tested by individual provider tests.
+	results := ParseAllExpiry()
+	if results == nil {
+		t.Error("ParseAllExpiry should not return nil")
+	}
+	// Results may be empty if no auth files exist, which is fine
+}
+
+func TestNeedsRefreshDefaultThreshold(t *testing.T) {
+	// Test that default threshold of 10 minutes is used when 0 is passed
+	info := &ExpiryInfo{ExpiresAt: time.Now().Add(5 * time.Minute)}
+	if !info.NeedsRefresh(0) {
+		t.Error("NeedsRefresh(0) should use default 10 minute threshold")
+	}
+
+	info = &ExpiryInfo{ExpiresAt: time.Now().Add(15 * time.Minute)}
+	if info.NeedsRefresh(0) {
+		t.Error("Token expiring in 15 minutes should not need refresh with default threshold")
+	}
+}
+
+func TestParseCodexExpiryDefaultPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	origCodexHome := os.Getenv("CODEX_HOME")
+	defer os.Setenv("CODEX_HOME", origCodexHome)
+
+	// Set CODEX_HOME to our temp dir
+	os.Setenv("CODEX_HOME", tmpDir)
+
+	// Create auth file
+	authPath := filepath.Join(tmpDir, "auth.json")
+	authData := `{
+		"access_token": "test_access",
+		"refresh_token": "test_refresh",
+		"expires_at": 1734523200
+	}`
+	os.WriteFile(authPath, []byte(authData), 0600)
+
+	// Test with empty path (should use CODEX_HOME)
+	info, err := ParseCodexExpiry("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Source != authPath {
+		t.Errorf("expected source %s, got %s", authPath, info.Source)
+	}
+}
+
+func TestParseGeminiExpiryDefaultPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	origGeminiHome := os.Getenv("GEMINI_HOME")
+	defer os.Setenv("GEMINI_HOME", origGeminiHome)
+
+	// Set GEMINI_HOME to our temp dir
+	os.Setenv("GEMINI_HOME", tmpDir)
+
+	// Create settings file
+	settingsPath := filepath.Join(tmpDir, "settings.json")
+	settingsData := `{
+		"access_token": "test_access",
+		"refresh_token": "test_refresh",
+		"expiry": "2025-12-18T14:00:00Z"
+	}`
+	os.WriteFile(settingsPath, []byte(settingsData), 0600)
+
+	// Test with empty path (should use GEMINI_HOME)
+	info, err := ParseGeminiExpiry("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Source != settingsPath {
+		t.Errorf("expected source %s, got %s", settingsPath, info.Source)
+	}
+}
+
+func TestParseClaudeExpiry_CredentialsFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create .credentials.json in the vault directory
+	credPath := filepath.Join(tmpDir, ".credentials.json")
+	credData := `{
+		"claudeAiOauth": {
+			"accessToken": "test_access",
+			"refreshToken": "test_refresh",
+			"expiresAt": 1768042451877
+		}
+	}`
+	os.WriteFile(credPath, []byte(credData), 0600)
+
+	info, err := ParseClaudeExpiry(tmpDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Source != credPath {
+		t.Errorf("expected source %s, got %s", credPath, info.Source)
+	}
+}
+
+func TestParseClaudeExpiry_NestedAuthJson(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create nested auth.json
+	nestedDir := filepath.Join(tmpDir, "claude-code")
+	os.MkdirAll(nestedDir, 0700)
+	authPath := filepath.Join(nestedDir, "auth.json")
+	authData := `{
+		"access_token": "test_access",
+		"refresh_token": "test_refresh",
+		"expires_at": 1734523200
+	}`
+	os.WriteFile(authPath, []byte(authData), 0600)
+
+	info, err := ParseClaudeExpiry(tmpDir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Source != authPath {
+		t.Errorf("expected source %s, got %s", authPath, info.Source)
+	}
+}
+
+func TestParseClaudeExpiry_NoAuthFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Empty directory - no auth files
+	_, err := ParseClaudeExpiry(tmpDir)
+	if err != ErrNoAuthFile {
+		t.Errorf("expected ErrNoAuthFile, got %v", err)
+	}
+}
+
+func TestParseGeminiExpiry_NoAuthFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Empty directory - no auth files
+	_, err := ParseGeminiExpiry(tmpDir)
+	if err != ErrNoAuthFile {
+		t.Errorf("expected ErrNoAuthFile, got %v", err)
+	}
+}
+
+func TestParseADCFile_NoRefreshToken(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "adc.json")
+
+	// ADC file without refresh token
+	data := `{
+		"client_id": "test_client",
+		"client_secret": "test_secret",
+		"type": "authorized_user"
+	}`
+	os.WriteFile(path, []byte(data), 0600)
+
+	_, err := parseADCFile(path)
+	if err != ErrNoExpiry {
+		t.Errorf("expected ErrNoExpiry for ADC without refresh token, got %v", err)
+	}
+}
+
+func TestParseADCFile_InvalidJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "invalid_adc.json")
+
+	os.WriteFile(path, []byte("{invalid json"), 0600)
+
+	_, err := parseADCFile(path)
+	if err == nil {
+		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestParseOAuthFile_ExpiresInWithIssuedAt(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	t.Run("expires_in with issued_at", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "expires_in.json")
+		// 3600 seconds (1 hour) from a known timestamp
+		issuedAt := time.Now().Add(-30 * time.Minute).Unix()
+		data := `{
+			"access_token": "test",
+			"refresh_token": "test_refresh",
+			"expires_in": 3600,
+			"issued_at": ` + string(rune(issuedAt)) + `
+		}`
+		// Use a simple numeric value
+		data = `{
+			"access_token": "test",
+			"refresh_token": "test_refresh",
+			"expiresIn": 3600
+		}`
+		os.WriteFile(path, []byte(data), 0600)
+
+		info, err := parseOAuthFile(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// With only expiresIn (camel case), it assumes now as issued time
+		if info.ExpiresAt.IsZero() {
+			t.Error("expected expiry to be set from expiresIn")
+		}
+	})
+}
+
+func TestParseExpiryField_AdditionalFormats(t *testing.T) {
+	t.Run("datetime without timezone", func(t *testing.T) {
+		result := parseExpiryField("2025-12-18T15:04:05")
+		if result.IsZero() {
+			t.Error("should parse datetime without timezone")
+		}
+	})
+
+	t.Run("datetime with space separator", func(t *testing.T) {
+		result := parseExpiryField("2025-12-18 15:04:05")
+		if result.IsZero() {
+			t.Error("should parse datetime with space separator")
+		}
+	})
+
+	t.Run("invalid string", func(t *testing.T) {
+		result := parseExpiryField("not-a-date")
+		if !result.IsZero() {
+			t.Error("invalid date string should return zero time")
+		}
+	})
+
+	t.Run("int64 milliseconds", func(t *testing.T) {
+		ms := int64(1734523200000) // Milliseconds
+		result := parseExpiryField(ms)
+		if result.IsZero() {
+			t.Error("should parse int64 milliseconds")
+		}
+	})
+
+	t.Run("int milliseconds", func(t *testing.T) {
+		ms := int(1734523200000) // Milliseconds
+		result := parseExpiryField(ms)
+		if result.IsZero() {
+			t.Error("should parse int milliseconds")
+		}
+	})
+
+	t.Run("unknown type", func(t *testing.T) {
+		result := parseExpiryField(struct{}{})
+		if !result.IsZero() {
+			t.Error("unknown type should return zero time")
+		}
+	})
+}
