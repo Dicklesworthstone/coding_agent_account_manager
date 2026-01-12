@@ -1,0 +1,511 @@
+// Package setup provides orchestration for setting up the distributed auth recovery system.
+package setup
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tailscale"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wezterm"
+)
+
+// Role indicates whether a machine runs coordinator or agent.
+type Role string
+
+const (
+	RoleCoordinator Role = "coordinator"
+	RoleAgent       Role = "agent"
+)
+
+// DiscoveredMachine represents a machine discovered from WezTerm and Tailscale.
+type DiscoveredMachine struct {
+	Name          string // Display name
+	WezTermDomain string // WezTerm SSH domain name (e.g., "csd")
+	PublicIP      string // Public/original IP from wezterm config
+	TailscaleIP   string // Tailscale IP if on tailnet
+	Username      string // SSH username
+	Port          int    // SSH port
+	IdentityFile  string // Path to SSH key
+	Role          Role   // coordinator or agent
+	IsReachable   bool   // Whether we can connect
+	IsLocal       bool   // Whether this is the local machine
+}
+
+// Options configures the setup process.
+type Options struct {
+	// WezTermConfig is the path to wezterm.lua. Auto-detected if empty.
+	WezTermConfig string
+
+	// UseTailscale enables Tailscale IP preference when available.
+	UseTailscale bool
+
+	// LocalPort is the port for the local auth-agent.
+	LocalPort int
+
+	// RemotePort is the port for remote coordinators.
+	RemotePort int
+
+	// Remotes limits setup to these domain names. Empty means all.
+	Remotes []string
+
+	// DryRun shows what would be done without making changes.
+	DryRun bool
+
+	// Logger for structured logging.
+	Logger *slog.Logger
+}
+
+// DefaultOptions returns the default setup options.
+func DefaultOptions() Options {
+	return Options{
+		UseTailscale: true,
+		LocalPort:    7891,
+		RemotePort:   7890,
+		Logger:       slog.Default(),
+	}
+}
+
+// Orchestrator handles the setup process.
+type Orchestrator struct {
+	opts          Options
+	logger        *slog.Logger
+	weztermConfig *wezterm.Config
+	tailscale     *tailscale.Client
+	localMachine  *DiscoveredMachine
+	remoteMachines []*DiscoveredMachine
+}
+
+// NewOrchestrator creates a new setup orchestrator.
+func NewOrchestrator(opts Options) *Orchestrator {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	return &Orchestrator{
+		opts:   opts,
+		logger: opts.Logger,
+	}
+}
+
+// Discover discovers all machines from WezTerm config and Tailscale.
+func (o *Orchestrator) Discover(ctx context.Context) error {
+	o.logger.Info("discovering machines...")
+
+	// Find WezTerm config
+	configPath := o.opts.WezTermConfig
+	if configPath == "" {
+		configPath = wezterm.FindConfigPath()
+		if configPath == "" {
+			return fmt.Errorf("WezTerm config not found. Try --wezterm-config flag")
+		}
+	}
+
+	o.logger.Info("parsing WezTerm config", "path", configPath)
+
+	// Parse WezTerm config
+	cfg, err := wezterm.ParseConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse WezTerm config: %w", err)
+	}
+	o.weztermConfig = cfg
+
+	if len(cfg.SSHDomains) == 0 {
+		return fmt.Errorf("no SSH domains found in WezTerm config")
+	}
+
+	o.logger.Info("found SSH domains", "count", len(cfg.SSHDomains))
+
+	// Check Tailscale availability
+	if o.opts.UseTailscale {
+		o.tailscale = tailscale.NewClient()
+		if !o.tailscale.IsAvailable(ctx) {
+			o.logger.Info("Tailscale not available, using public IPs only")
+			o.tailscale = nil
+		} else {
+			o.logger.Info("Tailscale available")
+		}
+	}
+
+	// Discover local machine
+	if err := o.discoverLocal(ctx); err != nil {
+		return err
+	}
+
+	// Discover remote machines
+	if err := o.discoverRemotes(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// discoverLocal identifies the local machine.
+func (o *Orchestrator) discoverLocal(ctx context.Context) error {
+	hostname, _ := os.Hostname()
+	o.logger.Info("local hostname", "hostname", hostname)
+
+	local := &DiscoveredMachine{
+		Name:    hostname,
+		Role:    RoleAgent,
+		IsLocal: true,
+	}
+
+	// Check if we're on a Tailscale network
+	if o.tailscale != nil {
+		self, err := o.tailscale.GetSelf(ctx)
+		if err == nil && self != nil {
+			local.Name = self.HostName
+			local.TailscaleIP = self.GetIPv4()
+			o.logger.Info("Tailscale identity",
+				"hostname", self.HostName,
+				"ip", local.TailscaleIP)
+		}
+	}
+
+	o.localMachine = local
+	return nil
+}
+
+// discoverRemotes discovers remote machines from WezTerm domains.
+func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
+	var machines []*DiscoveredMachine
+
+	// Get Tailscale peers for cross-referencing
+	var peers []*tailscale.Peer
+	if o.tailscale != nil {
+		var err error
+		peers, err = o.tailscale.GetPeers(ctx)
+		if err == nil {
+			o.logger.Info("Tailscale peers found", "count", len(peers))
+		}
+	}
+
+	for _, domain := range o.weztermConfig.SSHDomains {
+		// Skip if not in remotes filter
+		if len(o.opts.Remotes) > 0 && !contains(o.opts.Remotes, domain.Name) {
+			continue
+		}
+
+		machine := &DiscoveredMachine{
+			Name:          domain.Name,
+			WezTermDomain: domain.Name,
+			PublicIP:      domain.RemoteAddress,
+			Username:      domain.Username,
+			Port:          domain.Port,
+			IdentityFile:  domain.IdentityFile,
+			Role:          RoleCoordinator,
+		}
+
+		if machine.Port == 0 {
+			machine.Port = 22
+		}
+
+		// Try to find Tailscale IP
+		if o.tailscale != nil && len(peers) > 0 {
+			// Try matching by IP first
+			for _, peer := range peers {
+				if peer.GetIPv4() == domain.RemoteAddress {
+					machine.TailscaleIP = peer.GetIPv4()
+					machine.Name = peer.HostName
+					break
+				}
+			}
+
+			// If no match by IP, try fuzzy hostname match
+			if machine.TailscaleIP == "" {
+				peer, _ := o.tailscale.FindPeerByHostname(ctx, domain.Name)
+				if peer != nil {
+					machine.TailscaleIP = peer.GetIPv4()
+					machine.Name = peer.HostName
+				}
+			}
+		}
+
+		machines = append(machines, machine)
+
+		o.logger.Info("discovered remote",
+			"domain", domain.Name,
+			"public_ip", machine.PublicIP,
+			"tailscale_ip", machine.TailscaleIP,
+			"user", machine.Username)
+	}
+
+	o.remoteMachines = machines
+	return nil
+}
+
+// GetDiscoveredMachines returns all discovered machines.
+func (o *Orchestrator) GetDiscoveredMachines() []*DiscoveredMachine {
+	var all []*DiscoveredMachine
+	if o.localMachine != nil {
+		all = append(all, o.localMachine)
+	}
+	all = append(all, o.remoteMachines...)
+	return all
+}
+
+// GetRemoteMachines returns just the remote machines.
+func (o *Orchestrator) GetRemoteMachines() []*DiscoveredMachine {
+	return o.remoteMachines
+}
+
+// GetLocalMachine returns the local machine.
+func (o *Orchestrator) GetLocalMachine() *DiscoveredMachine {
+	return o.localMachine
+}
+
+// TestConnectivity tests SSH connectivity to a machine.
+func (o *Orchestrator) TestConnectivity(ctx context.Context, m *DiscoveredMachine) error {
+	machine := o.toSyncMachine(m)
+
+	opts := sync.ConnectOptions{
+		Timeout:  10 * time.Second,
+		UseAgent: true,
+	}
+
+	result := sync.TestMachineConnectivity(machine, opts)
+	m.IsReachable = result.Success
+
+	if !result.Success {
+		return result.Error
+	}
+	return nil
+}
+
+// toSyncMachine converts a DiscoveredMachine to a sync.Machine.
+func (o *Orchestrator) toSyncMachine(m *DiscoveredMachine) *sync.Machine {
+	// Prefer Tailscale IP if available and enabled
+	address := m.PublicIP
+	if o.opts.UseTailscale && m.TailscaleIP != "" {
+		address = m.TailscaleIP
+	}
+
+	return &sync.Machine{
+		Name:       m.Name,
+		Address:    address,
+		Port:       m.Port,
+		SSHUser:    m.Username,
+		SSHKeyPath: m.IdentityFile,
+	}
+}
+
+// SetupProgress tracks the progress of a setup operation.
+type SetupProgress struct {
+	Machine  string
+	Step     string
+	Status   string // pending, running, success, failed
+	Message  string
+	Started  time.Time
+	Finished time.Time
+}
+
+// SetupResult contains the results of the setup process.
+type SetupResult struct {
+	LocalConfigPath   string
+	CoordinatorConfig string
+	DeployResults     []*deploy.DeployResult
+	Errors            []error
+}
+
+// Setup performs the full setup process.
+func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress)) (*SetupResult, error) {
+	result := &SetupResult{}
+
+	if len(o.remoteMachines) == 0 {
+		return nil, fmt.Errorf("no remote machines to setup")
+	}
+
+	// Deploy coordinators to remote machines
+	for _, machine := range o.remoteMachines {
+		p := &SetupProgress{
+			Machine: machine.Name,
+			Step:    "deploy",
+			Status:  "running",
+			Started: time.Now(),
+		}
+		if progress != nil {
+			progress(p)
+		}
+
+		if o.opts.DryRun {
+			o.logger.Info("[dry-run] would deploy coordinator",
+				"machine", machine.Name,
+				"address", o.getAddress(machine))
+			p.Status = "success"
+			p.Message = "dry-run: skipped"
+			p.Finished = time.Now()
+			if progress != nil {
+				progress(p)
+			}
+			continue
+		}
+
+		deployResult, err := o.deployCoordinator(ctx, machine)
+		if err != nil {
+			p.Status = "failed"
+			p.Message = err.Error()
+			result.Errors = append(result.Errors, fmt.Errorf("%s: %w", machine.Name, err))
+			o.logger.Error("deployment failed",
+				"machine", machine.Name,
+				"error", err)
+		} else {
+			p.Status = "success"
+			p.Message = "deployed successfully"
+			o.logger.Info("deployment succeeded", "machine", machine.Name)
+		}
+		p.Finished = time.Now()
+
+		if deployResult != nil {
+			result.DeployResults = append(result.DeployResults, deployResult)
+		}
+
+		if progress != nil {
+			progress(p)
+		}
+	}
+
+	// Generate local agent config
+	localConfigPath, err := o.generateLocalConfig()
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Errorf("local config: %w", err))
+	} else {
+		result.LocalConfigPath = localConfigPath
+	}
+
+	return result, nil
+}
+
+// deployCoordinator deploys a coordinator to a remote machine.
+func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachine) (*deploy.DeployResult, error) {
+	syncMachine := o.toSyncMachine(m)
+
+	deployer := deploy.NewDeployer(syncMachine, o.logger)
+	if err := deployer.Connect(); err != nil {
+		return nil, fmt.Errorf("connect failed: %w", err)
+	}
+	defer deployer.Disconnect()
+
+	config := deploy.DefaultCoordinatorConfig()
+	config.Port = o.opts.RemotePort
+
+	return deployer.DeployCoordinator(ctx, config)
+}
+
+// generateLocalConfig generates the local agent configuration.
+func (o *Orchestrator) generateLocalConfig() (string, error) {
+	// Build coordinator endpoints
+	var coordinators []*agent.CoordinatorEndpoint
+	for _, m := range o.remoteMachines {
+		addr := o.getAddress(m)
+		coordinators = append(coordinators, &agent.CoordinatorEndpoint{
+			Name:        m.WezTermDomain,
+			URL:         fmt.Sprintf("http://%s:%d", addr, o.opts.RemotePort),
+			DisplayName: m.Name,
+		})
+	}
+
+	config := struct {
+		Port         int                          `json:"port"`
+		Coordinators []*agent.CoordinatorEndpoint `json:"coordinators"`
+		PollInterval string                       `json:"poll_interval"`
+		Accounts     []string                     `json:"accounts"`
+		Strategy     string                       `json:"strategy"`
+		ChromeProfile string                      `json:"chrome_profile"`
+	}{
+		Port:         o.opts.LocalPort,
+		Coordinators: coordinators,
+		PollInterval: "2s",
+		Accounts:     []string{},
+		Strategy:     "lru",
+		ChromeProfile: "",
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	// Determine config path
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		configDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+
+	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+
+	if o.opts.DryRun {
+		o.logger.Info("[dry-run] would write local agent config",
+			"path", configPath)
+		fmt.Println("--- distributed-agent.json ---")
+		fmt.Println(string(data))
+		fmt.Println("---")
+		return configPath, nil
+	}
+
+	// Create directory
+	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+		return "", err
+	}
+
+	// Write config
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		return "", err
+	}
+
+	o.logger.Info("wrote local agent config", "path", configPath)
+	return configPath, nil
+}
+
+// getAddress returns the best address to use for a machine.
+func (o *Orchestrator) getAddress(m *DiscoveredMachine) string {
+	if o.opts.UseTailscale && m.TailscaleIP != "" {
+		return m.TailscaleIP
+	}
+	return m.PublicIP
+}
+
+// PrintDiscoveryResults prints a summary of discovered machines.
+func (o *Orchestrator) PrintDiscoveryResults() {
+	fmt.Println()
+	fmt.Println("=== Discovery Results ===")
+
+	if o.localMachine != nil {
+		fmt.Printf("Local Machine:\n")
+		fmt.Printf("  Name: %s\n", o.localMachine.Name)
+		if o.localMachine.TailscaleIP != "" {
+			fmt.Printf("  Tailscale IP: %s\n", o.localMachine.TailscaleIP)
+		}
+		fmt.Printf("  Role: %s\n", o.localMachine.Role)
+		fmt.Println()
+	}
+
+	fmt.Printf("Remote Machines (%d):\n", len(o.remoteMachines))
+	for _, m := range o.remoteMachines {
+		fmt.Printf("\n  %s (%s):\n", m.Name, m.WezTermDomain)
+		fmt.Printf("    Public IP: %s\n", m.PublicIP)
+		if m.TailscaleIP != "" {
+			fmt.Printf("    Tailscale IP: %s (preferred)\n", m.TailscaleIP)
+		}
+		fmt.Printf("    User: %s\n", m.Username)
+		fmt.Printf("    Role: %s\n", m.Role)
+	}
+}
+
+// Helper functions
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if strings.EqualFold(s, item) {
+			return true
+		}
+	}
+	return false
+}
