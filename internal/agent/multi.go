@@ -200,6 +200,9 @@ func (a *MultiAgent) Stop(ctx context.Context) error {
 		a.browser.Close()
 	}
 
+	// Wait for pollLoop to finish
+	<-a.doneCh
+
 	// Save usage data
 	a.saveUsage()
 

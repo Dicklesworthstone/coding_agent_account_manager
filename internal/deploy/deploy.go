@@ -154,7 +154,11 @@ func (d *Deployer) RunCommand(ctx context.Context, cmd string) (string, error) {
 
 // GetRemoteVersion gets the caam version on the remote machine.
 func (d *Deployer) GetRemoteVersion(ctx context.Context) (string, error) {
-	output, err := d.RunCommand(ctx, "/usr/local/bin/caam --version 2>/dev/null || echo ''")
+	// First find where caam is installed (could be /usr/local/bin or ~/bin)
+	binaryPath := d.findBinaryPath(ctx)
+
+	// Check if binary exists and get version
+	output, err := d.RunCommand(ctx, binaryPath+" --version 2>/dev/null || echo ''")
 	if err != nil {
 		return "", nil // caam not installed
 	}

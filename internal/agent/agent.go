@@ -200,6 +200,8 @@ func (a *Agent) Stop(ctx context.Context) error {
 
 // pollLoop polls the coordinator for pending requests.
 func (a *Agent) pollLoop(ctx context.Context) {
+	defer close(a.doneCh)
+
 	ticker := time.NewTicker(a.config.PollInterval)
 	defer ticker.Stop()
 
