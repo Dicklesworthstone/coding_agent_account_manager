@@ -153,3 +153,8 @@ func (c *WezTermClient) IsAvailable(ctx context.Context) bool {
 	cmd := exec.CommandContext(ctx, c.binaryPath, "cli", "list", "--format", "json")
 	return cmd.Run() == nil
 }
+
+// Backend returns the backend name.
+func (c *WezTermClient) Backend() string {
+	return "wezterm"
+}

@@ -10,8 +10,31 @@ import (
 	"github.com/google/uuid"
 )
 
+// Backend specifies which terminal multiplexer to use for pane monitoring.
+type Backend string
+
+const (
+	// BackendWezTerm uses WezTerm's native mux-server (PREFERRED).
+	// Benefits: integrated multiplexing, domain awareness, rich metadata.
+	BackendWezTerm Backend = "wezterm"
+
+	// BackendTmux uses tmux as a fallback for other terminals.
+	// Use this with Ghostty, Alacritty, iTerm2, or other terminals without
+	// built-in multiplexing. Requires tmux server running.
+	// Limitations: no domain awareness, extra process layer, less metadata.
+	BackendTmux Backend = "tmux"
+
+	// BackendAuto tries WezTerm first, falls back to tmux.
+	BackendAuto Backend = "auto"
+)
+
 // Config configures the coordinator.
 type Config struct {
+	// Backend specifies which terminal multiplexer to use.
+	// Options: "wezterm" (preferred), "tmux", or "auto" (try wezterm, fall back to tmux).
+	// Default: "auto"
+	Backend Backend
+
 	// PollInterval is how often to check pane output.
 	PollInterval time.Duration
 
@@ -41,6 +64,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
+		Backend:       BackendAuto, // Try WezTerm first, fall back to tmux
 		PollInterval:  500 * time.Millisecond,
 		AuthTimeout:   60 * time.Second,
 		StateTimeout:  30 * time.Second,
@@ -69,15 +93,15 @@ type AuthResponse struct {
 
 // Coordinator manages pane monitoring and auth recovery.
 type Coordinator struct {
-	config   Config
-	wezterm  *WezTermClient
-	logger   *slog.Logger
-	trackers map[int]*PaneTracker // paneID -> tracker
-	requests map[string]*AuthRequest
-	mu       sync.RWMutex
-	stopCh   chan struct{}
-	doneCh   chan struct{}
-	running  bool
+	config     Config
+	paneClient PaneClient
+	logger     *slog.Logger
+	trackers   map[int]*PaneTracker // paneID -> tracker
+	requests   map[string]*AuthRequest
+	mu         sync.RWMutex
+	stopCh     chan struct{}
+	doneCh     chan struct{}
+	running    bool
 
 	// Callbacks
 	OnAuthRequest  func(req *AuthRequest)
@@ -91,14 +115,53 @@ func New(config Config) *Coordinator {
 		config.Logger = slog.Default()
 	}
 
+	// Select pane client based on backend configuration
+	paneClient := selectPaneClient(config.Backend, config.Logger)
+
 	return &Coordinator{
-		config:   config,
-		wezterm:  NewWezTermClient(),
-		logger:   config.Logger,
-		trackers: make(map[int]*PaneTracker),
-		requests: make(map[string]*AuthRequest),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		config:     config,
+		paneClient: paneClient,
+		logger:     config.Logger,
+		trackers:   make(map[int]*PaneTracker),
+		requests:   make(map[string]*AuthRequest),
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
+	}
+}
+
+// selectPaneClient chooses the appropriate backend based on configuration.
+func selectPaneClient(backend Backend, logger *slog.Logger) PaneClient {
+	ctx := context.Background()
+
+	switch backend {
+	case BackendWezTerm:
+		return NewWezTermClient()
+
+	case BackendTmux:
+		return NewTmuxClient()
+
+	case BackendAuto:
+		fallthrough
+	default:
+		// Try WezTerm first (preferred)
+		wezterm := NewWezTermClient()
+		if wezterm.IsAvailable(ctx) {
+			logger.Info("using WezTerm backend (preferred)")
+			return wezterm
+		}
+
+		// Fall back to tmux
+		tmux := NewTmuxClient()
+		if tmux.IsAvailable(ctx) {
+			logger.Info("WezTerm not available, using tmux backend",
+				"note", "WezTerm is recommended for better integration")
+			return tmux
+		}
+
+		// Neither available - return WezTerm anyway, errors will surface later
+		logger.Warn("no terminal multiplexer detected",
+			"hint", "start WezTerm or tmux before running the coordinator")
+		return wezterm
 	}
 }
 
@@ -161,7 +224,7 @@ func (c *Coordinator) monitorLoop(ctx context.Context) {
 
 // pollPanes checks all panes for state changes.
 func (c *Coordinator) pollPanes(ctx context.Context) {
-	panes, err := c.wezterm.ListPanes(ctx)
+	panes, err := c.paneClient.ListPanes(ctx)
 	if err != nil {
 		c.logger.Error("failed to list panes", "error", err)
 		return
@@ -203,7 +266,7 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 	c.mu.Unlock()
 
 	// Get pane output
-	output, err := c.wezterm.GetText(ctx, pane.PaneID, -c.config.OutputLines)
+	output, err := c.paneClient.GetText(ctx, pane.PaneID, -c.config.OutputLines)
 	if err != nil {
 		c.logger.Debug("failed to get pane text", "pane_id", pane.PaneID, "error", err)
 		return
@@ -267,7 +330,7 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 		tracker.SetState(StateRateLimited)
 
 		// Auto-inject /login command
-		if err := c.wezterm.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
+		if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
 			c.logger.Error("failed to inject /login",
 				"pane_id", tracker.PaneID,
 				"error", err)
@@ -287,7 +350,7 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 
 		// Auto-select option 1 (Claude account with subscription)
 		time.Sleep(200 * time.Millisecond)
-		if err := c.wezterm.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
+		if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
 			c.logger.Error("failed to inject option selection",
 				"pane_id", tracker.PaneID,
 				"error", err)
@@ -415,7 +478,7 @@ func (c *Coordinator) handleCodeReceivedState(ctx context.Context, tracker *Pane
 		"pane_id", tracker.PaneID,
 		"account", tracker.GetUsedAccount())
 
-	if err := c.wezterm.SendText(ctx, tracker.PaneID, code+"\n", true); err != nil {
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, code+"\n", true); err != nil {
 		c.logger.Error("failed to inject code",
 			"pane_id", tracker.PaneID,
 			"error", err)
@@ -462,7 +525,7 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 		"pane_id", tracker.PaneID)
 
 	time.Sleep(500 * time.Millisecond)
-	if err := c.wezterm.SendText(ctx, tracker.PaneID, c.config.ResumePrompt, true); err != nil {
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, c.config.ResumePrompt, true); err != nil {
 		c.logger.Error("failed to inject resume prompt",
 			"pane_id", tracker.PaneID,
 			"error", err)
@@ -574,4 +637,10 @@ func (c *Coordinator) GetTrackers() []*PaneTracker {
 		trackers = append(trackers, t)
 	}
 	return trackers
+}
+
+// Backend returns the name of the active terminal multiplexer backend.
+// Returns "wezterm" (preferred) or "tmux" (fallback).
+func (c *Coordinator) Backend() string {
+	return c.paneClient.Backend()
 }

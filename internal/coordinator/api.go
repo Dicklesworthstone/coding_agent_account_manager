@@ -165,7 +165,7 @@ func (a *APIServer) handleComplete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIServer) handleListPanes(w http.ResponseWriter, r *http.Request) {
-	panes, err := a.coordinator.wezterm.ListPanes(r.Context())
+	panes, err := a.coordinator.paneClient.ListPanes(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

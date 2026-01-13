@@ -17,9 +17,9 @@ import (
 var coordinatorCmd = &cobra.Command{
 	Use:   "auth-coordinator",
 	Short: "Run the distributed auth recovery coordinator daemon",
-	Long: `Monitor WezTerm panes for Claude Code rate limits and coordinate authentication.
+	Long: `Monitor terminal panes for Claude Code rate limits and coordinate authentication.
 
-The coordinator watches all WezTerm panes for rate limit messages. When detected, it:
+The coordinator watches terminal panes for rate limit messages. When detected, it:
 1. Auto-injects /login command
 2. Selects Claude subscription login method
 3. Extracts the OAuth URL
@@ -27,18 +27,29 @@ The coordinator watches all WezTerm panes for rate limit messages. When detected
 5. Receives auth codes from the agent and injects them
 6. Resumes the session automatically
 
+TERMINAL BACKENDS:
+  WezTerm (PREFERRED) - Use WezTerm's native mux-server for best integration.
+    Benefits: integrated multiplexing, domain awareness, rich metadata.
+
+  tmux (FALLBACK) - For Ghostty, Alacritty, iTerm2, or other terminals.
+    Requires: tmux server running (tmux new-session -d)
+    Limitations: no domain awareness, extra process layer, less metadata.
+
 This daemon should run on the remote machine where Claude Code sessions are running.
 The local auth-agent connects to this coordinator to complete OAuth flows.
 
 Examples:
-  # Start coordinator on default port (7890)
+  # Start coordinator (auto-detects best backend)
   caam auth-coordinator
+
+  # Force WezTerm backend
+  caam auth-coordinator --backend wezterm
+
+  # Force tmux backend (for Ghostty/Alacritty/iTerm2)
+  caam auth-coordinator --backend tmux
 
   # Custom port and verbose logging
   caam auth-coordinator --port 7891 --verbose
-
-  # Custom resume prompt
-  caam auth-coordinator --resume-prompt "continue working"
 
 SSH Tunnel Setup (run on local Mac):
   ssh -R 7890:localhost:7891 user@remote-server -N`,
@@ -46,10 +57,11 @@ SSH Tunnel Setup (run on local Mac):
 }
 
 var (
-	coordinatorPort        int
-	coordinatorPollMs      int
+	coordinatorPort         int
+	coordinatorPollMs       int
 	coordinatorResumePrompt string
-	coordinatorVerbose     bool
+	coordinatorVerbose      bool
+	coordinatorBackend      string
 )
 
 func init() {
@@ -61,6 +73,8 @@ func init() {
 		"proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
 		"Text to inject after successful auth")
 	coordinatorCmd.Flags().BoolVar(&coordinatorVerbose, "verbose", false, "Verbose output")
+	coordinatorCmd.Flags().StringVar(&coordinatorBackend, "backend", "auto",
+		"Terminal multiplexer backend: wezterm (preferred), tmux, or auto")
 }
 
 func runCoordinator(cmd *cobra.Command, args []string) error {
@@ -73,14 +87,22 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 		Level: logLevel,
 	}))
 
-	// Check WezTerm availability
-	wt := coordinator.NewWezTermClient()
-	if !wt.IsAvailable(cmd.Context()) {
-		return fmt.Errorf("wezterm CLI not available - is WezTerm mux-server running?")
+	// Parse backend flag
+	var backend coordinator.Backend
+	switch strings.ToLower(coordinatorBackend) {
+	case "wezterm":
+		backend = coordinator.BackendWezTerm
+	case "tmux":
+		backend = coordinator.BackendTmux
+	case "auto", "":
+		backend = coordinator.BackendAuto
+	default:
+		return fmt.Errorf("invalid backend %q: use wezterm, tmux, or auto", coordinatorBackend)
 	}
 
 	// Create coordinator config
 	config := coordinator.DefaultConfig()
+	config.Backend = backend
 	config.PollInterval = time.Duration(coordinatorPollMs) * time.Millisecond
 	config.ResumePrompt = coordinatorResumePrompt
 	config.Logger = logger
@@ -132,8 +154,12 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	}()
 
 	fmt.Printf("Auth coordinator started\n")
+	fmt.Printf("  Backend: %s\n", coord.Backend())
 	fmt.Printf("  API: http://localhost:%d\n", coordinatorPort)
 	fmt.Printf("  Poll interval: %dms\n", coordinatorPollMs)
+	if coord.Backend() == "tmux" {
+		fmt.Println("\nNote: Using tmux fallback. WezTerm is recommended for better integration.")
+	}
 	fmt.Println("\nWaiting for rate limits...")
 	fmt.Println("Press Ctrl+C to stop.")
 
