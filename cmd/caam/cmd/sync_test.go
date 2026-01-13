@@ -201,3 +201,20 @@ func TestSyncStatusJSONOutput(t *testing.T) {
 		t.Errorf("JSON output missing machines field")
 	}
 }
+
+func TestRemoteVaultPath(t *testing.T) {
+	defaultPath := sync.DefaultSyncerConfig().RemoteVaultPath
+
+	if got := remoteVaultPath(nil); got != defaultPath {
+		t.Fatalf("remoteVaultPath(nil) = %q, want %q", got, defaultPath)
+	}
+
+	if got := remoteVaultPath(&sync.Machine{}); got != defaultPath {
+		t.Fatalf("remoteVaultPath(empty) = %q, want %q", got, defaultPath)
+	}
+
+	custom := &sync.Machine{RemotePath: "/data/caam"}
+	if got := remoteVaultPath(custom); got != "/data/caam/vault" {
+		t.Fatalf("remoteVaultPath(custom) = %q, want %q", got, "/data/caam/vault")
+	}
+}

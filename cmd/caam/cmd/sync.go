@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"time"
 
@@ -490,8 +491,9 @@ func runSyncAdd(cmd *cobra.Command, args []string) error {
 	if testAfter {
 		fmt.Fprintln(cmd.OutOrStdout(), "")
 		fmt.Fprintf(cmd.OutOrStdout(), "Testing connectivity to %s...\n", name)
-		// TODO: Implement actual connectivity test
-		fmt.Fprintln(cmd.OutOrStdout(), "  ⚠️  Connection test not yet implemented")
+		pool := sync.NewConnectionPool(sync.DefaultConnectOptions())
+		defer pool.CloseAll()
+		testSyncMachine(cmd.OutOrStdout(), pool, machine)
 	}
 
 	return nil
@@ -561,40 +563,17 @@ func runSyncTest(cmd *cobra.Command, args []string) error {
 	pool := sync.NewConnectionPool(sync.DefaultConnectOptions())
 	defer pool.CloseAll()
 
-	testMachine := func(m *sync.Machine) bool {
-		client, err := pool.Get(m)
-		if err != nil {
-			fmt.Fprintf(cmd.OutOrStdout(), "  SSH connection: ✗ %v\n", err)
-			return false
-		}
-		// Try to verify caam vault exists on remote
-		exists, err := client.FileExists(".local/share/caam/vault")
-		if err != nil {
-			fmt.Fprintf(cmd.OutOrStdout(), "  SSH connection: ✓ connected\n")
-			fmt.Fprintf(cmd.OutOrStdout(), "  CAAM vault: ⚠️  could not check (%v)\n", err)
-			return true
-		}
-		if exists {
-			fmt.Fprintln(cmd.OutOrStdout(), "  SSH connection: ✓ connected")
-			fmt.Fprintln(cmd.OutOrStdout(), "  CAAM vault: ✓ found")
-		} else {
-			fmt.Fprintln(cmd.OutOrStdout(), "  SSH connection: ✓ connected")
-			fmt.Fprintln(cmd.OutOrStdout(), "  CAAM vault: ⚠️  not found (will be created on first sync)")
-		}
-		return true
-	}
-
 	if len(machines) == 1 {
 		m := machines[0]
 		fmt.Fprintf(cmd.OutOrStdout(), "Testing connection to %s (%s)...\n", m.Name, m.Address)
-		testMachine(m)
+		testSyncMachine(cmd.OutOrStdout(), pool, m)
 	} else {
 		fmt.Fprintln(cmd.OutOrStdout(), "Testing all machines...")
 		fmt.Fprintln(cmd.OutOrStdout())
 		passed := 0
 		for _, m := range machines {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s):\n", m.Name, m.Address)
-			if testMachine(m) {
+			if testSyncMachine(cmd.OutOrStdout(), pool, m) {
 				passed++
 			}
 			fmt.Fprintln(cmd.OutOrStdout())
@@ -603,6 +582,41 @@ func runSyncTest(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func testSyncMachine(out io.Writer, pool *sync.ConnectionPool, m *sync.Machine) bool {
+	client, err := pool.Get(m)
+	if err != nil {
+		fmt.Fprintf(out, "  SSH connection: ✗ %v\n", err)
+		return false
+	}
+
+	// Try to verify caam vault exists on remote
+	vaultPath := remoteVaultPath(m)
+	exists, err := client.FileExists(vaultPath)
+	if err != nil {
+		fmt.Fprintf(out, "  SSH connection: ✓ connected\n")
+		fmt.Fprintf(out, "  CAAM vault: ⚠️  could not check (%v)\n", err)
+		return true
+	}
+	if exists {
+		fmt.Fprintln(out, "  SSH connection: ✓ connected")
+		fmt.Fprintln(out, "  CAAM vault: ✓ found")
+	} else {
+		fmt.Fprintln(out, "  SSH connection: ✓ connected")
+		fmt.Fprintln(out, "  CAAM vault: ⚠️  not found (will be created on first sync)")
+	}
+	return true
+}
+
+func remoteVaultPath(m *sync.Machine) string {
+	if m == nil {
+		return sync.DefaultSyncerConfig().RemoteVaultPath
+	}
+	if strings.TrimSpace(m.RemotePath) == "" {
+		return sync.DefaultSyncerConfig().RemoteVaultPath
+	}
+	return path.Join(m.RemotePath, "vault")
 }
 
 // runSyncEnable enables auto-sync.

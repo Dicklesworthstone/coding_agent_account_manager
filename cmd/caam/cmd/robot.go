@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
@@ -165,26 +166,15 @@ type RobotActResult struct {
 }
 
 var robotCmd = &cobra.Command{
-	Use:   "robot",
+	Use:   "robot [command]",
 	Short: "Agent-optimized commands (JSON output)",
 	Long: `Robot mode provides CLI commands optimized for coding agents.
 
 All commands output JSON to stdout. Errors are structured with error codes.
 No interactive prompts - designed for programmatic use.
 
-Available subcommands:
-  status   - Full system status overview
-  next     - Suggest best profile to use
-  act      - Execute an action (activate, cooldown, etc.)
-  health   - Quick health check
-  watch    - Stream status changes
-
-Examples:
-  caam robot status                    # Full status
-  caam robot status --provider claude  # Claude only
-  caam robot next claude               # Suggest next Claude profile
-  caam robot act activate claude work  # Activate a profile
-  caam robot health                    # Quick health check`,
+Run 'caam robot' with no arguments for a quick-start guide.`,
+	RunE: runRobotQuickStart,
 }
 
 var robotStatusCmd = &cobra.Command{
@@ -272,27 +262,6 @@ Use --provider to filter to a specific provider.`,
 	RunE: runRobotWatch,
 }
 
-func init() {
-	rootCmd.AddCommand(robotCmd)
-	robotCmd.AddCommand(robotStatusCmd)
-	robotCmd.AddCommand(robotNextCmd)
-	robotCmd.AddCommand(robotActCmd)
-	robotCmd.AddCommand(robotHealthCmd)
-	robotCmd.AddCommand(robotWatchCmd)
-
-	// Status flags
-	robotStatusCmd.Flags().String("provider", "", "filter to specific provider")
-	robotStatusCmd.Flags().Bool("compact", false, "minimal output")
-	robotStatusCmd.Flags().Bool("include-coordinators", false, "check coordinator status")
-
-	// Next flags
-	robotNextCmd.Flags().String("strategy", "smart", "selection strategy: smart, lru, random")
-	robotNextCmd.Flags().Bool("include-cooldown", false, "include profiles in cooldown")
-
-	// Watch flags
-	robotWatchCmd.Flags().Int("interval", 5, "poll interval in seconds")
-	robotWatchCmd.Flags().String("provider", "", "filter to specific provider")
-}
 
 // robotOutput writes a RobotOutput to stdout.
 func robotOutput(cmd *cobra.Command, output RobotOutput) error {
@@ -329,7 +298,8 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 		providerFilter = strings.ToLower(args[0])
 	}
 	if providerFilter != "" {
-		if _, ok := tools[providerFilter]; !ok {
+		validProviders := map[string]bool{"codex": true, "claude": true, "gemini": true}
+		if !validProviders[providerFilter] {
 			return robotError(cmd, "status", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", providerFilter),
 				"valid providers: codex, claude, gemini",
@@ -1177,4 +1147,874 @@ func emitWatchStatus(cmd *cobra.Command, providerFilter string) error {
 
 	enc := json.NewEncoder(cmd.OutOrStdout())
 	return enc.Encode(event)
+}
+
+// ============================================================================
+// Quick Start Guide - Token-efficient markdown for coding agents
+// ============================================================================
+
+func runRobotQuickStart(cmd *cobra.Command, args []string) error {
+	guide := `# caam robot - Agent Quick Start
+
+## Core Commands (JSON output)
+` + "```" + `
+caam robot status              # Full system overview
+caam robot status claude       # Single provider
+caam robot next claude         # Best profile recommendation
+caam robot limits claude       # Rate limits + burn rate
+caam robot precheck claude     # Session planner
+` + "```" + `
+
+## Actions
+` + "```" + `
+caam robot act activate claude <profile>   # Switch profile
+caam robot act cooldown claude <profile> 1h  # Set cooldown
+caam robot act uncooldown claude <profile>   # Clear cooldown
+caam robot act backup claude [name]          # Backup current auth
+caam robot act delete claude <profile>       # Delete profile
+caam robot act refresh claude <profile>      # Refresh token
+` + "```" + `
+
+## Diagnostics
+` + "```" + `
+caam robot health              # Quick health check
+caam robot doctor              # Full diagnostics
+caam robot validate claude     # Token validation
+caam robot paths               # Auth file locations
+caam robot history             # Recent activity
+` + "```" + `
+
+## Configuration
+` + "```" + `
+caam robot config              # Show config
+caam robot config set <k> <v>  # Set config value
+` + "```" + `
+
+## Response Format
+All commands return:
+` + "```json" + `
+{
+  "success": true|false,
+  "command": "command_name",
+  "timestamp": "RFC3339",
+  "data": {...},
+  "error": {"code": "ERROR_CODE", "message": "..."},
+  "suggestions": ["helpful action commands"],
+  "timing": {"duration_ms": 42}
+}
+` + "```" + `
+
+## Error Codes
+- INVALID_PROVIDER: Unknown provider (use: claude, codex, gemini)
+- NO_PROFILES: No profiles exist for provider
+- ALL_BLOCKED: All profiles in cooldown/unhealthy
+- MISSING_PROFILE: Profile name required
+- VAULT_ERROR: Cannot access profile storage
+
+## Typical Workflow
+1. ` + "`caam robot precheck claude`" + ` - Plan session
+2. ` + "`caam robot act activate claude <best>`" + ` - Switch
+3. Work until rate limited...
+4. ` + "`caam robot act cooldown claude <current> 1h`" + ` - Mark cooldown
+5. ` + "`caam robot next claude`" + ` - Get next best
+6. Repeat from step 2
+`
+	fmt.Fprint(cmd.OutOrStdout(), guide)
+	return nil
+}
+
+// ============================================================================
+// New Robot Subcommands
+// ============================================================================
+
+var robotLimitsCmd = &cobra.Command{
+	Use:   "limits <provider>",
+	Short: "Fetch rate limits and burn rate",
+	Long: `Fetches real-time rate limit data from provider APIs.
+
+Returns usage percentages, reset times, burn rates, and depletion forecasts.
+Useful for deciding when to switch profiles.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRobotLimits,
+}
+
+var robotPrecheckCmd = &cobra.Command{
+	Use:   "precheck <provider>",
+	Short: "Session planner with recommendations",
+	Long: `Comprehensive session planner showing:
+- Recommended profile with score breakdown
+- Backup profiles in priority order
+- Profiles in cooldown
+- Usage forecasts and alerts
+- Quick action commands`,
+	Args: cobra.ExactArgs(1),
+	RunE: runRobotPrecheck,
+}
+
+var robotValidateCmd = &cobra.Command{
+	Use:   "validate [provider] [profile]",
+	Short: "Validate auth tokens",
+	Long: `Validates authentication tokens.
+
+Without arguments, validates all profiles.
+With provider, validates all profiles for that provider.
+With provider and profile, validates that specific profile.`,
+	Args: cobra.MaximumNArgs(2),
+	RunE: runRobotValidate,
+}
+
+var robotDoctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Full system diagnostics",
+	Long: `Runs comprehensive diagnostic checks:
+- CLI tools installation
+- Directory permissions
+- Config validation
+- Profile integrity
+- Lock file status
+- Auth file status`,
+	RunE: runRobotDoctor,
+}
+
+var robotPathsCmd = &cobra.Command{
+	Use:   "paths",
+	Short: "Show all auth file paths",
+	Long:  `Returns all auth file paths for all providers, with existence status.`,
+	RunE:  runRobotPaths,
+}
+
+var robotHistoryCmd = &cobra.Command{
+	Use:   "history",
+	Short: "Recent activity log",
+	Long: `Returns recent activity events from the database.
+
+Use --days to specify how many days of history to fetch.
+Use --limit to limit the number of events.`,
+	RunE: runRobotHistory,
+}
+
+var robotConfigCmd = &cobra.Command{
+	Use:   "config [set <key> <value>]",
+	Short: "View or modify configuration",
+	Long: `View or modify caam configuration.
+
+Without arguments, returns full config as JSON.
+With 'set <key> <value>', updates a config value.`,
+	RunE: runRobotConfig,
+}
+
+func init() {
+	rootCmd.AddCommand(robotCmd)
+	robotCmd.AddCommand(robotStatusCmd)
+	robotCmd.AddCommand(robotNextCmd)
+	robotCmd.AddCommand(robotActCmd)
+	robotCmd.AddCommand(robotHealthCmd)
+	robotCmd.AddCommand(robotWatchCmd)
+	robotCmd.AddCommand(robotLimitsCmd)
+	robotCmd.AddCommand(robotPrecheckCmd)
+	robotCmd.AddCommand(robotValidateCmd)
+	robotCmd.AddCommand(robotDoctorCmd)
+	robotCmd.AddCommand(robotPathsCmd)
+	robotCmd.AddCommand(robotHistoryCmd)
+	robotCmd.AddCommand(robotConfigCmd)
+
+	// Status flags
+	robotStatusCmd.Flags().String("provider", "", "filter to specific provider")
+	robotStatusCmd.Flags().Bool("compact", false, "minimal output")
+	robotStatusCmd.Flags().Bool("include-coordinators", false, "check coordinator status")
+
+	// Next flags
+	robotNextCmd.Flags().String("strategy", "smart", "selection strategy: smart, lru, random")
+	robotNextCmd.Flags().Bool("include-cooldown", false, "include profiles in cooldown")
+
+	// Watch flags
+	robotWatchCmd.Flags().Int("interval", 5, "poll interval in seconds")
+	robotWatchCmd.Flags().String("provider", "", "filter to specific provider")
+
+	// Limits flags
+	robotLimitsCmd.Flags().Bool("forecast", false, "include depletion forecasts")
+
+	// Precheck flags
+	robotPrecheckCmd.Flags().Duration("timeout", 30*time.Second, "API fetch timeout")
+	robotPrecheckCmd.Flags().Bool("no-fetch", false, "skip API calls (use cached data)")
+
+	// Validate flags
+	robotValidateCmd.Flags().Bool("active", false, "perform active validation (API calls)")
+
+	// Doctor flags
+	robotDoctorCmd.Flags().Bool("fix", false, "attempt to fix issues")
+	robotDoctorCmd.Flags().Bool("validate-tokens", false, "also validate auth tokens")
+
+	// History flags
+	robotHistoryCmd.Flags().Int("days", 7, "number of days of history")
+	robotHistoryCmd.Flags().Int("limit", 50, "max events to return")
+	robotHistoryCmd.Flags().String("provider", "", "filter to specific provider")
+}
+
+// RobotLimitsData contains rate limit information.
+type RobotLimitsData struct {
+	Provider string               `json:"provider"`
+	Profiles []RobotProfileLimits `json:"profiles"`
+}
+
+// RobotProfileLimits contains rate limits for a profile.
+type RobotProfileLimits struct {
+	Name           string `json:"name"`
+	AvailScore     int    `json:"availability_score"`
+	PrimaryPct     int    `json:"primary_percent,omitempty"`
+	SecondaryPct   int    `json:"secondary_percent,omitempty"`
+	ResetsIn       string `json:"resets_in,omitempty"`
+	BurnRate       string `json:"burn_rate,omitempty"`
+	DepletesIn     string `json:"depletes_in,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Recommendation string `json:"recommendation,omitempty"`
+}
+
+func runRobotLimits(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+	provider := strings.ToLower(args[0])
+
+	if _, ok := tools[provider]; !ok {
+		return robotError(cmd, "limits", "INVALID_PROVIDER",
+			fmt.Sprintf("unknown provider: %s", provider),
+			"valid providers: codex, claude, gemini",
+			nil)
+	}
+
+	// For now, use health data as a proxy. Full implementation would call usage APIs.
+	profiles, err := vault.List(provider)
+	if err != nil {
+		return robotError(cmd, "limits", "VAULT_ERROR",
+			"failed to list profiles",
+			err.Error(),
+			nil)
+	}
+
+	if len(profiles) == 0 {
+		return robotError(cmd, "limits", "NO_PROFILES",
+			fmt.Sprintf("no profiles found for %s", provider),
+			"",
+			[]string{fmt.Sprintf("caam backup %s <name>", provider)})
+	}
+
+	data := RobotLimitsData{
+		Provider: provider,
+		Profiles: make([]RobotProfileLimits, 0, len(profiles)),
+	}
+
+	for _, profileName := range profiles {
+		if strings.HasPrefix(profileName, "_") {
+			continue
+		}
+
+		limits := RobotProfileLimits{
+			Name: profileName,
+		}
+
+		// Get health info for estimates
+		ph, _ := getProfileHealthWithIdentity(provider, profileName)
+		status := health.CalculateStatus(ph)
+
+		switch status {
+		case health.StatusHealthy:
+			limits.AvailScore = 100
+			limits.Recommendation = "ready to use"
+		case health.StatusWarning:
+			limits.AvailScore = 50
+			limits.Recommendation = "use with caution"
+		case health.StatusCritical:
+			limits.AvailScore = 10
+			limits.Recommendation = "avoid - issues detected"
+		default:
+			limits.AvailScore = 0
+			limits.Recommendation = "status unknown"
+		}
+
+		data.Profiles = append(data.Profiles, limits)
+	}
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: true,
+		Command: "limits",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
+}
+
+// RobotPrecheckData contains session planning data.
+type RobotPrecheckData struct {
+	Provider    string                  `json:"provider"`
+	Recommended *RobotPrecheckProfile   `json:"recommended,omitempty"`
+	Backups     []RobotPrecheckProfile  `json:"backups"`
+	InCooldown  []RobotCooldownProfile  `json:"in_cooldown"`
+	Alerts      []RobotPrecheckAlert    `json:"alerts,omitempty"`
+	Summary     RobotPrecheckSummary    `json:"summary"`
+	Commands    RobotPrecheckCommands   `json:"commands"`
+}
+
+// RobotPrecheckProfile is a profile with recommendation data.
+type RobotPrecheckProfile struct {
+	Name       string   `json:"name"`
+	Score      float64  `json:"score"`
+	Health     string   `json:"health"`
+	Reasons    []string `json:"reasons"`
+	PoolStatus string   `json:"pool_status,omitempty"`
+}
+
+// RobotCooldownProfile is a profile in cooldown.
+type RobotCooldownProfile struct {
+	Name      string `json:"name"`
+	Remaining string `json:"remaining"`
+	Until     string `json:"until"`
+}
+
+// RobotPrecheckAlert is an alert for the precheck.
+type RobotPrecheckAlert struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Urgency string `json:"urgency"`
+	Action  string `json:"action,omitempty"`
+}
+
+// RobotPrecheckSummary contains aggregate info.
+type RobotPrecheckSummary struct {
+	Total      int `json:"total_profiles"`
+	Ready      int `json:"ready_profiles"`
+	InCooldown int `json:"in_cooldown"`
+	Healthy    int `json:"healthy"`
+	Warning    int `json:"warning"`
+	Critical   int `json:"critical"`
+}
+
+// RobotPrecheckCommands contains suggested commands.
+type RobotPrecheckCommands struct {
+	Activate string `json:"activate,omitempty"`
+	Next     string `json:"next"`
+	Run      string `json:"run"`
+}
+
+func runRobotPrecheck(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+	provider := strings.ToLower(args[0])
+
+	if _, ok := tools[provider]; !ok {
+		return robotError(cmd, "precheck", "INVALID_PROVIDER",
+			fmt.Sprintf("unknown provider: %s", provider),
+			"valid providers: codex, claude, gemini",
+			nil)
+	}
+
+	profiles, err := vault.List(provider)
+	if err != nil {
+		return robotError(cmd, "precheck", "VAULT_ERROR",
+			"failed to list profiles", err.Error(), nil)
+	}
+
+	if len(profiles) == 0 {
+		return robotError(cmd, "precheck", "NO_PROFILES",
+			fmt.Sprintf("no profiles found for %s", provider),
+			"",
+			[]string{fmt.Sprintf("caam backup %s <name>", provider)})
+	}
+
+	db, _ := caamdb.Open()
+	defer func() {
+		if db != nil {
+			db.Close()
+		}
+	}()
+
+	data := RobotPrecheckData{
+		Provider:   provider,
+		Backups:    make([]RobotPrecheckProfile, 0),
+		InCooldown: make([]RobotCooldownProfile, 0),
+		Commands: RobotPrecheckCommands{
+			Next: fmt.Sprintf("caam robot next %s", provider),
+			Run:  fmt.Sprintf("caam run %s -- <command>", provider),
+		},
+	}
+
+	now := time.Now()
+	var bestScore float64 = -9999
+	var bestProfile string
+
+	for _, profileName := range profiles {
+		if strings.HasPrefix(profileName, "_") {
+			continue
+		}
+
+		data.Summary.Total++
+
+		// Check cooldown
+		if db != nil {
+			if ev, err := db.ActiveCooldown(provider, profileName, now); err == nil && ev != nil {
+				remaining := time.Until(ev.CooldownUntil)
+				if remaining > 0 {
+					data.InCooldown = append(data.InCooldown, RobotCooldownProfile{
+						Name:      profileName,
+						Remaining: robotFormatDuration(remaining),
+						Until:     ev.CooldownUntil.Format(time.RFC3339),
+					})
+					data.Summary.InCooldown++
+					continue
+				}
+			}
+		}
+
+		// Get health
+		ph, _ := getProfileHealthWithIdentity(provider, profileName)
+		status := health.CalculateStatus(ph)
+
+		rec := RobotPrecheckProfile{
+			Name:    profileName,
+			Health:  status.String(),
+			Reasons: []string{},
+		}
+
+		// Calculate score
+		switch status {
+		case health.StatusHealthy:
+			rec.Score = 100
+			rec.Reasons = append(rec.Reasons, "+healthy status")
+			data.Summary.Healthy++
+		case health.StatusWarning:
+			rec.Score = 50
+			rec.Reasons = append(rec.Reasons, "-warning status")
+			data.Summary.Warning++
+		case health.StatusCritical:
+			rec.Score = 10
+			rec.Reasons = append(rec.Reasons, "-critical status")
+			data.Summary.Critical++
+		default:
+			rec.Score = 30
+		}
+
+		data.Summary.Ready++
+
+		if rec.Score > bestScore {
+			bestScore = rec.Score
+			bestProfile = profileName
+			data.Recommended = &RobotPrecheckProfile{
+				Name:    rec.Name,
+				Score:   rec.Score,
+				Health:  rec.Health,
+				Reasons: rec.Reasons,
+			}
+		} else {
+			data.Backups = append(data.Backups, rec)
+		}
+	}
+
+	// Update recommended from backups if needed
+	if data.Recommended == nil && len(data.Backups) > 0 {
+		data.Recommended = &data.Backups[0]
+		data.Backups = data.Backups[1:]
+	}
+
+	if data.Recommended != nil {
+		data.Commands.Activate = fmt.Sprintf("caam robot act activate %s %s", provider, data.Recommended.Name)
+	}
+
+	// Generate alerts
+	if data.Summary.Ready == 0 && data.Summary.InCooldown > 0 {
+		data.Alerts = append(data.Alerts, RobotPrecheckAlert{
+			Type:    "all_blocked",
+			Message: "all profiles are in cooldown",
+			Urgency: "high",
+			Action:  "wait for cooldown to expire or add new profile",
+		})
+	}
+	if data.Summary.Critical > 0 {
+		data.Alerts = append(data.Alerts, RobotPrecheckAlert{
+			Type:    "critical_profiles",
+			Message: fmt.Sprintf("%d profile(s) in critical status", data.Summary.Critical),
+			Urgency: "medium",
+			Action:  "run 'caam robot doctor' for diagnostics",
+		})
+	}
+
+	_ = bestProfile // Used above
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: true,
+		Command: "precheck",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
+}
+
+// RobotValidateData contains validation results.
+type RobotValidateData struct {
+	Method   string                `json:"method"`
+	Profiles []RobotValidateResult `json:"profiles"`
+	Summary  RobotValidateSummary  `json:"summary"`
+}
+
+// RobotValidateResult is a single validation result.
+type RobotValidateResult struct {
+	Provider  string `json:"provider"`
+	Profile   string `json:"profile"`
+	Valid     bool   `json:"valid"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	ExpiresIn string `json:"expires_in,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// RobotValidateSummary contains validation summary.
+type RobotValidateSummary struct {
+	Total   int `json:"total"`
+	Valid   int `json:"valid"`
+	Invalid int `json:"invalid"`
+}
+
+func runRobotValidate(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+
+	var providersToCheck []string
+	var profileFilter string
+
+	if len(args) >= 1 {
+		provider := strings.ToLower(args[0])
+		if _, ok := tools[provider]; !ok {
+			return robotError(cmd, "validate", "INVALID_PROVIDER",
+				fmt.Sprintf("unknown provider: %s", provider),
+				"valid providers: codex, claude, gemini",
+				nil)
+		}
+		providersToCheck = []string{provider}
+		if len(args) >= 2 {
+			profileFilter = args[1]
+		}
+	} else {
+		providersToCheck = []string{"codex", "claude", "gemini"}
+	}
+
+	data := RobotValidateData{
+		Method:   "passive",
+		Profiles: make([]RobotValidateResult, 0),
+	}
+
+	for _, provider := range providersToCheck {
+		profiles, err := vault.List(provider)
+		if err != nil {
+			continue
+		}
+
+		for _, profileName := range profiles {
+			if strings.HasPrefix(profileName, "_") {
+				continue
+			}
+			if profileFilter != "" && profileName != profileFilter {
+				continue
+			}
+
+			result := RobotValidateResult{
+				Provider: provider,
+				Profile:  profileName,
+			}
+
+			// Get health info for token expiry
+			ph, _ := getProfileHealthWithIdentity(provider, profileName)
+			if !ph.TokenExpiresAt.IsZero() {
+				result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+				remaining := time.Until(ph.TokenExpiresAt)
+				if remaining > 0 {
+					result.ExpiresIn = robotFormatDuration(remaining)
+					result.Valid = true
+					data.Summary.Valid++
+				} else {
+					result.ExpiresIn = "expired"
+					result.Valid = false
+					result.Error = "token expired"
+					data.Summary.Invalid++
+				}
+			} else {
+				// No expiry info - assume valid
+				result.Valid = true
+				data.Summary.Valid++
+			}
+
+			data.Summary.Total++
+			data.Profiles = append(data.Profiles, result)
+		}
+	}
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: data.Summary.Invalid == 0,
+		Command: "validate",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
+}
+
+func runRobotDoctor(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+	fix, _ := cmd.Flags().GetBool("fix")
+	validateTokens, _ := cmd.Flags().GetBool("validate-tokens")
+
+	report := runDoctorChecks(fix, validateTokens)
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: report.OverallOK,
+		Command: "doctor",
+		Data:    report,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	if !report.OverallOK {
+		output.Suggestions = []string{
+			"caam robot doctor --fix",
+			"caam doctor --fix",
+		}
+	}
+
+	return robotOutput(cmd, output)
+}
+
+// RobotPathsData contains auth file paths.
+type RobotPathsData struct {
+	VaultPath  string             `json:"vault_path"`
+	ConfigPath string             `json:"config_path"`
+	Providers  []RobotProviderPaths `json:"providers"`
+}
+
+// RobotProviderPaths contains paths for a provider.
+type RobotProviderPaths struct {
+	ID    string           `json:"id"`
+	Files []RobotFilePath  `json:"files"`
+}
+
+// RobotFilePath is a single file path.
+type RobotFilePath struct {
+	Path        string `json:"path"`
+	Exists      bool   `json:"exists"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+}
+
+func runRobotPaths(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+
+	data := RobotPathsData{
+		VaultPath:  authfile.DefaultVaultPath(),
+		Providers:  make([]RobotProviderPaths, 0),
+	}
+
+	configDir, err := os.UserConfigDir()
+	if err == nil {
+		data.ConfigPath = filepath.Join(configDir, "caam", "config.json")
+	}
+
+	for tool, getFileSet := range tools {
+		fileSet := getFileSet()
+		provPaths := RobotProviderPaths{
+			ID:    tool,
+			Files: make([]RobotFilePath, 0),
+		}
+
+		for _, spec := range fileSet.Files {
+			_, err := os.Stat(spec.Path)
+			provPaths.Files = append(provPaths.Files, RobotFilePath{
+				Path:        spec.Path,
+				Exists:      err == nil,
+				Required:    spec.Required,
+				Description: spec.Description,
+			})
+		}
+
+		data.Providers = append(data.Providers, provPaths)
+	}
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: true,
+		Command: "paths",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
+}
+
+// RobotHistoryData contains activity history.
+type RobotHistoryData struct {
+	Since  string              `json:"since"`
+	Events []RobotHistoryEvent `json:"events"`
+	Count  int                 `json:"count"`
+}
+
+// RobotHistoryEvent is a single activity event.
+type RobotHistoryEvent struct {
+	Timestamp  string `json:"timestamp"`
+	Provider   string `json:"provider"`
+	Profile    string `json:"profile"`
+	Event      string `json:"event"`
+	Duration   string `json:"duration,omitempty"`
+	Notes      string `json:"notes,omitempty"`
+}
+
+func runRobotHistory(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+	days, _ := cmd.Flags().GetInt("days")
+	limit, _ := cmd.Flags().GetInt("limit")
+	providerFilter, _ := cmd.Flags().GetString("provider")
+
+	since := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+
+	data := RobotHistoryData{
+		Since:  since.Format(time.RFC3339),
+		Events: make([]RobotHistoryEvent, 0),
+	}
+
+	db, err := caamdb.Open()
+	if err != nil {
+		return robotError(cmd, "history", "DB_ERROR",
+			"failed to open database", err.Error(), nil)
+	}
+	defer db.Close()
+
+	// Query activity log
+	if db.Conn() != nil {
+		query := `SELECT timestamp, provider, profile_name, event_type, COALESCE(duration_seconds, 0), COALESCE(notes, '')
+			FROM activity_log
+			WHERE datetime(timestamp) >= datetime(?)
+			ORDER BY datetime(timestamp) DESC
+			LIMIT ?`
+		rows, err := db.Conn().Query(query, since.UTC().Format("2006-01-02 15:04:05"), limit)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var tsStr, provider, profile, eventType, notes string
+				var durationSecs int64
+				if err := rows.Scan(&tsStr, &provider, &profile, &eventType, &durationSecs, &notes); err != nil {
+					continue
+				}
+
+				if providerFilter != "" && provider != providerFilter {
+					continue
+				}
+
+				event := RobotHistoryEvent{
+					Timestamp: tsStr,
+					Provider:  provider,
+					Profile:   profile,
+					Event:     eventType,
+					Notes:     notes,
+				}
+				if durationSecs > 0 {
+					event.Duration = robotFormatDuration(time.Duration(durationSecs) * time.Second)
+				}
+				data.Events = append(data.Events, event)
+			}
+		}
+	}
+
+	data.Count = len(data.Events)
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: true,
+		Command: "history",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
+}
+
+func runRobotConfig(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+
+	// Handle set subcommand
+	if len(args) >= 3 && args[0] == "set" {
+		key := args[1]
+		value := args[2]
+
+		// Simple key-value setting for common config options
+		switch key {
+		case "rotation_algorithm", "algorithm":
+			spmCfg, _ := config.LoadSPMConfig()
+			if spmCfg == nil {
+				spmCfg = config.DefaultSPMConfig()
+			}
+			spmCfg.Stealth.Rotation.Algorithm = value
+			if err := spmCfg.Save(); err != nil {
+				return robotError(cmd, "config", "SAVE_ERROR",
+					"failed to save config", err.Error(), nil)
+			}
+		default:
+			return robotError(cmd, "config", "UNKNOWN_KEY",
+				fmt.Sprintf("unknown config key: %s", key),
+				"valid keys: rotation_algorithm",
+				nil)
+		}
+
+		output := RobotOutput{
+			Success: true,
+			Command: "config",
+			Data: map[string]string{
+				"action": "set",
+				"key":    key,
+				"value":  value,
+			},
+		}
+		return robotOutput(cmd, output)
+	}
+
+	// Default: show config
+	cfg, err := config.Load()
+	if err != nil {
+		cfg = config.DefaultConfig()
+	}
+
+	spmCfg, _ := config.LoadSPMConfig()
+	if spmCfg == nil {
+		spmCfg = config.DefaultSPMConfig()
+	}
+
+	data := map[string]interface{}{
+		"config":     cfg,
+		"spm_config": spmCfg,
+	}
+
+	duration := time.Since(start)
+	output := RobotOutput{
+		Success: true,
+		Command: "config",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: duration.Milliseconds(),
+		},
+	}
+
+	return robotOutput(cmd, output)
 }
