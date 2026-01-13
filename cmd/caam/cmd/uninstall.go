@@ -141,7 +141,11 @@ func runUninstall(cmd *cobra.Command, args []string) error {
 	if err := removePath(signals.DefaultLogFilePath()); err != nil {
 		return fmt.Errorf("remove log file: %w", err)
 	}
-	_ = removePath(filepath.Dir(caamdb.DefaultPath()))
+	// Only attempt to remove the db parent directory if we're not keeping backups.
+	// When keepBackups is true, this directory (CAAM_HOME/data) contains the vault.
+	if !keepBackups {
+		_ = removePath(filepath.Dir(caamdb.DefaultPath()))
+	}
 
 	// Best-effort cleanup of empty caam home root.
 	_ = os.Remove(caamHomeRoot)

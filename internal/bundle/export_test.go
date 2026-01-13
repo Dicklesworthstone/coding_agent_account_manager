@@ -553,7 +553,7 @@ func TestCollectProjectFiles(t *testing.T) {
 		tmpDir := t.TempDir()
 		projectsPath := filepath.Join(tmpDir, "projects.json")
 
-		projectsData := `{"/path/to/project1": {"claude": "work"}, "/path/to/project2": {"codex": "personal"}}`
+		projectsData := `{"associations": {"/path/to/project1": {"claude": "work"}, "/path/to/project2": {"codex": "personal"}}}`
 		if err := os.WriteFile(projectsPath, []byte(projectsData), 0600); err != nil {
 			t.Fatal(err)
 		}

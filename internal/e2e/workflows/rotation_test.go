@@ -33,7 +33,8 @@ stealth:
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0600))
 	
 	// Setup vault with 3 profiles
-	vaultDir := filepath.Join(rootDir, "caam", "vault")
+	// When CAAM_HOME is set, vault path is CAAM_HOME/data/vault (not CAAM_HOME/vault)
+	vaultDir := filepath.Join(configDir, "data", "vault")
 	h.SetEnv("XDG_DATA_HOME", rootDir)
 	h.SetEnv("CAAM_HOME", configDir)
 	
