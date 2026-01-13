@@ -68,6 +68,7 @@ func (a *APIServer) withLogging(next http.Handler) http.Handler {
 // StatusResponse is the response from /status endpoint.
 type StatusResponse struct {
 	Running        bool                    `json:"running"`
+	Backend        string                  `json:"backend"`
 	PaneCount      int                     `json:"pane_count"`
 	PendingAuths   int                     `json:"pending_auths"`
 	Panes          []PaneStatusResponse    `json:"panes"`
@@ -104,6 +105,7 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatusResponse{
 		Running:        true,
+		Backend:        a.coordinator.Backend(),
 		PaneCount:      len(trackers),
 		PendingAuths:   len(pending),
 		Panes:          panes,
