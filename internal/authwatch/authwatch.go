@@ -418,9 +418,8 @@ func (t *Tracker) SaveState() error {
 		States:    t.states,
 		UpdatedAt: time.Now(),
 	}
-	t.mu.RUnlock()
-
 	data, err := json.MarshalIndent(stateFile, "", "  ")
+	t.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
