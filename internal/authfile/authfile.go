@@ -197,6 +197,9 @@ func (v *Vault) BasePath() string {
 // DefaultVaultPath returns the default vault location.
 // Falls back to current directory if home directory cannot be determined.
 func DefaultVaultPath() string {
+	if caamHome := os.Getenv("CAAM_HOME"); caamHome != "" {
+		return filepath.Join(caamHome, "data", "vault")
+	}
 	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
 		return filepath.Join(xdgData, "caam", "vault")
 	}

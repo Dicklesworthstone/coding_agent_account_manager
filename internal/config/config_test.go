@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -75,6 +76,127 @@ func TestConfigPath(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestMigrateDataToCAAMHomeMerge(t *testing.T) {
+	xdgData := t.TempDir()
+	caamHome := t.TempDir()
+
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("CAAM_HOME", caamHome)
+
+	sourceBase := filepath.Join(xdgData, "caam")
+	targetBase := filepath.Join(caamHome, "data")
+
+	legacyPath := filepath.Join(sourceBase, "vault", "claude", "work", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0700); err != nil {
+		t.Fatalf("MkdirAll legacyPath dir: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("legacy"), 0600); err != nil {
+		t.Fatalf("WriteFile legacyPath: %v", err)
+	}
+
+	targetPath := filepath.Join(targetBase, "vault", "claude", "work", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+		t.Fatalf("MkdirAll targetPath dir: %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte("target"), 0600); err != nil {
+		t.Fatalf("WriteFile targetPath: %v", err)
+	}
+
+	legacyNewPath := filepath.Join(sourceBase, "vault", "codex", "personal", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(legacyNewPath), 0700); err != nil {
+		t.Fatalf("MkdirAll legacyNewPath dir: %v", err)
+	}
+	if err := os.WriteFile(legacyNewPath, []byte("legacy-new"), 0600); err != nil {
+		t.Fatalf("WriteFile legacyNewPath: %v", err)
+	}
+
+	linkPath := filepath.Join(sourceBase, "vault", "link.json")
+	linkTarget := filepath.Join("codex", "personal", "auth.json")
+	symlinkCreated := true
+	if err := os.Symlink(linkTarget, linkPath); err != nil {
+		symlinkCreated = false
+	}
+
+	copied, err := MigrateDataToCAAMHome()
+	if err != nil {
+		t.Fatalf("MigrateDataToCAAMHome() error = %v", err)
+	}
+	if !copied {
+		t.Fatal("MigrateDataToCAAMHome() copied = false, want true")
+	}
+
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("ReadFile targetPath: %v", err)
+	}
+	if string(data) != "target" {
+		t.Fatalf("targetPath content = %q, want %q", string(data), "target")
+	}
+
+	newTargetPath := filepath.Join(targetBase, "vault", "codex", "personal", "auth.json")
+	data, err = os.ReadFile(newTargetPath)
+	if err != nil {
+		t.Fatalf("ReadFile newTargetPath: %v", err)
+	}
+	if string(data) != "legacy-new" {
+		t.Fatalf("newTargetPath content = %q, want %q", string(data), "legacy-new")
+	}
+
+	if symlinkCreated {
+		linkDest := filepath.Join(targetBase, "vault", "link.json")
+		info, err := os.Lstat(linkDest)
+		if err != nil {
+			t.Fatalf("Lstat linkDest: %v", err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("linkDest mode = %v, want symlink", info.Mode())
+		}
+		destTarget, err := os.Readlink(linkDest)
+		if err != nil {
+			t.Fatalf("Readlink linkDest: %v", err)
+		}
+		if destTarget != linkTarget {
+			t.Fatalf("linkDest target = %q, want %q", destTarget, linkTarget)
+		}
+	}
+}
+
+func TestMigrateDataToCAAMHomeNoCAAMHome(t *testing.T) {
+	t.Setenv("CAAM_HOME", "")
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	copied, err := MigrateDataToCAAMHome()
+	if err != nil {
+		t.Fatalf("MigrateDataToCAAMHome() error = %v", err)
+	}
+	if copied {
+		t.Fatal("MigrateDataToCAAMHome() copied = true, want false")
+	}
+}
+
+func TestMigrateDataToCAAMHomeRefusesNestedTarget(t *testing.T) {
+	xdgData := t.TempDir()
+	caamHome := filepath.Join(xdgData, "caam", "nested")
+
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("CAAM_HOME", caamHome)
+
+	if err := os.MkdirAll(filepath.Join(xdgData, "caam"), 0700); err != nil {
+		t.Fatalf("MkdirAll legacy base: %v", err)
+	}
+
+	copied, err := MigrateDataToCAAMHome()
+	if err == nil {
+		t.Fatal("MigrateDataToCAAMHome() error = nil, want error")
+	}
+	if copied {
+		t.Fatal("MigrateDataToCAAMHome() copied = true, want false")
+	}
+	if !strings.Contains(err.Error(), "refusing to migrate") {
+		t.Fatalf("MigrateDataToCAAMHome() error = %q, want refusal", err.Error())
+	}
 }
 
 func TestLoadNonExistent(t *testing.T) {

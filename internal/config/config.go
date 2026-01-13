@@ -3,7 +3,10 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,8 +92,12 @@ func ConfigPath() string {
 }
 
 // DefaultDataPath returns the base caam data directory path.
-// This follows XDG Base Directory Specification.
+// If CAAM_HOME is set, data is stored under CAAM_HOME/data.
+// Otherwise, it follows XDG Base Directory Specification.
 func DefaultDataPath() string {
+	if caamHome := os.Getenv("CAAM_HOME"); caamHome != "" {
+		return filepath.Join(caamHome, "data")
+	}
 	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
 		return filepath.Join(xdgData, "caam")
 	}
@@ -100,6 +107,189 @@ func DefaultDataPath() string {
 		return filepath.Join(".local", "share", "caam")
 	}
 	return filepath.Join(homeDir, ".local", "share", "caam")
+}
+
+// MigrateDataToCAAMHome copies legacy XDG data into CAAM_HOME/data if needed.
+// It never overwrites existing files and never deletes source data.
+// Returns true if any data was copied.
+func MigrateDataToCAAMHome() (bool, error) {
+	caamHome := strings.TrimSpace(os.Getenv("CAAM_HOME"))
+	if caamHome == "" {
+		return false, nil
+	}
+
+	targetBase := filepath.Join(caamHome, "data")
+	sourceBase := legacyDataPath()
+
+	sourceAbs, sourceErr := filepath.Abs(sourceBase)
+	targetAbs, targetErr := filepath.Abs(targetBase)
+	if sourceErr == nil && targetErr == nil {
+		if sourceAbs == targetAbs {
+			return false, nil
+		}
+		if strings.HasPrefix(targetAbs, sourceAbs+string(os.PathSeparator)) {
+			return false, fmt.Errorf("refusing to migrate: CAAM_HOME data path is within legacy data path")
+		}
+	}
+
+	if _, err := os.Stat(sourceBase); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat legacy data dir: %w", err)
+	}
+
+	if err := os.MkdirAll(targetBase, 0700); err != nil {
+		return false, fmt.Errorf("create CAAM_HOME data dir: %w", err)
+	}
+
+	copied, err := copyTreeSkipExisting(sourceBase, targetBase)
+	return copied > 0, err
+}
+
+func legacyDataPath() string {
+	if xdgData := os.Getenv("XDG_DATA_HOME"); xdgData != "" {
+		return filepath.Join(xdgData, "caam")
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".local", "share", "caam")
+	}
+	return filepath.Join(homeDir, ".local", "share", "caam")
+}
+
+func copyTreeSkipExisting(src, dst string) (int, error) {
+	var copied int
+	var errs []error
+
+	walkErr := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+		if rel == "." {
+			return nil
+		}
+
+		destPath := filepath.Join(dst, rel)
+
+		if d.IsDir() {
+			if info, err := os.Stat(destPath); err == nil {
+				if !info.IsDir() {
+					errs = append(errs, fmt.Errorf("destination %s exists and is not a directory", destPath))
+				}
+				return nil
+			}
+			if err := os.MkdirAll(destPath, 0700); err != nil {
+				errs = append(errs, err)
+			}
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			if _, err := os.Lstat(destPath); err == nil {
+				return nil
+			}
+			target, err := os.Readlink(path)
+			if err != nil {
+				errs = append(errs, err)
+				return nil
+			}
+			if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
+				errs = append(errs, err)
+				return nil
+			}
+			if err := os.Symlink(target, destPath); err != nil {
+				errs = append(errs, err)
+				return nil
+			}
+			copied++
+			return nil
+		}
+
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		if info, err := os.Stat(destPath); err == nil {
+			if info.IsDir() {
+				errs = append(errs, fmt.Errorf("destination %s is a directory, expected file", destPath))
+			}
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+		if err := copyFileAtomic(path, destPath, 0600); err != nil {
+			errs = append(errs, err)
+			return nil
+		}
+		copied++
+		return nil
+	})
+
+	if walkErr != nil {
+		errs = append(errs, walkErr)
+	}
+
+	if len(errs) > 0 {
+		return copied, errors.Join(errs...)
+	}
+	return copied, nil
+}
+
+func copyFileAtomic(src, dst string, mode os.FileMode) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(dst)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	if err := tmpFile.Chmod(mode); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return err
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, dst)
 }
 
 // Load reads the configuration from disk.

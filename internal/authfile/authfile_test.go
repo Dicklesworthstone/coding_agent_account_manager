@@ -20,10 +20,23 @@ func TestNewVault(t *testing.T) {
 
 func TestDefaultVaultPath(t *testing.T) {
 	// Save and restore environment
+	origCaamHome := os.Getenv("CAAM_HOME")
 	origXDG := os.Getenv("XDG_DATA_HOME")
+	defer os.Setenv("CAAM_HOME", origCaamHome)
 	defer os.Setenv("XDG_DATA_HOME", origXDG)
 
+	t.Run("with CAAM_HOME set", func(t *testing.T) {
+		os.Setenv("CAAM_HOME", "/custom/caam")
+		os.Setenv("XDG_DATA_HOME", "/custom/data")
+		path := DefaultVaultPath()
+		want := "/custom/caam/data/vault"
+		if path != want {
+			t.Errorf("DefaultVaultPath() = %q, want %q", path, want)
+		}
+	})
+
 	t.Run("with XDG_DATA_HOME set", func(t *testing.T) {
+		os.Unsetenv("CAAM_HOME")
 		os.Setenv("XDG_DATA_HOME", "/custom/data")
 		path := DefaultVaultPath()
 		want := "/custom/data/caam/vault"
@@ -33,6 +46,7 @@ func TestDefaultVaultPath(t *testing.T) {
 	})
 
 	t.Run("without XDG_DATA_HOME", func(t *testing.T) {
+		os.Unsetenv("CAAM_HOME")
 		os.Unsetenv("XDG_DATA_HOME")
 		path := DefaultVaultPath()
 		homeDir, _ := os.UserHomeDir()
