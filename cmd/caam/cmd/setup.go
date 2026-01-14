@@ -54,6 +54,8 @@ func init() {
 	setupDistributedCmd.Flags().String("wezterm-config", "", "path to wezterm.lua (default: auto-detect)")
 	setupDistributedCmd.Flags().Bool("use-tailscale", true, "prefer Tailscale IPs when available")
 	setupDistributedCmd.Flags().Bool("dry-run", false, "show what would be done without making changes")
+	setupDistributedCmd.Flags().Bool("yes", false, "skip confirmation prompt")
+	setupDistributedCmd.Flags().Bool("print-script", false, "print a pasteable setup script and exit")
 	setupDistributedCmd.Flags().Int("local-port", 7891, "port for local auth-agent")
 	setupDistributedCmd.Flags().Int("remote-port", 7890, "port for remote coordinators")
 	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these domain names")
@@ -66,6 +68,8 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	useTailscale, _ := cmd.Flags().GetBool("use-tailscale")
 	noTailscale, _ := cmd.Flags().GetBool("no-tailscale")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	assumeYes, _ := cmd.Flags().GetBool("yes")
+	printScript, _ := cmd.Flags().GetBool("print-script")
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")
 	remotes, _ := cmd.Flags().GetStringSlice("remotes")
@@ -102,8 +106,24 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no remote machines to setup")
 	}
 
+	if printScript {
+		script, err := orch.BuildSetupScript(setup.ScriptOptions{
+			WezTermConfig: weztermConfig,
+			UseTailscale:  useTailscale,
+			LocalPort:     localPort,
+			RemotePort:    remotePort,
+			Remotes:       remotes,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println("=== Pasteable Setup Script ===")
+		fmt.Println(script)
+		return nil
+	}
+
 	// Confirm before proceeding
-	if !dryRun {
+	if !dryRun && !assumeYes {
 		fmt.Printf("\nReady to deploy coordinators to %d remote machine(s).\n", len(remoteMachines))
 		fmt.Print("Continue? [y/N]: ")
 		var confirm string

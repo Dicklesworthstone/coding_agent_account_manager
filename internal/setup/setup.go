@@ -76,12 +76,21 @@ func DefaultOptions() Options {
 
 // Orchestrator handles the setup process.
 type Orchestrator struct {
-	opts          Options
-	logger        *slog.Logger
-	weztermConfig *wezterm.Config
-	tailscale     *tailscale.Client
-	localMachine  *DiscoveredMachine
+	opts           Options
+	logger         *slog.Logger
+	weztermConfig  *wezterm.Config
+	tailscale      *tailscale.Client
+	localMachine   *DiscoveredMachine
 	remoteMachines []*DiscoveredMachine
+}
+
+// ScriptOptions controls the generated setup script.
+type ScriptOptions struct {
+	WezTermConfig string
+	UseTailscale  bool
+	LocalPort     int
+	RemotePort    int
+	Remotes       []string
 }
 
 // NewOrchestrator creates a new setup orchestrator.
@@ -262,6 +271,70 @@ func (o *Orchestrator) GetLocalMachine() *DiscoveredMachine {
 	return o.localMachine
 }
 
+// BuildSetupScript returns a pasteable bash script for running setup and follow-up checks.
+func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
+	if o.localMachine == nil {
+		return "", fmt.Errorf("discovery not run")
+	}
+	if len(o.remoteMachines) == 0 {
+		return "", fmt.Errorf("no remote machines discovered")
+	}
+
+	var b strings.Builder
+	b.WriteString("#!/usr/bin/env bash\n")
+	b.WriteString("set -euo pipefail\n\n")
+	b.WriteString("# 1) Setup coordinators and local agent config\n")
+	b.WriteString("caam setup distributed --yes")
+	if opts.WezTermConfig != "" {
+		b.WriteString(" --wezterm-config ")
+		b.WriteString(shellQuote(opts.WezTermConfig))
+	}
+	if !opts.UseTailscale {
+		b.WriteString(" --no-tailscale")
+	}
+	if opts.LocalPort != 0 && opts.LocalPort != 7891 {
+		b.WriteString(fmt.Sprintf(" --local-port %d", opts.LocalPort))
+	}
+	if opts.RemotePort != 0 && opts.RemotePort != 7890 {
+		b.WriteString(fmt.Sprintf(" --remote-port %d", opts.RemotePort))
+	}
+	if len(opts.Remotes) > 0 {
+		b.WriteString(" --remotes ")
+		b.WriteString(shellQuote(strings.Join(opts.Remotes, ",")))
+	}
+	b.WriteString("\n\n")
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		configDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+
+	b.WriteString("# 2) Inspect and edit the local agent config\n")
+	b.WriteString(fmt.Sprintf("CONFIG_PATH=%s\n", shellQuote(configPath)))
+	b.WriteString("echo \"Edit $CONFIG_PATH to set chrome_profile and accounts\"\n\n")
+
+	b.WriteString("# 3) Check coordinator service status on remotes\n")
+	for _, m := range o.remoteMachines {
+		sshCmd := buildSSHCommand(m, opts)
+		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote("systemctl --user status caam-coordinator --no-pager")))
+	}
+	b.WriteString("\n")
+
+	b.WriteString("# 4) Smoke test coordinator status endpoints\n")
+	for _, m := range o.remoteMachines {
+		addr := m.PublicIP
+		if opts.UseTailscale && m.TailscaleIP != "" {
+			addr = m.TailscaleIP
+		}
+		b.WriteString(fmt.Sprintf("curl -fsS http://%s:%d/status\n", addr, opts.RemotePort))
+	}
+	b.WriteString("\n")
+	b.WriteString("# 5) Start the local auth agent\n")
+	b.WriteString("caam auth-agent --config \"$CONFIG_PATH\"\n")
+	return b.String(), nil
+}
+
 // TestConnectivity tests SSH connectivity to a machine.
 func (o *Orchestrator) TestConnectivity(ctx context.Context, m *DiscoveredMachine) error {
 	machine := o.toSyncMachine(m)
@@ -413,18 +486,18 @@ func (o *Orchestrator) generateLocalConfig() (string, error) {
 	}
 
 	config := struct {
-		Port         int                          `json:"port"`
-		Coordinators []*agent.CoordinatorEndpoint `json:"coordinators"`
-		PollInterval string                       `json:"poll_interval"`
-		Accounts     []string                     `json:"accounts"`
-		Strategy     string                       `json:"strategy"`
-		ChromeProfile string                      `json:"chrome_profile"`
+		Port          int                          `json:"port"`
+		Coordinators  []*agent.CoordinatorEndpoint `json:"coordinators"`
+		PollInterval  string                       `json:"poll_interval"`
+		Accounts      []string                     `json:"accounts"`
+		Strategy      string                       `json:"strategy"`
+		ChromeProfile string                       `json:"chrome_profile"`
 	}{
-		Port:         o.opts.LocalPort,
-		Coordinators: coordinators,
-		PollInterval: "2s",
-		Accounts:     []string{},
-		Strategy:     "lru",
+		Port:          o.opts.LocalPort,
+		Coordinators:  coordinators,
+		PollInterval:  "2s",
+		Accounts:      []string{},
+		Strategy:      "lru",
 		ChromeProfile: "",
 	}
 
@@ -497,6 +570,43 @@ func (o *Orchestrator) PrintDiscoveryResults() {
 		fmt.Printf("    User: %s\n", m.Username)
 		fmt.Printf("    Role: %s\n", m.Role)
 	}
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexFunc(s, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\'' || r == '"' || r == '\\' || r == '$' || r == '`'
+	}) == -1 {
+		return s
+	}
+	// Single-quote and escape existing single quotes.
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func buildSSHCommand(m *DiscoveredMachine, opts ScriptOptions) string {
+	addr := m.PublicIP
+	if opts.UseTailscale && m.TailscaleIP != "" {
+		addr = m.TailscaleIP
+	}
+
+	var b strings.Builder
+	b.WriteString("ssh")
+	if m.IdentityFile != "" {
+		b.WriteString(" -i ")
+		b.WriteString(shellQuote(m.IdentityFile))
+	}
+	if m.Port != 0 && m.Port != 22 {
+		b.WriteString(fmt.Sprintf(" -p %d", m.Port))
+	}
+	b.WriteString(" ")
+	if m.Username != "" {
+		b.WriteString(m.Username)
+		b.WriteString("@")
+	}
+	b.WriteString(addr)
+	return b.String()
 }
 
 // Helper functions

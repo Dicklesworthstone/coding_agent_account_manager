@@ -564,6 +564,7 @@ type Watcher struct {
 	done     chan struct{}
 	mu       sync.Mutex
 	running  bool
+	stopOnce sync.Once // Ensures done channel is only closed once
 }
 
 // NewWatcher creates a new auth file watcher.
@@ -586,10 +587,15 @@ func (w *Watcher) Start() error {
 	w.running = true
 	// Recreate done channel in case watcher was previously stopped
 	w.done = make(chan struct{})
+	w.stopOnce = sync.Once{} // Reset for new Start cycle
 	w.mu.Unlock()
 
 	// Capture initial state
 	if _, err := w.tracker.CaptureAll(); err != nil {
+		// Reset running state on failure so Start() can be called again
+		w.mu.Lock()
+		w.running = false
+		w.mu.Unlock()
 		return err
 	}
 
@@ -622,5 +628,9 @@ func (w *Watcher) Stop() {
 	}
 
 	w.running = false
-	close(w.done)
+	// Use sync.Once to ensure done channel is only closed once, preventing panic
+	// if Stop() is called concurrently or multiple times.
+	w.stopOnce.Do(func() {
+		close(w.done)
+	})
 }

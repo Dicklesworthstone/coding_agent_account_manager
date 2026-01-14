@@ -981,6 +981,59 @@ func TestWatcherStopNotRunning(t *testing.T) {
 	w.Stop()
 }
 
+func TestWatcherStartAfterCaptureError(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	// Set CODEX_HOME to a path that will cause CaptureAll to work
+	// but first we test with an invalid provider setup
+	oldCodexHome := os.Getenv("CODEX_HOME")
+	os.Setenv("CODEX_HOME", filepath.Join(tmpDir, "codex"))
+	defer os.Setenv("CODEX_HOME", oldCodexHome)
+
+	w := NewWatcher(vault, nil)
+
+	// Start should succeed since CaptureAll handles missing files gracefully
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Start()
+	}()
+
+	// Give it time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop
+	w.Stop()
+
+	// Should return without error
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Start did not return after Stop")
+	}
+
+	// Now we can start again (this tests that running was properly reset)
+	errCh2 := make(chan error, 1)
+	go func() {
+		errCh2 <- w.Start()
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	w.Stop()
+
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			t.Errorf("Second Start returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Second Start did not return after Stop")
+	}
+}
+
 func TestWatcherDetectsChanges(t *testing.T) {
 	tmpDir := t.TempDir()
 	vault := authfile.NewVault(tmpDir)

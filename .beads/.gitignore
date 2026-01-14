@@ -12,8 +12,14 @@ daemon.pid
 bd.sock
 bd.sock.startlock
 
+# Sync runtime/backoff state (created/removed by bd sync)
+sync-state.json
+
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
+
+# Session touch file (ephemeral session identifier)
+last-touched
 
 # Legacy database files
 db.sqlite

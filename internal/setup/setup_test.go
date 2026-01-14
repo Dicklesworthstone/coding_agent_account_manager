@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -218,5 +219,63 @@ func TestRemotesFilter(t *testing.T) {
 	// Should not match
 	if contains(remotes, "trj") {
 		t.Error("expected trj to not be in remotes")
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"simple", "simple"},
+		{"a b", "'a b'"},
+		{"a'b", "'a'\\''b'"},
+		{"", "''"},
+	}
+
+	for _, tt := range tests {
+		got := shellQuote(tt.input)
+		if got != tt.expected {
+			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestBuildSetupScript(t *testing.T) {
+	orch := NewOrchestrator(DefaultOptions())
+	orch.localMachine = &DiscoveredMachine{
+		Name:    "local",
+		IsLocal: true,
+	}
+	orch.remoteMachines = []*DiscoveredMachine{
+		{
+			Name:          "csd",
+			WezTermDomain: "csd",
+			PublicIP:      "1.2.3.4",
+			TailscaleIP:   "100.100.118.85",
+			Username:      "ubuntu",
+			Port:          2222,
+			IdentityFile:  "/tmp/id_ed25519",
+		},
+	}
+
+	script, err := orch.BuildSetupScript(ScriptOptions{
+		UseTailscale: true,
+		RemotePort:   7890,
+	})
+	if err != nil {
+		t.Fatalf("BuildSetupScript error: %v", err)
+	}
+	if !strings.Contains(script, "caam setup distributed --yes") {
+		t.Error("expected setup command in script")
+	}
+	if !strings.Contains(script, "curl -fsS http://100.100.118.85:7890/status") {
+		t.Error("expected tailscale status curl in script")
+	}
+	if !strings.Contains(script, "ssh -i /tmp/id_ed25519 -p 2222 ubuntu@100.100.118.85") {
+		t.Error("expected ssh status command in script")
+	}
+	if !strings.Contains(script, "caam auth-agent --config \"$CONFIG_PATH\"") {
+		t.Error("expected auth-agent start in script")
 	}
 }
