@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DefaultPassthroughs returns the default set of paths to symlink.
@@ -75,9 +76,25 @@ func NewManagerWithPaths(paths []string) (*Manager, error) {
 
 // SetupPassthroughs creates symlinks in the pseudo-HOME directory.
 func (m *Manager) SetupPassthroughs(pseudoHome string) error {
+	absPseudo, err := filepath.Abs(pseudoHome)
+	if err != nil {
+		return fmt.Errorf("resolve absolute path for pseudo home: %w", err)
+	}
+
 	for _, relPath := range m.passthroughs {
 		realPath := filepath.Join(m.realHome, relPath)
 		linkPath := filepath.Join(pseudoHome, relPath)
+
+		// Security check: prevent path traversal
+		absLink, err := filepath.Abs(linkPath)
+		if err != nil {
+			continue // Skip invalid paths
+		}
+		if !strings.HasPrefix(absLink, absPseudo+string(os.PathSeparator)) {
+			// This path attempts to escape the pseudo home directory
+			// Skip it to prevent overwriting files outside the profile
+			continue
+		}
 
 		// Skip if source doesn't exist
 		if _, err := os.Stat(realPath); os.IsNotExist(err) {
@@ -108,6 +125,11 @@ func (m *Manager) SetupPassthroughs(pseudoHome string) error {
 
 // VerifyPassthroughs checks the state of all passthrough symlinks.
 func (m *Manager) VerifyPassthroughs(pseudoHome string) ([]Status, error) {
+	absPseudo, err := filepath.Abs(pseudoHome)
+	if err != nil {
+		return nil, fmt.Errorf("resolve absolute path for pseudo home: %w", err)
+	}
+
 	var statuses []Status
 
 	for _, relPath := range m.passthroughs {
@@ -115,6 +137,19 @@ func (m *Manager) VerifyPassthroughs(pseudoHome string) ([]Status, error) {
 		linkPath := filepath.Join(pseudoHome, relPath)
 
 		status := Status{Path: relPath}
+
+		// Security check: prevent path traversal report
+		absLink, err := filepath.Abs(linkPath)
+		if err != nil {
+			status.Error = fmt.Sprintf("invalid path: %v", err)
+			statuses = append(statuses, status)
+			continue
+		}
+		if !strings.HasPrefix(absLink, absPseudo+string(os.PathSeparator)) {
+			status.Error = "invalid path: escapes profile directory"
+			statuses = append(statuses, status)
+			continue
+		}
 
 		// Check if source exists
 		if _, err := os.Stat(realPath); err == nil {
