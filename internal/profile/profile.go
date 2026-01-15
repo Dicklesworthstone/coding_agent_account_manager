@@ -800,36 +800,45 @@ func copyAuthFiles(source, target *Profile) error {
 	return nil
 }
 
-// copyDir copies contents from src to dst directory.
-// Only copies files, not subdirectories (auth files are flat).
+// copyDir copies contents from src to dst directory recursively.
 func copyDir(src, dst string) error {
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Source doesn't exist, nothing to copy
-		}
-		return err
+	if _, err := os.Stat(src); os.IsNotExist(err) {
+		return nil // Source doesn't exist, nothing to copy
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue // Skip subdirectories
-		}
-
-		srcPath := filepath.Join(src, entry.Name())
-		dstPath := filepath.Join(dst, entry.Name())
-
-		data, err := os.ReadFile(srcPath)
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return fmt.Errorf("read %s: %w", srcPath, err)
+			return err
 		}
 
-		if err := os.WriteFile(dstPath, data, 0600); err != nil {
-			return fmt.Errorf("write %s: %w", dstPath, err)
+		// Calculate relative path
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
 		}
-	}
 
-	return nil
+		if rel == "." {
+			return nil
+		}
+
+		targetPath := filepath.Join(dst, rel)
+
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, info.Mode())
+		}
+
+		// Copy file
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+
+		if err := os.WriteFile(targetPath, data, info.Mode()); err != nil {
+			return fmt.Errorf("write %s: %w", targetPath, err)
+		}
+
+		return nil
+	})
 }
 
 // Exists checks if a profile exists.

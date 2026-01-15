@@ -72,18 +72,32 @@ func scanTool(tool Tool) *DiscoveredAuth {
 		return nil
 	}
 
-	// Check if any required auth file exists
+	// Check for auth files
 	var primaryPath string
+	foundRequired := false
+
 	for _, spec := range fileSet.Files {
-		if spec.Required {
-			if _, err := os.Stat(spec.Path); err == nil {
-				primaryPath = spec.Path
-				break
+		if _, err := os.Stat(spec.Path); err == nil {
+			if spec.Required {
+				foundRequired = true
+				if primaryPath == "" {
+					primaryPath = spec.Path
+				}
+			} else {
+				// If we haven't found a required file yet, use this as candidate
+				if primaryPath == "" {
+					primaryPath = spec.Path
+				}
 			}
 		}
 	}
 
 	if primaryPath == "" {
+		return nil
+	}
+
+	// Verify we met requirements
+	if !foundRequired && !fileSet.AllowOptionalOnly {
 		return nil
 	}
 
