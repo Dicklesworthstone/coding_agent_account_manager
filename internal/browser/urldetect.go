@@ -15,6 +15,10 @@ import (
 // Matches: http://localhost:PORT/path?query or http://127.0.0.1:PORT/path?query
 var URLPattern = regexp.MustCompile(`https?://(?:localhost|127\.0\.0\.1):[0-9]+[^\s"']*`)
 
+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).
+// This prevents unbounded memory growth when output contains no newlines.
+const maxBufferSize = 64 * 1024
+
 // URLCallback is called when a URL is detected in the output.
 // Note: The return value is currently unused; all output is passed through.
 type URLCallback func(url string) bool
@@ -77,6 +81,19 @@ func (d *URLDetector) Write(p []byte) (n int, err error) {
 		}
 
 		d.buffer = d.buffer[idx+1:]
+	}
+
+	// Enforce buffer limit to prevent OOM on long lines without newlines
+	if len(d.buffer) > maxBufferSize {
+		// Process oversized buffer before clearing
+		if d.callback != nil {
+			lineStr := string(d.buffer)
+			urls := URLPattern.FindAllString(lineStr, -1)
+			for _, url := range urls {
+				d.callback(cleanURL(url))
+			}
+		}
+		d.buffer = nil
 	}
 
 	// Always pass through to output
@@ -266,6 +283,26 @@ func (w *captureWriter) Write(p []byte) (n int, err error) {
 			}
 
 			w.buffer = w.buffer[idx+1:]
+		}
+
+		// Enforce buffer limit to prevent OOM on long lines without newlines
+		if len(w.buffer) > maxBufferSize {
+			// Process oversized buffer before clearing
+			lineStr := string(w.buffer)
+			urls := URLPattern.FindAllString(lineStr, -1)
+			for _, url := range urls {
+				cleaned := cleanURL(url)
+				w.capture.mu.Lock()
+				w.capture.DetectedURLs = append(w.capture.DetectedURLs, DetectedURL{
+					URL:    cleaned,
+					Source: w.source,
+				})
+				if w.capture.OnURL != nil {
+					w.capture.OnURL(cleaned, w.source)
+				}
+				w.capture.mu.Unlock()
+			}
+			w.buffer = nil
 		}
 		w.mu.Unlock()
 	}

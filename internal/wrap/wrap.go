@@ -410,6 +410,10 @@ func (w *Wrapper) runOnce(ctx context.Context, profile string) (int, bool, error
 	return exitCode, rateLimitHit, nil
 }
 
+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).
+// This prevents unbounded memory growth when output contains no newlines.
+const maxBufferSize = 64 * 1024
+
 // teeWriter writes to a destination while also checking for rate limits.
 // It buffers data to ensure rate limit patterns aren't missed when split
 // across multiple Write calls (e.g., "rate li" then "mit exceeded").
@@ -444,6 +448,11 @@ func (t *teeWriter) Write(p []byte) (n int, err error) {
 	// (e.g., JSON error response or final output)
 	if len(t.buffer) > 0 {
 		t.detector.Check(string(t.buffer))
+	}
+
+	// Enforce buffer limit to prevent OOM on long lines without newlines
+	if len(t.buffer) > maxBufferSize {
+		t.buffer = nil
 	}
 
 	// Forward to destination

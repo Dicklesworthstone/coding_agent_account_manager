@@ -124,19 +124,29 @@ func NewDetector(provider Provider, customPatterns []string) (*Detector, error) 
 // Returns true if a rate limit pattern is detected.
 // The detection is sticky - once detected, it remains true.
 func (d *Detector) Check(text string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
+	// Fast path: check if already detected using read lock
+	d.mu.RLock()
 	if d.detected {
+		d.mu.RUnlock()
 		return true
 	}
+	// Capture patterns while holding read lock (patterns slice is immutable after creation)
+	patterns := d.patterns
+	d.mu.RUnlock()
 
-	for _, re := range d.patterns {
+	// Perform expensive regex matching outside the lock
+	for _, re := range patterns {
 		if re.MatchString(text) {
-			d.detected = true
-			// Extract the matching portion for the reason
-			match := re.FindString(text)
-			d.reason = strings.TrimSpace(match)
+			// Only acquire write lock when updating state
+			d.mu.Lock()
+			// Double-check in case another goroutine set it while we were matching
+			if !d.detected {
+				d.detected = true
+				// Extract the matching portion for the reason
+				match := re.FindString(text)
+				d.reason = strings.TrimSpace(match)
+			}
+			d.mu.Unlock()
 			return true
 		}
 	}
@@ -172,6 +182,10 @@ func (d *Detector) Provider() Provider {
 	defer d.mu.RUnlock()
 	return d.provider
 }
+
+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).
+// This prevents unbounded memory growth when output contains no newlines.
+const maxBufferSize = 64 * 1024
 
 // ObservingWriter wraps a writer and checks each write for rate limit patterns.
 type ObservingWriter struct {
@@ -216,6 +230,25 @@ func (w *ObservingWriter) Write(p []byte) (n int, err error) {
 		if w.callback != nil {
 			w.callback(line)
 		}
+	}
+
+	// Enforce buffer limit to prevent OOM on long lines without newlines
+	if len(w.buffer) > maxBufferSize {
+		// Process oversized buffer as a partial line
+		line := string(w.buffer)
+		w.detector.Check(line)
+		if w.callback != nil {
+			w.callback(line)
+		}
+		w.buffer = nil
+	}
+
+	// Compact buffer if it has grown large but contains little data
+	// (capacity > 4KB and usage < 25%)
+	if cap(w.buffer) > 4096 && len(w.buffer) < cap(w.buffer)/4 {
+		newBuf := make([]byte, len(w.buffer))
+		copy(newBuf, w.buffer)
+		w.buffer = newBuf
 	}
 
 	return n, nil
