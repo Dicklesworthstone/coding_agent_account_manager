@@ -190,16 +190,20 @@ func (c *Coordinator) Stop() error {
 		return nil
 	}
 	c.running = false
+	// Capture channels under lock to prevent TOCTOU race with Start()
+	// which might create new channels before we close these
+	stopCh := c.stopCh
+	doneCh := c.doneCh
 	c.mu.Unlock()
 
 	// Close stopCh only once (safe since we checked running flag under lock)
 	select {
-	case <-c.stopCh:
+	case <-stopCh:
 		// Already closed
 	default:
-		close(c.stopCh)
+		close(stopCh)
 	}
-	<-c.doneCh
+	<-doneCh
 	return nil
 }
 

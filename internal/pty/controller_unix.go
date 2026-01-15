@@ -3,7 +3,6 @@
 package pty
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -21,15 +20,13 @@ import (
 
 // unixController implements Controller for Unix systems (Linux, macOS, BSD).
 type unixController struct {
-	cmd    *exec.Cmd
-	ptmx   *os.File // PTY master
-	reader *bufio.Reader
-	opts   *Options
+	cmd  *exec.Cmd
+	ptmx *os.File // PTY master
+	opts *Options
 
-	mu        sync.Mutex
-	started   bool
-	closed    bool
-	outputBuf []byte
+	mu      sync.Mutex
+	started bool
+	closed  bool
 }
 
 // NewController creates a new PTY controller wrapping the given command.
@@ -86,7 +83,6 @@ func (c *unixController) Start() error {
 	}
 
 	c.ptmx = ptmx
-	c.reader = bufio.NewReader(ptmx)
 	c.started = true
 
 	return nil
@@ -191,8 +187,7 @@ func fdIsSet(fd int, set *unix.FdSet) bool {
 }
 
 // ReadLine reads a single line from the PTY output.
-// Note: This spawns a goroutine that may outlive context cancellation.
-// The goroutine will terminate when Close() is called.
+// Uses select() with short timeouts for interruptibility without goroutine leaks.
 func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	if !c.started {
@@ -203,32 +198,65 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 		c.mu.Unlock()
 		return "", ErrClosed
 	}
-	reader := c.reader
+	ptmx := c.ptmx
 	c.mu.Unlock()
 
-	// Use a goroutine to make ReadLine cancellable
-	type result struct {
-		line string
-		err  error
+	fd := int(ptmx.Fd())
+	if fd < 0 {
+		return "", fmt.Errorf("invalid pty fd")
 	}
-	ch := make(chan result, 1)
 
-	go func() {
-		line, err := reader.ReadString('\n')
-		ch <- result{line, err}
-	}()
+	var line []byte
+	buf := make([]byte, 1)
 
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case r := <-ch:
-		return r.line, r.err
+	for {
+		// Check context cancellation first
+		select {
+		case <-ctx.Done():
+			return string(line), ctx.Err()
+		default:
+		}
+
+		// Use select() with short timeout for interruptibility
+		var readfds unix.FdSet
+		if err := fdSet(fd, &readfds); err != nil {
+			return string(line), err
+		}
+
+		// 100ms timeout allows context cancellation checks
+		selectTimeout := unix.Timeval{Sec: 0, Usec: 100000}
+		n, err := unix.Select(fd+1, &readfds, nil, nil, &selectTimeout)
+		if err != nil {
+			if err == unix.EINTR {
+				continue // Interrupted, retry
+			}
+			return string(line), fmt.Errorf("select on pty: %w", err)
+		}
+
+		if n == 0 || !fdIsSet(fd, &readfds) {
+			// Timeout - loop back to check context
+			continue
+		}
+
+		// Data available, read one byte at a time
+		nread, err := ptmx.Read(buf)
+		if nread > 0 {
+			line = append(line, buf[0])
+			if buf[0] == '\n' {
+				return string(line), nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return string(line), io.EOF
+			}
+			return string(line), fmt.Errorf("read from pty: %w", err)
+		}
 	}
 }
 
 // WaitForPattern reads output until the pattern matches or timeout.
-// Note: This spawns a reader goroutine that may outlive the timeout.
-// The goroutine will terminate when Close() is called.
+// Uses select() with short timeouts for interruptibility without goroutine leaks.
 func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Regexp, timeout time.Duration) (string, error) {
 	if pattern == nil {
 		return "", fmt.Errorf("pattern cannot be nil")
@@ -245,66 +273,59 @@ func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Reg
 	ptmx := c.ptmx
 	c.mu.Unlock()
 
-	var output []byte
-
-	// Read data in a goroutine to make it interruptible
-	type readResult struct {
-		data []byte
-		err  error
+	fd := int(ptmx.Fd())
+	if fd < 0 {
+		return "", fmt.Errorf("invalid pty fd")
 	}
-	readCh := make(chan readResult, 1)
 
-	// Start a reader goroutine
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			n, err := ptmx.Read(buf)
-			if n > 0 {
-				// Copy the data to avoid race with buffer reuse
-				data := make([]byte, n)
-				copy(data, buf[:n])
-				select {
-				case readCh <- readResult{data: data}:
-				case <-ctx.Done():
-					return
-				}
-			}
-			if err != nil {
-				select {
-				case readCh <- readResult{err: err}:
-				case <-ctx.Done():
-				}
-				return
-			}
-		}
-	}()
+	var output []byte
+	buf := make([]byte, 4096)
 
 	for {
+		// Check context cancellation first
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
 				return string(output), ErrTimeout
 			}
 			return string(output), ctx.Err()
+		default:
+		}
 
-		case result := <-readCh:
-			if result.err != nil {
-				if result.err == io.EOF {
-					return string(output), io.EOF
-				}
-				return string(output), fmt.Errorf("read from pty: %w", result.err)
+		// Use select() with short timeout for interruptibility
+		var readfds unix.FdSet
+		if err := fdSet(fd, &readfds); err != nil {
+			return string(output), err
+		}
+
+		// 100ms timeout allows context cancellation checks
+		selectTimeout := unix.Timeval{Sec: 0, Usec: 100000}
+		n, err := unix.Select(fd+1, &readfds, nil, nil, &selectTimeout)
+		if err != nil {
+			if err == unix.EINTR {
+				continue // Interrupted, retry
 			}
+			return string(output), fmt.Errorf("select on pty: %w", err)
+		}
 
-			output = append(output, result.data...)
+		if n == 0 || !fdIsSet(fd, &readfds) {
+			// Timeout - loop back to check context
+			continue
+		}
+
+		// Data available, read it
+		nread, err := ptmx.Read(buf)
+		if nread > 0 {
+			output = append(output, buf[:nread]...)
 			if pattern.Match(output) {
 				return string(output), nil
 			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return string(output), io.EOF
+			}
+			return string(output), fmt.Errorf("read from pty: %w", err)
 		}
 	}
 }

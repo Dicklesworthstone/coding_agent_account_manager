@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -68,7 +67,8 @@ var RefreshGeminiToken = func(ctx context.Context, clientID, clientSecret, refre
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
+		// Use bounded read to prevent memory exhaustion from large error responses
+		body, err := readLimitedBody(resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("gemini refresh error %d (failed to read body: %v)", resp.StatusCode, err)
 		}

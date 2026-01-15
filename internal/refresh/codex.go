@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"time"
@@ -57,7 +56,8 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
+		// Use bounded read to prevent memory exhaustion from large error responses
+		body, err := readLimitedBody(resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("codex refresh error %d (failed to read body: %v)", resp.StatusCode, err)
 		}

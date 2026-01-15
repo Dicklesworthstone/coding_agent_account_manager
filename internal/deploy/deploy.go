@@ -274,12 +274,15 @@ func (d *Deployer) UploadBinary(ctx context.Context) (string, error) {
 	}
 
 	// Move to final location with sudo if needed
+	// Shell-escape paths to prevent command injection
 	installPath := "/usr/local/bin/caam"
-	_, err = d.RunCommand(ctx, fmt.Sprintf("sudo mv %s /usr/local/bin/caam && sudo chmod 755 /usr/local/bin/caam", tempPath))
+	escapedTempPath := shellEscape(tempPath)
+	escapedHome := shellEscape(home)
+	_, err = d.RunCommand(ctx, fmt.Sprintf("sudo mv %s /usr/local/bin/caam && sudo chmod 755 /usr/local/bin/caam", escapedTempPath))
 	if err != nil {
 		// Try without sudo - install to ~/bin
 		installPath = home + "/bin/caam"
-		_, err = d.RunCommand(ctx, fmt.Sprintf("mkdir -p %s/bin && mv %s %s/bin/caam && chmod 755 %s/bin/caam", home, tempPath, home, home))
+		_, err = d.RunCommand(ctx, fmt.Sprintf("mkdir -p %s/bin && mv %s %s/bin/caam && chmod 755 %s/bin/caam", escapedHome, escapedTempPath, escapedHome, escapedHome))
 		if err != nil {
 			return "", fmt.Errorf("failed to install binary: %w", err)
 		}
@@ -307,7 +310,8 @@ func (d *Deployer) findBinaryPath(ctx context.Context) string {
 	}
 
 	for _, loc := range locations {
-		if output, err := d.RunCommand(ctx, "test -x "+loc+" && echo yes"); err == nil {
+		// Shell-escape location to prevent command injection
+		if output, err := d.RunCommand(ctx, "test -x "+shellEscape(loc)+" && echo yes"); err == nil {
 			if strings.TrimSpace(output) == "yes" {
 				return loc
 			}
@@ -433,8 +437,8 @@ func (d *Deployer) WriteSystemdUnit(ctx context.Context, name string, config Sys
 		"path", unitPath,
 		"machine", d.machine.Name)
 
-	// Create directory
-	if _, err := d.RunCommand(ctx, fmt.Sprintf("mkdir -p %s", unitDir)); err != nil {
+	// Create directory (shell-escape to prevent injection)
+	if _, err := d.RunCommand(ctx, fmt.Sprintf("mkdir -p %s", shellEscape(unitDir))); err != nil {
 		return fmt.Errorf("failed to create systemd directory: %w", err)
 	}
 
@@ -462,13 +466,14 @@ func (d *Deployer) EnableAndStartService(ctx context.Context, name string) error
 		return fmt.Errorf("daemon-reload failed: %w", err)
 	}
 
-	// Enable service
-	if _, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user enable %s", name)); err != nil {
+	// Enable service (shell-escape name to prevent injection)
+	escapedName := shellEscape(name)
+	if _, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user enable %s", escapedName)); err != nil {
 		return fmt.Errorf("enable failed: %w", err)
 	}
 
 	// Start service
-	if _, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user restart %s", name)); err != nil {
+	if _, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user restart %s", escapedName)); err != nil {
 		return fmt.Errorf("start failed: %w", err)
 	}
 
@@ -477,7 +482,8 @@ func (d *Deployer) EnableAndStartService(ctx context.Context, name string) error
 
 // GetServiceStatus gets the status of a systemd user service.
 func (d *Deployer) GetServiceStatus(ctx context.Context, name string) (string, error) {
-	output, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user status %s --no-pager 2>/dev/null | head -3 || echo 'not found'", name))
+	// Shell-escape name to prevent injection
+	output, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user status %s --no-pager 2>/dev/null | head -3 || echo 'not found'", shellEscape(name)))
 	if err != nil {
 		return "unknown", nil
 	}
@@ -486,7 +492,8 @@ func (d *Deployer) GetServiceStatus(ctx context.Context, name string) (string, e
 
 // StopService stops a systemd user service.
 func (d *Deployer) StopService(ctx context.Context, name string) error {
-	_, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user stop %s 2>/dev/null || true", name))
+	// Shell-escape name to prevent injection
+	_, err := d.RunCommand(ctx, fmt.Sprintf("systemctl --user stop %s 2>/dev/null || true", shellEscape(name)))
 	return err
 }
 
@@ -620,6 +627,15 @@ func expandPath(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+// shellEscape escapes a string for safe use in shell commands.
+// This prevents command injection when interpolating user-controlled values.
+func shellEscape(s string) string {
+	// Use single quotes and escape any embedded single quotes
+	// 'foo' -> 'foo'
+	// foo'bar -> 'foo'\''bar'
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // CopyFile copies a file using io for larger files with atomic write pattern.

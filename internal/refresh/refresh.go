@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,6 +14,10 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
+
+// maxErrorBodySize limits how much of an error response body we read.
+// Prevents memory exhaustion from malicious/buggy servers.
+const maxErrorBodySize = 64 * 1024 // 64KB
 
 // DefaultRefreshThreshold is the time before expiry to trigger a refresh.
 const DefaultRefreshThreshold = 10 * time.Minute
@@ -293,4 +298,11 @@ func snapshotMatchesProfile(fileSet authfile.AuthFileSet, vault *authfile.Vault,
 	}
 
 	return true
+}
+
+// readLimitedBody reads up to maxErrorBodySize bytes from the reader.
+// This prevents memory exhaustion from malicious or buggy servers that
+// might return unexpectedly large error responses.
+func readLimitedBody(r io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, maxErrorBodySize))
 }
