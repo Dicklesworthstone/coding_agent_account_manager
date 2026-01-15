@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
@@ -472,7 +473,7 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 					content := string(data)
 					if len(content) > 0 {
 						// Check if it contains GEMINI_API_KEY
-						if contains(content, "GEMINI_API_KEY") {
+						if strings.Contains(content, "GEMINI_API_KEY") {
 							return true, ""
 						}
 						return false, "missing GEMINI_API_KEY"
@@ -568,16 +569,6 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	}
 
 	return detection, nil
-}
-
-// contains checks if s contains substr (simple implementation to avoid importing strings).
-func contains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // ImportAuth imports detected auth files into a profile directory.
@@ -764,7 +755,7 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 				result.Error = fmt.Sprintf("cannot read .env: %v", err)
 				return result, nil
 			}
-			if !contains(string(data), "GEMINI_API_KEY") {
+			if !strings.Contains(string(data), "GEMINI_API_KEY") {
 				result.Valid = false
 				result.Error = "GEMINI_API_KEY not found in .env"
 				return result, nil

@@ -81,7 +81,7 @@ func ResolveHome() string {
 	return codexHome()
 }
 
-var codexCredentialsStoreRe = regexp.MustCompile(`(?m)^\s*cli_auth_credentials_store\s*=\s*\"[^\"]*\"\s*$`)
+var codexCredentialsStoreRe = regexp.MustCompile(`(?m)^\s*cli_auth_credentials_store\s*=\s*\"[^\"]*\"`)
 
 // EnsureFileCredentialStore ensures Codex uses file-based credential storage.
 // This is required for CAAM to manage auth.json reliably.
