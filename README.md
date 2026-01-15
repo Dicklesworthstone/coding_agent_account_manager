@@ -65,7 +65,7 @@ flowchart LR
     style Vault fill:#16213e,stroke:#4a4a6a,color:#fff
 ```
 
-**That's it.** No daemons, no databases, no network calls. Just `cp` with extra steps.
+**That's it.** No external database servers (uses embedded SQLite), no required daemons (optional background service available). Just `cp` with extra steps.
 
 ### Why This Works
 
