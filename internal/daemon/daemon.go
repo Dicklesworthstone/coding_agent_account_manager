@@ -762,58 +762,6 @@ func LogFilePath() string {
 	return filepath.Join(homeDir, ".local", "share", "caam", "daemon.log")
 }
 
-// WritePIDFile writes the current process ID to the PID file using atomic write.
-func WritePIDFile() error {
-	path := PIDFilePath()
-	pid := os.Getpid()
-	data := []byte(fmt.Sprintf("%d\n", pid))
-
-	// Create parent directory if needed
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fmt.Errorf("create pid dir: %w", err)
-	}
-
-	// Check for existing running process
-	if existingPID, err := ReadPIDFile(); err == nil && existingPID != pid {
-		if IsProcessRunning(existingPID) {
-			return fmt.Errorf("pid file already points to running process (pid=%d)", existingPID)
-		}
-		// Stale PID file, remove it
-		_ = os.Remove(path)
-	}
-
-	// Atomic write: temp file + fsync + rename
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("create temp pid file: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write temp pid file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("sync temp pid file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close temp pid file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename temp pid file: %w", err)
-	}
-
-	return nil
-}
-
 // RemovePIDFile removes the PID file.
 func RemovePIDFile() error {
 	return os.Remove(PIDFilePath())

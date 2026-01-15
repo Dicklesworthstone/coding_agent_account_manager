@@ -140,45 +140,6 @@ func TestLogFilePath(t *testing.T) {
 	}
 }
 
-func TestWriteAndReadPIDFile(t *testing.T) {
-	pidPath := PIDFilePath()
-
-	// If there's already a running daemon, skip this test
-	if existingPID, err := ReadPIDFile(); err == nil && IsProcessRunning(existingPID) {
-		t.Skipf("skipping: daemon already running with PID %d", existingPID)
-	}
-
-	// Clean up any stale PID file first
-	os.Remove(pidPath)
-
-	// Write PID file
-	if err := WritePIDFile(); err != nil {
-		t.Fatalf("WritePIDFile failed: %v", err)
-	}
-	defer os.Remove(pidPath)
-
-	// Read PID file
-	pid, err := ReadPIDFile()
-	if err != nil {
-		t.Fatalf("ReadPIDFile failed: %v", err)
-	}
-
-	if pid != os.Getpid() {
-		t.Errorf("expected PID %d, got %d", os.Getpid(), pid)
-	}
-
-	// Remove PID file
-	if err := RemovePIDFile(); err != nil {
-		t.Errorf("RemovePIDFile failed: %v", err)
-	}
-
-	// Verify it's gone
-	_, err = ReadPIDFile()
-	if err == nil {
-		t.Error("expected error reading removed PID file")
-	}
-}
-
 func TestIsProcessRunning(t *testing.T) {
 	// Current process should be running
 	if !IsProcessRunning(os.Getpid()) {
@@ -718,64 +679,6 @@ func TestDaemon_CheckAndBackup_VerboseMode(t *testing.T) {
 	d.checkAndBackup()
 }
 
-func TestWritePIDFile_ExistingProcess(t *testing.T) {
-	// Use a custom PID file path for this test
-	tmpDir := t.TempDir()
-	customPath := filepath.Join(tmpDir, "test-daemon.pid")
-
-	// Save and restore original path
-	originalPath := PIDFilePath()
-	SetPIDFilePath(customPath)
-	defer SetPIDFilePath(originalPath)
-
-	// First write should succeed
-	if err := WritePIDFile(); err != nil {
-		t.Fatalf("First WritePIDFile failed: %v", err)
-	}
-	defer os.Remove(customPath)
-
-	// Reading should return current PID
-	pid, err := ReadPIDFile()
-	if err != nil {
-		t.Fatalf("ReadPIDFile failed: %v", err)
-	}
-	if pid != os.Getpid() {
-		t.Errorf("PID = %d, want %d", pid, os.Getpid())
-	}
-
-	// Writing again should succeed (same process)
-	if err := WritePIDFile(); err != nil {
-		t.Errorf("Second WritePIDFile failed: %v", err)
-	}
-}
-
-func TestWritePIDFile_StaleFile(t *testing.T) {
-	tmpDir := t.TempDir()
-	customPath := filepath.Join(tmpDir, "test-daemon.pid")
-
-	originalPath := PIDFilePath()
-	SetPIDFilePath(customPath)
-	defer SetPIDFilePath(originalPath)
-
-	// Create a stale PID file with non-existent process
-	os.WriteFile(customPath, []byte("999999999\n"), 0600)
-
-	// WritePIDFile should succeed (stale file removed)
-	if err := WritePIDFile(); err != nil {
-		t.Fatalf("WritePIDFile with stale file failed: %v", err)
-	}
-	defer os.Remove(customPath)
-
-	// Should have our PID now
-	pid, err := ReadPIDFile()
-	if err != nil {
-		t.Fatalf("ReadPIDFile failed: %v", err)
-	}
-	if pid != os.Getpid() {
-		t.Errorf("PID = %d, want %d", pid, os.Getpid())
-	}
-}
-
 func TestGetDaemonStatus_Running(t *testing.T) {
 	tmpDir := t.TempDir()
 	customPath := filepath.Join(tmpDir, "test-daemon.pid")
@@ -785,8 +688,8 @@ func TestGetDaemonStatus_Running(t *testing.T) {
 	defer SetPIDFilePath(originalPath)
 
 	// Write our own PID (current process)
-	if err := WritePIDFile(); err != nil {
-		t.Fatalf("WritePIDFile failed: %v", err)
+	if err := os.WriteFile(customPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
 	}
 	defer os.Remove(customPath)
 
@@ -1385,13 +1288,6 @@ func TestDaemon_InitAuthPool_CallbacksTriggered(t *testing.T) {
 	if stats.PoolSummary == nil {
 		t.Error("PoolSummary should not be nil")
 	}
-}
-
-func TestDaemon_WritePIDFile_ReadOnlyDir(t *testing.T) {
-	// This test would require creating a read-only directory
-	// which can be problematic in CI environments
-	// Skip for now, but document what we'd test
-	t.Skip("Skipping read-only directory test")
 }
 
 func TestDaemon_LogFilePath_WithoutHome(t *testing.T) {
