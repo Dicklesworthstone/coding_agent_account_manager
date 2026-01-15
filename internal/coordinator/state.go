@@ -237,20 +237,17 @@ var Patterns = struct {
 func DetectState(output string) (PaneState, map[string]string) {
 	metadata := make(map[string]string)
 
-	// Check for rate limit first (most common case)
-	if Patterns.RateLimit.MatchString(output) {
-		if match := Patterns.UsageLimitReset.FindStringSubmatch(output); len(match) > 1 {
-			metadata["reset_time"] = match[1]
-		}
-		return StateRateLimited, metadata
+	// Check for login success first (highest priority)
+	if Patterns.LoginSuccess.MatchString(output) {
+		return StateResuming, metadata
 	}
 
-	// Check for login method selection prompt
-	if Patterns.SelectMethod.MatchString(output) {
-		return StateAwaitingMethodSelect, metadata
+	// Check for login failure
+	if Patterns.LoginFailed.MatchString(output) {
+		return StateFailed, metadata
 	}
 
-	// Check for OAuth URL
+	// Check for OAuth URL (implies awaiting URL state)
 	if match := Patterns.OAuthURL.FindString(output); match != "" {
 		metadata["oauth_url"] = match
 		return StateAwaitingURL, metadata
@@ -265,14 +262,17 @@ func DetectState(output string) (PaneState, map[string]string) {
 		return StateAwaitingURL, metadata
 	}
 
-	// Check for login success
-	if Patterns.LoginSuccess.MatchString(output) {
-		return StateResuming, metadata
+	// Check for login method selection prompt
+	if Patterns.SelectMethod.MatchString(output) {
+		return StateAwaitingMethodSelect, metadata
 	}
 
-	// Check for login failure
-	if Patterns.LoginFailed.MatchString(output) {
-		return StateFailed, metadata
+	// Check for rate limit last (lowest priority, as it might be in history)
+	if Patterns.RateLimit.MatchString(output) {
+		if match := Patterns.UsageLimitReset.FindStringSubmatch(output); len(match) > 1 {
+			metadata["reset_time"] = match[1]
+		}
+		return StateRateLimited, metadata
 	}
 
 	return StateIdle, metadata

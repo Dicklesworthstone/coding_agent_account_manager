@@ -65,6 +65,22 @@ func (h *ClaudeLoginHandler) IsLoginInProgress(output string) bool {
 func (h *ClaudeLoginHandler) IsLoginComplete(output string) bool {
 	lower := strings.ToLower(output)
 
+	// Check for negative patterns first to avoid false positives
+	negativePatterns := []string{
+		"not logged in",
+		"failed to log in",
+		"login failed",
+		"unable to log in",
+		"ensure you are logged in",
+		"make sure you are logged in",
+	}
+
+	for _, p := range negativePatterns {
+		if strings.Contains(lower, p) {
+			return false
+		}
+	}
+
 	patterns := []string{
 		"successfully logged in",
 		"logged in successfully",

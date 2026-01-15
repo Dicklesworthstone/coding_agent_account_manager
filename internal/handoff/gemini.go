@@ -68,6 +68,23 @@ func (h *GeminiLoginHandler) IsLoginInProgress(output string) bool {
 func (h *GeminiLoginHandler) IsLoginComplete(output string) bool {
 	lower := strings.ToLower(output)
 
+	// Check for negative patterns first to avoid false positives
+	negativePatterns := []string{
+		"not logged in",
+		"failed to log in",
+		"login failed",
+		"unable to log in",
+		"ensure you are logged in",
+		"make sure you are logged in",
+		"not authenticated",
+	}
+
+	for _, p := range negativePatterns {
+		if strings.Contains(lower, p) {
+			return false
+		}
+	}
+
 	patterns := []string{
 		"successfully authenticated",
 		"authentication successful",
