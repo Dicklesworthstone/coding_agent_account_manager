@@ -100,6 +100,7 @@ func (d *TextInputDialog) SetWidth(width int) {
 // SetStyles sets the styles for the dialog.
 func (d *TextInputDialog) SetStyles(styles Styles) {
 	d.styles = styles
+	d.input.Cursor.Style = styles.InputCursor
 }
 
 // Focus focuses the dialog input.
@@ -180,8 +181,13 @@ func (d *TextInputDialog) View() string {
 		d.styles.StatusKey.Render("esc") + " cancel"
 	content.WriteString(help)
 
+	style := d.styles.Dialog
+	if d.focused {
+		style = d.styles.DialogFocused
+	}
+
 	// Wrap in dialog box
-	return d.styles.Dialog.
+	return style.
 		Width(d.width).
 		Render(content.String())
 }
@@ -341,8 +347,13 @@ func (d *ConfirmDialog) View() string {
 		d.styles.StatusKey.Render("enter") + " confirm"
 	content.WriteString(help)
 
+	style := d.styles.Dialog
+	if d.focused {
+		style = d.styles.DialogFocused
+	}
+
 	// Wrap in dialog box
-	return d.styles.Dialog.
+	return style.
 		Width(d.width).
 		Render(content.String())
 }
@@ -408,6 +419,9 @@ func (d *MultiFieldDialog) SetWidth(width int) {
 // SetStyles sets the styles for the dialog.
 func (d *MultiFieldDialog) SetStyles(styles Styles) {
 	d.styles = styles
+	for i := range d.inputs {
+		d.inputs[i].Cursor.Style = styles.InputCursor
+	}
 }
 
 // Focus focuses the dialog.
@@ -576,8 +590,13 @@ func (d *MultiFieldDialog) View() string {
 		d.styles.StatusKey.Render("esc") + " cancel"
 	content.WriteString(help)
 
+	style := d.styles.Dialog
+	if d.isFocused {
+		style = d.styles.DialogFocused
+	}
+
 	// Wrap in dialog box
-	return d.styles.Dialog.
+	return style.
 		Width(d.width).
 		Render(content.String())
 }

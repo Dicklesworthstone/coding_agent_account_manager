@@ -309,3 +309,162 @@ Fixed two instances of incorrect path construction using string concatenation in
 - `cmd/caam/cmd/root.go:210`: Same pattern fixed
 
 These fixes ensure cross-platform compatibility (Windows path separators).
+
+---
+
+## ast-grep vs ripgrep (quick guidance)
+
+**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, so results ignore comments/strings, understand syntax, and can **safely rewrite** code.
+
+* Refactors/codemods: rename APIs, change import forms, rewrite call sites or variable kinds.
+* Policy checks: enforce patterns across a repo (`scan` with rules + `test`).
+* Editor/automation: LSP mode; `--json` output for tooling.
+
+**Use `ripgrep` when text is enough.** It's the fastest way to grep literals/regex across files.
+
+* Recon: find strings, TODOs, log lines, config values, or non-code assets.
+* Pre-filter: narrow candidate files before a precise pass.
+
+**Rule of thumb**
+
+* Need correctness over speed, or you'll **apply changes** → start with `ast-grep`.
+* Need raw speed or you're just **hunting text** → start with `rg`.
+* Often combine: `rg` to shortlist files, then `ast-grep` to match/modify with precision.
+
+**Snippets**
+
+Find structured code (ignores comments/strings):
+
+```bash
+ast-grep run -l Go -p 'func $NAME($PARAMS) $RET { $$$BODY }'
+```
+
+Find all error checks:
+
+```bash
+ast-grep run -l Go -p 'if err != nil { $$$BODY }'
+```
+
+Quick textual hunt:
+
+```bash
+rg -n 'filepath\.Join\(' -t go
+```
+
+Combine speed + precision:
+
+```bash
+rg -l -t go 'json\.Marshal' | xargs ast-grep run -l Go -p 'json.Marshal($ARG)' --json
+```
+
+**Mental model**
+
+* Unit of match: `ast-grep` = node; `rg` = line.
+* False positives: `ast-grep` low; `rg` depends on your regex.
+* Rewrites: `ast-grep` first-class; `rg` requires ad-hoc sed/awk and risks collateral edits.
+
+---
+
+## Morph Warp Grep — AI-Powered Code Search
+
+Use `mcp__morph-mcp__warp_grep` for "how does X work?" discovery across the codebase.
+
+When to use:
+
+- You don't know where something lives.
+- You want data flow across multiple files (CLI → config → auth → profiles).
+- You want all touchpoints of a cross-cutting concern (e.g., profile rotation, OAuth refresh).
+
+Example:
+
+```
+mcp__morph-mcp__warp_grep(
+  repoPath: "/data/projects/coding_agent_account_manager",
+  query: "How does the profile rotation scoring algorithm work?"
+)
+```
+
+Warp Grep:
+
+- Expands a natural-language query to multiple search patterns.
+- Runs targeted greps, reads code, follows imports, then returns concise snippets with line numbers.
+- Reduces token usage by returning only relevant slices, not entire files.
+
+When **not** to use Warp Grep:
+
+- You already know the function/identifier name; use `rg`.
+- You know the exact file; just open it.
+- You only need a yes/no existence check.
+
+Comparison:
+
+| Scenario | Tool |
+| ---------------------------------- | ---------- |
+| "How does OAuth refresh work?" | warp_grep |
+| "Where is `RotateProfile` defined?" | `rg` |
+| "Rename `cfg` to `config`" | `ast-grep` |
+
+---
+
+## Beads Workflow Integration
+
+When starting a beads-tracked task:
+
+1. **Pick ready work** (Beads)
+   - `bd ready --json` → choose one item (highest priority, no blockers)
+2. **Reserve edit surface** (Mail)
+   - `file_reservation_paths(project_key, agent_name, ["internal/**"], ttl_seconds=3600, exclusive=true, reason="caam-123")`
+3. **Announce start** (Mail)
+   - `send_message(..., thread_id="caam-123", subject="[caam-123] Start: <short title>", ack_required=true)`
+4. **Work and update**
+   - Reply in-thread with progress and attach artifacts/images; keep the discussion in one thread per issue id
+5. **Complete and release**
+   - `bd close caam-123 --reason "Completed"` (Beads is status authority)
+   - `release_file_reservations(project_key, agent_name, paths=["internal/**"])`
+   - Final Mail reply: `[caam-123] Completed` with summary and links
+
+Mapping cheat-sheet:
+- **Mail `thread_id`** ↔ `caam-###`
+- **Mail subject**: `[caam-###] ...`
+- **File reservation `reason`**: `caam-###`
+- **Commit messages (optional)**: include `caam-###` for traceability
+
+---
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - `go test ./...`, `golangci-lint run`
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+
+---
+
+## Note for Codex/GPT-5.2
+
+If you are Codex or GPT-5.2 (or any non-Claude agent): another agent (often Claude Code) may have made changes to the working tree since you last saw it. Before assuming your mental model of the code is correct:
+
+1. Run `git status` to see uncommitted changes
+2. Run `git log --oneline -5` to see recent commits
+3. Re-read any files you plan to modify
+
+This prevents you from overwriting another agent's work or making edits based on stale context

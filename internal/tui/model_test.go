@@ -654,6 +654,9 @@ func TestDialogOverlayView(t *testing.T) {
 	if !strings.Contains(view, dialogContent) {
 		t.Errorf("expected dialog content in view, got %q", view)
 	}
+	if !strings.Contains(view, "caam - Coding Agent Account Manager") {
+		t.Errorf("expected background view to be retained in overlay")
+	}
 }
 
 // TestDialogOverlayViewSmallScreen tests dialogOverlayView with small dimensions.
@@ -713,9 +716,9 @@ func TestIsCompactLayout(t *testing.T) {
 		{50, 30, true},   // Narrow width
 		{150, 20, true},  // Short height
 		{150, 40, false}, // Full size
-		{99, 30, true},   // Just under width threshold
-		{100, 27, true},  // Just under height threshold
-		{100, 28, false}, // Exactly at thresholds
+		{93, 30, true},   // Just under width threshold
+		{94, 23, true},   // Just under height threshold
+		{94, 24, false},  // Exactly at thresholds
 	}
 
 	for _, tc := range tests {
@@ -730,6 +733,60 @@ func TestIsCompactLayout(t *testing.T) {
 					tc.width, tc.height, result, tc.expected)
 			}
 		})
+	}
+}
+
+func TestLayoutModeTiny(t *testing.T) {
+	m := New()
+	m.width = minTinyWidth - 1
+	m.height = 40
+	if m.layoutMode() != layoutTiny {
+		t.Errorf("expected tiny layout for narrow width, got %v", m.layoutMode())
+	}
+
+	m.width = 120
+	m.height = minTinyHeight - 1
+	if m.layoutMode() != layoutTiny {
+		t.Errorf("expected tiny layout for short height, got %v", m.layoutMode())
+	}
+}
+
+func TestFullLayoutSpecWidths(t *testing.T) {
+	m := New()
+	m.width = minFullWidth() + 20
+	m.height = minFullHeight + 10
+
+	spec := m.fullLayoutSpec(20)
+	available := m.width - (layoutGap * 2)
+	total := spec.ProviderWidth + spec.ProfilesWidth + spec.DetailWidth
+
+	if spec.ProviderWidth < minProviderWidth {
+		t.Errorf("provider width below min: %d", spec.ProviderWidth)
+	}
+	if spec.ProfilesWidth < minProfilesWidth {
+		t.Errorf("profiles width below min: %d", spec.ProfilesWidth)
+	}
+	if spec.DetailWidth < minDetailWidth {
+		t.Errorf("detail width below min: %d", spec.DetailWidth)
+	}
+	if total > available {
+		t.Errorf("panel widths exceed available: %d > %d", total, available)
+	}
+}
+
+func TestCompactLayoutSpecTinyDetailHeights(t *testing.T) {
+	m := New()
+	spec := m.compactLayoutSpec(layoutTiny, 30, 1)
+	if !spec.ShowDetail {
+		t.Error("expected detail to be enabled for tall tiny layout")
+	}
+	if spec.ProfilesHeight <= 0 {
+		t.Error("expected profiles height to be positive in tiny layout")
+	}
+
+	spec = m.compactLayoutSpec(layoutTiny, 10, 1)
+	if spec.ShowDetail {
+		t.Error("expected detail to be disabled for short tiny layout")
 	}
 }
 
@@ -1084,7 +1141,7 @@ func TestRenderStatusBar(t *testing.T) {
 
 	// Test with zero width
 	m.width = 0
-	view := m.renderStatusBar()
+	view := m.renderStatusBar(layoutSpec{Mode: layoutFull})
 	if view != "" {
 		t.Errorf("expected empty string for zero width, got %q", view)
 	}
@@ -1092,7 +1149,7 @@ func TestRenderStatusBar(t *testing.T) {
 	// Test with status message
 	m.width = 100
 	m.statusMsg = "Test status"
-	view = m.renderStatusBar()
+	view = m.renderStatusBar(layoutSpec{Mode: layoutFull})
 	if !strings.Contains(view, "Test status") {
 		t.Errorf("expected status message in view, got %q", view)
 	}
@@ -1100,21 +1157,21 @@ func TestRenderStatusBar(t *testing.T) {
 	// Test with narrow width (< 70)
 	m.statusMsg = ""
 	m.width = 50
-	view = m.renderStatusBar()
+	view = m.renderStatusBar(layoutSpec{Mode: layoutCompact})
 	if !strings.Contains(view, "quit") {
 		t.Errorf("expected 'quit' hint in narrow view, got %q", view)
 	}
 
 	// Test with medium width (70-99)
 	m.width = 80
-	view = m.renderStatusBar()
+	view = m.renderStatusBar(layoutSpec{Mode: layoutCompact})
 	if !strings.Contains(view, "provider") {
 		t.Errorf("expected 'provider' hint in medium view, got %q", view)
 	}
 
 	// Test with full width (>= 100)
 	m.width = 120
-	view = m.renderStatusBar()
+	view = m.renderStatusBar(layoutSpec{Mode: layoutFull})
 	if !strings.Contains(view, "switch provider") {
 		t.Errorf("expected 'switch provider' hint in full view, got %q", view)
 	}

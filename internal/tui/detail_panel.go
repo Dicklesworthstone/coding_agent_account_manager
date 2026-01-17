@@ -44,7 +44,9 @@ type DetailPanelStyles struct {
 	Label        lipgloss.Style
 	Value        lipgloss.Style
 	StatusOK     lipgloss.Style
+	StatusWarn   lipgloss.Style
 	StatusBad    lipgloss.Style
+	StatusMuted  lipgloss.Style
 	LockIcon     lipgloss.Style
 	Divider      lipgloss.Style
 	ActionHeader lipgloss.Style
@@ -55,53 +57,65 @@ type DetailPanelStyles struct {
 
 // DefaultDetailPanelStyles returns the default styles for the detail panel.
 func DefaultDetailPanelStyles() DetailPanelStyles {
+	return NewDetailPanelStyles(DefaultTheme())
+}
+
+// NewDetailPanelStyles returns themed styles for the detail panel.
+func NewDetailPanelStyles(theme Theme) DetailPanelStyles {
+	p := theme.Palette
+	keycap := keycapStyle(theme, true).Width(8).Align(lipgloss.Center)
+
 	return DetailPanelStyles{
 		Border: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDarkGray).
+			Border(theme.Border).
+			BorderForeground(p.BorderMuted).
+			Background(p.Surface).
 			Padding(0, 1),
 
 		Title: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorPurple).
+			Foreground(p.Accent).
 			MarginBottom(1),
 
 		Label: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Width(12),
 
 		Value: lipgloss.NewStyle().
-			Foreground(colorWhite),
+			Foreground(p.Text),
 
 		StatusOK: lipgloss.NewStyle().
-			Foreground(colorGreen).
+			Foreground(p.Success).
 			Bold(true),
 
+		StatusWarn: lipgloss.NewStyle().
+			Foreground(p.Warning),
+
 		StatusBad: lipgloss.NewStyle().
-			Foreground(colorRed),
+			Foreground(p.Danger),
+
+		StatusMuted: lipgloss.NewStyle().
+			Foreground(p.Muted),
 
 		LockIcon: lipgloss.NewStyle().
-			Foreground(colorYellow),
+			Foreground(p.Warning),
 
 		Divider: lipgloss.NewStyle().
-			Foreground(colorDarkGray),
+			Foreground(p.BorderMuted),
 
 		ActionHeader: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorCyan).
+			Foreground(p.Info).
 			MarginTop(1).
 			MarginBottom(1),
 
-		ActionKey: lipgloss.NewStyle().
-			Foreground(colorPurple).
-			Bold(true).
-			Width(8),
+		ActionKey: keycap,
 
 		ActionDesc: lipgloss.NewStyle().
-			Foreground(colorGray),
+			Foreground(p.Muted),
 
 		Empty: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Italic(true).
 			Padding(2, 2),
 	}
@@ -109,8 +123,13 @@ func DefaultDetailPanelStyles() DetailPanelStyles {
 
 // NewDetailPanel creates a new detail panel.
 func NewDetailPanel() *DetailPanel {
+	return NewDetailPanelWithTheme(DefaultTheme())
+}
+
+// NewDetailPanelWithTheme creates a new detail panel using a theme.
+func NewDetailPanelWithTheme(theme Theme) *DetailPanel {
 	return &DetailPanel{
-		styles: DefaultDetailPanelStyles(),
+		styles: NewDetailPanelStyles(theme),
 	}
 }
 
@@ -157,11 +176,11 @@ func (p *DetailPanel) View() string {
 	case health.StatusHealthy:
 		statusStyle = p.styles.StatusOK
 	case health.StatusWarning:
-		statusStyle = lipgloss.NewStyle().Foreground(colorYellow)
+		statusStyle = p.styles.StatusWarn
 	case health.StatusCritical:
 		statusStyle = p.styles.StatusBad
 	default:
-		statusStyle = lipgloss.NewStyle().Foreground(colorGray)
+		statusStyle = p.styles.StatusMuted
 	}
 	rows = append(rows, p.renderRow("Status", statusStyle.Render(statusText)))
 
@@ -183,7 +202,7 @@ func (p *DetailPanel) View() string {
 		if prof.ErrorCount >= 3 {
 			errorStr = p.styles.StatusBad.Render(errorStr)
 		} else {
-			errorStr = lipgloss.NewStyle().Foreground(colorYellow).Render(errorStr)
+			errorStr = p.styles.StatusWarn.Render(errorStr)
 		}
 		rows = append(rows, p.renderRow("Errors", errorStr))
 	} else {

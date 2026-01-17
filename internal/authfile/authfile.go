@@ -607,8 +607,12 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		return "", err
 	}
 
-	// Hash the current auth files
+	// Hash the current auth files.
+	// Prefer required files for matching; optional files can change frequently
+	// (e.g., settings/session files) and should not break profile detection.
 	currentHashes := make(map[string]string)
+	optionalHashes := make(map[string]string)
+	requiredFound := false
 	for _, spec := range fileSet.Files {
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
@@ -617,11 +621,23 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		if err != nil {
 			continue
 		}
-		currentHashes[filepath.Base(spec.Path)] = hash
+		base := filepath.Base(spec.Path)
+		if spec.Required {
+			requiredFound = true
+			currentHashes[base] = hash
+			continue
+		}
+		optionalHashes[base] = hash
+	}
+
+	if !requiredFound {
+		if fileSet.AllowOptionalOnly {
+			currentHashes = optionalHashes
+		}
 	}
 
 	if len(currentHashes) == 0 {
-		return "", nil // No auth files present
+		return "", nil // No relevant auth files present
 	}
 
 	// Compare with each profile

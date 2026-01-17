@@ -26,6 +26,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // providerAccountURLs maps provider names to their account management URLs.
@@ -52,6 +53,44 @@ const (
 	stateEditProfile
 	stateSyncAdd
 	stateSyncEdit
+)
+
+type layoutMode int
+
+const (
+	layoutFull layoutMode = iota
+	layoutCompact
+	layoutTiny
+)
+
+type layoutSpec struct {
+	Mode           layoutMode
+	ProviderWidth  int
+	ProfilesWidth  int
+	DetailWidth    int
+	Gap            int
+	ContentHeight  int
+	ProfilesHeight int
+	DetailHeight   int
+	ShowDetail     bool
+}
+
+const (
+	layoutGap                 = 2
+	minProviderWidth          = 18
+	maxProviderWidth          = 26
+	minProfilesWidth          = 40
+	maxProfilesWidth          = 90
+	minDetailWidth            = 32
+	maxDetailWidth            = 48
+	minFullHeight             = 24
+	minTinyWidth              = 64
+	minTinyHeight             = 16
+	minCompactDetailHeight    = 14
+	minCompactProfilesHeight  = 6
+	minCompactDetailMinHeight = 7
+	dialogMinWidth            = 24
+	dialogMargin              = 4
 )
 
 // confirmAction represents the action being confirmed.
@@ -157,7 +196,8 @@ func New() Model {
 // NewWithProviders creates a new TUI model with the specified providers.
 func NewWithProviders(providers []string) Model {
 	cwd, _ := os.Getwd()
-	profilesPanel := NewProfilesPanel()
+	theme := DefaultTheme()
+	profilesPanel := NewProfilesPanelWithTheme(theme)
 	if len(providers) > 0 {
 		profilesPanel.SetProvider(providers[0])
 	}
@@ -169,12 +209,12 @@ func NewWithProviders(providers []string) Model {
 		selected:       0,
 		state:          stateList,
 		keys:           defaultKeyMap(),
-		styles:         DefaultStyles(),
-		providerPanel:  NewProviderPanel(providers),
+		styles:         NewStyles(theme),
+		providerPanel:  NewProviderPanelWithTheme(providers, theme),
 		profilesPanel:  profilesPanel,
-		detailPanel:    NewDetailPanel(),
-		usagePanel:     NewUsagePanel(),
-		syncPanel:      NewSyncPanel(),
+		detailPanel:    NewDetailPanelWithTheme(theme),
+		usagePanel:     NewUsagePanelWithTheme(theme),
+		syncPanel:      NewSyncPanelWithTheme(theme),
 		vaultPath:      authfile.DefaultVaultPath(),
 		badges:         make(map[string]profileBadge),
 		runtime:        defaultRuntime,
@@ -619,6 +659,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampDialogWidths()
 		return m, nil
 
 	case profilesLoadedMsg:
@@ -1061,8 +1102,9 @@ func (m Model) handleBackupProfile() (tea.Model, tea.Cmd) {
 		fmt.Sprintf("Backup %s Auth", provider),
 		"Enter profile name (alphanumeric, underscore, hyphen, or period):",
 	)
+	m.backupDialog.SetStyles(m.styles)
 	m.backupDialog.SetPlaceholder("work-main")
-	m.backupDialog.SetWidth(50)
+	m.backupDialog.SetWidth(m.dialogWidth(50))
 	m.state = stateBackupDialog
 	m.statusMsg = ""
 	return m, nil
@@ -1152,8 +1194,9 @@ func (m Model) processBackupSubmit(profileName string) (tea.Model, tea.Cmd) {
 			"Profile Exists",
 			fmt.Sprintf("Profile '%s' already exists. Overwrite?", profileName),
 		)
+		m.confirmDialog.SetStyles(m.styles)
 		m.confirmDialog.SetLabels("Overwrite", "Cancel")
-		m.confirmDialog.SetWidth(50)
+		m.confirmDialog.SetWidth(m.dialogWidth(50))
 		m.state = stateConfirmOverwrite
 		return m, nil
 	}
@@ -1221,6 +1264,8 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "a":
 		m.syncAddDialog = newSyncMachineDialog("Add Sync Machine", nil)
+		m.syncAddDialog.SetStyles(m.styles)
+		m.syncAddDialog.SetWidth(m.dialogWidth(m.syncAddDialog.width))
 		m.state = stateSyncAdd
 		m.statusMsg = ""
 		return m, nil
@@ -1235,6 +1280,8 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if machine := m.syncPanel.SelectedMachine(); machine != nil {
 			m.pendingSyncMachine = machine.ID
 			m.syncEditDialog = newSyncMachineDialog("Edit Sync Machine", machine)
+			m.syncEditDialog.SetStyles(m.styles)
+			m.syncEditDialog.SetWidth(m.dialogWidth(m.syncEditDialog.width))
 			m.state = stateSyncEdit
 			m.statusMsg = ""
 			return m, nil
@@ -1396,7 +1443,8 @@ func (m Model) handleEditProfile() (tea.Model, tea.Cmd) {
 	}
 
 	m.editDialog = NewMultiFieldDialog("Edit Profile", fields)
-	m.editDialog.SetWidth(64)
+	m.editDialog.SetStyles(m.styles)
+	m.editDialog.SetWidth(m.dialogWidth(64))
 	m.pendingEditProvider = provider
 	m.pendingEditProfile = info.Name
 	m.state = stateEditProfile
@@ -1527,6 +1575,8 @@ func (m Model) handleSyncAddKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if values.Name == "" || values.Address == "" {
 			m.statusMsg = "Name and address are required"
 			m.syncAddDialog = newSyncMachineDialogWithValues("Add Sync Machine", values)
+			m.syncAddDialog.SetStyles(m.styles)
+			m.syncAddDialog.SetWidth(m.dialogWidth(m.syncAddDialog.width))
 			m.state = stateSyncAdd
 			return m, nil
 		}
@@ -1560,6 +1610,8 @@ func (m Model) handleSyncEditKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if values.Name == "" || values.Address == "" {
 			m.statusMsg = "Name and address are required"
 			m.syncEditDialog = newSyncMachineDialogWithValues("Edit Sync Machine", values)
+			m.syncEditDialog.SetStyles(m.styles)
+			m.syncEditDialog.SetWidth(m.dialogWidth(m.syncEditDialog.width))
 			m.state = stateSyncEdit
 			return m, nil
 		}
@@ -2085,14 +2137,29 @@ func (m Model) View() string {
 
 // dialogOverlayView renders the main view with a dialog overlay centered on top.
 func (m Model) dialogOverlayView(dialogContent string) string {
-	// Render the main view as background
-	mainView := m.mainView()
+	if m.width <= 0 || m.height <= 0 {
+		return dialogContent
+	}
 
-	// Center the dialog on the screen
+	mainView := m.mainView()
+	background := lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, mainView)
+	background = m.styles.DialogOverlay.Render(background)
+
 	dialogWidth := lipgloss.Width(dialogContent)
 	dialogHeight := lipgloss.Height(dialogContent)
+	if dialogWidth < 0 {
+		dialogWidth = 0
+	}
+	if dialogHeight < 0 {
+		dialogHeight = 0
+	}
+	if dialogWidth > m.width {
+		dialogWidth = m.width
+	}
+	if dialogHeight > m.height {
+		dialogHeight = m.height
+	}
 
-	// Calculate position to center
 	x := (m.width - dialogWidth) / 2
 	y := (m.height - dialogHeight) / 2
 	if x < 0 {
@@ -2102,16 +2169,88 @@ func (m Model) dialogOverlayView(dialogContent string) string {
 		y = 0
 	}
 
-	// Create a positioned dialog overlay
-	positioned := lipgloss.Place(
-		m.width, m.height,
-		lipgloss.Center, lipgloss.Center,
-		dialogContent,
-	)
+	bgLines := padOverlayLines(background, m.width, m.height)
+	overlayLines := padOverlayLines(dialogContent, dialogWidth, dialogHeight)
 
-	// Dim the background slightly by replacing it with the positioned dialog
-	_ = mainView // Background is implied by the dialog box styling
-	return positioned
+	for i := 0; i < dialogHeight; i++ {
+		target := y + i
+		if target < 0 || target >= len(bgLines) {
+			continue
+		}
+		left := cutANSI(bgLines[target], 0, x)
+		right := cutANSI(bgLines[target], x+dialogWidth, m.width)
+		overlay := overlayLines[i]
+		if ansi.StringWidth(overlay) > dialogWidth {
+			overlay = cutANSI(overlay, 0, dialogWidth)
+		}
+		bgLines[target] = left + overlay + right
+	}
+
+	return strings.Join(bgLines, "\n")
+}
+
+func padOverlayLines(content string, width, height int) []string {
+	lines := strings.Split(content, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	st := lipgloss.NewStyle().Width(width)
+	for i, line := range lines {
+		cut := cutANSI(line, 0, width)
+		lines[i] = st.Render(cut)
+	}
+	return lines
+}
+
+func cutANSI(s string, left, right int) string {
+	if right <= left {
+		return ""
+	}
+	if right < 0 {
+		return ""
+	}
+	if left < 0 {
+		left = 0
+	}
+	truncated := ansi.Truncate(s, right, "")
+	if left == 0 {
+		return truncated
+	}
+	return trimLeftANSI(truncated, left)
+}
+
+func trimLeftANSI(s string, left int) string {
+	if left <= 0 {
+		return s
+	}
+	state := ansi.NormalState
+	width := 0
+	var out strings.Builder
+
+	for len(s) > 0 {
+		seq, w, n, newState := ansi.DecodeSequence(s, state, nil)
+		state = newState
+		if n == 0 {
+			break
+		}
+		if w == 0 {
+			out.WriteString(seq)
+			s = s[n:]
+			continue
+		}
+		if width+w <= left {
+			width += w
+			s = s[n:]
+			continue
+		}
+		out.WriteString(seq)
+		out.WriteString(s[n:])
+		return out.String()
+	}
+	return ""
 }
 
 // mainView renders the main list view.
@@ -2130,50 +2269,26 @@ func (m Model) mainView() string {
 	}
 
 	var panels string
-	if m.isCompactLayout() {
+	layoutMode := m.layoutMode()
+	var layout layoutSpec
+
+	if layoutMode != layoutFull {
 		tabs := m.renderProviderTabs()
 		tabsHeight := lipgloss.Height(tabs)
-		remainingHeight := contentHeight - tabsHeight - 1
-		if remainingHeight < 0 {
-			remainingHeight = 0
-		}
-
-		profilesHeight := remainingHeight
-		detailHeight := 0
-		showDetail := remainingHeight >= 14
-		if showDetail {
-			profilesHeight = remainingHeight * 6 / 10
-			if profilesHeight < 8 {
-				profilesHeight = 8
-			}
-			detailHeight = remainingHeight - profilesHeight - 1
-			if detailHeight < 7 {
-				detailHeight = 7
-				profilesHeight = remainingHeight - detailHeight - 1
-				if profilesHeight < 6 {
-					profilesHeight = 6
-					if profilesHeight+detailHeight+1 > remainingHeight {
-						detailHeight = remainingHeight - profilesHeight - 1
-						if detailHeight < 0 {
-							detailHeight = 0
-						}
-					}
-				}
-			}
-		}
+		layout = m.compactLayoutSpec(layoutMode, contentHeight, tabsHeight)
 
 		var profilesPanelView string
 		if m.profilesPanel != nil {
-			m.profilesPanel.SetSize(m.width, profilesHeight)
+			m.profilesPanel.SetSize(m.width, layout.ProfilesHeight)
 			profilesPanelView = m.profilesPanel.View()
 		} else {
 			profilesPanelView = m.renderProfileList()
 		}
 
 		var detailPanelView string
-		if m.detailPanel != nil && showDetail && detailHeight > 0 {
+		if m.detailPanel != nil && layout.ShowDetail {
 			m.syncDetailPanel()
-			m.detailPanel.SetSize(m.width, detailHeight)
+			m.detailPanel.SetSize(m.width, layout.DetailHeight)
 			detailPanelView = m.detailPanel.View()
 		}
 
@@ -2183,23 +2298,17 @@ func (m Model) mainView() string {
 			panels = lipgloss.JoinVertical(lipgloss.Left, tabs, profilesPanelView)
 		}
 	} else {
-		// Calculate panel dimensions
-		providerPanelWidth := 20
-		detailPanelWidth := 38
-		profilesPanelWidth := m.width - providerPanelWidth - detailPanelWidth - 10 // Account for borders and spacing
-		if profilesPanelWidth < 40 {
-			profilesPanelWidth = 40
-		}
+		layout = m.fullLayoutSpec(contentHeight)
 
 		// Sync and render provider panel
 		m.providerPanel.SetActiveProvider(m.activeProvider)
-		m.providerPanel.SetSize(providerPanelWidth, contentHeight)
+		m.providerPanel.SetSize(layout.ProviderWidth, contentHeight)
 		providerPanelView := m.providerPanel.View()
 
 		// Sync and render profiles panel (center panel)
 		var profilesPanelView string
 		if m.profilesPanel != nil {
-			m.profilesPanel.SetSize(profilesPanelWidth, contentHeight)
+			m.profilesPanel.SetSize(layout.ProfilesWidth, contentHeight)
 			profilesPanelView = m.profilesPanel.View()
 		} else {
 			profilesPanelView = m.renderProfileList()
@@ -2209,7 +2318,7 @@ func (m Model) mainView() string {
 		var detailPanelView string
 		if m.detailPanel != nil {
 			m.syncDetailPanel()
-			m.detailPanel.SetSize(detailPanelWidth, contentHeight)
+			m.detailPanel.SetSize(layout.DetailWidth, contentHeight)
 			detailPanelView = m.detailPanel.View()
 		}
 
@@ -2217,15 +2326,15 @@ func (m Model) mainView() string {
 		panels = lipgloss.JoinHorizontal(
 			lipgloss.Top,
 			providerPanelView,
-			"  ", // Spacing
+			strings.Repeat(" ", layout.Gap),
 			profilesPanelView,
-			"  ", // Spacing
+			strings.Repeat(" ", layout.Gap),
 			detailPanelView,
 		)
 	}
 
 	// Status bar
-	status := m.renderStatusBar()
+	status := m.renderStatusBar(layout)
 
 	// Combine header, panels, and status
 	content := lipgloss.JoinVertical(
@@ -2250,16 +2359,185 @@ func (m Model) mainView() string {
 }
 
 func (m Model) isCompactLayout() bool {
+	return m.layoutMode() != layoutFull
+}
+
+func (m Model) layoutMode() layoutMode {
 	if m.width <= 0 || m.height <= 0 {
-		return false
+		return layoutFull
 	}
-	if m.width < 100 {
-		return true
+	if m.width < minFullWidth() || m.height < minFullHeight {
+		if m.width < minTinyWidth || m.height < minTinyHeight {
+			return layoutTiny
+		}
+		return layoutCompact
 	}
-	if m.height < 28 {
-		return true
+	return layoutFull
+}
+
+func minFullWidth() int {
+	return minProviderWidth + minProfilesWidth + minDetailWidth + (layoutGap * 2)
+}
+
+func (m Model) fullLayoutSpec(contentHeight int) layoutSpec {
+	spec := layoutSpec{
+		Mode:          layoutFull,
+		Gap:           layoutGap,
+		ContentHeight: contentHeight,
 	}
-	return false
+
+	if m.width <= 0 {
+		return spec
+	}
+
+	available := m.width - (layoutGap * 2)
+	if available < 0 {
+		available = 0
+	}
+
+	provider := minProviderWidth
+	detail := minDetailWidth
+	profiles := minProfilesWidth
+	extra := available - (provider + detail + profiles)
+	if extra < 0 {
+		extra = 0
+	}
+
+	// Give most extra width to profiles, then detail, then provider.
+	profilesBoost := min(extra, maxProfilesWidth-profiles)
+	profiles += profilesBoost
+	extra -= profilesBoost
+
+	detailBoost := min(extra, maxDetailWidth-detail)
+	detail += detailBoost
+	extra -= detailBoost
+
+	providerBoost := min(extra, maxProviderWidth-provider)
+	provider += providerBoost
+	extra -= providerBoost
+
+	profiles += extra
+
+	if provider < minProviderWidth {
+		provider = minProviderWidth
+	}
+	if detail < minDetailWidth {
+		detail = minDetailWidth
+	}
+	if profiles < minProfilesWidth {
+		profiles = minProfilesWidth
+	}
+
+	// Final safety check to avoid overflow.
+	total := provider + detail + profiles
+	if total > available && available > 0 {
+		overflow := total - available
+		if profiles-overflow >= minProfilesWidth {
+			profiles -= overflow
+		} else if detail-overflow >= minDetailWidth {
+			detail -= overflow
+		}
+	}
+
+	spec.ProviderWidth = provider
+	spec.DetailWidth = detail
+	spec.ProfilesWidth = max(0, available-provider-detail)
+	return spec
+}
+
+func (m Model) compactLayoutSpec(mode layoutMode, contentHeight, tabsHeight int) layoutSpec {
+	spec := layoutSpec{
+		Mode:          mode,
+		Gap:           layoutGap,
+		ContentHeight: contentHeight,
+	}
+	remainingHeight := contentHeight - tabsHeight - 1
+	if remainingHeight < 0 {
+		remainingHeight = 0
+	}
+
+	showDetail := remainingHeight >= minCompactDetailHeight
+	profilesHeight := remainingHeight
+	detailHeight := 0
+
+	if showDetail {
+		profilesHeight = remainingHeight * 6 / 10
+		if profilesHeight < minCompactProfilesHeight {
+			profilesHeight = minCompactProfilesHeight
+		}
+		detailHeight = remainingHeight - profilesHeight - 1
+		if detailHeight < minCompactDetailMinHeight {
+			detailHeight = minCompactDetailMinHeight
+			profilesHeight = remainingHeight - detailHeight - 1
+			if profilesHeight < minCompactProfilesHeight {
+				profilesHeight = minCompactProfilesHeight
+				if profilesHeight+detailHeight+1 > remainingHeight {
+					detailHeight = remainingHeight - profilesHeight - 1
+					if detailHeight < 0 {
+						detailHeight = 0
+					}
+				}
+			}
+		}
+	}
+
+	spec.ProfilesHeight = profilesHeight
+	spec.DetailHeight = detailHeight
+	spec.ShowDetail = showDetail && detailHeight > 0
+	return spec
+}
+
+func (m Model) layoutDebugString(spec layoutSpec) string {
+	if spec.Mode == layoutFull {
+		return fmt.Sprintf("layout=full w=%d h=%d p=%d pr=%d d=%d", m.width, m.height, spec.ProviderWidth, spec.ProfilesWidth, spec.DetailWidth)
+	}
+	mode := "compact"
+	if spec.Mode == layoutTiny {
+		mode = "tiny"
+	}
+	return fmt.Sprintf("layout=%s w=%d h=%d ph=%d dh=%d", mode, m.width, m.height, spec.ProfilesHeight, spec.DetailHeight)
+}
+
+func (m Model) debugEnabled() bool {
+	return os.Getenv("CAAM_DEBUG") != ""
+}
+
+func (m Model) dialogWidth(preferred int) int {
+	if preferred <= 0 {
+		preferred = dialogMinWidth
+	}
+	if m.width <= 0 {
+		return preferred
+	}
+	maxWidth := m.width - dialogMargin
+	if maxWidth <= 0 {
+		return preferred
+	}
+	if maxWidth < dialogMinWidth {
+		return maxWidth
+	}
+	if preferred > maxWidth {
+		return maxWidth
+	}
+	return preferred
+}
+
+func (m *Model) clampDialogWidths() {
+	if m.backupDialog != nil {
+		m.backupDialog.SetWidth(m.dialogWidth(m.backupDialog.width))
+	}
+	if m.confirmDialog != nil {
+		m.confirmDialog.SetWidth(m.dialogWidth(m.confirmDialog.width))
+	}
+	if m.editDialog != nil {
+		m.editDialog.SetWidth(m.dialogWidth(m.editDialog.width))
+	}
+	if m.syncAddDialog != nil {
+		m.syncAddDialog.SetWidth(m.dialogWidth(m.syncAddDialog.width))
+	}
+	if m.syncEditDialog != nil {
+		m.syncEditDialog.SetWidth(m.dialogWidth(m.syncEditDialog.width))
+	}
 }
 
 func (m Model) projectContextLine() string {
@@ -2352,7 +2630,7 @@ func (m Model) renderProfileList() string {
 }
 
 // renderStatusBar renders the bottom status bar.
-func (m Model) renderStatusBar() string {
+func (m Model) renderStatusBar(layout layoutSpec) string {
 	if m.width <= 0 {
 		return ""
 	}
@@ -2376,6 +2654,20 @@ func (m Model) renderStatusBar() string {
 		left += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
 		left += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" switch provider  ")
 		left += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
+	}
+
+	if m.debugEnabled() {
+		debugLine := m.layoutDebugString(layout)
+		if debugLine != "" {
+			right := m.styles.StatusText.Render(debugLine)
+			leftWidth := lipgloss.Width(left)
+			rightWidth := lipgloss.Width(right)
+			gap := m.width - leftWidth - rightWidth
+			if gap < 1 {
+				gap = 1
+			}
+			left = left + strings.Repeat(" ", gap) + right
+		}
 	}
 
 	return m.styles.StatusBar.Width(m.width).Render(left)

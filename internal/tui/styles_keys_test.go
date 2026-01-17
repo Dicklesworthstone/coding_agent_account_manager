@@ -88,6 +88,16 @@ func TestDefaultStyles(t *testing.T) {
 			t.Error("Dialog style should render non-empty output")
 		}
 
+		result = styles.DialogFocused.Render("Dialog content")
+		if result == "" {
+			t.Error("DialogFocused style should render non-empty output")
+		}
+
+		result = styles.DialogOverlay.Render("Dialog background")
+		if result == "" {
+			t.Error("DialogOverlay style should render non-empty output")
+		}
+
 		result = styles.DialogTitle.Render("Title")
 		if result == "" {
 			t.Error("DialogTitle style should render non-empty output")
@@ -101,6 +111,13 @@ func TestDefaultStyles(t *testing.T) {
 		result = styles.DialogButtonActive.Render("Active Button")
 		if result == "" {
 			t.Error("DialogButtonActive style should render non-empty output")
+		}
+	})
+
+	t.Run("Input styles initialized", func(t *testing.T) {
+		result := styles.InputCursor.Render("|")
+		if result == "" {
+			t.Error("InputCursor style should render non-empty output")
 		}
 	})
 }

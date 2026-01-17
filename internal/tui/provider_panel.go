@@ -20,48 +20,66 @@ type ProviderPanel struct {
 
 // ProviderPanelStyles holds the styles for the provider panel.
 type ProviderPanelStyles struct {
-	Border       lipgloss.Style
-	Title        lipgloss.Style
-	Item         lipgloss.Style
-	SelectedItem lipgloss.Style
-	Count        lipgloss.Style
+	Border          lipgloss.Style
+	Title           lipgloss.Style
+	Item            lipgloss.Style
+	SelectedItem    lipgloss.Style
+	Count           lipgloss.Style
+	ActiveIndicator lipgloss.Style
 }
 
 // DefaultProviderPanelStyles returns the default styles for the provider panel.
 func DefaultProviderPanelStyles() ProviderPanelStyles {
+	return NewProviderPanelStyles(DefaultTheme())
+}
+
+// NewProviderPanelStyles returns themed styles for the provider panel.
+func NewProviderPanelStyles(theme Theme) ProviderPanelStyles {
+	p := theme.Palette
+
 	return ProviderPanelStyles{
 		Border: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDarkGray).
+			Border(theme.Border).
+			BorderForeground(p.BorderMuted).
+			Background(p.Surface).
 			Padding(0, 1),
 
 		Title: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorPurple).
+			Foreground(p.Accent).
 			MarginBottom(1),
 
 		Item: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			PaddingLeft(1),
 
 		SelectedItem: lipgloss.NewStyle().
-			Foreground(colorWhite).
+			Foreground(p.Text).
 			Bold(true).
-			Background(colorDarkGray).
+			Background(p.Selection).
 			PaddingLeft(1),
 
 		Count: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Italic(true),
+
+		ActiveIndicator: lipgloss.NewStyle().
+			Foreground(p.Success).
+			Bold(true),
 	}
 }
 
 // NewProviderPanel creates a new provider panel.
 func NewProviderPanel(providers []string) *ProviderPanel {
+	return NewProviderPanelWithTheme(providers, DefaultTheme())
+}
+
+// NewProviderPanelWithTheme creates a new provider panel using a theme.
+func NewProviderPanelWithTheme(providers []string, theme Theme) *ProviderPanel {
 	return &ProviderPanel{
 		providers:     providers,
 		profileCounts: make(map[string]int),
-		styles:        DefaultProviderPanelStyles(),
+		styles:        NewProviderPanelStyles(theme),
 	}
 }
 
@@ -98,7 +116,7 @@ func (p *ProviderPanel) View() string {
 		indicator := "  "
 		style := p.styles.Item
 		if i == p.activeProvider {
-			indicator = lipgloss.NewStyle().Foreground(colorGreen).Render("▶ ")
+			indicator = p.styles.ActiveIndicator.Render("▶ ")
 			style = p.styles.SelectedItem
 		}
 

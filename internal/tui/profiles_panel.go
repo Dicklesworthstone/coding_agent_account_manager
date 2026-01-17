@@ -48,7 +48,9 @@ type ProfilesPanelStyles struct {
 	SelectedRow     lipgloss.Style
 	ActiveIndicator lipgloss.Style
 	StatusOK        lipgloss.Style
+	StatusWarn      lipgloss.Style
 	StatusBad       lipgloss.Style
+	StatusMuted     lipgloss.Style
 	LockIcon        lipgloss.Style
 	ProjectBadge    lipgloss.Style
 	Empty           lipgloss.Style
@@ -56,51 +58,65 @@ type ProfilesPanelStyles struct {
 
 // DefaultProfilesPanelStyles returns the default styles for the profiles panel.
 func DefaultProfilesPanelStyles() ProfilesPanelStyles {
+	return NewProfilesPanelStyles(DefaultTheme())
+}
+
+// NewProfilesPanelStyles returns themed styles for the profiles panel.
+func NewProfilesPanelStyles(theme Theme) ProfilesPanelStyles {
+	p := theme.Palette
+
 	return ProfilesPanelStyles{
 		Border: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDarkGray).
+			Border(theme.Border).
+			BorderForeground(p.BorderMuted).
+			Background(p.Surface).
 			Padding(0, 1),
 
 		Title: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorPurple).
+			Foreground(p.Accent).
 			MarginBottom(1),
 
 		Header: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderBottom(true).
-			BorderForeground(colorDarkGray),
+			BorderForeground(p.BorderMuted),
 
 		Row: lipgloss.NewStyle().
-			Foreground(colorWhite),
+			Foreground(p.Text),
 
 		SelectedRow: lipgloss.NewStyle().
-			Foreground(colorWhite).
+			Foreground(p.Text).
 			Bold(true).
-			Background(colorDarkGray),
+			Background(p.Selection),
 
 		ActiveIndicator: lipgloss.NewStyle().
-			Foreground(colorGreen).
+			Foreground(p.Success).
 			Bold(true),
 
 		StatusOK: lipgloss.NewStyle().
-			Foreground(colorGreen),
+			Foreground(p.Success),
+
+		StatusWarn: lipgloss.NewStyle().
+			Foreground(p.Warning),
 
 		StatusBad: lipgloss.NewStyle().
-			Foreground(colorRed),
+			Foreground(p.Danger),
+
+		StatusMuted: lipgloss.NewStyle().
+			Foreground(p.Muted),
 
 		LockIcon: lipgloss.NewStyle().
-			Foreground(colorYellow),
+			Foreground(p.Warning),
 
 		ProjectBadge: lipgloss.NewStyle().
-			Foreground(colorCyan).
+			Foreground(p.Info).
 			Bold(true),
 
 		Empty: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Italic(true).
 			Padding(2, 2),
 	}
@@ -112,11 +128,11 @@ func (s ProfilesPanelStyles) StatusStyle(status health.HealthStatus) lipgloss.St
 	case health.StatusHealthy:
 		return s.StatusOK
 	case health.StatusWarning:
-		return lipgloss.NewStyle().Foreground(colorYellow)
+		return s.StatusWarn
 	case health.StatusCritical:
 		return s.StatusBad
 	default:
-		return lipgloss.NewStyle().Foreground(colorGray)
+		return s.StatusMuted
 	}
 }
 
@@ -157,9 +173,14 @@ func formatDuration(d time.Duration) string {
 
 // NewProfilesPanel creates a new profiles panel.
 func NewProfilesPanel() *ProfilesPanel {
+	return NewProfilesPanelWithTheme(DefaultTheme())
+}
+
+// NewProfilesPanelWithTheme creates a new profiles panel using a theme.
+func NewProfilesPanelWithTheme(theme Theme) *ProfilesPanel {
 	return &ProfilesPanel{
 		profiles: []ProfileInfo{},
-		styles:   DefaultProfilesPanelStyles(),
+		styles:   NewProfilesPanelStyles(theme),
 	}
 }
 

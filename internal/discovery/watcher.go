@@ -285,22 +285,57 @@ func (w *Watcher) processChange(path string) {
 	// Extract identity from the auth file
 	ident, err := w.extractIdentity(provider, path)
 	if err != nil {
-		w.logger.Debug("failed to extract identity",
+		w.logger.Debug("failed to extract identity; falling back to auto profile",
 			"provider", provider,
 			"path", path,
 			"error", err)
-		return
+		ident = nil
 	}
 
-	if ident == nil || ident.Email == "" {
-		w.logger.Debug("no identity found in auth file",
+	email := ""
+	if ident != nil {
+		email = strings.TrimSpace(ident.Email)
+	}
+
+	if email == "" {
+		if !authfile.HasAuthFiles(fileSet) {
+			w.logger.Debug("no auth files found; skipping auto backup",
+				"provider", provider,
+				"path", path)
+			return
+		}
+
+		// If this auth state already matches a saved profile, skip.
+		if active, err := w.vault.ActiveProfile(fileSet); err == nil && active != "" {
+			w.logger.Debug("auth matches existing profile; identity missing",
+				"provider", provider,
+				"profile", active)
+			return
+		}
+
+		// No identity available; still back up with an auto-generated name.
+		autoName := w.autoProfileName(provider)
+		w.logger.Info("identity missing; backing up with auto profile name",
 			"provider", provider,
-			"path", path)
+			"profile", autoName)
+		if err := w.vault.Backup(fileSet, autoName); err != nil {
+			w.logger.Error("failed to backup auto profile",
+				"provider", provider,
+				"profile", autoName,
+				"error", err)
+			if w.config.OnError != nil {
+				w.config.OnError(fmt.Errorf("backup %s/%s: %w", provider, autoName, err))
+			}
+			return
+		}
+		if w.config.OnDiscovery != nil {
+			w.config.OnDiscovery(provider, autoName, ident)
+		}
 		return
 	}
 
 	// Check if this profile already exists in vault
-	email := ident.Email
+	email = strings.TrimSpace(email)
 	profiles, err := w.vault.List(provider)
 	if err != nil {
 		w.logger.Error("failed to list profiles",
@@ -357,6 +392,32 @@ func (w *Watcher) processChange(path string) {
 	if w.config.OnDiscovery != nil {
 		w.config.OnDiscovery(provider, email, ident)
 	}
+}
+
+// autoProfileName generates a unique, user-deletable profile name when identity is missing.
+func (w *Watcher) autoProfileName(provider string) string {
+	base := "auto-" + time.Now().Format("20060102-150405")
+	if w == nil || w.vault == nil {
+		return base
+	}
+	profiles, err := w.vault.List(provider)
+	if err != nil || len(profiles) == 0 {
+		return base
+	}
+	exists := make(map[string]struct{}, len(profiles))
+	for _, p := range profiles {
+		exists[p] = struct{}{}
+	}
+	if _, ok := exists[base]; !ok {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if _, ok := exists[candidate]; !ok {
+			return candidate
+		}
+	}
+	return base
 }
 
 // extractIdentity extracts account identity from an auth file.
@@ -496,15 +557,34 @@ func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) (
 		}
 
 		if err != nil {
-			logger.Debug("failed to extract identity",
+			logger.Debug("failed to extract identity; falling back to auto profile",
 				"provider", provider,
 				"error", err)
-			continue
+			ident = nil
 		}
 
 		if ident == nil || ident.Email == "" {
-			logger.Debug("no email in identity",
-				"provider", provider)
+			// If current auth already matches a saved profile, skip.
+			if active, err := vault.ActiveProfile(fileSet); err == nil && active != "" {
+				logger.Debug("auth matches existing profile; identity missing",
+					"provider", provider,
+					"profile", active)
+				continue
+			}
+
+			// No identity available; still back up with an auto-generated name.
+			autoName := autoProfileName(vault, provider)
+			logger.Info("identity missing; backing up with auto profile name",
+				"provider", provider,
+				"profile", autoName)
+			if err := vault.Backup(fileSet, autoName); err != nil {
+				logger.Error("failed to backup auto profile",
+					"provider", provider,
+					"profile", autoName,
+					"error", err)
+				continue
+			}
+			discovered = append(discovered, fmt.Sprintf("%s/%s", provider, autoName))
 			continue
 		}
 
@@ -552,4 +632,29 @@ func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) (
 	}
 
 	return discovered, nil
+}
+
+func autoProfileName(vault *authfile.Vault, provider string) string {
+	base := "auto-" + time.Now().Format("20060102-150405")
+	if vault == nil {
+		return base
+	}
+	profiles, err := vault.List(provider)
+	if err != nil || len(profiles) == 0 {
+		return base
+	}
+	exists := make(map[string]struct{}, len(profiles))
+	for _, p := range profiles {
+		exists[p] = struct{}{}
+	}
+	if _, ok := exists[base]; !ok {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if _, ok := exists[candidate]; !ok {
+			return candidate
+		}
+	}
+	return base
 }

@@ -60,46 +60,59 @@ type SyncPanelStyles struct {
 
 // DefaultSyncPanelStyles returns the default styles for the sync panel.
 func DefaultSyncPanelStyles() SyncPanelStyles {
+	return NewSyncPanelStyles(DefaultTheme())
+}
+
+// NewSyncPanelStyles returns themed styles for the sync panel.
+func NewSyncPanelStyles(theme Theme) SyncPanelStyles {
+	p := theme.Palette
+
 	return SyncPanelStyles{
 		Title: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorPurple),
+			Foreground(p.Accent),
 		StatusEnabled: lipgloss.NewStyle().
-			Foreground(colorGreen).
+			Foreground(p.Success).
 			Bold(true),
 		StatusDisabled: lipgloss.NewStyle().
-			Foreground(colorRed),
+			Foreground(p.Danger),
 		Machine: lipgloss.NewStyle().
-			Foreground(colorWhite),
+			Foreground(p.Text),
 		SelectedMachine: lipgloss.NewStyle().
-			Foreground(colorCyan).
+			Foreground(p.Info).
 			Bold(true),
 		StatusOnline: lipgloss.NewStyle().
-			Foreground(colorGreen),
+			Foreground(p.Success),
 		StatusOffline: lipgloss.NewStyle().
-			Foreground(colorGray),
+			Foreground(p.Muted),
 		StatusSyncing: lipgloss.NewStyle().
-			Foreground(colorYellow),
+			Foreground(p.Warning),
 		StatusError: lipgloss.NewStyle().
-			Foreground(colorRed),
+			Foreground(p.Danger),
 		KeyHint: lipgloss.NewStyle().
-			Foreground(colorGray),
+			Foreground(p.Muted),
 		Border: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDarkGray).
+			Border(theme.Border).
+			BorderForeground(p.BorderMuted).
+			Background(p.Surface).
 			Padding(1, 2),
 		Empty: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Italic(true),
 	}
 }
 
 // NewSyncPanel creates a new sync panel.
 func NewSyncPanel() *SyncPanel {
+	return NewSyncPanelWithTheme(DefaultTheme())
+}
+
+// NewSyncPanelWithTheme creates a new sync panel using a theme.
+func NewSyncPanelWithTheme(theme Theme) *SyncPanel {
 	return &SyncPanel{
 		visible:     false,
 		selectedIdx: 0,
-		styles:      DefaultSyncPanelStyles(),
+		styles:      NewSyncPanelStyles(theme),
 	}
 }
 

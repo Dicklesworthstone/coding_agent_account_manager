@@ -25,6 +25,7 @@ func TestDefaultProviderPanelStyles(t *testing.T) {
 		{"Item", func() string { return styles.Item.Render("test") }},
 		{"SelectedItem", func() string { return styles.SelectedItem.Render("test") }},
 		{"Count", func() string { return styles.Count.Render("test") }},
+		{"ActiveIndicator", func() string { return styles.ActiveIndicator.Render("test") }},
 	}
 
 	for _, tt := range tests {
@@ -184,7 +185,9 @@ func TestDefaultDetailPanelStyles(t *testing.T) {
 		{"Label", func() string { return styles.Label.Render("test") }},
 		{"Value", func() string { return styles.Value.Render("test") }},
 		{"StatusOK", func() string { return styles.StatusOK.Render("test") }},
+		{"StatusWarn", func() string { return styles.StatusWarn.Render("test") }},
 		{"StatusBad", func() string { return styles.StatusBad.Render("test") }},
+		{"StatusMuted", func() string { return styles.StatusMuted.Render("test") }},
 		{"LockIcon", func() string { return styles.LockIcon.Render("test") }},
 		{"Divider", func() string { return styles.Divider.Render("test") }},
 		{"ActionHeader", func() string { return styles.ActionHeader.Render("test") }},
@@ -361,7 +364,9 @@ func TestDefaultProfilesPanelStyles(t *testing.T) {
 		{"SelectedRow", func() string { return styles.SelectedRow.Render("test") }},
 		{"ActiveIndicator", func() string { return styles.ActiveIndicator.Render("test") }},
 		{"StatusOK", func() string { return styles.StatusOK.Render("test") }},
+		{"StatusWarn", func() string { return styles.StatusWarn.Render("test") }},
 		{"StatusBad", func() string { return styles.StatusBad.Render("test") }},
+		{"StatusMuted", func() string { return styles.StatusMuted.Render("test") }},
 		{"LockIcon", func() string { return styles.LockIcon.Render("test") }},
 		{"ProjectBadge", func() string { return styles.ProjectBadge.Render("test") }},
 		{"Empty", func() string { return styles.Empty.Render("test") }},
@@ -681,7 +686,7 @@ func TestTruncate(t *testing.T) {
 		{"hello", 5, "hello"},
 		{"hi", 3, "hi"},
 		{"hi", 2, "hi"},
-		{"hello", 3, "hel"}, // width <= 3, no ellipsis
+		{"hello", 3, "hel"},        // width <= 3, no ellipsis
 		{"über test", 6, "übe..."}, // Unicode test
 	}
 

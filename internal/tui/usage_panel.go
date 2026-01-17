@@ -39,30 +39,43 @@ type UsagePanelStyles struct {
 }
 
 func DefaultUsagePanelStyles() UsagePanelStyles {
+	return NewUsagePanelStyles(DefaultTheme())
+}
+
+// NewUsagePanelStyles returns themed styles for the usage panel.
+func NewUsagePanelStyles(theme Theme) UsagePanelStyles {
+	p := theme.Palette
+
 	return UsagePanelStyles{
 		Border: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorDarkGray).
+			Border(theme.Border).
+			BorderForeground(p.BorderMuted).
+			Background(p.Surface).
 			Padding(1, 2),
 		Title: lipgloss.NewStyle().
 			Bold(true).
-			Foreground(colorPurple),
+			Foreground(p.Accent),
 		Row: lipgloss.NewStyle().
-			Foreground(colorWhite),
+			Foreground(p.Text),
 		BarFill: lipgloss.NewStyle().
-			Foreground(colorCyan),
+			Foreground(p.Info),
 		Empty: lipgloss.NewStyle().
-			Foreground(colorGray).
+			Foreground(p.Muted).
 			Italic(true),
 		Footer: lipgloss.NewStyle().
-			Foreground(colorGray),
+			Foreground(p.Muted),
 	}
 }
 
 func NewUsagePanel() *UsagePanel {
+	return NewUsagePanelWithTheme(DefaultTheme())
+}
+
+// NewUsagePanelWithTheme creates a new usage panel using a theme.
+func NewUsagePanelWithTheme(theme Theme) *UsagePanel {
 	return &UsagePanel{
 		timeRange: 7,
-		styles:    DefaultUsagePanelStyles(),
+		styles:    NewUsagePanelStyles(theme),
 	}
 }
 

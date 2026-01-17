@@ -60,8 +60,9 @@ func (m Model) handleExportVault() (tea.Model, tea.Cmd) {
 		"Export Vault",
 		fmt.Sprintf("Export all %d profiles to a zip bundle?", totalProfiles),
 	)
+	m.confirmDialog.SetStyles(m.styles)
 	m.confirmDialog.SetLabels("Export", "Cancel")
-	m.confirmDialog.SetWidth(50)
+	m.confirmDialog.SetWidth(m.dialogWidth(50))
 	m.state = stateExportConfirm
 	m.statusMsg = ""
 	return m, nil
@@ -155,8 +156,9 @@ func (m Model) handleImportBundle() (tea.Model, tea.Cmd) {
 		"Import Bundle",
 		"Enter path to bundle zip file:",
 	)
+	dialog.SetStyles(m.styles)
 	dialog.SetPlaceholder("~/backup.zip or /path/to/bundle.zip")
-	dialog.SetWidth(60)
+	dialog.SetWidth(m.dialogWidth(60))
 	m.backupDialog = dialog // Reuse backup dialog field
 	m.state = stateImportPath
 	m.statusMsg = ""
@@ -362,8 +364,9 @@ func (m Model) handleImportPreview(msg importPreviewMsg) (tea.Model, tea.Cmd) {
 
 	// Show confirmation dialog with preview
 	m.confirmDialog = NewConfirmDialog("Import Bundle", previewText)
+	m.confirmDialog.SetStyles(m.styles)
 	m.confirmDialog.SetLabels("Import", "Cancel")
-	m.confirmDialog.SetWidth(55)
+	m.confirmDialog.SetWidth(m.dialogWidth(55))
 	m.state = stateImportConfirm
 	m.statusMsg = ""
 	return m, nil

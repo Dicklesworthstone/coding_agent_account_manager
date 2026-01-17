@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -182,4 +183,88 @@ func TestWatcher_UpdateExisting(t *testing.T) {
 	// Should report the update
 	assert.Len(t, discovered, 1)
 	assert.Equal(t, "claude/existing@example.com", discovered[0])
+}
+
+func TestWatchOnce_AutoProfileOnIdentityError(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	homeDir := filepath.Join(tmpDir, "home")
+
+	require.NoError(t, os.MkdirAll(vaultDir, 0700))
+	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
+
+	vault := authfile.NewVault(vaultDir)
+
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", homeDir)
+	defer func() {
+		if origHome != "" {
+			os.Setenv("HOME", origHome)
+		}
+	}()
+
+	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
+
+	discovered, err := WatchOnce(vault, []string{"claude"}, nil)
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+	assert.True(t, strings.HasPrefix(discovered[0], "claude/auto-"))
+
+	profiles, err := vault.List("claude")
+	require.NoError(t, err)
+	require.Len(t, profiles, 1)
+	assert.True(t, strings.HasPrefix(profiles[0], "auto-"))
+}
+
+func TestWatcher_AutoProfileOnIdentityError(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	homeDir := filepath.Join(tmpDir, "home")
+
+	require.NoError(t, os.MkdirAll(vaultDir, 0700))
+	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
+
+	vault := authfile.NewVault(vaultDir)
+
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", homeDir)
+	defer func() {
+		if origHome != "" {
+			os.Setenv("HOME", origHome)
+		}
+	}()
+
+	var mu sync.Mutex
+	var discoveries []string
+
+	watcher, err := NewWatcher(vault, WatcherConfig{
+		Providers:        []string{"claude"},
+		DebounceInterval: 100 * time.Millisecond,
+		OnDiscovery: func(provider, email string, ident *identity.Identity) {
+			mu.Lock()
+			discoveries = append(discoveries, provider+"/"+email)
+			mu.Unlock()
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	require.NoError(t, watcher.Start(ctx))
+	defer watcher.Stop()
+
+	time.Sleep(200 * time.Millisecond)
+
+	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
+
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Len(t, discoveries, 1)
+	assert.True(t, strings.HasPrefix(discoveries[0], "claude/auto-"))
 }

@@ -220,6 +220,41 @@ carol@gmail.com
 
 **Aliases:** `caam switch` and `caam use` work like `caam activate`
 
+### Quick Switch: `pick` + aliases
+
+Use `caam pick` when you want the fastest possible profile swap:
+
+```bash
+caam pick claude           # fzf if installed; numbered prompt otherwise
+caam pick                  # uses your default_provider if set
+```
+
+Set a default provider so you can omit the tool name:
+
+```bash
+caam config set default_provider claude
+```
+
+Aliases make long emails painless (works for `pick` and `activate`):
+
+```bash
+caam alias claude work-account-1 work
+caam pick claude            # type "work" at the prompt
+caam activate claude work   # alias resolution works here too
+```
+
+SSH-safe fallback (no fzf, no TTY): use direct activation:
+
+```bash
+caam activate claude work-account-1
+```
+
+fzf one-liner (if you prefer piping):
+
+```bash
+sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activate claude "$sel"
+```
+
 ### Smart Profile Management
 
 | Command | Description |
