@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="coding_agent_account_manager_illustration.webp" alt="caam - Coding Agent Account Manager" width="600">
+</p>
+
 # caam - Coding Agent Account Manager
 
 ![Release](https://img.shields.io/github/v/release/Dicklesworthstone/coding_agent_account_manager?style=for-the-badge&color=bd93f9)
