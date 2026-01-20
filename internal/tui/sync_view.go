@@ -32,12 +32,22 @@ func (p *SyncPanel) View() string {
 	}
 
 	if p.loading {
-		body := p.styles.Empty.Render("Loading sync state...")
+		var body string
+		if p.loadingSpinner != nil {
+			body = p.loadingSpinner.View()
+		} else {
+			body = p.styles.Empty.Render("Loading sync state...")
+		}
 		return p.render(title, statusLine, body)
 	}
 
 	if p.syncing {
-		body := p.styles.Empty.Render("Syncing...")
+		var body string
+		if p.syncingSpinner != nil {
+			body = p.syncingSpinner.View()
+		} else {
+			body = p.styles.Empty.Render("Syncing...")
+		}
 		return p.render(title, statusLine, body)
 	}
 

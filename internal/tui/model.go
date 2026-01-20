@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -487,7 +488,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = "Reload requested"
 		cmds := []tea.Cmd{m.loadProfiles, m.loadProjectContext(), m.watchSignals()}
 		if m.usagePanel != nil && m.usagePanel.Visible() {
-			m.usagePanel.SetLoading(true)
+			cmds = append(cmds, m.usagePanel.SetLoading(true))
 			cmds = append(cmds, m.loadUsageStats())
 		}
 		return m, tea.Batch(cmds...)
@@ -620,15 +621,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case syncStartedMsg:
+		var spinnerCmd tea.Cmd
 		if m.syncPanel != nil {
-			m.syncPanel.SetSyncing(true)
+			spinnerCmd = m.syncPanel.SetSyncing(true)
 		}
 		if msg.machineName != "" {
 			m.statusMsg = "Syncing " + msg.machineName + "..."
 		} else {
 			m.statusMsg = "Syncing..."
 		}
-		return m, nil
+		return m, spinnerCmd
 
 	case syncCompletedMsg:
 		if m.syncPanel != nil {
@@ -652,6 +654,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			)
 		}
 		return m, m.loadSyncState()
+
+	case spinner.TickMsg:
+		// Forward spinner tick messages to panels with active spinners.
+		var cmds []tea.Cmd
+		if m.usagePanel != nil && m.usagePanel.loading {
+			_, cmd := m.usagePanel.Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		if m.syncPanel != nil && (m.syncPanel.loading || m.syncPanel.syncing) {
+			_, cmd := m.syncPanel.Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
@@ -779,20 +801,20 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "1":
 			m.usagePanel.SetTimeRange(1)
-			m.usagePanel.SetLoading(true)
-			return m, m.loadUsageStats()
+			spinnerCmd := m.usagePanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadUsageStats())
 		case "2":
 			m.usagePanel.SetTimeRange(7)
-			m.usagePanel.SetLoading(true)
-			return m, m.loadUsageStats()
+			spinnerCmd := m.usagePanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadUsageStats())
 		case "3":
 			m.usagePanel.SetTimeRange(30)
-			m.usagePanel.SetLoading(true)
-			return m, m.loadUsageStats()
+			spinnerCmd := m.usagePanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadUsageStats())
 		case "4":
 			m.usagePanel.SetTimeRange(0)
-			m.usagePanel.SetLoading(true)
-			return m, m.loadUsageStats()
+			spinnerCmd := m.usagePanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadUsageStats())
 		}
 	}
 
@@ -931,8 +953,8 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.usagePanel.Toggle()
 		if m.usagePanel.Visible() {
-			m.usagePanel.SetLoading(true)
-			return m, m.loadUsageStats()
+			spinnerCmd := m.usagePanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadUsageStats())
 		}
 		return m, nil
 
@@ -942,8 +964,8 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.syncPanel.Toggle()
 		if m.syncPanel.Visible() {
-			m.syncPanel.SetLoading(true)
-			return m, m.loadSyncState()
+			spinnerCmd := m.syncPanel.SetLoading(true)
+			return m, tea.Batch(spinnerCmd, m.loadSyncState())
 		}
 		return m, nil
 
@@ -1298,8 +1320,8 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		if machine := m.syncPanel.SelectedMachine(); machine != nil {
 			m.statusMsg = "Syncing " + machine.Name + "..."
-			m.syncPanel.SetSyncing(true)
-			return m, m.syncWithMachine(machine.ID)
+			spinnerCmd := m.syncPanel.SetSyncing(true)
+			return m, tea.Batch(spinnerCmd, m.syncWithMachine(machine.ID))
 		}
 		return m, nil
 

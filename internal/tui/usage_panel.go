@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -18,7 +19,9 @@ type UsagePanel struct {
 	width  int
 	height int
 
-	styles UsagePanelStyles
+	styles  UsagePanelStyles
+	spinner *Spinner
+	theme   Theme
 }
 
 type ProfileUsage struct {
@@ -76,6 +79,8 @@ func NewUsagePanelWithTheme(theme Theme) *UsagePanel {
 	return &UsagePanel{
 		timeRange: 7,
 		styles:    NewUsagePanelStyles(theme),
+		spinner:   NewSpinnerWithTheme(theme, "Loading usage stats…"),
+		theme:     theme,
 	}
 }
 
@@ -107,11 +112,33 @@ func (u *UsagePanel) TimeRange() int {
 	return u.timeRange
 }
 
-func (u *UsagePanel) SetLoading(loading bool) {
+func (u *UsagePanel) SetLoading(loading bool) tea.Cmd {
 	if u == nil {
-		return
+		return nil
 	}
 	u.loading = loading
+	if loading && u.spinner != nil {
+		return u.spinner.Tick()
+	}
+	return nil
+}
+
+// Loading returns whether the panel is in loading state.
+func (u *UsagePanel) Loading() bool {
+	if u == nil {
+		return false
+	}
+	return u.loading
+}
+
+// Update handles messages for the usage panel (primarily spinner ticks).
+func (u *UsagePanel) Update(msg tea.Msg) (*UsagePanel, tea.Cmd) {
+	if u == nil || !u.loading || u.spinner == nil {
+		return u, nil
+	}
+	var cmd tea.Cmd
+	u.spinner, cmd = u.spinner.Update(msg)
+	return u, cmd
 }
 
 func (u *UsagePanel) SetSize(width, height int) {
@@ -166,7 +193,12 @@ func (u *UsagePanel) View() string {
 	timeRange := u.timeRangeLabel()
 
 	if u.loading {
-		body := u.styles.Empty.Render("Loading usage stats…")
+		var body string
+		if u.spinner != nil {
+			body = u.spinner.View()
+		} else {
+			body = u.styles.Empty.Render("Loading usage stats…")
+		}
 		return u.render(title, timeRange, body)
 	}
 

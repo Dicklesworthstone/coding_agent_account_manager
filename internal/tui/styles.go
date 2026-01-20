@@ -29,6 +29,8 @@ type ThemeOptions struct {
 	Mode     ThemeMode
 	Contrast ThemeContrast
 	NoColor  bool
+	// ReducedMotion disables animated UI effects (e.g., spinners).
+	ReducedMotion bool
 }
 
 // Theme defines the active palette and rendering characteristics.
@@ -36,6 +38,8 @@ type Theme struct {
 	Mode     ThemeMode
 	Contrast ThemeContrast
 	NoColor  bool
+	// ReducedMotion disables animated UI effects (e.g., spinners).
+	ReducedMotion bool
 	Palette  Palette
 	Border   lipgloss.Border
 }
@@ -80,6 +84,9 @@ func DefaultThemeOptions() ThemeOptions {
 // - TERM=dumb disables color output.
 // - CAAM_TUI_THEME=auto|dark|light|high-contrast
 // - CAAM_TUI_CONTRAST=normal|high
+// - CAAM_TUI_REDUCED_MOTION=1 (or true/yes/on) disables animation
+// - CAAM_REDUCED_MOTION=1 (alias)
+// - REDUCED_MOTION=1 (generic)
 func ThemeOptionsFromEnv() ThemeOptions {
 	opts := DefaultThemeOptions()
 
@@ -90,6 +97,10 @@ func ThemeOptionsFromEnv() ThemeOptions {
 	term := strings.TrimSpace(strings.ToLower(os.Getenv("TERM")))
 	if term == "dumb" {
 		opts.NoColor = true
+	}
+
+	if envBool("CAAM_TUI_REDUCED_MOTION") || envBool("CAAM_REDUCED_MOTION") || envBool("REDUCED_MOTION") {
+		opts.ReducedMotion = true
 	}
 
 	theme := strings.TrimSpace(strings.ToLower(os.Getenv("CAAM_TUI_THEME")))
@@ -135,6 +146,7 @@ func NewTheme(opts ThemeOptions) Theme {
 		Mode:     opts.Mode,
 		Contrast: opts.Contrast,
 		NoColor:  opts.NoColor,
+		ReducedMotion: opts.ReducedMotion,
 		Palette:  palette,
 		Border:   border,
 	}
@@ -241,6 +253,46 @@ func keycapStyle(theme Theme, compact bool) lipgloss.Style {
 		style = style.Padding(0, 1)
 	}
 	return style
+}
+
+func envBool(key string) bool {
+	val, ok := os.LookupEnv(key)
+	if !ok {
+		return false
+	}
+	val = strings.TrimSpace(strings.ToLower(val))
+	if val == "" {
+		return true
+	}
+	switch val {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// spinnerStyle returns the centralized spinner styling for the current theme.
+func spinnerStyle(theme Theme) lipgloss.Style {
+	style := lipgloss.NewStyle()
+	if theme.NoColor {
+		return style
+	}
+	return style.Foreground(theme.Palette.Accent)
+}
+
+func spinnerEnabled(theme Theme) bool {
+	return !theme.ReducedMotion
+}
+
+func spinnerMessageStyle(theme Theme) lipgloss.Style {
+	style := lipgloss.NewStyle()
+	if theme.NoColor {
+		return style
+	}
+	return style.Foreground(theme.Palette.Muted)
 }
 
 // Styles holds all the lipgloss styles for the TUI.

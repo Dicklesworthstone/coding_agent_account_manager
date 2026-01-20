@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -27,6 +28,11 @@ type SyncPanel struct {
 
 	// Styles
 	styles SyncPanelStyles
+
+	// Spinners for loading states
+	loadingSpinner *Spinner
+	syncingSpinner *Spinner
+	theme          Theme
 }
 
 // MachineInfo is a display-friendly representation of a machine.
@@ -110,9 +116,12 @@ func NewSyncPanel() *SyncPanel {
 // NewSyncPanelWithTheme creates a new sync panel using a theme.
 func NewSyncPanelWithTheme(theme Theme) *SyncPanel {
 	return &SyncPanel{
-		visible:     false,
-		selectedIdx: 0,
-		styles:      NewSyncPanelStyles(theme),
+		visible:        false,
+		selectedIdx:    0,
+		styles:         NewSyncPanelStyles(theme),
+		loadingSpinner: NewSpinnerWithTheme(theme, "Loading sync state..."),
+		syncingSpinner: NewSpinnerWithTheme(theme, "Syncing..."),
+		theme:          theme,
 	}
 }
 
@@ -141,20 +150,76 @@ func (p *SyncPanel) SetSize(width, height int) {
 	p.height = height
 }
 
-// SetLoading sets the loading state.
-func (p *SyncPanel) SetLoading(loading bool) {
+// SetLoading sets the loading state and returns a command to start the spinner.
+func (p *SyncPanel) SetLoading(loading bool) tea.Cmd {
 	if p == nil {
-		return
+		return nil
 	}
 	p.loading = loading
+	if loading && p.loadingSpinner != nil {
+		return p.loadingSpinner.Tick()
+	}
+	return nil
 }
 
-// SetSyncing sets the syncing state.
-func (p *SyncPanel) SetSyncing(syncing bool) {
+// SetSyncing sets the syncing state and returns a command to start the spinner.
+func (p *SyncPanel) SetSyncing(syncing bool) tea.Cmd {
 	if p == nil {
-		return
+		return nil
 	}
 	p.syncing = syncing
+	if syncing && p.syncingSpinner != nil {
+		return p.syncingSpinner.Tick()
+	}
+	return nil
+}
+
+// Loading returns whether the panel is in loading state.
+func (p *SyncPanel) Loading() bool {
+	if p == nil {
+		return false
+	}
+	return p.loading
+}
+
+// Syncing returns whether the panel is in syncing state.
+func (p *SyncPanel) Syncing() bool {
+	if p == nil {
+		return false
+	}
+	return p.syncing
+}
+
+// Update handles messages for the sync panel (primarily spinner ticks).
+func (p *SyncPanel) Update(msg tea.Msg) (*SyncPanel, tea.Cmd) {
+	if p == nil {
+		return p, nil
+	}
+
+	var cmds []tea.Cmd
+
+	// Update loading spinner
+	if p.loading && p.loadingSpinner != nil {
+		var cmd tea.Cmd
+		p.loadingSpinner, cmd = p.loadingSpinner.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+
+	// Update syncing spinner
+	if p.syncing && p.syncingSpinner != nil {
+		var cmd tea.Cmd
+		p.syncingSpinner, cmd = p.syncingSpinner.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+
+	if len(cmds) > 0 {
+		return p, tea.Batch(cmds...)
+	}
+	return p, nil
 }
 
 // SetState sets the sync state and updates the machine list.
