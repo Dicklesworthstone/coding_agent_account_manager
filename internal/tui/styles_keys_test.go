@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // =============================================================================
@@ -66,6 +67,21 @@ func TestDefaultStyles(t *testing.T) {
 		if result == "" {
 			t.Error("StatusText style should render non-empty output")
 		}
+
+		result = styles.StatusSuccess.Render("Success")
+		if result == "" {
+			t.Error("StatusSuccess style should render non-empty output")
+		}
+
+		result = styles.StatusWarning.Render("Warning")
+		if result == "" {
+			t.Error("StatusWarning style should render non-empty output")
+		}
+
+		result = styles.StatusError.Render("Error")
+		if result == "" {
+			t.Error("StatusError style should render non-empty output")
+		}
 	})
 
 	t.Run("Empty state style initialized", func(t *testing.T) {
@@ -118,6 +134,51 @@ func TestDefaultStyles(t *testing.T) {
 		result := styles.InputCursor.Render("|")
 		if result == "" {
 			t.Error("InputCursor style should render non-empty output")
+		}
+	})
+}
+
+func TestStatusSeverityStyleMapping(t *testing.T) {
+	theme := NewTheme(DefaultThemeOptions())
+	styles := NewStyles(theme)
+
+	tests := []struct {
+		severity StatusSeverity
+		want     interface{}
+	}{
+		{StatusSuccess, theme.Palette.Success},
+		{StatusWarning, theme.Palette.Warning},
+		{StatusError, theme.Palette.Danger},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.severity.String(), func(t *testing.T) {
+			style := styles.StatusSeverityStyle(tt.severity)
+			fg := style.GetForeground()
+			t.Logf("severity=%s foreground=%v", tt.severity.String(), fg)
+			if fg != tt.want {
+				t.Fatalf("severity=%s foreground=%v, want %v", tt.severity.String(), fg, tt.want)
+			}
+		})
+	}
+
+	t.Run("info uses StatusText", func(t *testing.T) {
+		style := styles.StatusSeverityStyle(StatusInfo)
+		fg := style.GetForeground()
+		t.Logf("severity=info foreground=%v", fg)
+		if fg != styles.StatusText.GetForeground() {
+			t.Fatalf("info foreground=%v, want %v", fg, styles.StatusText.GetForeground())
+		}
+	})
+
+	t.Run("no-color theme leaves severity styles uncolored", func(t *testing.T) {
+		theme := NewTheme(ThemeOptions{NoColor: true})
+		styles := NewStyles(theme)
+		style := styles.StatusSeverityStyle(StatusError)
+		fg := style.GetForeground()
+		t.Logf("severity=error foreground=%v", fg)
+		if fg != (lipgloss.NoColor{}) {
+			t.Fatalf("expected no color foreground, got %v", fg)
 		}
 	})
 }

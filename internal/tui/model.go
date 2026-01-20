@@ -2656,11 +2656,45 @@ func (m Model) renderStatusBar(layout layoutSpec) string {
 	if m.width <= 0 {
 		return ""
 	}
-
-	if m.statusMsg != "" {
-		return m.styles.StatusBar.Width(m.width).Render(m.styles.StatusText.Render(m.statusMsg))
+	contentWidth := m.width - 2
+	if contentWidth < 1 {
+		contentWidth = m.width
 	}
 
+	if m.statusMsg != "" {
+		hints := m.statusHintLine(layout, false)
+		severity := statusSeverityFromMessage(m.statusMsg)
+		statusStyle := m.styles.StatusSeverityStyle(severity)
+		statusText := statusStyle.Render(m.statusMsg)
+		if hints == "" {
+			return m.styles.StatusBar.Width(m.width).Render(statusText)
+		}
+
+		statusWidth := lipgloss.Width(statusText)
+		hintsWidth := lipgloss.Width(hints)
+		if statusWidth+1+hintsWidth > contentWidth {
+			available := contentWidth - hintsWidth - 1
+			if available < 4 {
+				return m.styles.StatusBar.Width(m.width).Render(statusText)
+			}
+			truncated := truncateString(m.statusMsg, available)
+			statusText = statusStyle.Render(truncated)
+			statusWidth = lipgloss.Width(statusText)
+		}
+
+		gap := contentWidth - statusWidth - hintsWidth
+		if gap < 1 {
+			gap = 1
+		}
+		line := statusText + strings.Repeat(" ", gap) + hints
+		return m.styles.StatusBar.Width(m.width).Render(line)
+	}
+
+	hints := m.statusHintLine(layout, true)
+	return m.styles.StatusBar.Width(m.width).Render(hints)
+}
+
+func (m Model) statusHintLine(layout layoutSpec, includeDebug bool) string {
 	left := ""
 	switch {
 	case m.width < 70:
@@ -2678,7 +2712,7 @@ func (m Model) renderStatusBar(layout layoutSpec) string {
 		left += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
 	}
 
-	if m.debugEnabled() {
+	if includeDebug && m.debugEnabled() {
 		debugLine := m.layoutDebugString(layout)
 		if debugLine != "" {
 			right := m.styles.StatusText.Render(debugLine)
@@ -2692,7 +2726,78 @@ func (m Model) renderStatusBar(layout layoutSpec) string {
 		}
 	}
 
-	return m.styles.StatusBar.Width(m.width).Render(left)
+	return left
+}
+
+func statusSeverityFromMessage(msg string) StatusSeverity {
+	msg = strings.TrimSpace(strings.ToLower(msg))
+	if msg == "" {
+		return StatusInfo
+	}
+
+	errorMarkers := []string{
+		"error",
+		"failed",
+		"cannot",
+		"can't",
+		"unable",
+		"invalid",
+		"not found",
+		"denied",
+		"forbidden",
+		"expired",
+		"corrupt",
+		"locked",
+	}
+	for _, marker := range errorMarkers {
+		if strings.Contains(msg, marker) {
+			return StatusError
+		}
+	}
+
+	warnMarkers := []string{
+		"warning",
+		"warn",
+		"cancelled",
+		"canceled",
+		"not configured",
+		"no profile",
+		"no profiles",
+		"no auth",
+		"missing",
+		"ignored",
+	}
+	for _, marker := range warnMarkers {
+		if strings.Contains(msg, marker) {
+			return StatusWarning
+		}
+	}
+
+	successMarkers := []string{
+		"success",
+		"completed",
+		"complete",
+		"activated",
+		"added",
+		"updated",
+		"deleted",
+		"removed",
+		"backed up",
+		"refreshed",
+		"exported",
+		"imported",
+		"saved",
+		"associated",
+		"synced",
+		"connection test:",
+	}
+	for _, marker := range successMarkers {
+		if strings.Contains(msg, marker) {
+			return StatusSuccess
+		}
+	}
+
+	return StatusInfo
 }
 
 // helpView renders the help screen.

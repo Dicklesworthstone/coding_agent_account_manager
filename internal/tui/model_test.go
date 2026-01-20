@@ -9,6 +9,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestNew(t *testing.T) {
@@ -639,7 +640,7 @@ func TestShowRefreshSuccess(t *testing.T) {
 // TestDialogOverlayView tests the dialogOverlayView method.
 func TestDialogOverlayView(t *testing.T) {
 	m := New()
-	m.width = 80
+	m.width = 120
 	m.height = 24
 	m.profiles = map[string][]Profile{
 		"claude": {{Name: "test@example.com"}},
@@ -1177,6 +1178,48 @@ func TestRenderStatusBar(t *testing.T) {
 	}
 }
 
+func TestStatusBarSeveritySnapshots(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	m := New()
+	m.width = 120
+
+	tests := []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{
+			name:    "success",
+			message: "Exported",
+			want: "" +
+				" Exported                                                q   quit   ?   help   tab   switch provider   enter   activate",
+		},
+		{
+			name:    "warning",
+			message: "No profile selected",
+			want: "" +
+				" No profile selected                                     q   quit   ?   help   tab   switch provider   enter   activate",
+		},
+		{
+			name:    "error",
+			message: "Export failed",
+			want: "" +
+				" Export failed                                           q   quit   ?   help   tab   switch provider   enter   activate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m.statusMsg = tt.message
+			got := normalizeStatusSnapshot(m.renderStatusBar(layoutSpec{Mode: layoutFull}))
+			if got != tt.want {
+				t.Fatalf("status snapshot mismatch\n--- got ---\n%s\n--- want ---\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestApplySearchFilter tests the applySearchFilter method.
 func TestApplySearchFilter(t *testing.T) {
 	m := New()
@@ -1216,6 +1259,15 @@ func TestApplySearchFilter(t *testing.T) {
 	if !strings.Contains(m.statusMsg, "0 match") {
 		t.Errorf("expected 0 matches for 'nonexistent', got %q", m.statusMsg)
 	}
+}
+
+func normalizeStatusSnapshot(s string) string {
+	plain := ansi.Strip(s)
+	lines := strings.Split(plain, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " ")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // TestApplySearchFilterNilPanel tests applySearchFilter with nil profilesPanel.

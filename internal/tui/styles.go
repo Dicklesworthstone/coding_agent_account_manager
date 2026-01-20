@@ -33,6 +33,29 @@ type ThemeOptions struct {
 	ReducedMotion bool
 }
 
+// StatusSeverity indicates the severity of a status message.
+type StatusSeverity int
+
+const (
+	StatusInfo StatusSeverity = iota
+	StatusSuccess
+	StatusWarning
+	StatusError
+)
+
+func (s StatusSeverity) String() string {
+	switch s {
+	case StatusSuccess:
+		return "success"
+	case StatusWarning:
+		return "warning"
+	case StatusError:
+		return "error"
+	default:
+		return "info"
+	}
+}
+
 // Theme defines the active palette and rendering characteristics.
 type Theme struct {
 	Mode     ThemeMode
@@ -40,8 +63,8 @@ type Theme struct {
 	NoColor  bool
 	// ReducedMotion disables animated UI effects (e.g., spinners).
 	ReducedMotion bool
-	Palette  Palette
-	Border   lipgloss.Border
+	Palette       Palette
+	Border        lipgloss.Border
 }
 
 // Palette holds the color tokens used throughout the TUI.
@@ -143,12 +166,12 @@ func NewTheme(opts ThemeOptions) Theme {
 	}
 
 	return Theme{
-		Mode:     opts.Mode,
-		Contrast: opts.Contrast,
-		NoColor:  opts.NoColor,
+		Mode:          opts.Mode,
+		Contrast:      opts.Contrast,
+		NoColor:       opts.NoColor,
 		ReducedMotion: opts.ReducedMotion,
-		Palette:  palette,
-		Border:   border,
+		Palette:       palette,
+		Border:        border,
 	}
 }
 
@@ -310,9 +333,12 @@ type Styles struct {
 	Active       lipgloss.Style
 
 	// Status bar styles
-	StatusBar  lipgloss.Style
-	StatusKey  lipgloss.Style
-	StatusText lipgloss.Style
+	StatusBar     lipgloss.Style
+	StatusKey     lipgloss.Style
+	StatusText    lipgloss.Style
+	StatusSuccess lipgloss.Style
+	StatusWarning lipgloss.Style
+	StatusError   lipgloss.Style
 
 	// Empty state
 	Empty lipgloss.Style
@@ -403,6 +429,10 @@ func NewStyles(theme Theme) Styles {
 		StatusText: lipgloss.NewStyle().
 			Foreground(p.Muted),
 
+		StatusSuccess: statusSeverityStyle(theme, p.Success),
+		StatusWarning: statusSeverityStyle(theme, p.Warning),
+		StatusError:   statusSeverityStyle(theme, p.Danger),
+
 		Empty: lipgloss.NewStyle().
 			Foreground(p.Muted).
 			Italic(true).
@@ -448,4 +478,26 @@ func NewStyles(theme Theme) Styles {
 			Foreground(p.Accent).
 			Bold(true),
 	}
+}
+
+// StatusSeverityStyle returns the status style for the given severity.
+func (s Styles) StatusSeverityStyle(severity StatusSeverity) lipgloss.Style {
+	switch severity {
+	case StatusSuccess:
+		return s.StatusSuccess
+	case StatusWarning:
+		return s.StatusWarning
+	case StatusError:
+		return s.StatusError
+	default:
+		return s.StatusText
+	}
+}
+
+func statusSeverityStyle(theme Theme, color lipgloss.TerminalColor) lipgloss.Style {
+	style := lipgloss.NewStyle()
+	if theme.NoColor {
+		return style
+	}
+	return style.Foreground(color)
 }
