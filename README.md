@@ -12,10 +12,12 @@
 > **Sub-100ms account switching for AI coding CLIs with fixed-cost subscription plans. When you hit usage limits on Claude Max, GPT Pro, or Gemini Ultra, don't wait 60 seconds for browser OAuth—just swap to another account instantly.**
 
 ```bash
-# Install
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_account_manager/main/install.sh?$(date +%s)" | bash
+```
 
-# Use
+Usage:
+
+```bash
 caam backup claude alice@gmail.com      # Save current auth
 caam activate claude bob@gmail.com      # Switch instantly
 ```
