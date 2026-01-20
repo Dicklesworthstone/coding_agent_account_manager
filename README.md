@@ -615,7 +615,33 @@ Run `caam status`. It shows the active profile (email) for each tool based on co
 
 ## Installation
 
-### One-liner (Recommended)
+### Recommended: Homebrew (macOS/Linux)
+
+```bash
+brew install dicklesworthstone/tap/caam
+```
+
+This method provides:
+- Automatic updates via `brew upgrade`
+- Dependency management
+- Easy uninstall via `brew uninstall`
+
+### Windows: Scoop
+
+```powershell
+scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+scoop install dicklesworthstone/caam
+```
+
+### Alternative: Direct Download
+
+Download the latest release for your platform:
+- [Linux x86_64](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-linux-amd64)
+- [macOS Intel](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-darwin-amd64)
+- [macOS ARM](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-darwin-arm64)
+- [Windows](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-windows-amd64.exe)
+
+### Alternative: Install Script
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_account_manager/main/install.sh?$(date +%s)" | bash

@@ -548,6 +548,9 @@ main() {
         print_info "  3. Switch: caam activate claude other-account"
         print_info ""
         print_info "Run 'caam --help' for all commands."
+        echo ""
+        echo "Tip: You can also install via Homebrew:"
+        echo "  brew install dicklesworthstone/tap/caam"
         exit 0
     fi
 
@@ -562,6 +565,9 @@ main() {
     print_info "  3. Switch: caam activate claude other-account"
     print_info ""
     print_info "Run 'caam --help' for all commands."
+    echo ""
+    echo "Tip: You can also install via Homebrew:"
+    echo "  brew install dicklesworthstone/tap/caam"
 }
 
 if [[ ${BASH_SOURCE+x} != x ]]; then
