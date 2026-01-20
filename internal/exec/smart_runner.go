@@ -468,6 +468,7 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 			}()
 		}
 	})
+	defer writer.Flush()
 
 	for {
 		// Poll for output (ReadOutput is non-blocking with timeout)
