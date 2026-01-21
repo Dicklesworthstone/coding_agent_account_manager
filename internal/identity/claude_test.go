@@ -97,6 +97,81 @@ func TestExtractFromClaudeCredentials_MissingFile(t *testing.T) {
 	}
 }
 
+// TestExtractFromClaudeCredentials_CurrentFormat tests the realistic format
+// seen in current Claude Code auth files (early 2026+).
+// These files do NOT contain email or accountId - only expiresAt and subscriptionType.
+// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001)
+func TestExtractFromClaudeCredentials_CurrentFormat(t *testing.T) {
+	exp := time.Now().Add(4 * time.Hour).UTC()
+	cred := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			// accessToken is opaque (not a JWT)
+			"accessToken":      "sk-ant-oat01-XXXX-opaque-token-not-decodable-XXXX",
+			"refreshToken":     "sk-ant-ort01-YYYY-refresh-token-YYYY",
+			"expiresAt":        exp.UnixMilli(),
+			"subscriptionType": "claude_pro_2025",
+			// NOTE: email and accountId are NOT present in current format
+		},
+	}
+	path := writeClaudeFile(t, cred)
+
+	identity, err := ExtractFromClaudeCredentials(path)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	// Provider should always be set
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+
+	// PlanType and ExpiresAt should be populated
+	if identity.PlanType != "claude_pro_2025" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "claude_pro_2025")
+	}
+	if identity.ExpiresAt.IsZero() {
+		t.Error("ExpiresAt should not be zero")
+	}
+
+	// Email and AccountID should be empty (not present in current format)
+	if identity.Email != "" {
+		t.Errorf("Email should be empty in current format, got %q", identity.Email)
+	}
+	if identity.AccountID != "" {
+		t.Errorf("AccountID should be empty in current format, got %q", identity.AccountID)
+	}
+}
+
+// TestExtractFromClaudeCredentials_OpaqueToken verifies we don't crash
+// or return misleading data when given an opaque (non-JWT) access token.
+func TestExtractFromClaudeCredentials_OpaqueToken(t *testing.T) {
+	cred := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			// This looks like a JWT but isn't - it's an opaque token
+			"accessToken":      "sk-ant-oat01-this.is.not.a.jwt",
+			"subscriptionType": "max",
+		},
+	}
+	path := writeClaudeFile(t, cred)
+
+	identity, err := ExtractFromClaudeCredentials(path)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	// Should succeed but with empty identity fields (no email/accountId)
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+	if identity.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "max")
+	}
+	// Email and AccountID should be empty
+	if identity.Email != "" || identity.AccountID != "" {
+		t.Errorf("Expected empty email/accountId, got email=%q accountId=%q", identity.Email, identity.AccountID)
+	}
+}
+
 func writeClaudeFile(t *testing.T, content map[string]interface{}) string {
 	t.Helper()
 

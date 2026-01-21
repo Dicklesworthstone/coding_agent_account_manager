@@ -25,6 +25,7 @@
 **File:** `internal/identity/claude.go:12-41`
 **Function:** `ExtractFromClaudeCredentials`
 **Classification:** Fixable
+**Status:** ✅ RESOLVED (2026-01-21, caam-u8wz)
 
 **Assumptions:**
 - `claudeAiOauth` contains `accountId`, `email`, `subscriptionType`, `expiresAt`
@@ -35,6 +36,12 @@
 
 **Action:** Return empty strings for missing fields; update TUI to handle empty identity gracefully.
 
+**Resolution:**
+- Function already returns empty strings for missing fields (graceful degradation)
+- Added detailed documentation warning that email/accountId are no longer present
+- Added test cases for current Claude auth format without email/accountId
+- Added test cases for opaque tokens
+
 ---
 
 ### CLAUDE-002: Auth File Identity Extraction
@@ -42,6 +49,7 @@
 **File:** `internal/discovery/identity.go:31-68`
 **Function:** `extractClaudeIdentity`
 **Classification:** Remove/Disable
+**Status:** ✅ RESOLVED (2026-01-21, caam-u8wz)
 
 **Assumptions:**
 - Auth files contain `email`, `user.email`, or `accountId`
@@ -52,6 +60,12 @@
 - Claude tokens are OPAQUE, not JWTs - cannot be decoded
 
 **Action:** Remove JWT decoding attempt; return empty identity with `success=true` to avoid errors.
+
+**Resolution:**
+- Removed JWT decoding from `extractClaudeIdentity()` - Claude tokens are opaque
+- Added `claudeAiOauth` field checking for email/accountId (backwards compatibility)
+- Function returns empty identity with `valid=true` when no identity available
+- Added comprehensive test coverage for opaque token scenarios
 
 ---
 

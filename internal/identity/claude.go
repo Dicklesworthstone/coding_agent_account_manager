@@ -9,6 +9,15 @@ import (
 )
 
 // ExtractFromClaudeCredentials reads Claude .credentials.json and extracts identity.
+//
+// IMPORTANT: Current Claude auth files (as of early 2026) do NOT include:
+//   - accountId: No longer present in claudeAiOauth
+//   - email: No longer present in claudeAiOauth
+//
+// These fields will return empty strings. Only expiresAt and subscriptionType
+// are reliably present. Callers should handle empty identity fields gracefully.
+//
+// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001)
 func ExtractFromClaudeCredentials(path string) (*Identity, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

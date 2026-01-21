@@ -126,21 +126,60 @@ func TestExtractClaudeIdentity(t *testing.T) {
 			wantValid: true,
 		},
 		{
-			name: "user object with email",
+			name: "claudeAiOauth with email",
 			data: map[string]interface{}{
-				"user": map[string]interface{}{
-					"email": "user@domain.com",
+				"claudeAiOauth": map[string]interface{}{
+					"email":     "oauth@example.com",
+					"accountId": "acc-123",
 				},
 			},
-			wantID:    "user@domain.com",
+			wantID:    "oauth@example.com",
 			wantValid: true,
 		},
 		{
-			name: "accountId fallback",
+			name: "claudeAiOauth accountId only",
+			data: map[string]interface{}{
+				"claudeAiOauth": map[string]interface{}{
+					"accountId": "acc-456",
+				},
+			},
+			wantID:    "acc-456",
+			wantValid: true,
+		},
+		{
+			name: "accountId fallback at root",
 			data: map[string]interface{}{
 				"accountId": "acc-12345",
 			},
 			wantID:    "acc-12345",
+			wantValid: true,
+		},
+		{
+			// Current Claude format (2026+): no email/accountId, opaque tokens.
+			// JWT decoding should NOT be attempted - tokens are opaque.
+			// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-002)
+			name: "current format - opaque token no identity",
+			data: map[string]interface{}{
+				"claudeAiOauth": map[string]interface{}{
+					"accessToken":      "sk-ant-oat01-opaque-token",
+					"refreshToken":     "sk-ant-ort01-refresh-token",
+					"expiresAt":        1737500000000,
+					"subscriptionType": "claude_pro_2025",
+					// NOTE: email and accountId are NOT present
+				},
+			},
+			wantID:    "", // Empty - no identity available
+			wantValid: true,
+		},
+		{
+			// Verify we don't crash or return misleading data from fake "JWT"
+			name: "opaque token that looks like JWT",
+			data: map[string]interface{}{
+				"claudeAiOauth": map[string]interface{}{
+					"accessToken": "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ImZha2VAZXhhbXBsZS5jb20ifQ.",
+				},
+			},
+			wantID:    "", // Should NOT decode JWT - Claude tokens are opaque
 			wantValid: true,
 		},
 		{

@@ -28,42 +28,43 @@ func ExtractIdentity(tool Tool, authPath string) (string, bool) {
 }
 
 // extractClaudeIdentity parses Claude's .claude.json for identity info.
-// Claude stores OAuth tokens; we try to decode JWT to find email.
+//
+// IMPORTANT: Claude tokens are OPAQUE, not JWTs. Do not attempt to decode them.
+// Current Claude auth files do NOT contain email or accountId fields.
+// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-002)
 func extractClaudeIdentity(data []byte) (string, bool) {
 	var auth map[string]interface{}
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return "", false
 	}
 
-	// Try to get identity from various fields
-	// Check for direct email field
+	// Check for direct email field (rare, but possible in older versions)
 	if email, ok := auth["email"].(string); ok && email != "" {
 		return email, true
 	}
 
-	// Check for user object with email
-	if user, ok := auth["user"].(map[string]interface{}); ok {
-		if email, ok := user["email"].(string); ok && email != "" {
+	// Check claudeAiOauth for identity fields
+	if oauth, ok := auth["claudeAiOauth"].(map[string]interface{}); ok {
+		// Check for email (no longer present in current versions)
+		if email, ok := oauth["email"].(string); ok && email != "" {
 			return email, true
 		}
-	}
-
-	// Try to decode JWT tokens for email claim
-	tokenFields := []string{"oauthAccessToken", "accessToken", "access_token", "claudeAiSessionKey"}
-	for _, field := range tokenFields {
-		if token, ok := auth[field].(string); ok && token != "" {
-			if email := extractEmailFromJWT(token); email != "" {
-				return email, true
-			}
+		// Check for accountId (no longer present in current versions)
+		if accountID, ok := oauth["accountId"].(string); ok && accountID != "" {
+			return accountID, true
 		}
 	}
 
-	// Check for account ID as fallback
+	// Check for account ID at root level as fallback
 	if accountID, ok := auth["accountId"].(string); ok && accountID != "" {
 		return accountID, true
 	}
 
-	// Valid auth file but couldn't extract identity
+	// NOTE: We intentionally do NOT attempt JWT decoding here.
+	// Claude access tokens are opaque strings, not JWTs.
+	// Attempting to decode them would fail silently and waste cycles.
+
+	// Valid auth file but no identity available (expected for current Claude versions)
 	return "", true
 }
 
