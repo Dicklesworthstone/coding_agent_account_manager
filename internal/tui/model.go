@@ -182,6 +182,10 @@ type Model struct {
 	pendingSyncMachine  string
 	pendingEditProvider string
 	pendingEditProfile  string
+
+	// Help renderer with Glamour markdown support and caching
+	helpRenderer *HelpRenderer
+	theme        Theme
 }
 
 // DefaultProviders returns the default list of provider names.
@@ -225,6 +229,8 @@ func NewWithProviders(providers []string) Model {
 		vaultMeta:      make(map[string]map[string]vaultProfileMeta),
 		projectStore:   project.NewStore(""),
 		healthStorage:  health.NewStorage(""),
+		helpRenderer:   NewHelpRenderer(theme),
+		theme:          theme,
 	}
 }
 
@@ -2800,63 +2806,22 @@ func statusSeverityFromMessage(msg string) StatusSeverity {
 	return StatusInfo
 }
 
-// helpView renders the help screen.
+// helpView renders the help screen with Glamour markdown rendering.
 func (m Model) helpView() string {
-	help := `
-caam - Coding Agent Account Manager
-====================================
+	if m.helpRenderer == nil {
+		// Fallback to plain text if renderer not initialized
+		return m.styles.Help.Render(MainHelpMarkdown())
+	}
 
-KEYBOARD SHORTCUTS
+	// Update renderer width for proper word wrap
+	contentWidth := m.width - 8 // Account for padding
+	if contentWidth < 60 {
+		contentWidth = 60
+	}
+	m.helpRenderer.SetWidth(contentWidth)
 
-Navigation
-  ↑/k     Move up                    ←/h     Previous provider
-  ↓/j     Move down                  →       Next provider
-  tab     Cycle providers            /       Search/filter profiles
-
-Profile Actions
-  enter   Activate selected profile (instant switch!)
-  l       Login/refresh OAuth token
-  e       Edit profile settings
-  o       Open account page in browser
-  d       Delete profile (with confirmation)
-  p       Set project association for current directory
-
-Vault & Data
-  b       Backup current auth to a new profile
-  u       Toggle usage stats panel (1/2/3/4 for time ranges)
-  S       Toggle sync panel
-  E       Export vault to encrypted bundle
-  I       Import vault from bundle
-
-General
-  ?       Toggle this help
-  q/esc   Quit
-
-HEALTH STATUS INDICATORS
-  🟢  Healthy   Token valid >1hr, no recent errors
-  🟡  Warning   Token expiring soon or minor issues
-  🔴  Critical  Token expired or repeated errors
-  ⚪  Unknown   Health data not available
-
-SMART PROFILE FEATURES (via CLI)
-  caam activate <tool> --auto     Smart rotation picks best profile
-  caam run <tool> -- <args>       Wrap CLI with auto-failover on rate limits
-  caam cooldown set <profile>     Mark profile as rate-limited
-  caam cooldown list              View active cooldowns
-  caam next <tool>                Preview which profile rotation would pick
-
-ROTATION ALGORITHMS (config.yaml → stealth.rotation.algorithm)
-  smart       Multi-factor scoring: health, cooldown, recency, plan type
-  round_robin Sequential cycling through profiles
-  random      Random selection
-
-PROJECT ASSOCIATIONS
-  Profiles can be linked to directories. When you activate in a project
-  directory, caam uses the associated profile automatically.
-
-Press any key to return...
-`
-	return m.styles.Help.Render(help)
+	rendered := m.helpRenderer.Render(MainHelpMarkdown())
+	return m.styles.Help.Render(rendered)
 }
 
 func (m Model) dumpStatsLine() string {

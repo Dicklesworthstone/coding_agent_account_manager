@@ -924,17 +924,20 @@ func TestDumpStatsLine(t *testing.T) {
 
 // TestHelpView tests the helpView method.
 func TestHelpView(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
 	m := New()
 	view := m.helpView()
 
 	if view == "" {
 		t.Error("expected non-empty help view")
 	}
-	if !strings.Contains(view, "KEYBOARD SHORTCUTS") {
-		t.Errorf("expected help view to contain shortcuts section")
+	// The help view uses Glamour markdown rendering, check for key content (case-insensitive)
+	viewLower := strings.ToLower(view)
+	if !strings.Contains(viewLower, "keyboard shortcuts") {
+		t.Errorf("expected help view to contain shortcuts section, got: %s", view[:min(len(view), 200)])
 	}
-	if !strings.Contains(view, "enter") {
-		t.Errorf("expected help view to contain enter key info")
+	if !strings.Contains(viewLower, "enter") {
+		t.Errorf("expected help view to contain enter key info, got: %s", view[:min(len(view), 200)])
 	}
 }
 
