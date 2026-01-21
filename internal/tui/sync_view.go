@@ -114,7 +114,14 @@ func (p *SyncPanel) renderMachineRow(m *sync.Machine, selected bool) string {
 
 // render renders the full panel with title, status, and body.
 func (p *SyncPanel) render(title, status, body string) string {
-	inner := lipgloss.JoinVertical(lipgloss.Left, title, status, "", body)
+	// Render breadcrumb for navigation context
+	contentWidth := p.width - 6 // Account for border and padding
+	if contentWidth < 40 {
+		contentWidth = 40
+	}
+	breadcrumb := RenderBreadcrumb("Sync", p.theme, contentWidth)
+
+	inner := lipgloss.JoinVertical(lipgloss.Left, breadcrumb, title, status, "", body)
 	if p.width > 0 {
 		return p.styles.Border.Width(p.width - 2).Height(p.height - 2).Render(inner)
 	}

@@ -234,7 +234,14 @@ func (u *UsagePanel) View() string {
 }
 
 func (u *UsagePanel) render(title, timeRange, body string) string {
-	inner := lipgloss.JoinVertical(lipgloss.Left, title, timeRange, "", body)
+	// Render breadcrumb for navigation context
+	contentWidth := u.width - 6 // Account for border and padding
+	if contentWidth < 40 {
+		contentWidth = 40
+	}
+	breadcrumb := RenderBreadcrumb("Usage", u.theme, contentWidth)
+
+	inner := lipgloss.JoinVertical(lipgloss.Left, breadcrumb, title, timeRange, "", body)
 	if u.width > 0 {
 		return u.styles.Border.Width(u.width - 2).Height(u.height - 2).Render(inner)
 	}

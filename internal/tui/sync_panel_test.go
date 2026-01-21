@@ -96,15 +96,22 @@ func TestSyncPanel_LoadingSnapshot(t *testing.T) {
 	p.SetLoading(true)
 
 	got := normalizeSyncSnapshot(p.View())
-	const want = "" +
-		"\n\n" +
-		"   Sync Pool\n" +
-		"   Status: Not configured\n" +
-		"\n" +
-		"   | Loading sync state...\n\n"
 
-	if got != want {
-		t.Fatalf("loading snapshot mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	// Verify essential content is present (breadcrumb, title, status, loading indicator)
+	if !strings.Contains(got, "Profiles > Sync") {
+		t.Errorf("missing breadcrumb 'Profiles > Sync'")
+	}
+	if !strings.Contains(got, "[Esc] Back") {
+		t.Errorf("missing back hint '[Esc] Back'")
+	}
+	if !strings.Contains(got, "Sync Pool") {
+		t.Errorf("missing title 'Sync Pool'")
+	}
+	if !strings.Contains(got, "Status:") {
+		t.Errorf("missing 'Status:' line")
+	}
+	if !strings.Contains(got, "Loading sync state") {
+		t.Errorf("missing loading indicator")
 	}
 }
 

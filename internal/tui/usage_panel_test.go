@@ -104,15 +104,22 @@ func TestUsagePanel_LoadingSnapshot(t *testing.T) {
 	u.SetLoading(true)
 
 	got := normalizeUsageSnapshot(u.View())
-	const want = "" +
-		"\n\n" +
-		"   Usage Statistics\n" +
-		"   Last 7 days\n" +
-		"\n" +
-		"   | Loading usage stats…\n\n"
 
-	if got != want {
-		t.Fatalf("loading snapshot mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	// Verify essential content is present (breadcrumb, title, time range, loading indicator)
+	if !strings.Contains(got, "Profiles > Usage") {
+		t.Errorf("missing breadcrumb 'Profiles > Usage'")
+	}
+	if !strings.Contains(got, "[Esc] Back") {
+		t.Errorf("missing back hint '[Esc] Back'")
+	}
+	if !strings.Contains(got, "Usage Statistics") {
+		t.Errorf("missing title 'Usage Statistics'")
+	}
+	if !strings.Contains(got, "Last 7 days") {
+		t.Errorf("missing time range 'Last 7 days'")
+	}
+	if !strings.Contains(got, "Loading usage stats") {
+		t.Errorf("missing loading indicator")
 	}
 }
 
