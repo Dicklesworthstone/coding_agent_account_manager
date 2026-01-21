@@ -5,6 +5,7 @@ project_name: caam
 before:
   hooks:
     - go mod tidy
+    - sh -c 'mkdir -p dist && go_version=$(go env GOVERSION) && printf "{\n  \"version\": \"%s\",\n  \"commit\": \"%s\",\n  \"date\": \"%s\",\n  \"go_version\": \"%s\"\n}\n" "{{ .Version }}" "{{ .FullCommit }}" "{{ .Date }}" "$go_version" > dist/release-manifest.json'
 
 builds:
   - id: caam
@@ -37,7 +38,18 @@ archives:
         format: zip
 
 checksum:
-  name_template: "checksums.txt"
+  name_template: "SHA256SUMS"
+
+signs:
+  - id: checksum
+    cmd: cosign
+    signature: "${artifact}.sig"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
@@ -59,6 +71,8 @@ release:
     name: coding_agent_account_manager
   draft: false
   prerelease: auto
+  extra_files:
+    - glob: dist/release-manifest.json
 
 # Homebrew tap publishing
 brews:

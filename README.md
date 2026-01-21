@@ -691,6 +691,22 @@ Download the latest release for your platform:
 - [macOS ARM](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-darwin-arm64)
 - [Windows](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-windows-amd64.exe)
 
+### Verify Release Artifacts
+
+Each release ships with signed checksums:
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.sig \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity "https://github.com/Dicklesworthstone/coding_agent_account_manager/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  SHA256SUMS
+
+sha256sum -c SHA256SUMS
+# macOS fallback:
+# shasum -a 256 -c SHA256SUMS
+```
+
 ### Alternative: Install Script
 
 ```bash

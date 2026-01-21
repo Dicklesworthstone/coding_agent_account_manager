@@ -299,6 +299,129 @@ if __name__ == "__main__":
 PY
 }
 
+select_named_asset() {
+    local asset_name="$1"
+    ensure_python || return 1
+
+    local release_json
+    release_json=$(cat) || return 1
+
+    CAAM_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$asset_name" <<'PY'
+import json
+import os
+import sys
+
+
+def main():
+    if len(sys.argv) < 2:
+        return 1
+    target = sys.argv[1]
+    release_json = os.environ.get("CAAM_RELEASE_JSON", "")
+    if not release_json:
+        sys.stderr.write("Missing release metadata\n")
+        return 1
+    try:
+        data = json.loads(release_json)
+    except Exception as exc:
+        sys.stderr.write(f"Failed to parse release JSON: {exc}\n")
+        return 1
+
+    assets = data.get("assets") or []
+    for asset in assets:
+        name = asset.get("name") or ""
+        if name == target:
+            url = asset.get("browser_download_url") or ""
+            if url:
+                print(url)
+                return 0
+    print("")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+}
+
+verify_release_assets() {
+    local release_json="$1"
+    local version="$2"
+    local asset_name="$3"
+    local archive_path="$4"
+    local tmp_dir="$5"
+
+    if [ -n "${CAAM_SKIP_VERIFY:-}" ]; then
+        print_warn "Skipping release verification (CAAM_SKIP_VERIFY set)."
+        return 0
+    fi
+
+    local checksums_url signature_url
+    checksums_url=$(printf '%s' "$release_json" | select_named_asset "SHA256SUMS") || true
+    signature_url=$(printf '%s' "$release_json" | select_named_asset "SHA256SUMS.sig") || true
+
+    if [ -z "$checksums_url" ] || [ -z "$signature_url" ]; then
+        print_error "Release is missing SHA256SUMS or SHA256SUMS.sig assets."
+        return 1
+    fi
+
+    local checksums_path="$tmp_dir/SHA256SUMS"
+    local signature_path="$tmp_dir/SHA256SUMS.sig"
+
+    print_info "Downloading checksums and signature..."
+    if ! download_file "$checksums_url" "$checksums_path"; then
+        print_error "Failed to download SHA256SUMS."
+        return 1
+    fi
+    if ! download_file "$signature_url" "$signature_path"; then
+        print_error "Failed to download SHA256SUMS.sig."
+        return 1
+    fi
+
+    if ! command -v cosign >/dev/null 2>&1; then
+        print_error "cosign is required to verify release signatures."
+        print_error "Install cosign or set CAAM_SKIP_VERIFY=1 to bypass verification."
+        return 1
+    fi
+
+    local identity="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/tags/${version}"
+    if ! cosign verify-blob \
+        --bundle "$signature_path" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        --certificate-identity "$identity" \
+        "$checksums_path" >/dev/null 2>&1; then
+        print_error "Signature verification failed."
+        return 1
+    fi
+
+    if [ -z "$asset_name" ]; then
+        asset_name=$(basename "$archive_path")
+    fi
+
+    local expected actual
+    expected=$(grep -F " $asset_name" "$checksums_path" | awk '{print $1}' | head -1)
+    if [ -z "$expected" ]; then
+        print_error "Checksum entry not found for $asset_name."
+        return 1
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        print_error "sha256sum or shasum is required for checksum verification."
+        return 1
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        print_error "Checksum verification failed."
+        return 1
+    fi
+
+    print_success "Verified release signature and checksum."
+    return 0
+}
+
 is_tty() {
     [ -t 0 ] && [ -t 1 ]
 }
@@ -417,6 +540,10 @@ try_binary_install() {
 
     if ! download_file "$download_url" "$archive_path"; then
         print_warn "Download failed"
+        return 1
+    fi
+
+    if ! verify_release_assets "$release_json" "$version" "$asset_name" "$archive_path" "$tmp_dir"; then
         return 1
     fi
 

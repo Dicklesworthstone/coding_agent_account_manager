@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   goreleaser:
@@ -20,6 +21,9 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -31,3 +35,25 @@ jobs:
           # Token with write access to homebrew-tap and scoop-bucket repos
           # Set this as a repository secret with repo scope
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Verify release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          release_json=$(curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$api")
+          RELEASE_JSON="$release_json" python - <<-PY
+          	import json
+          	import os
+          	import sys
+
+          	data = json.loads(os.environ.get("RELEASE_JSON", "{}"))
+          	names = {asset.get("name") for asset in data.get("assets", [])}
+          	required = {"SHA256SUMS", "SHA256SUMS.sig"}
+          	missing = sorted(required - names)
+          	if missing:
+          	    sys.stderr.write("Missing release assets: " + ", ".join(missing) + "\n")
+          	    sys.exit(1)
+          	print("Release assets verified:", ", ".join(sorted(required)))
+          	PY
