@@ -5,17 +5,7 @@ project_name: caam
 before:
   hooks:
     - go mod tidy
-    - |
-      mkdir -p dist
-      go_version=$(go env GOVERSION)
-      cat > dist/release-manifest.json <<EOF
-      {
-        "version": "{{ .Version }}",
-        "commit": "{{ .FullCommit }}",
-        "date": "{{ .Date }}",
-        "go_version": "$go_version"
-      }
-EOF
+    - sh -c 'mkdir -p dist && go_version=$(go env GOVERSION) && printf "{\"version\":\"%s\",\"commit\":\"%s\",\"date\":\"%s\",\"go_version\":\"%s\"}\n" "{{ .Version }}" "{{ .FullCommit }}" "{{ .Date }}" "$go_version" > dist/release-manifest.json'
 
 builds:
   - id: caam
