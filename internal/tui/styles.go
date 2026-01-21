@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/charmbracelet/lipgloss"
@@ -55,6 +56,30 @@ func (s StatusSeverity) String() string {
 	default:
 		return "info"
 	}
+}
+
+// ToastDuration is how long a toast is visible before auto-dismissing.
+const ToastDuration = 3 * time.Second
+
+// Toast represents a transient notification message.
+type Toast struct {
+	Message   string
+	Severity  StatusSeverity
+	CreatedAt time.Time
+}
+
+// NewToast creates a new toast with the current timestamp.
+func NewToast(message string, severity StatusSeverity) Toast {
+	return Toast{
+		Message:   message,
+		Severity:  severity,
+		CreatedAt: time.Now(),
+	}
+}
+
+// IsExpired returns true if the toast has exceeded its display duration.
+func (t Toast) IsExpired() bool {
+	return time.Since(t.CreatedAt) >= ToastDuration
 }
 
 // Theme defines the active palette and rendering characteristics.
@@ -458,6 +483,17 @@ type Styles struct {
 	SearchQuery     lipgloss.Style
 	SearchCursor    lipgloss.Style
 	SearchMatchInfo lipgloss.Style
+
+	// Toast styles
+	ToastSuccess lipgloss.Style
+	ToastWarning lipgloss.Style
+	ToastError   lipgloss.Style
+	ToastInfo    lipgloss.Style
+
+	// Status bar segment styles
+	StatusModeNormal lipgloss.Style
+	StatusModeSearch lipgloss.Style
+	StatusModeHelp   lipgloss.Style
 }
 
 // DefaultStyles returns the default style configuration.
@@ -601,6 +637,43 @@ func NewStyles(theme Theme) Styles {
 		SearchMatchInfo: lipgloss.NewStyle().
 			Foreground(p.Muted).
 			Italic(true),
+
+		ToastSuccess: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Success).
+			Bold(true),
+
+		ToastWarning: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Warning).
+			Bold(true),
+
+		ToastError: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Danger).
+			Bold(true),
+
+		ToastInfo: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Info),
+
+		StatusModeNormal: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Text).
+			Background(p.SurfaceMuted).
+			Bold(true),
+
+		StatusModeSearch: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Text).
+			Background(p.Accent).
+			Bold(true),
+
+		StatusModeHelp: lipgloss.NewStyle().
+			Padding(0, 1).
+			Foreground(p.Text).
+			Background(p.Info).
+			Bold(true),
 	}
 }
 
@@ -615,6 +688,20 @@ func (s Styles) StatusSeverityStyle(severity StatusSeverity) lipgloss.Style {
 		return s.StatusError
 	default:
 		return s.StatusText
+	}
+}
+
+// ToastStyle returns the toast style for the given severity.
+func (s Styles) ToastStyle(severity StatusSeverity) lipgloss.Style {
+	switch severity {
+	case StatusSuccess:
+		return s.ToastSuccess
+	case StatusWarning:
+		return s.ToastWarning
+	case StatusError:
+		return s.ToastError
+	default:
+		return s.ToastInfo
 	}
 }
 

@@ -68,6 +68,7 @@ type PaneTracker struct {
 	ErrorMessage  string
 	RetryCount    int
 	LastOutput    string // Cached output for duplicate detection
+	Cooldowns     map[string]time.Time // action -> cooldown expiry
 	mu            sync.RWMutex
 }
 
@@ -79,6 +80,7 @@ func NewPaneTracker(paneID int) *PaneTracker {
 		State:        StateIdle,
 		LastCheck:    now,
 		StateEntered: now,
+		Cooldowns:    make(map[string]time.Time),
 	}
 }
 
@@ -115,6 +117,7 @@ func (t *PaneTracker) Reset() {
 	t.ReceivedCode = ""
 	t.UsedAccount = ""
 	t.ErrorMessage = ""
+	t.Cooldowns = make(map[string]time.Time)
 }
 
 // Thread-safe accessors for tracker fields
@@ -195,6 +198,53 @@ func (t *PaneTracker) SetAuthResponse(code, account string) {
 	defer t.mu.Unlock()
 	t.ReceivedCode = code
 	t.UsedAccount = account
+}
+
+// SetCooldown sets a cooldown for an action.
+func (t *PaneTracker) SetCooldown(action string, duration time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Cooldowns[action] = time.Now().Add(duration)
+}
+
+// IsOnCooldown returns true if an action is on cooldown.
+func (t *PaneTracker) IsOnCooldown(action string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	expiry, ok := t.Cooldowns[action]
+	if !ok {
+		return false
+	}
+	return time.Now().Before(expiry)
+}
+
+// CooldownRemaining returns the remaining cooldown time for an action.
+func (t *PaneTracker) CooldownRemaining(action string) time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	expiry, ok := t.Cooldowns[action]
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(expiry)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// ClearCooldown removes a cooldown for an action.
+func (t *PaneTracker) ClearCooldown(action string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.Cooldowns, action)
+}
+
+// ClearAllCooldowns removes all cooldowns.
+func (t *PaneTracker) ClearAllCooldowns() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Cooldowns = make(map[string]time.Time)
 }
 
 // Patterns for detecting Claude Code states.

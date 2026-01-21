@@ -55,6 +55,7 @@ const (
 	stateEditProfile
 	stateSyncAdd
 	stateSyncEdit
+	stateCommandPalette
 )
 
 type layoutMode int
@@ -184,9 +185,15 @@ type Model struct {
 	pendingEditProvider string
 	pendingEditProfile  string
 
+	// Command palette dialog
+	commandPalette *CommandPaletteDialog
+
 	// Help renderer with Glamour markdown support and caching
 	helpRenderer *HelpRenderer
 	theme        Theme
+
+	// Toast notifications
+	toasts []Toast
 }
 
 // DefaultProviders returns the default list of provider names.
@@ -506,6 +513,34 @@ type activateResultMsg struct {
 	err      error
 }
 
+// toastTickMsg is sent to check for expired toasts.
+type toastTickMsg struct{}
+
+// toastTick returns a command that ticks after the toast duration.
+func toastTick() tea.Cmd {
+	return tea.Tick(ToastDuration, func(t time.Time) tea.Msg {
+		return toastTickMsg{}
+	})
+}
+
+// addToast adds a new toast notification and returns a command to schedule expiration.
+func (m *Model) addToast(message string, severity StatusSeverity) tea.Cmd {
+	m.toasts = append(m.toasts, NewToast(message, severity))
+	return toastTick()
+}
+
+// expireToasts removes expired toasts and returns true if any remain.
+func (m *Model) expireToasts() bool {
+	var active []Toast
+	for _, t := range m.toasts {
+		if !t.IsExpired() {
+			active = append(active, t)
+		}
+	}
+	m.toasts = active
+	return len(m.toasts) > 0
+}
+
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -595,6 +630,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case badgeExpiredMsg:
 		delete(m.badges, msg.key)
 		m.syncProfilesPanel()
+		return m, nil
+
+	case toastTickMsg:
+		if m.expireToasts() {
+			return m, toastTick()
+		}
 		return m, nil
 
 	case usageStatsLoadedMsg:
@@ -888,6 +929,8 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSyncAddKeys(msg)
 	case stateSyncEdit:
 		return m.handleSyncEditKeys(msg)
+	case stateCommandPalette:
+		return m.handleCommandPaletteKeys(msg)
 	}
 
 	// Normal list view key handling
@@ -1013,6 +1056,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Import):
 		return m.handleImportBundle()
+
+	case key.Matches(msg, m.keys.Palette):
+		return m.handleOpenCommandPalette()
 	}
 
 	return m, nil
@@ -1099,7 +1145,7 @@ func (m *Model) applySearchFilter() {
 	} else {
 		m.selectedProfileName = ""
 	}
-	m.statusMsg = fmt.Sprintf("/%s (%d matches)", m.searchQuery, len(filtered))
+	// Note: statusMsg not set here; search bar shows match count
 }
 
 // handleActivateProfile initiates profile activation with confirmation.
@@ -1698,8 +1744,90 @@ func (m Model) handleSyncEditKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleEnterSearchMode() (tea.Model, tea.Cmd) {
 	m.state = stateSearch
 	m.searchQuery = ""
-	m.statusMsg = "Type to filter profiles (Esc to cancel)"
+	m.statusMsg = "" // Search bar shows all search info
 	return m, nil
+}
+
+// handleOpenCommandPalette opens the command palette overlay.
+func (m Model) handleOpenCommandPalette() (tea.Model, tea.Cmd) {
+	m.commandPalette = NewCommandPaletteDialog("Command Palette", DefaultCommands())
+	m.commandPalette.SetStyles(m.styles)
+	m.commandPalette.SetWidth(60)
+	m.state = stateCommandPalette
+	m.statusMsg = ""
+	return m, nil
+}
+
+// handleCommandPaletteAction executes the selected command palette action.
+func (m Model) handleCommandPaletteAction(action string) (tea.Model, tea.Cmd) {
+	m.state = stateList
+	m.commandPalette = nil
+
+	switch action {
+	case "activate":
+		return m.handleActivateProfile()
+	case "backup":
+		return m.handleBackupProfile()
+	case "delete":
+		return m.handleDeleteProfile()
+	case "edit":
+		return m.handleEditProfile()
+	case "login":
+		return m.handleLoginProfile()
+	case "open":
+		return m.handleOpenInBrowser()
+	case "project":
+		return m.handleSetProjectAssociation()
+	case "usage":
+		if m.usagePanel != nil {
+			m.usagePanel.Toggle()
+			if m.usagePanel.Visible() {
+				spinnerCmd := m.usagePanel.SetLoading(true)
+				return m, tea.Batch(spinnerCmd, m.loadUsageStats())
+			}
+		}
+	case "sync":
+		if m.syncPanel != nil {
+			m.syncPanel.Toggle()
+			if m.syncPanel.Visible() {
+				spinnerCmd := m.syncPanel.SetLoading(true)
+				return m, tea.Batch(spinnerCmd, m.loadSyncState())
+			}
+		}
+	case "export":
+		return m.handleExportVault()
+	case "import":
+		return m.handleImportBundle()
+	case "help":
+		m.state = stateHelp
+	}
+
+	return m, nil
+}
+
+// handleCommandPaletteKeys handles keys when the command palette is open.
+func (m Model) handleCommandPaletteKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.commandPalette == nil {
+		m.state = stateList
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.commandPalette, cmd = m.commandPalette.Update(msg)
+
+	switch m.commandPalette.Result() {
+	case DialogResultSubmit:
+		if chosen := m.commandPalette.ChosenCommand(); chosen != nil {
+			return m.handleCommandPaletteAction(chosen.Action)
+		}
+		m.state = stateList
+		m.commandPalette = nil
+	case DialogResultCancel:
+		m.state = stateList
+		m.commandPalette = nil
+	}
+
+	return m, cmd
 }
 
 func (m Model) handleSetProjectAssociation() (tea.Model, tea.Cmd) {
@@ -2183,6 +2311,11 @@ func (m Model) View() string {
 			return m.dialogOverlayView(m.syncEditDialog.View())
 		}
 		return m.mainView()
+	case stateCommandPalette:
+		if m.commandPalette != nil {
+			return m.dialogOverlayView(m.commandPalette.View())
+		}
+		return m.mainView()
 	default:
 		if m.usagePanel != nil && m.usagePanel.Visible() {
 			m.usagePanel.SetSize(m.width, m.height)
@@ -2323,8 +2456,15 @@ func (m Model) mainView() string {
 	}
 	header := lipgloss.JoinVertical(lipgloss.Left, headerLines...)
 
+	// Search bar (rendered when in search mode)
+	searchBar := m.renderSearchBar()
+	searchBarHeight := 0
+	if searchBar != "" {
+		searchBarHeight = lipgloss.Height(searchBar)
+	}
+
 	headerHeight := lipgloss.Height(header)
-	contentHeight := m.height - headerHeight - 2
+	contentHeight := m.height - headerHeight - searchBarHeight - 2
 	if contentHeight < 0 {
 		contentHeight = 0
 	}
@@ -2397,13 +2537,23 @@ func (m Model) mainView() string {
 	// Status bar
 	status := m.renderStatusBar(layout)
 
-	// Combine header, panels, and status
-	content := lipgloss.JoinVertical(
-		lipgloss.Left,
-		header,
-		"",
-		panels,
-	)
+	// Combine header, search bar (if active), panels, and status
+	var content string
+	if searchBar != "" {
+		content = lipgloss.JoinVertical(
+			lipgloss.Left,
+			header,
+			searchBar,
+			panels,
+		)
+	} else {
+		content = lipgloss.JoinVertical(
+			lipgloss.Left,
+			header,
+			"",
+			panels,
+		)
+	}
 
 	// Add status bar at bottom
 	availableHeight := m.height - lipgloss.Height(content) - 2
@@ -2690,7 +2840,60 @@ func (m Model) renderProfileList() string {
 	return lipgloss.JoinVertical(lipgloss.Left, items...)
 }
 
-// renderStatusBar renders the bottom status bar.
+// renderSearchBar renders a visible search bar when in search mode.
+func (m Model) renderSearchBar() string {
+	if m.state != stateSearch {
+		return ""
+	}
+
+	// Calculate match count for display
+	provider := m.currentProvider()
+	profiles := m.profiles[provider]
+	projectDefault := m.projectDefaultForProvider(provider)
+	query := strings.ToLower(m.searchQuery)
+	matchCount := 0
+	for _, p := range profiles {
+		info := m.buildProfileInfo(provider, p, projectDefault)
+		if profileMatchesQuery(info, query) {
+			matchCount++
+		}
+	}
+
+	// Build search bar content
+	prompt := m.styles.SearchPrompt.Render("/")
+	queryText := m.styles.SearchQuery.Render(m.searchQuery)
+	cursor := m.styles.SearchCursor.Render("█")
+	matchInfo := m.styles.SearchMatchInfo.Render(fmt.Sprintf(" (%d matches)", matchCount))
+
+	// Hints for search mode
+	hints := m.styles.StatusKey.Render("Enter") +
+		m.styles.StatusText.Render(" accept  ") +
+		m.styles.StatusKey.Render("Esc") +
+		m.styles.StatusText.Render(" cancel")
+
+	// Calculate available width for search bar content
+	barWidth := m.width - 4 // Account for border padding
+	if barWidth < 20 {
+		barWidth = 20
+	}
+
+	// Left side: prompt + query + cursor + match info
+	left := prompt + queryText + cursor + matchInfo
+	leftWidth := lipgloss.Width(left)
+	hintsWidth := lipgloss.Width(hints)
+
+	// Calculate gap between left and hints
+	gap := barWidth - leftWidth - hintsWidth
+	if gap < 1 {
+		gap = 1
+	}
+
+	content := left + strings.Repeat(" ", gap) + hints
+	return m.styles.SearchBar.Width(m.width - 2).Render(content)
+}
+
+// renderStatusBar renders the bottom status bar with 3 segments:
+// left (mode indicator), center (status/toast message), right (key hints).
 func (m Model) renderStatusBar(layout layoutSpec) string {
 	if m.width <= 0 {
 		return ""
@@ -2700,72 +2903,131 @@ func (m Model) renderStatusBar(layout layoutSpec) string {
 		contentWidth = m.width
 	}
 
-	if m.statusMsg != "" {
-		hints := m.statusHintLine(layout, false)
-		severity := statusSeverityFromMessage(m.statusMsg)
-		statusStyle := m.styles.StatusSeverityStyle(severity)
-		statusText := statusStyle.Render(m.statusMsg)
-		if hints == "" {
-			return m.styles.StatusBar.Width(m.width).Render(statusText)
-		}
+	// Left segment: mode indicator
+	left := m.statusModeIndicator()
 
-		statusWidth := lipgloss.Width(statusText)
-		hintsWidth := lipgloss.Width(hints)
-		if statusWidth+1+hintsWidth > contentWidth {
-			available := contentWidth - hintsWidth - 1
-			if available < 4 {
-				return m.styles.StatusBar.Width(m.width).Render(statusText)
-			}
-			truncated := truncateString(m.statusMsg, available)
-			statusText = statusStyle.Render(truncated)
-			statusWidth = lipgloss.Width(statusText)
-		}
+	// Right segment: key hints (always visible)
+	right := m.statusKeyHints(layout)
 
-		gap := contentWidth - statusWidth - hintsWidth
+	// Center segment: status message or toast
+	center := m.statusCenterMessage()
+
+	// Calculate widths
+	leftWidth := lipgloss.Width(left)
+	rightWidth := lipgloss.Width(right)
+	centerWidth := lipgloss.Width(center)
+
+	// Minimum gap between segments
+	minGap := 2
+	availableForCenter := contentWidth - leftWidth - rightWidth - (2 * minGap)
+
+	// Truncate center if needed
+	if center != "" && centerWidth > availableForCenter && availableForCenter > 4 {
+		severity := m.statusMessageSeverity()
+		truncated := truncateString(m.statusCenterText(), availableForCenter)
+		center = m.styles.StatusSeverityStyle(severity).Render(truncated)
+		centerWidth = lipgloss.Width(center)
+	}
+
+	// Build the line with proper spacing
+	if center == "" {
+		// No center message: left + gap + right
+		gap := contentWidth - leftWidth - rightWidth
 		if gap < 1 {
 			gap = 1
 		}
-		line := statusText + strings.Repeat(" ", gap) + hints
+		line := left + strings.Repeat(" ", gap) + right
 		return m.styles.StatusBar.Width(m.width).Render(line)
 	}
 
-	hints := m.statusHintLine(layout, true)
-	return m.styles.StatusBar.Width(m.width).Render(hints)
-}
-
-func (m Model) statusHintLine(layout layoutSpec, includeDebug bool) string {
-	left := ""
-	switch {
-	case m.width < 70:
-		left = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		left += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help")
-	case m.width < 100:
-		left = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		left += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
-		left += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" provider  ")
-		left += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
-	default:
-		left = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		left += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
-		left += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" switch provider  ")
-		left += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
+	// With center message: left + gap + center + gap + right
+	leftGap := minGap
+	totalUsed := leftWidth + leftGap + centerWidth + minGap + rightWidth
+	if totalUsed > contentWidth {
+		// Compress gaps evenly
+		leftGap = 1
+	}
+	rightGap := contentWidth - leftWidth - leftGap - centerWidth - rightWidth
+	if rightGap < 1 {
+		rightGap = 1
 	}
 
-	if includeDebug && m.debugEnabled() {
+	line := left + strings.Repeat(" ", leftGap) + center + strings.Repeat(" ", rightGap) + right
+	return m.styles.StatusBar.Width(m.width).Render(line)
+}
+
+// statusModeIndicator returns the rendered mode indicator for the status bar.
+func (m Model) statusModeIndicator() string {
+	switch m.state {
+	case stateSearch:
+		return m.styles.StatusModeSearch.Render("SEARCH")
+	case stateHelp:
+		return m.styles.StatusModeHelp.Render("HELP")
+	case stateCommandPalette:
+		return m.styles.StatusModeSearch.Render("CMD")
+	default:
+		// Show current provider as context
+		if len(m.providers) > 0 && m.activeProvider >= 0 && m.activeProvider < len(m.providers) {
+			provider := strings.ToUpper(m.providers[m.activeProvider])
+			return m.styles.StatusModeNormal.Render(provider)
+		}
+		return m.styles.StatusModeNormal.Render("NORMAL")
+	}
+}
+
+// statusKeyHints returns the key hints for the status bar right segment.
+func (m Model) statusKeyHints(layout layoutSpec) string {
+	var hints string
+	switch {
+	case m.width < 70:
+		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
+		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help")
+	case m.width < 100:
+		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
+		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
+		hints += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" provider")
+	default:
+		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
+		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
+		hints += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" provider  ")
+		hints += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
+	}
+
+	if m.debugEnabled() {
 		debugLine := m.layoutDebugString(layout)
 		if debugLine != "" {
-			right := m.styles.StatusText.Render(debugLine)
-			leftWidth := lipgloss.Width(left)
-			rightWidth := lipgloss.Width(right)
-			gap := m.width - leftWidth - rightWidth
-			if gap < 1 {
-				gap = 1
-			}
-			left = left + strings.Repeat(" ", gap) + right
+			hints += "  " + m.styles.StatusText.Render(debugLine)
 		}
 	}
 
-	return left
+	return hints
+}
+
+// statusCenterText returns the raw text for the center status message.
+func (m Model) statusCenterText() string {
+	// Toasts take priority over statusMsg
+	if len(m.toasts) > 0 {
+		return m.toasts[len(m.toasts)-1].Message
+	}
+	return m.statusMsg
+}
+
+// statusMessageSeverity returns the severity for the current center message.
+func (m Model) statusMessageSeverity() StatusSeverity {
+	if len(m.toasts) > 0 {
+		return m.toasts[len(m.toasts)-1].Severity
+	}
+	return statusSeverityFromMessage(m.statusMsg)
+}
+
+// statusCenterMessage returns the rendered center message for the status bar.
+func (m Model) statusCenterMessage() string {
+	text := m.statusCenterText()
+	if text == "" {
+		return ""
+	}
+	severity := m.statusMessageSeverity()
+	return m.styles.StatusSeverityStyle(severity).Render(text)
 }
 
 func statusSeverityFromMessage(msg string) StatusSeverity {

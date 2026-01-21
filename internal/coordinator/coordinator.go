@@ -59,18 +59,26 @@ type Config struct {
 
 	// LocalAgentURL is the URL of the local auth agent.
 	LocalAgentURL string
+
+	// LoginCooldown is the minimum time between /login injections per pane.
+	LoginCooldown time.Duration
+
+	// MethodSelectCooldown is the minimum time between method selection injections per pane.
+	MethodSelectCooldown time.Duration
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		Backend:       BackendAuto, // Try WezTerm first, fall back to tmux
-		PollInterval:  500 * time.Millisecond,
-		AuthTimeout:   60 * time.Second,
-		StateTimeout:  30 * time.Second,
-		OutputLines:   100,
-		ResumePrompt:  "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
-		LocalAgentURL: "http://localhost:7890",
+		Backend:              BackendAuto, // Try WezTerm first, fall back to tmux
+		PollInterval:         500 * time.Millisecond,
+		AuthTimeout:          60 * time.Second,
+		StateTimeout:         30 * time.Second,
+		OutputLines:          100,
+		ResumePrompt:         "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
+		LocalAgentURL:        "http://localhost:7890",
+		LoginCooldown:        5 * time.Second,
+		MethodSelectCooldown: 2 * time.Second,
 	}
 }
 
@@ -333,16 +341,30 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 	if detected == StateRateLimited {
 		c.logger.Info("rate limit detected",
 			"pane_id", tracker.PaneID,
-			"reset_time", metadata["reset_time"])
+			"reset_time", metadata["reset_time"],
+			"action", "rate_limit_detected")
 		tracker.SetState(StateRateLimited)
+
+		// Check login cooldown before injecting
+		if tracker.IsOnCooldown("login") {
+			c.logger.Debug("login on cooldown, skipping injection",
+				"pane_id", tracker.PaneID,
+				"remaining", tracker.CooldownRemaining("login"),
+				"action", "cooldown_skip")
+			return
+		}
 
 		// Auto-inject /login command
 		if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
 			c.logger.Error("failed to inject /login",
 				"pane_id", tracker.PaneID,
-				"error", err)
+				"error", err,
+				"action", "login_inject_failed")
 		} else {
-			c.logger.Debug("injected /login command", "pane_id", tracker.PaneID)
+			c.logger.Debug("injected /login command",
+				"pane_id", tracker.PaneID,
+				"action", "login_injected")
+			tracker.SetCooldown("login", c.config.LoginCooldown)
 		}
 	}
 }
@@ -352,15 +374,32 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 
 	switch detected {
 	case StateAwaitingMethodSelect:
-		c.logger.Debug("method selection prompt detected", "pane_id", tracker.PaneID)
+		c.logger.Debug("method selection prompt detected",
+			"pane_id", tracker.PaneID,
+			"action", "method_select_detected")
 		tracker.SetState(StateAwaitingMethodSelect)
+
+		// Check method select cooldown before injecting
+		if tracker.IsOnCooldown("method_select") {
+			c.logger.Debug("method select on cooldown, skipping injection",
+				"pane_id", tracker.PaneID,
+				"remaining", tracker.CooldownRemaining("method_select"),
+				"action", "cooldown_skip")
+			return
+		}
 
 		// Auto-select option 1 (Claude account with subscription)
 		time.Sleep(200 * time.Millisecond)
 		if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
 			c.logger.Error("failed to inject option selection",
 				"pane_id", tracker.PaneID,
-				"error", err)
+				"error", err,
+				"action", "method_select_failed")
+		} else {
+			c.logger.Debug("injected option selection",
+				"pane_id", tracker.PaneID,
+				"action", "method_select_injected")
+			tracker.SetCooldown("method_select", c.config.MethodSelectCooldown)
 		}
 
 	case StateAwaitingURL:
@@ -370,14 +409,16 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 			tracker.SetOAuthURL(url)
 			tracker.SetState(StateAwaitingURL)
 			c.logger.Info("OAuth URL detected (skip method select)",
-				"pane_id", tracker.PaneID)
+				"pane_id", tracker.PaneID,
+				"action", "url_detected")
 		}
 	}
 
 	// Check timeout
 	if tracker.TimeSinceStateChange() > c.config.StateTimeout {
 		c.logger.Warn("rate limited state timeout, resetting",
-			"pane_id", tracker.PaneID)
+			"pane_id", tracker.PaneID,
+			"action", "state_timeout")
 		tracker.Reset()
 	}
 }

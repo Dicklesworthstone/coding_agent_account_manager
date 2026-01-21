@@ -600,3 +600,254 @@ func (d *MultiFieldDialog) View() string {
 		Width(d.width).
 		Render(content.String())
 }
+
+// CommandAction represents an executable command in the palette.
+type CommandAction struct {
+	Name        string
+	Description string
+	Shortcut    string
+	Action      string // Action identifier for handling
+}
+
+// CommandPaletteDialog is a searchable command palette overlay.
+type CommandPaletteDialog struct {
+	title    string
+	input    textinput.Model
+	commands []CommandAction
+	filtered []CommandAction
+	selected int
+	result   DialogResult
+	chosen   *CommandAction
+	keys     DialogKeyMap
+	styles   Styles
+	width    int
+	height   int
+	focused  bool
+}
+
+// NewCommandPaletteDialog creates a new command palette dialog.
+func NewCommandPaletteDialog(title string, commands []CommandAction) *CommandPaletteDialog {
+	ti := textinput.New()
+	ti.Focus()
+	ti.CharLimit = 64
+	ti.Width = 40
+	ti.Placeholder = "Type to filter commands..."
+
+	return &CommandPaletteDialog{
+		title:    title,
+		input:    ti,
+		commands: commands,
+		filtered: commands,
+		selected: 0,
+		result:   DialogResultNone,
+		keys:     DefaultDialogKeyMap(),
+		styles:   DefaultStyles(),
+		width:    50,
+		height:   20,
+		focused:  true,
+	}
+}
+
+// DefaultCommands returns the default set of palette commands.
+func DefaultCommands() []CommandAction {
+	return []CommandAction{
+		{Name: "Activate Profile", Description: "Switch to the selected profile", Shortcut: "enter", Action: "activate"},
+		{Name: "Backup Current Auth", Description: "Create a backup of current auth", Shortcut: "b", Action: "backup"},
+		{Name: "Delete Profile", Description: "Delete the selected profile", Shortcut: "d", Action: "delete"},
+		{Name: "Edit Profile", Description: "Edit profile details", Shortcut: "e", Action: "edit"},
+		{Name: "Login/Refresh", Description: "Refresh authentication", Shortcut: "l", Action: "login"},
+		{Name: "Open in Browser", Description: "Open provider in browser", Shortcut: "o", Action: "open"},
+		{Name: "Set Project Association", Description: "Link profile to current project", Shortcut: "p", Action: "project"},
+		{Name: "Usage Statistics", Description: "View usage stats", Shortcut: "u", Action: "usage"},
+		{Name: "Sync Pool", Description: "Manage sync pool", Shortcut: "S", Action: "sync"},
+		{Name: "Export Vault", Description: "Export profiles to vault", Shortcut: "E", Action: "export"},
+		{Name: "Import Bundle", Description: "Import profiles from bundle", Shortcut: "I", Action: "import"},
+		{Name: "Help", Description: "Show help screen", Shortcut: "?", Action: "help"},
+	}
+}
+
+// SetStyles sets the styles for the dialog.
+func (d *CommandPaletteDialog) SetStyles(styles Styles) {
+	d.styles = styles
+	d.input.Cursor.Style = styles.InputCursor
+}
+
+// Focus focuses the dialog.
+func (d *CommandPaletteDialog) Focus() {
+	d.focused = true
+	d.input.Focus()
+}
+
+// Blur blurs the dialog.
+func (d *CommandPaletteDialog) Blur() {
+	d.focused = false
+	d.input.Blur()
+}
+
+// Result returns the dialog result.
+func (d *CommandPaletteDialog) Result() DialogResult {
+	return d.result
+}
+
+// ChosenCommand returns the selected command (if any).
+func (d *CommandPaletteDialog) ChosenCommand() *CommandAction {
+	return d.chosen
+}
+
+// Reset resets the dialog to its initial state.
+func (d *CommandPaletteDialog) Reset() {
+	d.input.Reset()
+	d.result = DialogResultNone
+	d.chosen = nil
+	d.selected = 0
+	d.filtered = d.commands
+	d.input.Focus()
+}
+
+// SetWidth sets the dialog width.
+func (d *CommandPaletteDialog) SetWidth(width int) {
+	d.width = width
+	d.input.Width = width - 8
+}
+
+// filterCommands filters commands based on the current input.
+func (d *CommandPaletteDialog) filterCommands() {
+	query := strings.ToLower(d.input.Value())
+	if query == "" {
+		d.filtered = d.commands
+		return
+	}
+
+	var filtered []CommandAction
+	for _, cmd := range d.commands {
+		name := strings.ToLower(cmd.Name)
+		desc := strings.ToLower(cmd.Description)
+		shortcut := strings.ToLower(cmd.Shortcut)
+		if strings.Contains(name, query) ||
+			strings.Contains(desc, query) ||
+			strings.Contains(shortcut, query) {
+			filtered = append(filtered, cmd)
+		}
+	}
+	d.filtered = filtered
+
+	// Reset selection if out of bounds
+	if d.selected >= len(d.filtered) {
+		d.selected = 0
+	}
+}
+
+// Update handles messages for the dialog.
+func (d *CommandPaletteDialog) Update(msg tea.Msg) (*CommandPaletteDialog, tea.Cmd) {
+	if !d.focused {
+		return d, nil
+	}
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyEscape:
+			d.result = DialogResultCancel
+			return d, nil
+		case tea.KeyEnter:
+			if len(d.filtered) > 0 && d.selected < len(d.filtered) {
+				d.chosen = &d.filtered[d.selected]
+				d.result = DialogResultSubmit
+			}
+			return d, nil
+		case tea.KeyUp, tea.KeyCtrlP:
+			if d.selected > 0 {
+				d.selected--
+			}
+			return d, nil
+		case tea.KeyDown, tea.KeyCtrlN:
+			if d.selected < len(d.filtered)-1 {
+				d.selected++
+			}
+			return d, nil
+		}
+	}
+
+	// Update input and filter
+	var cmd tea.Cmd
+	d.input, cmd = d.input.Update(msg)
+	d.filterCommands()
+	return d, cmd
+}
+
+// View renders the dialog.
+func (d *CommandPaletteDialog) View() string {
+	var content strings.Builder
+
+	// Title
+	if d.title != "" {
+		content.WriteString(d.styles.DialogTitle.Render(d.title))
+		content.WriteString("\n\n")
+	}
+
+	// Search input
+	content.WriteString(d.input.View())
+	content.WriteString("\n\n")
+
+	// Command list
+	maxVisible := 8
+	if len(d.filtered) < maxVisible {
+		maxVisible = len(d.filtered)
+	}
+
+	// Calculate scroll offset
+	scrollOffset := 0
+	if d.selected >= maxVisible {
+		scrollOffset = d.selected - maxVisible + 1
+	}
+
+	for i := scrollOffset; i < scrollOffset+maxVisible && i < len(d.filtered); i++ {
+		cmd := d.filtered[i]
+		isSelected := i == d.selected
+
+		// Format: [shortcut] Name - Description
+		shortcutStyle := d.styles.StatusKey
+		nameStyle := d.styles.Item
+		if isSelected {
+			nameStyle = d.styles.SelectedItem
+		}
+
+		shortcut := shortcutStyle.Render("[" + cmd.Shortcut + "]")
+		name := nameStyle.Render(" " + cmd.Name)
+		desc := d.styles.StatusText.Render(" - " + cmd.Description)
+
+		line := shortcut + name + desc
+		if isSelected {
+			line = "▸ " + line
+		} else {
+			line = "  " + line
+		}
+
+		content.WriteString(line)
+		if i < scrollOffset+maxVisible-1 && i < len(d.filtered)-1 {
+			content.WriteString("\n")
+		}
+	}
+
+	if len(d.filtered) == 0 {
+		content.WriteString(d.styles.Empty.Render("No matching commands"))
+	}
+
+	content.WriteString("\n\n")
+
+	// Help text
+	help := d.styles.StatusKey.Render("↑↓") + " navigate  " +
+		d.styles.StatusKey.Render("enter") + " select  " +
+		d.styles.StatusKey.Render("esc") + " cancel"
+	content.WriteString(help)
+
+	style := d.styles.Dialog
+	if d.focused {
+		style = d.styles.DialogFocused
+	}
+
+	// Wrap in dialog box
+	return style.
+		Width(d.width).
+		Render(content.String())
+}

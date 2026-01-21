@@ -1176,8 +1176,12 @@ func TestRenderStatusBar(t *testing.T) {
 	// Test with full width (>= 100)
 	m.width = 120
 	view = m.renderStatusBar(layoutSpec{Mode: layoutFull})
-	if !strings.Contains(view, "switch provider") {
-		t.Errorf("expected 'switch provider' hint in full view, got %q", view)
+	// Updated: status bar now shows "provider" not "switch provider" for conciseness
+	if !strings.Contains(view, "provider") {
+		t.Errorf("expected 'provider' hint in full view, got %q", view)
+	}
+	if !strings.Contains(view, "activate") {
+		t.Errorf("expected 'activate' hint in full view, got %q", view)
 	}
 }
 
@@ -1187,6 +1191,8 @@ func TestStatusBarSeveritySnapshots(t *testing.T) {
 	m := New()
 	m.width = 120
 
+	// Status bar now has 3 segments: mode indicator | center message | key hints
+	// The format is: " CLAUDE  message  q quit ? help tab provider enter activate"
 	tests := []struct {
 		name    string
 		message string
@@ -1196,19 +1202,19 @@ func TestStatusBarSeveritySnapshots(t *testing.T) {
 			name:    "success",
 			message: "Exported",
 			want: "" +
-				" Exported                                                q   quit   ?   help   tab   switch provider   enter   activate",
+				"  CLAUDE   Exported                                             q   quit   ?   help   tab   provider   enter   activate",
 		},
 		{
 			name:    "warning",
 			message: "No profile selected",
 			want: "" +
-				" No profile selected                                     q   quit   ?   help   tab   switch provider   enter   activate",
+				"  CLAUDE   No profile selected                                  q   quit   ?   help   tab   provider   enter   activate",
 		},
 		{
 			name:    "error",
 			message: "Export failed",
 			want: "" +
-				" Export failed                                           q   quit   ?   help   tab   switch provider   enter   activate",
+				"  CLAUDE   Export failed                                        q   quit   ?   help   tab   provider   enter   activate",
 		},
 	}
 
@@ -1238,29 +1244,29 @@ func TestApplySearchFilter(t *testing.T) {
 	// Test with empty query - should show all
 	m.searchQuery = ""
 	m.applySearchFilter()
-	if !strings.Contains(m.statusMsg, "3 matches") {
-		t.Errorf("expected 3 matches for empty query, got %q", m.statusMsg)
+	if m.profilesPanel.Count() != 3 {
+		t.Errorf("expected 3 profiles for empty query, got %d", m.profilesPanel.Count())
 	}
 
 	// Test with specific query
 	m.searchQuery = "work"
 	m.applySearchFilter()
-	if !strings.Contains(m.statusMsg, "1 match") {
-		t.Errorf("expected 1 match for 'work' query, got %q", m.statusMsg)
+	if m.profilesPanel.Count() != 1 {
+		t.Errorf("expected 1 profile for 'work' query, got %d", m.profilesPanel.Count())
 	}
 
 	// Test with case-insensitive query
 	m.searchQuery = "PERSONAL"
 	m.applySearchFilter()
-	if !strings.Contains(m.statusMsg, "1 match") {
-		t.Errorf("expected 1 match for 'PERSONAL' query, got %q", m.statusMsg)
+	if m.profilesPanel.Count() != 1 {
+		t.Errorf("expected 1 profile for 'PERSONAL' query, got %d", m.profilesPanel.Count())
 	}
 
 	// Test with no matches
 	m.searchQuery = "nonexistent"
 	m.applySearchFilter()
-	if !strings.Contains(m.statusMsg, "0 match") {
-		t.Errorf("expected 0 matches for 'nonexistent', got %q", m.statusMsg)
+	if m.profilesPanel.Count() != 0 {
+		t.Errorf("expected 0 profiles for 'nonexistent', got %d", m.profilesPanel.Count())
 	}
 }
 
@@ -1281,6 +1287,47 @@ func TestApplySearchFilterNilPanel(t *testing.T) {
 
 	// Should not panic
 	m.applySearchFilter()
+}
+
+func TestRenderSearchBar(t *testing.T) {
+	m := New()
+	m.width = 80
+	m.height = 24
+	m.profiles = map[string][]Profile{
+		"claude": {
+			{Name: "work@example.com"},
+			{Name: "personal@gmail.com"},
+		},
+	}
+	m.profilesPanel = NewProfilesPanel()
+
+	// Test that search bar is empty when not in search mode
+	m.state = stateList
+	bar := m.renderSearchBar()
+	if bar != "" {
+		t.Errorf("expected empty search bar in list mode, got %q", bar)
+	}
+
+	// Test that search bar is rendered when in search mode
+	m.state = stateSearch
+	m.searchQuery = ""
+	bar = m.renderSearchBar()
+	if bar == "" {
+		t.Error("expected non-empty search bar in search mode")
+	}
+	if !strings.Contains(bar, "/") {
+		t.Error("expected search bar to contain '/' prompt")
+	}
+	if !strings.Contains(bar, "matches") {
+		t.Error("expected search bar to contain match count")
+	}
+
+	// Test with search query
+	m.searchQuery = "work"
+	bar = m.renderSearchBar()
+	if !strings.Contains(bar, "work") {
+		t.Errorf("expected search bar to contain query 'work', got %q", bar)
+	}
 }
 
 // TestHandleEditProfile tests the handleEditProfile method.
@@ -1368,5 +1415,258 @@ func TestRenderProviderTabsWithCounts(t *testing.T) {
 	view = m.renderProviderTabs()
 	if !strings.Contains(view, "2") { // Should show count
 		// This may depend on styling, so just check it renders
+	}
+}
+
+// TestToastCreation tests creating new toasts.
+func TestToastCreation(t *testing.T) {
+	toast := NewToast("Test message", StatusSuccess)
+	if toast.Message != "Test message" {
+		t.Errorf("expected message 'Test message', got %q", toast.Message)
+	}
+	if toast.Severity != StatusSuccess {
+		t.Errorf("expected severity StatusSuccess, got %v", toast.Severity)
+	}
+	if toast.CreatedAt.IsZero() {
+		t.Error("expected non-zero CreatedAt")
+	}
+	if toast.IsExpired() {
+		t.Error("new toast should not be expired")
+	}
+}
+
+// TestToastExpiration tests toast expiration logic.
+func TestToastExpiration(t *testing.T) {
+	// Create an already-expired toast by manipulating CreatedAt
+	toast := Toast{
+		Message:   "Old toast",
+		Severity:  StatusInfo,
+		CreatedAt: time.Now().Add(-ToastDuration - time.Second),
+	}
+	if !toast.IsExpired() {
+		t.Error("old toast should be expired")
+	}
+}
+
+// TestAddToast tests adding toasts to the model.
+func TestAddToast(t *testing.T) {
+	m := New()
+	if len(m.toasts) != 0 {
+		t.Errorf("expected 0 toasts initially, got %d", len(m.toasts))
+	}
+
+	cmd := m.addToast("Success!", StatusSuccess)
+	if len(m.toasts) != 1 {
+		t.Errorf("expected 1 toast after addToast, got %d", len(m.toasts))
+	}
+	if m.toasts[0].Message != "Success!" {
+		t.Errorf("expected message 'Success!', got %q", m.toasts[0].Message)
+	}
+	if cmd == nil {
+		t.Error("expected non-nil command for toast tick")
+	}
+}
+
+// TestExpireToasts tests the toast expiration mechanism.
+func TestExpireToasts(t *testing.T) {
+	m := New()
+
+	// Add a fresh toast
+	m.toasts = append(m.toasts, NewToast("Fresh", StatusInfo))
+
+	// Add an expired toast
+	m.toasts = append(m.toasts, Toast{
+		Message:   "Expired",
+		Severity:  StatusWarning,
+		CreatedAt: time.Now().Add(-ToastDuration - time.Second),
+	})
+
+	if len(m.toasts) != 2 {
+		t.Fatalf("expected 2 toasts before expiration, got %d", len(m.toasts))
+	}
+
+	hasRemaining := m.expireToasts()
+	if !hasRemaining {
+		t.Error("expected remaining toasts after expiration")
+	}
+	if len(m.toasts) != 1 {
+		t.Errorf("expected 1 toast after expiration, got %d", len(m.toasts))
+	}
+	if m.toasts[0].Message != "Fresh" {
+		t.Errorf("expected fresh toast to remain, got %q", m.toasts[0].Message)
+	}
+}
+
+// TestStatusModeIndicator tests the mode indicator in status bar.
+func TestStatusModeIndicator(t *testing.T) {
+	m := New()
+	m.width = 100
+	m.height = 30
+
+	// Test normal state shows provider
+	m.state = stateList
+	indicator := m.statusModeIndicator()
+	plainIndicator := ansi.Strip(indicator)
+	if !strings.Contains(plainIndicator, "CLAUDE") {
+		t.Errorf("expected CLAUDE in normal mode indicator, got %q", plainIndicator)
+	}
+
+	// Test search state
+	m.state = stateSearch
+	indicator = m.statusModeIndicator()
+	plainIndicator = ansi.Strip(indicator)
+	if !strings.Contains(plainIndicator, "SEARCH") {
+		t.Errorf("expected SEARCH in search mode indicator, got %q", plainIndicator)
+	}
+
+	// Test help state
+	m.state = stateHelp
+	indicator = m.statusModeIndicator()
+	plainIndicator = ansi.Strip(indicator)
+	if !strings.Contains(plainIndicator, "HELP") {
+		t.Errorf("expected HELP in help mode indicator, got %q", plainIndicator)
+	}
+
+	// Test command palette state
+	m.state = stateCommandPalette
+	indicator = m.statusModeIndicator()
+	plainIndicator = ansi.Strip(indicator)
+	if !strings.Contains(plainIndicator, "CMD") {
+		t.Errorf("expected CMD in command palette mode indicator, got %q", plainIndicator)
+	}
+}
+
+// TestStatusKeyHints tests that key hints are always present.
+func TestStatusKeyHints(t *testing.T) {
+	m := New()
+
+	layout := layoutSpec{Mode: layoutFull}
+
+	// Test narrow width
+	m.width = 60
+	hints := m.statusKeyHints(layout)
+	plainHints := ansi.Strip(hints)
+	if !strings.Contains(plainHints, "quit") {
+		t.Errorf("expected 'quit' in narrow hints, got %q", plainHints)
+	}
+	if !strings.Contains(plainHints, "help") {
+		t.Errorf("expected 'help' in narrow hints, got %q", plainHints)
+	}
+
+	// Test wide width
+	m.width = 120
+	hints = m.statusKeyHints(layout)
+	plainHints = ansi.Strip(hints)
+	if !strings.Contains(plainHints, "activate") {
+		t.Errorf("expected 'activate' in wide hints, got %q", plainHints)
+	}
+}
+
+// TestStatusCenterMessage tests center message rendering with toasts and statusMsg.
+func TestStatusCenterMessage(t *testing.T) {
+	m := New()
+
+	// Test with no message
+	if m.statusCenterText() != "" {
+		t.Errorf("expected empty center text, got %q", m.statusCenterText())
+	}
+
+	// Test with statusMsg
+	m.statusMsg = "Status message"
+	if m.statusCenterText() != "Status message" {
+		t.Errorf("expected 'Status message', got %q", m.statusCenterText())
+	}
+
+	// Test that toast takes priority
+	m.addToast("Toast message", StatusSuccess)
+	if m.statusCenterText() != "Toast message" {
+		t.Errorf("expected toast to take priority, got %q", m.statusCenterText())
+	}
+	if m.statusMessageSeverity() != StatusSuccess {
+		t.Errorf("expected StatusSuccess severity, got %v", m.statusMessageSeverity())
+	}
+}
+
+// TestRenderStatusBarThreeSegments tests the 3-segment status bar layout.
+func TestRenderStatusBarThreeSegments(t *testing.T) {
+	m := New()
+	m.width = 100
+	m.height = 30
+
+	layout := layoutSpec{Mode: layoutFull}
+
+	// Render status bar
+	bar := m.renderStatusBar(layout)
+	plainBar := ansi.Strip(bar)
+
+	// Should contain mode indicator (provider name)
+	if !strings.Contains(plainBar, "CLAUDE") {
+		t.Errorf("expected CLAUDE mode indicator in status bar, got %q", plainBar)
+	}
+
+	// Should contain key hints
+	if !strings.Contains(plainBar, "quit") {
+		t.Errorf("expected 'quit' key hint in status bar, got %q", plainBar)
+	}
+
+	// Add a status message and verify layout
+	m.statusMsg = "Test status"
+	bar = m.renderStatusBar(layout)
+	plainBar = ansi.Strip(bar)
+
+	// Should still have mode and hints
+	if !strings.Contains(plainBar, "CLAUDE") {
+		t.Errorf("expected CLAUDE mode indicator with status message, got %q", plainBar)
+	}
+	if !strings.Contains(plainBar, "quit") {
+		t.Errorf("expected 'quit' hint with status message, got %q", plainBar)
+	}
+	// Should have status message
+	if !strings.Contains(plainBar, "Test status") {
+		t.Errorf("expected status message in bar, got %q", plainBar)
+	}
+}
+
+// TestToastTickMsg tests the toast tick message handling.
+func TestToastTickMsg(t *testing.T) {
+	m := New()
+
+	// Add an expired toast
+	m.toasts = append(m.toasts, Toast{
+		Message:   "Expired",
+		Severity:  StatusInfo,
+		CreatedAt: time.Now().Add(-ToastDuration - time.Second),
+	})
+
+	// Process tick message
+	newModel, cmd := m.Update(toastTickMsg{})
+	updated := newModel.(Model)
+
+	if len(updated.toasts) != 0 {
+		t.Errorf("expected expired toast to be removed, got %d toasts", len(updated.toasts))
+	}
+	// Should not return another tick command when no toasts remain
+	if cmd != nil {
+		t.Error("expected no tick command when no toasts remain")
+	}
+}
+
+// TestToastTickMsgWithRemaining tests tick when toasts remain.
+func TestToastTickMsgWithRemaining(t *testing.T) {
+	m := New()
+
+	// Add a fresh toast
+	m.toasts = append(m.toasts, NewToast("Fresh", StatusInfo))
+
+	// Process tick message
+	newModel, cmd := m.Update(toastTickMsg{})
+	updated := newModel.(Model)
+
+	if len(updated.toasts) != 1 {
+		t.Errorf("expected 1 toast to remain, got %d", len(updated.toasts))
+	}
+	// Should return another tick command to check later
+	if cmd == nil {
+		t.Error("expected tick command when toasts remain")
 	}
 }

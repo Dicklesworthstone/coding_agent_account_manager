@@ -499,3 +499,144 @@ func TestDialogKeyMap(t *testing.T) {
 		t.Error("expected Tab keybinding to have keys")
 	}
 }
+
+func TestCommandPaletteDialog_Creation(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	if d.Result() != DialogResultNone {
+		t.Errorf("expected DialogResultNone, got %v", d.Result())
+	}
+
+	if d.ChosenCommand() != nil {
+		t.Error("expected nil chosen command on creation")
+	}
+}
+
+func TestCommandPaletteDialog_Filter(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	// Filter by typing "back"
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+
+	// The filter should narrow down to backup command
+	view := d.View()
+	if !strings.Contains(view, "Backup") {
+		t.Error("expected filter to show backup command")
+	}
+}
+
+func TestCommandPaletteDialog_Navigation(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	// Move down
+	d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	d.Update(tea.KeyMsg{Type: tea.KeyDown})
+
+	// Move up
+	d.Update(tea.KeyMsg{Type: tea.KeyUp})
+
+	// Result should still be none
+	if d.Result() != DialogResultNone {
+		t.Errorf("expected DialogResultNone, got %v", d.Result())
+	}
+}
+
+func TestCommandPaletteDialog_Select(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	// Press Enter to select first command
+	d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	if d.Result() != DialogResultSubmit {
+		t.Errorf("expected DialogResultSubmit, got %v", d.Result())
+	}
+
+	chosen := d.ChosenCommand()
+	if chosen == nil {
+		t.Fatal("expected a chosen command")
+	}
+	if chosen.Action != "activate" {
+		t.Errorf("expected first command (activate), got %s", chosen.Action)
+	}
+}
+
+func TestCommandPaletteDialog_Cancel(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	// Press Escape to cancel
+	d.Update(tea.KeyMsg{Type: tea.KeyEscape})
+
+	if d.Result() != DialogResultCancel {
+		t.Errorf("expected DialogResultCancel, got %v", d.Result())
+	}
+}
+
+func TestCommandPaletteDialog_Reset(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+
+	// Select a command
+	d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	// Reset
+	d.Reset()
+
+	if d.Result() != DialogResultNone {
+		t.Errorf("expected DialogResultNone after reset, got %v", d.Result())
+	}
+	if d.ChosenCommand() != nil {
+		t.Error("expected nil chosen command after reset")
+	}
+}
+
+func TestCommandPaletteDialog_View(t *testing.T) {
+	commands := DefaultCommands()
+	d := NewCommandPaletteDialog("Test Palette", commands)
+	d.SetStyles(DefaultStyles())
+
+	view := d.View()
+
+	// Should contain the title
+	if !strings.Contains(view, "Test Palette") {
+		t.Error("expected view to contain title")
+	}
+
+	// Should contain help text
+	if !strings.Contains(view, "navigate") {
+		t.Error("expected view to contain navigation help")
+	}
+
+	// Should contain at least one command
+	if !strings.Contains(view, "Activate") {
+		t.Error("expected view to contain Activate command")
+	}
+}
+
+func TestDefaultCommands(t *testing.T) {
+	commands := DefaultCommands()
+
+	if len(commands) == 0 {
+		t.Error("expected at least one default command")
+	}
+
+	// Check that all commands have required fields
+	for i, cmd := range commands {
+		if cmd.Name == "" {
+			t.Errorf("command %d has empty name", i)
+		}
+		if cmd.Action == "" {
+			t.Errorf("command %d has empty action", i)
+		}
+		if cmd.Shortcut == "" {
+			t.Errorf("command %d has empty shortcut", i)
+		}
+	}
+}

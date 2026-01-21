@@ -24,6 +24,7 @@ type keyMap struct {
 	Sync    key.Binding
 	Export  key.Binding
 	Import  key.Binding
+	Palette key.Binding
 
 	// Confirmation
 	Confirm key.Binding
@@ -104,6 +105,10 @@ func defaultKeyMap() keyMap {
 		Import: key.NewBinding(
 			key.WithKeys("I"),
 			key.WithHelp("I", "import bundle"),
+		),
+		Palette: key.NewBinding(
+			key.WithKeys("ctrl+p"),
+			key.WithHelp("ctrl+p", "command palette"),
 		),
 		Confirm: key.NewBinding(
 			key.WithKeys("y", "enter"),

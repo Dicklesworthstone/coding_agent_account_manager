@@ -28,9 +28,11 @@ func NewAPIServer(coordinator *Coordinator, port int, logger *slog.Logger) *APIS
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", api.handleHealth)
 	mux.HandleFunc("GET /status", api.handleStatus)
 	mux.HandleFunc("GET /auth/pending", api.handleGetPending)
 	mux.HandleFunc("POST /auth/complete", api.handleComplete)
+	mux.HandleFunc("POST /auth/submit", api.handleComplete) // alias
 	mux.HandleFunc("GET /panes", api.handleListPanes)
 
 	api.server = &http.Server{
@@ -63,6 +65,25 @@ func (a *APIServer) withLogging(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"duration", time.Since(start))
 	})
+}
+
+// HealthResponse is the response from /health endpoint.
+type HealthResponse struct {
+	Status    string    `json:"status"`
+	Timestamp time.Time `json:"timestamp"`
+	Backend   string    `json:"backend"`
+	Uptime    string    `json:"uptime,omitempty"`
+}
+
+func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	resp := HealthResponse{
+		Status:    "ok",
+		Timestamp: time.Now(),
+		Backend:   a.coordinator.Backend(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // StatusResponse is the response from /status endpoint.

@@ -197,6 +197,89 @@ func TestDefaultStylesConsistency(t *testing.T) {
 	}
 }
 
+func TestToastStyleMapping(t *testing.T) {
+	theme := NewTheme(DefaultThemeOptions())
+	styles := NewStyles(theme)
+
+	tests := []struct {
+		severity StatusSeverity
+		want     interface{}
+	}{
+		{StatusSuccess, theme.Palette.Success},
+		{StatusWarning, theme.Palette.Warning},
+		{StatusError, theme.Palette.Danger},
+		{StatusInfo, theme.Palette.Info},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.severity.String(), func(t *testing.T) {
+			style := styles.ToastStyle(tt.severity)
+			fg := style.GetForeground()
+			t.Logf("toast severity=%s foreground=%v", tt.severity.String(), fg)
+			if fg != tt.want {
+				t.Fatalf("toast severity=%s foreground=%v, want %v", tt.severity.String(), fg, tt.want)
+			}
+		})
+	}
+}
+
+func TestToastStylesInitialized(t *testing.T) {
+	styles := DefaultStyles()
+
+	t.Run("ToastSuccess style initialized", func(t *testing.T) {
+		result := styles.ToastSuccess.Render("Success!")
+		if result == "" {
+			t.Error("ToastSuccess style should render non-empty output")
+		}
+	})
+
+	t.Run("ToastWarning style initialized", func(t *testing.T) {
+		result := styles.ToastWarning.Render("Warning!")
+		if result == "" {
+			t.Error("ToastWarning style should render non-empty output")
+		}
+	})
+
+	t.Run("ToastError style initialized", func(t *testing.T) {
+		result := styles.ToastError.Render("Error!")
+		if result == "" {
+			t.Error("ToastError style should render non-empty output")
+		}
+	})
+
+	t.Run("ToastInfo style initialized", func(t *testing.T) {
+		result := styles.ToastInfo.Render("Info!")
+		if result == "" {
+			t.Error("ToastInfo style should render non-empty output")
+		}
+	})
+}
+
+func TestStatusModeStylesInitialized(t *testing.T) {
+	styles := DefaultStyles()
+
+	t.Run("StatusModeNormal style initialized", func(t *testing.T) {
+		result := styles.StatusModeNormal.Render("NORMAL")
+		if result == "" {
+			t.Error("StatusModeNormal style should render non-empty output")
+		}
+	})
+
+	t.Run("StatusModeSearch style initialized", func(t *testing.T) {
+		result := styles.StatusModeSearch.Render("SEARCH")
+		if result == "" {
+			t.Error("StatusModeSearch style should render non-empty output")
+		}
+	})
+
+	t.Run("StatusModeHelp style initialized", func(t *testing.T) {
+		result := styles.StatusModeHelp.Render("HELP")
+		if result == "" {
+			t.Error("StatusModeHelp style should render non-empty output")
+		}
+	})
+}
+
 // =============================================================================
 // keys.go Tests
 // =============================================================================
