@@ -93,8 +93,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	if hasExistingAuth && !force {
 		fmt.Printf("Current %s auth will be backed up and cleared.\n", tool)
-		fmt.Print("Continue? [Y/n]: ")
-		if !promptConfirm(true) {
+		ok, err := confirmProceed(cmd.InOrStdin(), cmd.OutOrStdout())
+		if err != nil {
+			return fmt.Errorf("confirm proceed: %w", err)
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}
@@ -249,16 +252,4 @@ func runToolLogin(ctx context.Context, tool string, deviceCode bool) error {
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
-}
-
-// promptConfirm prompts for yes/no confirmation.
-func promptConfirm(defaultYes bool) bool {
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(strings.ToLower(input))
-
-	if input == "" {
-		return defaultYes
-	}
-	return input == "y" || input == "yes"
 }

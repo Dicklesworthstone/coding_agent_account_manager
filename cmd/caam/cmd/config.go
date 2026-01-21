@@ -44,6 +44,7 @@ func init() {
 	configCmd.AddCommand(configSetCmd)
 	configCmd.AddCommand(configResetCmd)
 	configCmd.AddCommand(configPathCmd)
+	configCmd.AddCommand(configTUICmd)
 }
 
 // configShowCmd shows the current configuration.
@@ -239,6 +240,8 @@ func getConfigValue(cfg *config.SPMConfig, key string) (string, error) {
 		return getHandoffValue(&cfg.Handoff, field)
 	case "daemon":
 		return getDaemonValue(&cfg.Daemon, field)
+	case "tui":
+		return getTUIValue(&cfg.TUI, field)
 	default:
 		return "", fmt.Errorf("unknown section: %s", section)
 	}
@@ -423,6 +426,8 @@ func setConfigValue(cfg *config.SPMConfig, key, value string) error {
 		return setHandoffValue(&cfg.Handoff, field, value)
 	case "daemon":
 		return setDaemonValue(&cfg.Daemon, field, value)
+	case "tui":
+		return setTUIValue(&cfg.TUI, field, value)
 	default:
 		return fmt.Errorf("unknown section: %s", section)
 	}
@@ -686,5 +691,171 @@ func parseBool(s string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid boolean: %s (use true/false, yes/no, 1/0)", s)
 	}
+}
+
+func getTUIValue(t *config.TUIConfig, field string) (string, error) {
+	switch field {
+	case "theme":
+		return t.Theme, nil
+	case "high_contrast":
+		return strconv.FormatBool(t.HighContrast), nil
+	case "reduced_motion":
+		return strconv.FormatBool(t.ReducedMotion), nil
+	case "toasts":
+		return strconv.FormatBool(t.Toasts), nil
+	case "mouse":
+		return strconv.FormatBool(t.Mouse), nil
+	case "show_key_hints":
+		return strconv.FormatBool(t.ShowKeyHints), nil
+	case "density":
+		return t.Density, nil
+	case "no_tui":
+		return strconv.FormatBool(t.NoTUI), nil
+	default:
+		return "", fmt.Errorf("unknown tui field: %s", field)
+	}
+}
+
+func setTUIValue(t *config.TUIConfig, field, value string) error {
+	switch field {
+	case "theme":
+		theme := strings.ToLower(strings.TrimSpace(value))
+		switch theme {
+		case "auto", "dark", "light":
+			t.Theme = theme
+		default:
+			return fmt.Errorf("invalid theme: %s (use auto, dark, or light)", value)
+		}
+	case "high_contrast":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.HighContrast = b
+	case "reduced_motion":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.ReducedMotion = b
+	case "toasts":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.Toasts = b
+	case "mouse":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.Mouse = b
+	case "show_key_hints":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.ShowKeyHints = b
+	case "density":
+		density := strings.ToLower(strings.TrimSpace(value))
+		switch density {
+		case "cozy", "compact":
+			t.Density = density
+		default:
+			return fmt.Errorf("invalid density: %s (use cozy or compact)", value)
+		}
+	case "no_tui":
+		b, err := parseBool(value)
+		if err != nil {
+			return err
+		}
+		t.NoTUI = b
+	default:
+		return fmt.Errorf("unknown tui field: %s", field)
+	}
+	return nil
+}
+
+// configTUICmd shows and manages TUI preferences.
+var configTUICmd = &cobra.Command{
+	Use:   "tui [key] [value]",
+	Short: "View and modify TUI preferences",
+	Long: `View and modify TUI appearance and behavior preferences.
+
+When called without arguments, shows all TUI settings.
+When called with a key, shows that specific setting.
+When called with a key and value, sets that setting.
+
+Available keys:
+  theme          Color scheme: auto (default), dark, light
+  high_contrast  Enable high-contrast colors (bool)
+  reduced_motion Disable animations like spinners (bool)
+  toasts         Show transient notifications (bool)
+  mouse          Enable mouse support (bool)
+  show_key_hints Show keyboard shortcuts in status bar (bool)
+  density        Spacing: cozy (default), compact
+  no_tui         Disable TUI entirely (bool)
+
+Environment variable overrides (higher priority than config):
+  CAAM_TUI_THEME          Theme setting
+  CAAM_TUI_CONTRAST       high or normal
+  CAAM_TUI_REDUCED_MOTION Disable animations
+  CAAM_TUI_TOASTS         Show toasts
+  CAAM_TUI_MOUSE          Mouse support
+  CAAM_TUI_KEY_HINTS      Key hints
+  CAAM_TUI_DENSITY        cozy or compact
+  CAAM_NO_TUI / NO_TUI    Disable TUI
+
+Examples:
+  caam config tui                          # Show all TUI settings
+  caam config tui theme                    # Show theme setting
+  caam config tui theme dark               # Set theme to dark
+  caam config tui reduced_motion true      # Disable animations
+  caam config tui density compact          # Use compact spacing`,
+	Args: cobra.MaximumNArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			// Show all TUI settings
+			fmt.Println("TUI Preferences")
+			fmt.Println("───────────────────────────────────────────")
+			fmt.Printf("  %-16s %s\n", "theme:", spmConfig.TUI.Theme)
+			fmt.Printf("  %-16s %t\n", "high_contrast:", spmConfig.TUI.HighContrast)
+			fmt.Printf("  %-16s %t\n", "reduced_motion:", spmConfig.TUI.ReducedMotion)
+			fmt.Printf("  %-16s %t\n", "toasts:", spmConfig.TUI.Toasts)
+			fmt.Printf("  %-16s %t\n", "mouse:", spmConfig.TUI.Mouse)
+			fmt.Printf("  %-16s %t\n", "show_key_hints:", spmConfig.TUI.ShowKeyHints)
+			fmt.Printf("  %-16s %s\n", "density:", spmConfig.TUI.Density)
+			fmt.Printf("  %-16s %t\n", "no_tui:", spmConfig.TUI.NoTUI)
+			fmt.Println()
+			fmt.Printf("Config file: %s\n", config.SPMConfigPath())
+			return nil
+		}
+
+		key := "tui." + args[0]
+		if len(args) == 1 {
+			// Get specific value
+			value, err := getConfigValue(spmConfig, key)
+			if err != nil {
+				return err
+			}
+			fmt.Println(value)
+			return nil
+		}
+
+		// Set value
+		value := args[1]
+		if err := setConfigValue(spmConfig, key, value); err != nil {
+			return err
+		}
+
+		if err := spmConfig.Save(); err != nil {
+			return fmt.Errorf("save config: %w", err)
+		}
+
+		// Show updated value
+		newValue, _ := getConfigValue(spmConfig, key)
+		fmt.Printf("tui.%s = %s\n", args[0], newValue)
+		return nil
+	},
 }
 

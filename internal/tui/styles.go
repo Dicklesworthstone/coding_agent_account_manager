@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -148,6 +149,100 @@ func ThemeOptionsFromEnv() ThemeOptions {
 	}
 
 	return opts
+}
+
+// ThemeOptionsFromConfig derives theme options from SPM config.
+// This respects the config file settings, which are then overridden
+// by environment variables via config.ApplyEnvOverrides().
+func ThemeOptionsFromConfig(cfg *config.SPMConfig) ThemeOptions {
+	opts := DefaultThemeOptions()
+
+	if cfg == nil {
+		return opts
+	}
+
+	// Apply config file settings
+	switch strings.ToLower(cfg.TUI.Theme) {
+	case "light":
+		opts.Mode = ThemeLight
+	case "dark":
+		opts.Mode = ThemeDark
+	case "auto", "":
+		opts.Mode = ThemeAuto
+	}
+
+	if cfg.TUI.HighContrast {
+		opts.Contrast = ContrastHigh
+	}
+
+	opts.ReducedMotion = cfg.TUI.ReducedMotion
+
+	// Apply environment overrides (higher priority)
+	// Note: config.ApplyEnvOverrides() already applied env vars to cfg,
+	// but we still need to check NO_COLOR and TERM which are not in config
+	if _, ok := os.LookupEnv("NO_COLOR"); ok {
+		opts.NoColor = true
+	}
+
+	term := strings.TrimSpace(strings.ToLower(os.Getenv("TERM")))
+	if term == "dumb" {
+		opts.NoColor = true
+	}
+
+	return opts
+}
+
+// TUIPreferences holds all TUI configuration including theme and behavior.
+type TUIPreferences struct {
+	ThemeOptions
+	Toasts       bool
+	Mouse        bool
+	ShowKeyHints bool
+	Density      string // "cozy" or "compact"
+	NoTUI        bool
+}
+
+// DefaultTUIPreferences returns sensible defaults for TUI preferences.
+func DefaultTUIPreferences() TUIPreferences {
+	return TUIPreferences{
+		ThemeOptions: DefaultThemeOptions(),
+		Toasts:       true,
+		Mouse:        true,
+		ShowKeyHints: true,
+		Density:      "cozy",
+		NoTUI:        false,
+	}
+}
+
+// TUIPreferencesFromConfig loads full TUI preferences from SPM config.
+func TUIPreferencesFromConfig(cfg *config.SPMConfig) TUIPreferences {
+	prefs := DefaultTUIPreferences()
+	if cfg == nil {
+		return prefs
+	}
+
+	prefs.ThemeOptions = ThemeOptionsFromConfig(cfg)
+	prefs.Toasts = cfg.TUI.Toasts
+	prefs.Mouse = cfg.TUI.Mouse
+	prefs.ShowKeyHints = cfg.TUI.ShowKeyHints
+	prefs.Density = cfg.TUI.Density
+	prefs.NoTUI = cfg.TUI.NoTUI
+
+	if prefs.Density == "" {
+		prefs.Density = "cozy"
+	}
+
+	return prefs
+}
+
+// LoadTUIPreferences loads TUI preferences from the SPM config file.
+// Falls back to defaults if the config file cannot be read.
+func LoadTUIPreferences() TUIPreferences {
+	cfg, err := config.LoadSPMConfig()
+	if err != nil {
+		return DefaultTUIPreferences()
+	}
+	return TUIPreferencesFromConfig(cfg)
 }
 
 // NewTheme builds a theme from options.

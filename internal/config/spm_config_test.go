@@ -855,6 +855,319 @@ future_section:
 	}
 }
 
+func TestTUIConfigDefaults(t *testing.T) {
+	cfg := DefaultSPMConfig()
+
+	if cfg.TUI.Theme != "auto" {
+		t.Errorf("TUI.Theme = %q, want %q", cfg.TUI.Theme, "auto")
+	}
+	if cfg.TUI.HighContrast {
+		t.Error("TUI.HighContrast should be false by default")
+	}
+	if cfg.TUI.ReducedMotion {
+		t.Error("TUI.ReducedMotion should be false by default")
+	}
+	if !cfg.TUI.Toasts {
+		t.Error("TUI.Toasts should be true by default")
+	}
+	if !cfg.TUI.Mouse {
+		t.Error("TUI.Mouse should be true by default")
+	}
+	if !cfg.TUI.ShowKeyHints {
+		t.Error("TUI.ShowKeyHints should be true by default")
+	}
+	if cfg.TUI.Density != "cozy" {
+		t.Errorf("TUI.Density = %q, want %q", cfg.TUI.Density, "cozy")
+	}
+	if cfg.TUI.NoTUI {
+		t.Error("TUI.NoTUI should be false by default")
+	}
+}
+
+func TestTUIConfigEnvOverrides(t *testing.T) {
+	// Helper to save and restore env vars
+	saveEnv := func(key string) (restore func()) {
+		orig, had := os.LookupEnv(key)
+		return func() {
+			if had {
+				_ = os.Setenv(key, orig)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	}
+
+	// Create temp config dir
+	origCaamHome := os.Getenv("CAAM_HOME")
+	defer os.Setenv("CAAM_HOME", origCaamHome)
+	tmpDir := t.TempDir()
+	os.Setenv("CAAM_HOME", tmpDir)
+
+	// Create minimal config file
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("version: 1\n"), 0600); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	t.Run("CAAM_TUI_THEME", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_THEME")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_THEME", "dark")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if cfg.TUI.Theme != "dark" {
+			t.Errorf("TUI.Theme = %q, want %q", cfg.TUI.Theme, "dark")
+		}
+	})
+
+	t.Run("CAAM_TUI_CONTRAST", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_CONTRAST")
+		defer restore()
+
+		for _, v := range []string{"high", "hc", "1", "true"} {
+			os.Setenv("CAAM_TUI_CONTRAST", v)
+			cfg, err := LoadSPMConfig()
+			if err != nil {
+				t.Fatalf("LoadSPMConfig() error = %v", err)
+			}
+			if !cfg.TUI.HighContrast {
+				t.Errorf("CAAM_TUI_CONTRAST=%q should set HighContrast=true", v)
+			}
+		}
+	})
+
+	t.Run("CAAM_TUI_REDUCED_MOTION", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_REDUCED_MOTION")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_REDUCED_MOTION", "true")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if !cfg.TUI.ReducedMotion {
+			t.Error("TUI.ReducedMotion should be true")
+		}
+	})
+
+	t.Run("REDUCED_MOTION fallback", func(t *testing.T) {
+		restore := saveEnv("REDUCED_MOTION")
+		defer restore()
+
+		os.Setenv("REDUCED_MOTION", "1")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if !cfg.TUI.ReducedMotion {
+			t.Error("TUI.ReducedMotion should be true from REDUCED_MOTION")
+		}
+	})
+
+	t.Run("CAAM_TUI_TOASTS", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_TOASTS")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_TOASTS", "false")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if cfg.TUI.Toasts {
+			t.Error("TUI.Toasts should be false")
+		}
+	})
+
+	t.Run("CAAM_TUI_MOUSE", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_MOUSE")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_MOUSE", "0")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if cfg.TUI.Mouse {
+			t.Error("TUI.Mouse should be false")
+		}
+	})
+
+	t.Run("CAAM_TUI_KEY_HINTS", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_KEY_HINTS")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_KEY_HINTS", "no")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if cfg.TUI.ShowKeyHints {
+			t.Error("TUI.ShowKeyHints should be false")
+		}
+	})
+
+	t.Run("CAAM_TUI_DENSITY", func(t *testing.T) {
+		restore := saveEnv("CAAM_TUI_DENSITY")
+		defer restore()
+
+		os.Setenv("CAAM_TUI_DENSITY", "compact")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if cfg.TUI.Density != "compact" {
+			t.Errorf("TUI.Density = %q, want %q", cfg.TUI.Density, "compact")
+		}
+	})
+
+	t.Run("CAAM_NO_TUI", func(t *testing.T) {
+		restore := saveEnv("CAAM_NO_TUI")
+		defer restore()
+
+		os.Setenv("CAAM_NO_TUI", "1")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if !cfg.TUI.NoTUI {
+			t.Error("TUI.NoTUI should be true")
+		}
+	})
+
+	t.Run("NO_TUI fallback", func(t *testing.T) {
+		restore := saveEnv("NO_TUI")
+		defer restore()
+
+		os.Setenv("NO_TUI", "true")
+		cfg, err := LoadSPMConfig()
+		if err != nil {
+			t.Fatalf("LoadSPMConfig() error = %v", err)
+		}
+		if !cfg.TUI.NoTUI {
+			t.Error("TUI.NoTUI should be true from NO_TUI")
+		}
+	})
+}
+
+func TestTUIConfigValidation(t *testing.T) {
+	// Save original env
+	origCaamHome := os.Getenv("CAAM_HOME")
+	defer os.Setenv("CAAM_HOME", origCaamHome)
+
+	tmpDir := t.TempDir()
+	os.Setenv("CAAM_HOME", tmpDir)
+
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "invalid theme",
+			yaml: `
+version: 1
+health:
+  refresh_threshold: 10m
+  warning_threshold: 1h
+  penalty_decay_rate: 0.8
+  penalty_decay_interval: 5m
+tui:
+  theme: neon
+`,
+			wantErr: "tui.theme must be one of: auto, dark, light",
+		},
+		{
+			name: "invalid density",
+			yaml: `
+version: 1
+health:
+  refresh_threshold: 10m
+  warning_threshold: 1h
+  penalty_decay_rate: 0.8
+  penalty_decay_interval: 5m
+tui:
+  density: spacious
+`,
+			wantErr: "tui.density must be one of: cozy, compact",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(tmpDir, "config.yaml")
+			if err := os.WriteFile(configPath, []byte(tc.yaml), 0600); err != nil {
+				t.Fatalf("Failed to write config file: %v", err)
+			}
+
+			_, err := LoadSPMConfig()
+			if err == nil {
+				t.Errorf("LoadSPMConfig() should return error")
+			} else if !contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want to contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTUIConfigSaveAndLoad(t *testing.T) {
+	// Save original env
+	origCaamHome := os.Getenv("CAAM_HOME")
+	defer os.Setenv("CAAM_HOME", origCaamHome)
+
+	tmpDir := t.TempDir()
+	os.Setenv("CAAM_HOME", tmpDir)
+
+	cfg := DefaultSPMConfig()
+	cfg.TUI.Theme = "light"
+	cfg.TUI.HighContrast = true
+	cfg.TUI.ReducedMotion = true
+	cfg.TUI.Toasts = false
+	cfg.TUI.Mouse = false
+	cfg.TUI.ShowKeyHints = false
+	cfg.TUI.Density = "compact"
+	cfg.TUI.NoTUI = true
+
+	// Save
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Load
+	loaded, err := LoadSPMConfig()
+	if err != nil {
+		t.Fatalf("LoadSPMConfig() error = %v", err)
+	}
+
+	// Verify
+	if loaded.TUI.Theme != "light" {
+		t.Errorf("Loaded TUI.Theme = %q, want %q", loaded.TUI.Theme, "light")
+	}
+	if !loaded.TUI.HighContrast {
+		t.Error("Loaded TUI.HighContrast should be true")
+	}
+	if !loaded.TUI.ReducedMotion {
+		t.Error("Loaded TUI.ReducedMotion should be true")
+	}
+	if loaded.TUI.Toasts {
+		t.Error("Loaded TUI.Toasts should be false")
+	}
+	if loaded.TUI.Mouse {
+		t.Error("Loaded TUI.Mouse should be false")
+	}
+	if loaded.TUI.ShowKeyHints {
+		t.Error("Loaded TUI.ShowKeyHints should be false")
+	}
+	if loaded.TUI.Density != "compact" {
+		t.Errorf("Loaded TUI.Density = %q, want %q", loaded.TUI.Density, "compact")
+	}
+	if !loaded.TUI.NoTUI {
+		t.Error("Loaded TUI.NoTUI should be true")
+	}
+}
+
 func TestNewConfigSectionDefaults(t *testing.T) {
 	cfg := DefaultSPMConfig()
 

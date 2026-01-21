@@ -580,6 +580,56 @@ claude "explain this authentication flow"
 
 ---
 
+## TUI Configuration
+
+Customize the TUI appearance and behavior through `~/.caam/config.yaml`:
+
+```yaml
+tui:
+  theme: auto          # auto | dark | light
+  high_contrast: false # Enable high-contrast colors for accessibility
+  reduced_motion: false # Disable animated UI effects (spinners)
+  toasts: true         # Show transient notification messages
+  mouse: true          # Enable mouse support
+  show_key_hints: true # Show keyboard shortcuts in status bar
+  density: cozy        # cozy | compact
+  no_tui: false        # Disable TUI, use CLI-only mode
+```
+
+### Environment Variable Overrides
+
+Environment variables take precedence over config file settings:
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `CAAM_TUI_THEME` | `auto`, `dark`, `light` | Color scheme |
+| `CAAM_TUI_CONTRAST` | `high`, `hc`, `1`, `true` | High contrast mode |
+| `CAAM_TUI_REDUCED_MOTION` | `true`, `false` | Disable animations |
+| `REDUCED_MOTION` | `1` | Standard accessibility env var |
+| `CAAM_TUI_TOASTS` | `true`, `false` | Toast notifications |
+| `CAAM_TUI_MOUSE` | `true`, `false` | Mouse support |
+| `CAAM_TUI_KEY_HINTS` | `true`, `false` | Keyboard hints |
+| `CAAM_TUI_DENSITY` | `cozy`, `compact` | UI spacing |
+| `CAAM_NO_TUI` or `NO_TUI` | `true`, `1` | Disable TUI entirely |
+
+### Managing TUI Config via CLI
+
+```bash
+# View all TUI settings
+caam config tui
+
+# View a specific setting
+caam config tui theme
+caam config tui density
+
+# Change settings
+caam config tui theme dark
+caam config tui density compact
+caam config tui high_contrast true
+```
+
+---
+
 ## FAQ
 
 **Q: Does this work with API keys / pay-per-token plans?**

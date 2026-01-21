@@ -29,6 +29,44 @@ type SPMConfig struct {
 	LoginPatterns LoginPatternsConfig        `yaml:"login_patterns"`
 	Subscriptions map[string]SubscriptionConfig `yaml:"subscriptions,omitempty"`
 	Daemon        DaemonConfig               `yaml:"daemon"`
+	TUI           TUIConfig                  `yaml:"tui"`
+}
+
+// TUIConfig holds TUI appearance and behavior preferences.
+// Settings can be overridden by environment variables (higher priority)
+// or CLI flags (highest priority).
+type TUIConfig struct {
+	// Theme controls the color scheme: "auto" (default), "dark", or "light".
+	// Environment override: CAAM_TUI_THEME
+	Theme string `yaml:"theme"`
+
+	// HighContrast enables high-contrast colors for better accessibility.
+	// Environment override: CAAM_TUI_CONTRAST=high
+	HighContrast bool `yaml:"high_contrast"`
+
+	// ReducedMotion disables animated UI effects like spinners.
+	// Environment override: CAAM_TUI_REDUCED_MOTION or REDUCED_MOTION
+	ReducedMotion bool `yaml:"reduced_motion"`
+
+	// Toasts enables transient notification messages.
+	// Environment override: CAAM_TUI_TOASTS
+	Toasts bool `yaml:"toasts"`
+
+	// Mouse enables mouse support in the TUI.
+	// Environment override: CAAM_TUI_MOUSE
+	Mouse bool `yaml:"mouse"`
+
+	// ShowKeyHints shows keyboard shortcut hints in the status bar.
+	// Environment override: CAAM_TUI_KEY_HINTS
+	ShowKeyHints bool `yaml:"show_key_hints"`
+
+	// Density controls spacing: "cozy" (default) or "compact".
+	// Environment override: CAAM_TUI_DENSITY
+	Density string `yaml:"density"`
+
+	// NoTUI disables the TUI entirely, using plain text output instead.
+	// Environment override: CAAM_NO_TUI or NO_TUI
+	NoTUI bool `yaml:"no_tui"`
 }
 
 // HealthConfig contains health and refresh settings.
@@ -367,6 +405,16 @@ func DefaultSPMConfig() *SPMConfig {
 			RefreshThreshold: Duration(30 * time.Minute),
 			Verbose:          false,
 		},
+		TUI: TUIConfig{
+			Theme:         "auto",
+			HighContrast:  false,
+			ReducedMotion: false,
+			Toasts:        true,
+			Mouse:         true,
+			ShowKeyHints:  true,
+			Density:       "cozy",
+			NoTUI:         false,
+		},
 	}
 }
 
@@ -588,6 +636,16 @@ func (c *SPMConfig) Validate() error {
 		return err
 	}
 
+	// TUI validation
+	validThemes := map[string]bool{"auto": true, "dark": true, "light": true, "": true}
+	if !validThemes[c.TUI.Theme] {
+		return fmt.Errorf("tui.theme must be one of: auto, dark, light")
+	}
+	validDensities := map[string]bool{"cozy": true, "compact": true, "": true}
+	if !validDensities[c.TUI.Density] {
+		return fmt.Errorf("tui.density must be one of: cozy, compact")
+	}
+
 	return nil
 }
 
@@ -685,6 +743,67 @@ func (c *SPMConfig) ApplyEnvOverrides() {
 	if v := os.Getenv("CAAM_HEALTH_REFRESH_THRESHOLD"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.Health.RefreshThreshold = Duration(d)
+		}
+	}
+
+	// TUI
+	if v := os.Getenv("CAAM_TUI_THEME"); v != "" {
+		theme := strings.ToLower(strings.TrimSpace(v))
+		switch theme {
+		case "auto", "dark", "light":
+			c.TUI.Theme = theme
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_CONTRAST"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "high", "hc", "1", "true":
+			c.TUI.HighContrast = true
+		case "normal", "0", "false":
+			c.TUI.HighContrast = false
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_REDUCED_MOTION"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.ReducedMotion = b
+		}
+	} else if v := os.Getenv("CAAM_REDUCED_MOTION"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.ReducedMotion = b
+		}
+	} else if v := os.Getenv("REDUCED_MOTION"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.ReducedMotion = b
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_TOASTS"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.Toasts = b
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_MOUSE"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.Mouse = b
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_KEY_HINTS"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.ShowKeyHints = b
+		}
+	}
+	if v := os.Getenv("CAAM_TUI_DENSITY"); v != "" {
+		density := strings.ToLower(strings.TrimSpace(v))
+		switch density {
+		case "cozy", "compact":
+			c.TUI.Density = density
+		}
+	}
+	if v := os.Getenv("CAAM_NO_TUI"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.NoTUI = b
+		}
+	} else if v := os.Getenv("NO_TUI"); v != "" {
+		if b, err := parseBool(v); err == nil {
+			c.TUI.NoTUI = b
 		}
 	}
 }
