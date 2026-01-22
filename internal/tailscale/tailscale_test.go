@@ -172,3 +172,192 @@ func TestOnlinePeersCount(t *testing.T) {
 		t.Errorf("expected 3 online peers, got %d", onlineCount)
 	}
 }
+
+// Test resilient JSON parsing with ParseStatus
+func TestParseStatusResilient(t *testing.T) {
+	status, err := ParseStatus([]byte(sampleStatusJSON))
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.BackendState != "Running" {
+		t.Errorf("expected BackendState=Running, got %s", status.BackendState)
+	}
+
+	if !status.IsRunning() {
+		t.Error("expected IsRunning() to return true")
+	}
+
+	if status.HasWarnings() {
+		t.Errorf("expected no warnings for valid JSON, got %d", len(status.Warnings))
+	}
+}
+
+// Test parsing JSON with unknown fields (schema drift simulation)
+const sampleStatusWithUnknownFields = `{
+  "Version": "2.0.0-beta",
+  "BackendState": "Running",
+  "NewUnknownField": "should be ignored",
+  "Self": {
+    "ID": "n123",
+    "HostName": "testhost",
+    "TailscaleIPs": ["100.1.2.3"],
+    "Online": true,
+    "SomeNewField": 42
+  },
+  "Peer": {
+    "key1": {
+      "ID": "n456",
+      "HostName": "peer1",
+      "TailscaleIPs": ["100.4.5.6"],
+      "Online": true,
+      "ExperimentalField": true
+    }
+  }
+}`
+
+func TestParseStatusWithUnknownFields(t *testing.T) {
+	status, err := ParseStatus([]byte(sampleStatusWithUnknownFields))
+	if err != nil {
+		t.Fatalf("ParseStatus failed with unknown fields: %v", err)
+	}
+
+	if status.BackendState != "Running" {
+		t.Errorf("expected BackendState=Running, got %s", status.BackendState)
+	}
+
+	if status.Self == nil {
+		t.Fatal("Self is nil")
+	}
+
+	if status.Self.HostName != "testhost" {
+		t.Errorf("expected Self.HostName=testhost, got %s", status.Self.HostName)
+	}
+
+	if len(status.Peer) != 1 {
+		t.Errorf("expected 1 peer, got %d", len(status.Peer))
+	}
+}
+
+// Test parsing partial/malformed JSON
+func TestParseStatusPartialJSON(t *testing.T) {
+	// JSON with some valid fields but missing others
+	partialJSON := `{
+  "Version": "1.50.0",
+  "BackendState": "Running"
+}`
+
+	status, err := ParseStatus([]byte(partialJSON))
+	if err != nil {
+		t.Fatalf("ParseStatus failed with partial JSON: %v", err)
+	}
+
+	if status.Version != "1.50.0" {
+		t.Errorf("expected Version=1.50.0, got %s", status.Version)
+	}
+
+	if status.Self != nil {
+		t.Error("expected Self to be nil for partial JSON")
+	}
+
+	if status.Peer != nil && len(status.Peer) > 0 {
+		t.Error("expected empty Peer map for partial JSON")
+	}
+}
+
+// Test missing BackendState generates warning
+func TestParseStatusMissingBackendState(t *testing.T) {
+	noBackendState := `{
+  "Version": "1.50.0",
+  "Self": {
+    "HostName": "test"
+  }
+}`
+
+	status, err := ParseStatus([]byte(noBackendState))
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if !status.HasWarnings() {
+		t.Error("expected warning for missing BackendState")
+	}
+
+	foundWarning := false
+	for _, w := range status.Warnings {
+		if w.Field == "BackendState" {
+			foundWarning = true
+			break
+		}
+	}
+	if !foundWarning {
+		t.Error("expected BackendState warning in warnings list")
+	}
+}
+
+// Test ParseWarning String method
+func TestParseWarningString(t *testing.T) {
+	w := ParseWarning{
+		Field:   "Peer[abc123]",
+		Message: "missing required field",
+	}
+
+	expected := "Peer[abc123]: missing required field"
+	if w.String() != expected {
+		t.Errorf("ParseWarning.String() = %q, want %q", w.String(), expected)
+	}
+}
+
+// Test Status.IsRunning for various states
+func TestStatusIsRunning(t *testing.T) {
+	tests := []struct {
+		state    string
+		expected bool
+	}{
+		{"Running", true},
+		{"Stopped", false},
+		{"Starting", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		status := &Status{BackendState: tt.state}
+		if status.IsRunning() != tt.expected {
+			t.Errorf("IsRunning() for state %q = %v, want %v", tt.state, status.IsRunning(), tt.expected)
+		}
+	}
+}
+
+// Test optional Peer fields
+func TestPeerOptionalFields(t *testing.T) {
+	jsonWithOptionalFields := `{
+  "ID": "n123",
+  "HostName": "testpeer",
+  "TailscaleIPs": ["100.1.2.3"],
+  "Online": true,
+  "UserID": 12345,
+  "ExitNode": true,
+  "LastSeen": "2025-01-20T10:30:00Z"
+}`
+
+	var peer Peer
+	if err := json.Unmarshal([]byte(jsonWithOptionalFields), &peer); err != nil {
+		t.Fatalf("failed to parse peer JSON: %v", err)
+	}
+
+	if peer.UserID == nil {
+		t.Error("expected UserID to be set")
+	} else if *peer.UserID != 12345 {
+		t.Errorf("expected UserID=12345, got %d", *peer.UserID)
+	}
+
+	if peer.ExitNode == nil {
+		t.Error("expected ExitNode to be set")
+	} else if !*peer.ExitNode {
+		t.Error("expected ExitNode=true")
+	}
+
+	if peer.LastSeen == nil {
+		t.Error("expected LastSeen to be set")
+	}
+}

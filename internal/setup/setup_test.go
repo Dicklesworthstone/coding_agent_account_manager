@@ -279,3 +279,120 @@ func TestBuildSetupScript(t *testing.T) {
 		t.Error("expected auth-agent start in script")
 	}
 }
+
+// Test MachineOverride struct
+func TestMachineOverrideFields(t *testing.T) {
+	override := MachineOverride{
+		PreferredIP:  "10.0.0.1",
+		Username:     "admin",
+		Port:         2222,
+		IdentityFile: "/custom/key",
+		Disabled:     false,
+	}
+
+	if override.PreferredIP != "10.0.0.1" {
+		t.Errorf("expected PreferredIP=10.0.0.1, got %s", override.PreferredIP)
+	}
+	if override.Username != "admin" {
+		t.Errorf("expected Username=admin, got %s", override.Username)
+	}
+	if override.Port != 2222 {
+		t.Errorf("expected Port=2222, got %d", override.Port)
+	}
+	if override.Disabled {
+		t.Error("expected Disabled=false")
+	}
+}
+
+// Test DiscoveryWarning struct
+func TestDiscoveryWarning(t *testing.T) {
+	w := DiscoveryWarning{
+		Machine: "csd",
+		Code:    "NO_TAILSCALE_MATCH",
+		Message: "no Tailscale peer found",
+	}
+
+	if w.Machine != "csd" {
+		t.Errorf("expected Machine=csd, got %s", w.Machine)
+	}
+	if w.Code != "NO_TAILSCALE_MATCH" {
+		t.Errorf("expected Code=NO_TAILSCALE_MATCH, got %s", w.Code)
+	}
+}
+
+// Test discovery warning methods
+func TestOrchestratorWarningMethods(t *testing.T) {
+	orch := NewOrchestrator(DefaultOptions())
+
+	// Initially no warnings
+	if orch.HasDiscoveryWarnings() {
+		t.Error("expected no warnings initially")
+	}
+	if len(orch.GetDiscoveryWarnings()) != 0 {
+		t.Error("expected empty warnings list initially")
+	}
+
+	// Add a warning
+	orch.addWarning("csd", "TEST_CODE", "test message")
+
+	if !orch.HasDiscoveryWarnings() {
+		t.Error("expected HasDiscoveryWarnings to be true after adding warning")
+	}
+
+	warnings := orch.GetDiscoveryWarnings()
+	if len(warnings) != 1 {
+		t.Errorf("expected 1 warning, got %d", len(warnings))
+	}
+
+	if warnings[0].Machine != "csd" {
+		t.Errorf("expected warning machine=csd, got %s", warnings[0].Machine)
+	}
+	if warnings[0].Code != "TEST_CODE" {
+		t.Errorf("expected warning code=TEST_CODE, got %s", warnings[0].Code)
+	}
+}
+
+// Test GetTailscaleVersion
+func TestGetTailscaleVersion(t *testing.T) {
+	orch := NewOrchestrator(DefaultOptions())
+
+	// Initially empty
+	if orch.GetTailscaleVersion() != "" {
+		t.Error("expected empty tailscale version initially")
+	}
+
+	// Set a version
+	orch.tailscaleVersion = "1.56.1"
+
+	if orch.GetTailscaleVersion() != "1.56.1" {
+		t.Errorf("expected 1.56.1, got %s", orch.GetTailscaleVersion())
+	}
+}
+
+// Test Options with ManualOverrides
+func TestOptionsWithManualOverrides(t *testing.T) {
+	opts := DefaultOptions()
+	opts.ManualOverrides = map[string]MachineOverride{
+		"csd": {
+			PreferredIP: "192.168.1.100",
+			Username:    "custom-user",
+		},
+		"css": {
+			Disabled: true,
+		},
+	}
+
+	if len(opts.ManualOverrides) != 2 {
+		t.Errorf("expected 2 overrides, got %d", len(opts.ManualOverrides))
+	}
+
+	csdOverride := opts.ManualOverrides["csd"]
+	if csdOverride.PreferredIP != "192.168.1.100" {
+		t.Errorf("expected csd override IP=192.168.1.100, got %s", csdOverride.PreferredIP)
+	}
+
+	cssOverride := opts.ManualOverrides["css"]
+	if !cssOverride.Disabled {
+		t.Error("expected css override to be disabled")
+	}
+}

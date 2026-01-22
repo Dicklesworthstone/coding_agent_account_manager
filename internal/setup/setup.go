@@ -40,6 +40,27 @@ type DiscoveredMachine struct {
 	IsLocal       bool   // Whether this is the local machine
 }
 
+// MachineOverride provides manual address/config overrides for a machine.
+type MachineOverride struct {
+	// PreferredIP overrides both public and tailscale IPs.
+	PreferredIP string `json:"preferred_ip,omitempty"`
+	// Username overrides the SSH username from WezTerm.
+	Username string `json:"username,omitempty"`
+	// Port overrides the SSH port.
+	Port int `json:"port,omitempty"`
+	// IdentityFile overrides the SSH key path.
+	IdentityFile string `json:"identity_file,omitempty"`
+	// Disabled skips this machine during discovery.
+	Disabled bool `json:"disabled,omitempty"`
+}
+
+// DiscoveryWarning represents a non-fatal issue during discovery.
+type DiscoveryWarning struct {
+	Machine string // Machine name or empty for global
+	Code    string // Warning code (e.g., "NO_TAILSCALE_MATCH")
+	Message string // Human-readable description
+}
+
 // Options configures the setup process.
 type Options struct {
 	// WezTermConfig is the path to wezterm.lua. Auto-detected if empty.
@@ -56,6 +77,10 @@ type Options struct {
 
 	// Remotes limits setup to these domain names. Empty means all.
 	Remotes []string
+
+	// ManualOverrides maps WezTerm domain names to manual address/config overrides.
+	// Use this when discovery produces wrong results or for machines not on tailnet.
+	ManualOverrides map[string]MachineOverride
 
 	// DryRun shows what would be done without making changes.
 	DryRun bool
@@ -76,12 +101,14 @@ func DefaultOptions() Options {
 
 // Orchestrator handles the setup process.
 type Orchestrator struct {
-	opts           Options
-	logger         *slog.Logger
-	weztermConfig  *wezterm.Config
-	tailscale      *tailscale.Client
-	localMachine   *DiscoveredMachine
-	remoteMachines []*DiscoveredMachine
+	opts              Options
+	logger            *slog.Logger
+	weztermConfig     *wezterm.Config
+	tailscale         *tailscale.Client
+	tailscaleVersion  string // CLI version for debugging schema drift
+	localMachine      *DiscoveredMachine
+	remoteMachines    []*DiscoveredMachine
+	discoveryWarnings []DiscoveryWarning
 }
 
 // ScriptOptions controls the generated setup script.
@@ -137,9 +164,12 @@ func (o *Orchestrator) Discover(ctx context.Context) error {
 		o.tailscale = tailscale.NewClient()
 		if !o.tailscale.IsAvailable(ctx) {
 			o.logger.Info("Tailscale not available, using public IPs only")
+			o.addWarning("", "TAILSCALE_UNAVAILABLE", "Tailscale not running or not accessible; using public IPs only")
 			o.tailscale = nil
 		} else {
-			o.logger.Info("Tailscale available")
+			// Log CLI version for debugging schema drift issues
+			o.tailscaleVersion = o.tailscale.GetVersionString(ctx)
+			o.logger.Info("Tailscale available", "cli_version", o.tailscaleVersion)
 		}
 	}
 
@@ -189,11 +219,23 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 
 	// Get Tailscale peers for cross-referencing
 	var peers []*tailscale.Peer
+	var tailscaleStatus *tailscale.Status
 	if o.tailscale != nil {
 		var err error
-		peers, err = o.tailscale.GetPeers(ctx)
+		tailscaleStatus, err = o.tailscale.GetStatus(ctx)
 		if err == nil {
+			// Check for parsing warnings (schema drift)
+			if tailscaleStatus.HasWarnings() {
+				for _, w := range tailscaleStatus.Warnings {
+					o.addWarning("", "TAILSCALE_PARSE_WARNING", w.String())
+				}
+			}
+			for _, peer := range tailscaleStatus.Peer {
+				peers = append(peers, peer)
+			}
 			o.logger.Info("Tailscale peers found", "count", len(peers))
+		} else {
+			o.addWarning("", "TAILSCALE_STATUS_ERROR", fmt.Sprintf("failed to get status: %v", err))
 		}
 	}
 
@@ -201,6 +243,14 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 		// Skip if not in remotes filter
 		if len(o.opts.Remotes) > 0 && !contains(o.opts.Remotes, domain.Name) {
 			continue
+		}
+
+		// Check for manual override
+		if override, ok := o.opts.ManualOverrides[domain.Name]; ok {
+			if override.Disabled {
+				o.logger.Info("skipping disabled domain", "domain", domain.Name)
+				continue
+			}
 		}
 
 		machine := &DiscoveredMachine{
@@ -217,23 +267,64 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 			machine.Port = 22
 		}
 
-		// Try to find Tailscale IP
-		if o.tailscale != nil && len(peers) > 0 {
-			// Try matching by IP first
-			for _, peer := range peers {
-				if peer.GetIPv4() == domain.RemoteAddress {
-					machine.TailscaleIP = peer.GetIPv4()
-					machine.Name = peer.HostName
-					break
-				}
+		// Apply manual overrides if present
+		if override, ok := o.opts.ManualOverrides[domain.Name]; ok {
+			if override.PreferredIP != "" {
+				machine.PublicIP = override.PreferredIP
+				machine.TailscaleIP = "" // Clear tailscale IP when manually overridden
+				o.logger.Info("using manual override for IP",
+					"domain", domain.Name,
+					"ip", override.PreferredIP)
 			}
+			if override.Username != "" {
+				machine.Username = override.Username
+			}
+			if override.Port != 0 {
+				machine.Port = override.Port
+			}
+			if override.IdentityFile != "" {
+				machine.IdentityFile = override.IdentityFile
+			}
+		} else {
+			// Try to find Tailscale IP (only if no manual override)
+			if o.tailscale != nil && len(peers) > 0 {
+				matchedByIP := false
+				var ambiguousMatches []string
 
-			// If no match by IP, try fuzzy hostname match
-			if machine.TailscaleIP == "" {
-				peer, _ := o.tailscale.FindPeerByHostname(ctx, domain.Name)
-				if peer != nil {
-					machine.TailscaleIP = peer.GetIPv4()
-					machine.Name = peer.HostName
+				// Try matching by IP first
+				for _, peer := range peers {
+					if peer.GetIPv4() == domain.RemoteAddress {
+						machine.TailscaleIP = peer.GetIPv4()
+						machine.Name = peer.HostName
+						matchedByIP = true
+						break
+					}
+				}
+
+				// If no match by IP, try fuzzy hostname match
+				if !matchedByIP {
+					peer, _ := o.tailscale.FindPeerByHostname(ctx, domain.Name)
+					if peer != nil {
+						machine.TailscaleIP = peer.GetIPv4()
+						machine.Name = peer.HostName
+					} else {
+						// Check for possible ambiguous matches
+						domainLower := strings.ToLower(domain.Name)
+						for _, p := range peers {
+							hostLower := strings.ToLower(p.HostName)
+							if strings.Contains(hostLower, domainLower) || strings.Contains(domainLower, hostLower) {
+								ambiguousMatches = append(ambiguousMatches, p.HostName)
+							}
+						}
+
+						if len(ambiguousMatches) > 1 {
+							o.addWarning(domain.Name, "AMBIGUOUS_MATCH",
+								fmt.Sprintf("multiple potential Tailscale peers: %s", strings.Join(ambiguousMatches, ", ")))
+						} else if machine.TailscaleIP == "" {
+							o.addWarning(domain.Name, "NO_TAILSCALE_MATCH",
+								fmt.Sprintf("no Tailscale peer found matching '%s'; using public IP", domain.Name))
+						}
+					}
 				}
 			}
 		}
@@ -249,6 +340,32 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 
 	o.remoteMachines = machines
 	return nil
+}
+
+// addWarning adds a discovery warning.
+func (o *Orchestrator) addWarning(machine, code, message string) {
+	w := DiscoveryWarning{
+		Machine: machine,
+		Code:    code,
+		Message: message,
+	}
+	o.discoveryWarnings = append(o.discoveryWarnings, w)
+	o.logger.Warn("discovery warning", "machine", machine, "code", code, "message", message)
+}
+
+// GetDiscoveryWarnings returns all warnings from the discovery process.
+func (o *Orchestrator) GetDiscoveryWarnings() []DiscoveryWarning {
+	return o.discoveryWarnings
+}
+
+// HasDiscoveryWarnings returns true if there were any warnings during discovery.
+func (o *Orchestrator) HasDiscoveryWarnings() bool {
+	return len(o.discoveryWarnings) > 0
+}
+
+// GetTailscaleVersion returns the detected Tailscale CLI version.
+func (o *Orchestrator) GetTailscaleVersion() string {
+	return o.tailscaleVersion
 }
 
 // GetDiscoveredMachines returns all discovered machines.
@@ -574,17 +691,20 @@ func (o *Orchestrator) PrintDiscoveryResults() {
 	fmt.Println()
 	fmt.Println("=== Discovery Results ===")
 
+	if o.tailscaleVersion != "" {
+		fmt.Printf("Tailscale CLI version: %s\n", o.tailscaleVersion)
+	}
+
 	if o.localMachine != nil {
-		fmt.Printf("Local Machine:\n")
+		fmt.Printf("\nLocal Machine:\n")
 		fmt.Printf("  Name: %s\n", o.localMachine.Name)
 		if o.localMachine.TailscaleIP != "" {
 			fmt.Printf("  Tailscale IP: %s\n", o.localMachine.TailscaleIP)
 		}
 		fmt.Printf("  Role: %s\n", o.localMachine.Role)
-		fmt.Println()
 	}
 
-	fmt.Printf("Remote Machines (%d):\n", len(o.remoteMachines))
+	fmt.Printf("\nRemote Machines (%d):\n", len(o.remoteMachines))
 	for _, m := range o.remoteMachines {
 		fmt.Printf("\n  %s (%s):\n", m.Name, m.WezTermDomain)
 		fmt.Printf("    Public IP: %s\n", m.PublicIP)
@@ -593,6 +713,18 @@ func (o *Orchestrator) PrintDiscoveryResults() {
 		}
 		fmt.Printf("    User: %s\n", m.Username)
 		fmt.Printf("    Role: %s\n", m.Role)
+	}
+
+	// Print warnings if any
+	if len(o.discoveryWarnings) > 0 {
+		fmt.Printf("\n=== Discovery Warnings (%d) ===\n", len(o.discoveryWarnings))
+		for _, w := range o.discoveryWarnings {
+			if w.Machine != "" {
+				fmt.Printf("  [%s] %s: %s\n", w.Code, w.Machine, w.Message)
+			} else {
+				fmt.Printf("  [%s] %s\n", w.Code, w.Message)
+			}
+		}
 	}
 }
 
