@@ -1,0 +1,6 @@
+{
+  "tokens": {
+    "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6Im5lc3RlZEBleGFtcGxlLmNvbSIsImV4cCI6MTczNzYxOTIwMCwicGxhbiI6Im1heCJ9.fake_signature",
+    "access_token": "opaque-nested-access-token"
+  }
+}

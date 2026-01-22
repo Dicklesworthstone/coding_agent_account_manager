@@ -1,0 +1,4 @@
+{
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImNvZGV4QGV4YW1wbGUuY29tIiwiZXhwIjoxNzM3NjE5MjAwLCJzdWIiOiJ1c2VyLTEyMyIsInBsYW4iOiJwcm8ifQ.fake_signature",
+  "access_token": "opaque-access-token"
+}

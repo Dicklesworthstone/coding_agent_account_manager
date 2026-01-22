@@ -1,0 +1,10 @@
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-XXXX-legacy-token-XXXX",
+    "refreshToken": "sk-ant-ort01-YYYY-refresh-token-YYYY",
+    "expiresAt": 1737619200000,
+    "subscriptionType": "max",
+    "accountId": "acc-123456789",
+    "email": "user@example.com"
+  }
+}

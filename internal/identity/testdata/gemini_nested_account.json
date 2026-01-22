@@ -1,0 +1,6 @@
+{
+  "account": {
+    "email": "account@example.com"
+  },
+  "project_id": "nested-project"
+}

@@ -214,3 +214,46 @@ func writeAuthFile(t *testing.T, content map[string]interface{}) string {
 	}
 	return path
 }
+
+// Fixture-based tests for Codex identity extraction
+
+func TestFixture_CodexWithEmail(t *testing.T) {
+	identity, err := ExtractFromCodexAuth("testdata/codex_with_email.json")
+	if err != nil {
+		t.Fatalf("ExtractFromCodexAuth error: %v", err)
+	}
+
+	if identity.Provider != "codex" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "codex")
+	}
+	if identity.Email != "codex@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "codex@example.com")
+	}
+	if identity.PlanType != "pro" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "pro")
+	}
+}
+
+func TestFixture_CodexNestedTokens(t *testing.T) {
+	identity, err := ExtractFromCodexAuth("testdata/codex_nested_tokens.json")
+	if err != nil {
+		t.Fatalf("ExtractFromCodexAuth error: %v", err)
+	}
+
+	if identity.Provider != "codex" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "codex")
+	}
+	if identity.Email != "nested@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "nested@example.com")
+	}
+	if identity.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "max")
+	}
+}
+
+func TestFixture_CodexNoTokens(t *testing.T) {
+	_, err := ExtractFromCodexAuth("testdata/codex_no_tokens.json")
+	if err == nil {
+		t.Error("expected error for fixture without tokens")
+	}
+}

@@ -98,3 +98,73 @@ func writeGeminiFile(t *testing.T, content map[string]interface{}) string {
 	}
 	return path
 }
+
+// Fixture-based tests for Gemini identity extraction
+
+func TestFixture_GeminiWithEmail(t *testing.T) {
+	identity, err := ExtractFromGeminiConfig("testdata/gemini_with_email.json")
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+
+	if identity.Provider != "gemini" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "gemini")
+	}
+	if identity.Email != "gemini-user@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "gemini-user@example.com")
+	}
+	if identity.Organization != "my-project-123" {
+		t.Errorf("Organization = %q, want %q", identity.Organization, "my-project-123")
+	}
+}
+
+func TestFixture_GeminiNestedAccount(t *testing.T) {
+	identity, err := ExtractFromGeminiConfig("testdata/gemini_nested_account.json")
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+
+	if identity.Provider != "gemini" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "gemini")
+	}
+	if identity.Email != "account@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "account@example.com")
+	}
+	if identity.Organization != "nested-project" {
+		t.Errorf("Organization = %q, want %q", identity.Organization, "nested-project")
+	}
+}
+
+func TestFixture_GeminiNestedUser(t *testing.T) {
+	identity, err := ExtractFromGeminiConfig("testdata/gemini_nested_user.json")
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+
+	if identity.Provider != "gemini" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "gemini")
+	}
+	// user.email should be extracted
+	if identity.Email != "user@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "user@example.com")
+	}
+}
+
+func TestFixture_GeminiNoEmail(t *testing.T) {
+	identity, err := ExtractFromGeminiConfig("testdata/gemini_no_email.json")
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+
+	if identity.Provider != "gemini" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "gemini")
+	}
+	// Email should be empty
+	if identity.Email != "" {
+		t.Errorf("Email should be empty, got %q", identity.Email)
+	}
+	// Organization should be set from project_id
+	if identity.Organization != "project-without-email" {
+		t.Errorf("Organization = %q, want %q", identity.Organization, "project-without-email")
+	}
+}

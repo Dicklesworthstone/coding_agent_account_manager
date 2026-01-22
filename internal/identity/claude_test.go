@@ -186,3 +186,104 @@ func writeClaudeFile(t *testing.T, content map[string]interface{}) string {
 	}
 	return path
 }
+
+// Fixture-based tests for comprehensive coverage
+
+func TestFixture_ClaudeCurrentFormat(t *testing.T) {
+	identity, err := ExtractFromClaudeCredentials("testdata/claude_current_format.json")
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+	if identity.PlanType != "claude_pro_2025" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "claude_pro_2025")
+	}
+	// Current format has no email/accountId
+	if identity.Email != "" {
+		t.Errorf("Email should be empty, got %q", identity.Email)
+	}
+	if identity.AccountID != "" {
+		t.Errorf("AccountID should be empty, got %q", identity.AccountID)
+	}
+	// expiresAt: 1737619200000 ms = 2025-01-23T12:00:00Z
+	if identity.ExpiresAt.IsZero() {
+		t.Error("ExpiresAt should not be zero")
+	}
+}
+
+func TestFixture_ClaudeLegacyWithEmail(t *testing.T) {
+	identity, err := ExtractFromClaudeCredentials("testdata/claude_legacy_with_email.json")
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+	if identity.Email != "user@example.com" {
+		t.Errorf("Email = %q, want %q", identity.Email, "user@example.com")
+	}
+	if identity.AccountID != "acc-123456789" {
+		t.Errorf("AccountID = %q, want %q", identity.AccountID, "acc-123456789")
+	}
+	if identity.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "max")
+	}
+}
+
+func TestFixture_ClaudeMinimal(t *testing.T) {
+	identity, err := ExtractFromClaudeCredentials("testdata/claude_minimal.json")
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+	// Minimal has only accessToken, no identity fields
+	if identity.Email != "" || identity.AccountID != "" || identity.PlanType != "" {
+		t.Errorf("Expected all empty fields, got email=%q accountId=%q planType=%q",
+			identity.Email, identity.AccountID, identity.PlanType)
+	}
+}
+
+func TestFixture_ClaudeNoOauth(t *testing.T) {
+	identity, err := ExtractFromClaudeCredentials("testdata/claude_no_oauth.json")
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	// Valid JSON but no claudeAiOauth section
+	if identity.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", identity.Provider, "claude")
+	}
+	if identity.Email != "" || identity.AccountID != "" || identity.PlanType != "" {
+		t.Errorf("Expected all empty fields for no oauth, got %+v", identity)
+	}
+}
+
+func TestFixture_ClaudeEpochSeconds(t *testing.T) {
+	identity, err := ExtractFromClaudeCredentials("testdata/claude_epoch_seconds.json")
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+
+	// This fixture has expiresAt in seconds (not milliseconds)
+	// The parser should normalize it correctly
+	if identity.ExpiresAt.IsZero() {
+		t.Error("ExpiresAt should not be zero")
+	}
+	if identity.PlanType != "free" {
+		t.Errorf("PlanType = %q, want %q", identity.PlanType, "free")
+	}
+}
+
+func TestFixture_ClaudeInvalid(t *testing.T) {
+	_, err := ExtractFromClaudeCredentials("testdata/claude_invalid.json")
+	if err == nil {
+		t.Error("expected error for invalid JSON fixture")
+	}
+}

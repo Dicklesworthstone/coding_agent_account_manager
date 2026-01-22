@@ -1,0 +1,8 @@
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-XXXX-opaque-token-not-decodable-XXXX",
+    "refreshToken": "sk-ant-ort01-YYYY-refresh-token-YYYY",
+    "expiresAt": 1737619200000,
+    "subscriptionType": "claude_pro_2025"
+  }
+}
