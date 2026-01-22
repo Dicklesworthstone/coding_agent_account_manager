@@ -1,0 +1,22 @@
+{
+  "Version": "1.56.1",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "nSelf456",
+    "HostName": "ipv6-host",
+    "DNSName": "ipv6-host.tail1f21e.ts.net.",
+    "TailscaleIPs": ["fd7a:115c:a1e0::dead:beef"],
+    "Online": true,
+    "OS": "linux"
+  },
+  "Peer": {
+    "nodekey:ipv6peer": {
+      "ID": "n9001",
+      "HostName": "peer-ipv6",
+      "DNSName": "peer-ipv6.tail1f21e.ts.net.",
+      "TailscaleIPs": ["fd7a:115c:a1e0::cafe:babe"],
+      "Online": true,
+      "OS": "linux"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "Version": "1.56.1",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "nSelf123",
+    "HostName": "macmini",
+    "DNSName": "macmini.tail1f21e.ts.net.",
+    "TailscaleIPs": ["100.114.183.31", "fd7a:115c:a1e0::9734:b71f"],
+    "Online": true,
+    "OS": "darwin"
+  },
+  "Peer": {
+    "nodekey:online1": {
+      "ID": "n1001",
+      "HostName": "server-prod",
+      "DNSName": "server-prod.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.90.1.1", "fd7a:115c:a1e0::9001:0001"],
+      "Online": true,
+      "OS": "linux"
+    },
+    "nodekey:offline1": {
+      "ID": "n1002",
+      "HostName": "server-dev",
+      "DNSName": "server-dev.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.90.1.2"],
+      "Online": false,
+      "OS": "linux"
+    },
+    "nodekey:online2": {
+      "ID": "n1003",
+      "HostName": "nas-storage",
+      "DNSName": "nas-storage.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.90.1.3"],
+      "Online": true,
+      "OS": "linux"
+    },
+    "nodekey:offline2": {
+      "ID": "n1004",
+      "HostName": "laptop-old",
+      "DNSName": "laptop-old.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.90.1.4"],
+      "Online": false,
+      "OS": "darwin"
+    }
+  }
+}

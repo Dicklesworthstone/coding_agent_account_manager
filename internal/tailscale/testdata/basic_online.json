@@ -1,0 +1,30 @@
+{
+  "Version": "1.56.1",
+  "BackendState": "Running",
+  "Self": {
+    "ID": "nSelf123",
+    "HostName": "localdev",
+    "DNSName": "localdev.tail1f21e.ts.net.",
+    "TailscaleIPs": ["100.91.120.17", "fd7a:115c:a1e0::4534:7811"],
+    "Online": true,
+    "OS": "linux"
+  },
+  "Peer": {
+    "nodekey:abc123": {
+      "ID": "n1234",
+      "HostName": "SuperServer",
+      "DNSName": "superserver.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.90.148.85", "fd7a:115c:a1e0::f334:9455"],
+      "Online": true,
+      "OS": "linux"
+    },
+    "nodekey:def456": {
+      "ID": "n5678",
+      "HostName": "SenseDemoBox",
+      "DNSName": "sensedemobox.tail1f21e.ts.net.",
+      "TailscaleIPs": ["100.100.118.85"],
+      "Online": true,
+      "OS": "linux"
+    }
+  }
+}

@@ -215,3 +215,142 @@ return config
 		t.Errorf("expected 0 domains for empty config, got %d", len(domains))
 	}
 }
+
+// Fixture-based tests for comprehensive coverage
+
+func TestParseFixture_Basic(t *testing.T) {
+	cfg, err := ParseConfig("testdata/basic.lua")
+	if err != nil {
+		t.Fatalf("failed to parse basic.lua: %v", err)
+	}
+
+	if len(cfg.SSHDomains) != 2 {
+		t.Fatalf("expected 2 domains, got %d", len(cfg.SSHDomains))
+	}
+
+	// Verify first domain
+	csd := cfg.GetDomainByName("csd")
+	if csd == nil {
+		t.Fatal("expected to find domain 'csd'")
+	}
+	if csd.RemoteAddress != "192.168.1.100" {
+		t.Errorf("csd.RemoteAddress = %s, want 192.168.1.100", csd.RemoteAddress)
+	}
+	if csd.Username != "ubuntu" {
+		t.Errorf("csd.Username = %s, want ubuntu", csd.Username)
+	}
+	if csd.Multiplexing != "WezTerm" {
+		t.Errorf("csd.Multiplexing = %s, want WezTerm", csd.Multiplexing)
+	}
+
+	// Verify identity file expansion
+	home, _ := os.UserHomeDir()
+	expectedKey := filepath.Join(home, ".ssh", "csd.pem")
+	if csd.IdentityFile != expectedKey {
+		t.Errorf("csd.IdentityFile = %s, want %s", csd.IdentityFile, expectedKey)
+	}
+}
+
+func TestParseFixture_MultipleDomains(t *testing.T) {
+	cfg, err := ParseConfig("testdata/multiple_domains.lua")
+	if err != nil {
+		t.Fatalf("failed to parse multiple_domains.lua: %v", err)
+	}
+
+	if len(cfg.SSHDomains) != 5 {
+		t.Fatalf("expected 5 domains, got %d", len(cfg.SSHDomains))
+	}
+
+	// Verify multiplexing filtering
+	multiplexed := cfg.GetMultiplexedDomains()
+	if len(multiplexed) != 3 {
+		t.Errorf("expected 3 WezTerm-multiplexed domains, got %d", len(multiplexed))
+	}
+
+	// Verify hostname-based domain
+	staging := cfg.GetDomainByName("staging")
+	if staging == nil {
+		t.Fatal("expected to find domain 'staging'")
+	}
+	if staging.RemoteAddress != "staging.example.com" {
+		t.Errorf("staging.RemoteAddress = %s, want staging.example.com", staging.RemoteAddress)
+	}
+
+	// Verify tilde expansion
+	dev := cfg.GetDomainByName("dev")
+	if dev == nil {
+		t.Fatal("expected to find domain 'dev'")
+	}
+	home, _ := os.UserHomeDir()
+	expectedKey := filepath.Join(home, ".ssh", "dev_key")
+	if dev.IdentityFile != expectedKey {
+		t.Errorf("dev.IdentityFile = %s, want %s", dev.IdentityFile, expectedKey)
+	}
+}
+
+func TestParseFixture_TailscaleIPs(t *testing.T) {
+	cfg, err := ParseConfig("testdata/tailscale_ips.lua")
+	if err != nil {
+		t.Fatalf("failed to parse tailscale_ips.lua: %v", err)
+	}
+
+	if len(cfg.SSHDomains) != 3 {
+		t.Fatalf("expected 3 domains, got %d", len(cfg.SSHDomains))
+	}
+
+	// Verify Tailscale IP
+	ts1 := cfg.GetDomainByName("ts-server1")
+	if ts1 == nil {
+		t.Fatal("expected to find domain 'ts-server1'")
+	}
+	if ts1.RemoteAddress != "100.90.148.85" {
+		t.Errorf("ts-server1.RemoteAddress = %s, want 100.90.148.85", ts1.RemoteAddress)
+	}
+
+	// Verify public IP
+	pub := cfg.GetDomainByName("public-server")
+	if pub == nil {
+		t.Fatal("expected to find domain 'public-server'")
+	}
+	if pub.RemoteAddress != "203.0.113.50" {
+		t.Errorf("public-server.RemoteAddress = %s, want 203.0.113.50", pub.RemoteAddress)
+	}
+}
+
+func TestParseFixture_Minimal(t *testing.T) {
+	cfg, err := ParseConfig("testdata/minimal.lua")
+	if err != nil {
+		t.Fatalf("failed to parse minimal.lua: %v", err)
+	}
+
+	if len(cfg.SSHDomains) != 1 {
+		t.Fatalf("expected 1 domain, got %d", len(cfg.SSHDomains))
+	}
+
+	minimal := cfg.SSHDomains[0]
+	if minimal.Name != "minimal" {
+		t.Errorf("minimal.Name = %s, want minimal", minimal.Name)
+	}
+	if minimal.RemoteAddress != "10.0.0.1" {
+		t.Errorf("minimal.RemoteAddress = %s, want 10.0.0.1", minimal.RemoteAddress)
+	}
+	// Username should be empty (not specified)
+	if minimal.Username != "" {
+		t.Errorf("minimal.Username = %s, want empty", minimal.Username)
+	}
+	// Port should default to 22
+	if minimal.Port != 22 {
+		t.Errorf("minimal.Port = %d, want 22", minimal.Port)
+	}
+}
+
+func TestParseFixture_NoSSHDomains(t *testing.T) {
+	cfg, err := ParseConfig("testdata/no_ssh_domains.lua")
+	if err != nil {
+		t.Fatalf("failed to parse no_ssh_domains.lua: %v", err)
+	}
+
+	if len(cfg.SSHDomains) != 0 {
+		t.Errorf("expected 0 domains, got %d", len(cfg.SSHDomains))
+	}
+}

@@ -2,6 +2,7 @@ package tailscale
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 )
 
@@ -359,5 +360,184 @@ func TestPeerOptionalFields(t *testing.T) {
 
 	if peer.LastSeen == nil {
 		t.Error("expected LastSeen to be set")
+	}
+}
+
+// Fixture-based tests for comprehensive coverage
+
+func loadFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/" + name)
+	if err != nil {
+		t.Fatalf("failed to load fixture %s: %v", name, err)
+	}
+	return data
+}
+
+func TestFixture_BasicOnline(t *testing.T) {
+	data := loadFixture(t, "basic_online.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.Version != "1.56.1" {
+		t.Errorf("Version = %s, want 1.56.1", status.Version)
+	}
+	if !status.IsRunning() {
+		t.Error("expected IsRunning() = true")
+	}
+	if status.HasWarnings() {
+		t.Errorf("expected no warnings, got %d", len(status.Warnings))
+	}
+	if status.Self == nil {
+		t.Fatal("Self is nil")
+	}
+	if status.Self.HostName != "localdev" {
+		t.Errorf("Self.HostName = %s, want localdev", status.Self.HostName)
+	}
+	if len(status.Peer) != 2 {
+		t.Errorf("len(Peer) = %d, want 2", len(status.Peer))
+	}
+}
+
+func TestFixture_MixedOnlineOffline(t *testing.T) {
+	data := loadFixture(t, "mixed_online_offline.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if len(status.Peer) != 4 {
+		t.Fatalf("expected 4 peers, got %d", len(status.Peer))
+	}
+
+	// Count online peers
+	onlineCount := 0
+	for _, peer := range status.Peer {
+		if peer.Online {
+			onlineCount++
+		}
+	}
+	if onlineCount != 2 {
+		t.Errorf("expected 2 online peers, got %d", onlineCount)
+	}
+}
+
+func TestFixture_SchemaDriftV2(t *testing.T) {
+	data := loadFixture(t, "schema_drift_v2.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	// Should still parse successfully with unknown fields
+	if status.Version != "2.0.0-beta" {
+		t.Errorf("Version = %s, want 2.0.0-beta", status.Version)
+	}
+	if !status.IsRunning() {
+		t.Error("expected IsRunning() = true")
+	}
+	if status.Self == nil {
+		t.Fatal("Self is nil")
+	}
+	if status.Self.HostName != "testhost" {
+		t.Errorf("Self.HostName = %s, want testhost", status.Self.HostName)
+	}
+
+	// Check optional fields were parsed
+	if status.Self.UserID == nil {
+		t.Error("expected Self.UserID to be set")
+	} else if *status.Self.UserID != 12345 {
+		t.Errorf("Self.UserID = %d, want 12345", *status.Self.UserID)
+	}
+
+	// Check peer with optional fields
+	if len(status.Peer) != 1 {
+		t.Fatalf("expected 1 peer, got %d", len(status.Peer))
+	}
+	for _, peer := range status.Peer {
+		if peer.ExitNode == nil || !*peer.ExitNode {
+			t.Error("expected peer to be exit node")
+		}
+	}
+}
+
+func TestFixture_Minimal(t *testing.T) {
+	data := loadFixture(t, "minimal.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.Version != "1.50.0" {
+		t.Errorf("Version = %s, want 1.50.0", status.Version)
+	}
+	if !status.IsRunning() {
+		t.Error("expected IsRunning() = true")
+	}
+	if status.Self != nil {
+		t.Error("expected Self to be nil for minimal fixture")
+	}
+	if status.Peer != nil && len(status.Peer) > 0 {
+		t.Error("expected Peer to be empty for minimal fixture")
+	}
+}
+
+func TestFixture_IPv6Only(t *testing.T) {
+	data := loadFixture(t, "ipv6_only.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.Self == nil {
+		t.Fatal("Self is nil")
+	}
+
+	// GetIPv4 should return empty for IPv6-only
+	ipv4 := status.Self.GetIPv4()
+	if ipv4 != "" {
+		t.Errorf("expected empty IPv4 for IPv6-only, got %s", ipv4)
+	}
+
+	// Peer should also be IPv6-only
+	for _, peer := range status.Peer {
+		if peer.GetIPv4() != "" {
+			t.Errorf("expected empty IPv4 for peer, got %s", peer.GetIPv4())
+		}
+	}
+}
+
+func TestFixture_NotRunning(t *testing.T) {
+	data := loadFixture(t, "not_running.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.IsRunning() {
+		t.Error("expected IsRunning() = false for Stopped state")
+	}
+	if status.BackendState != "Stopped" {
+		t.Errorf("BackendState = %s, want Stopped", status.BackendState)
+	}
+}
+
+func TestFixture_NoPeers(t *testing.T) {
+	data := loadFixture(t, "no_peers.json")
+	status, err := ParseStatus(data)
+	if err != nil {
+		t.Fatalf("ParseStatus failed: %v", err)
+	}
+
+	if status.Self == nil {
+		t.Fatal("Self is nil")
+	}
+	if status.Self.HostName != "lonely-host" {
+		t.Errorf("Self.HostName = %s, want lonely-host", status.Self.HostName)
+	}
+	if len(status.Peer) != 0 {
+		t.Errorf("expected 0 peers, got %d", len(status.Peer))
 	}
 }
