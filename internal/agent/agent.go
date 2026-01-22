@@ -131,6 +131,14 @@ func (a *Agent) Start(ctx context.Context) error {
 	a.doneCh = make(chan struct{})
 	a.mu.Unlock()
 
+	// Pre-flight check: ensure Chrome is available
+	if !IsChromeAvailable() {
+		return fmt.Errorf("Chrome/Chromium not found. Install Chrome or run 'caam doctor --auto' for guided installation")
+	}
+
+	chromePath := GetChromePath()
+	a.logger.Info("using Chrome", "path", chromePath)
+
 	// Initialize browser
 	a.browser = NewBrowser(BrowserConfig{
 		UserDataDir: a.config.ChromeUserDataDir,

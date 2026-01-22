@@ -59,9 +59,12 @@ func (b *Browser) Close() {
 // If preferredAccount is set, it will try to select that Google account.
 // Returns the code, the account actually used, and any error.
 func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
-	b.logger.Info("starting OAuth flow",
+	// Only log URL details at debug level to avoid exposing tokens
+	b.logger.Debug("starting OAuth flow",
 		"url_prefix", truncateURL(oauthURL, 60),
 		"preferred_account", preferredAccount)
+	b.logger.Info("starting OAuth flow",
+		"has_preferred_account", preferredAccount != "")
 
 	// Create browser context with options
 	opts := []chromedp.ExecAllocatorOption{
@@ -148,29 +151,68 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 				b.logger.Debug("attempting to select account", "account", preferredAccount)
 				usedAccount = preferredAccount
 
-				// Try to click the account
-				err = chromedp.Run(taskCtx,
-					chromedp.Click(fmt.Sprintf(`div[data-email="%s"]`, preferredAccount),
-						chromedp.ByQuery,
-						chromedp.NodeVisible),
-				)
-				if err != nil {
-					b.logger.Debug("could not click preferred account, trying alternatives",
-						"error", err)
-					// Try clicking any account
+				// Try multiple selector strategies for account selection
+				accountSelectors := []string{
+					fmt.Sprintf(`div[data-email="%s"]`, preferredAccount),
+					fmt.Sprintf(`li[data-email="%s"]`, preferredAccount),
+					fmt.Sprintf(`[data-identifier="%s"]`, preferredAccount),
+					// Anthropic/Claude-specific selectors
+					fmt.Sprintf(`button[data-email="%s"]`, preferredAccount),
+					fmt.Sprintf(`a[data-email="%s"]`, preferredAccount),
+				}
+
+				selected := false
+				for _, selector := range accountSelectors {
 					err = chromedp.Run(taskCtx,
-						chromedp.Click(`div[data-identifier]`,
+						chromedp.Click(selector,
 							chromedp.ByQuery,
 							chromedp.NodeVisible),
 					)
+					if err == nil {
+						selected = true
+						break
+					}
+				}
+
+				if !selected {
+					b.logger.Debug("could not click preferred account, trying generic selectors")
+					// Fallback: try clicking any visible account
+					fallbackSelectors := []string{
+						`div[data-identifier]`,
+						`li[data-identifier]`,
+						`[role="listitem"][data-email]`,
+						`button[data-email]`,
+					}
+					for _, selector := range fallbackSelectors {
+						err = chromedp.Run(taskCtx,
+							chromedp.Click(selector,
+								chromedp.ByQuery,
+								chromedp.NodeVisible),
+						)
+						if err == nil {
+							break
+						}
+					}
 				}
 			} else {
-				// Just click the first available account
-				err = chromedp.Run(taskCtx,
-					chromedp.Click(`div[data-identifier]`,
-						chromedp.ByQuery,
-						chromedp.NodeVisible),
-				)
+				// No preferred account - click first available
+				fallbackSelectors := []string{
+					`div[data-identifier]`,
+					`li[data-identifier]`,
+					`[role="listitem"][data-email]`,
+					`button[data-email]`,
+					`div[data-email]`,
+				}
+				for _, selector := range fallbackSelectors {
+					err = chromedp.Run(taskCtx,
+						chromedp.Click(selector,
+							chromedp.ByQuery,
+							chromedp.NodeVisible),
+					)
+					if err == nil {
+						break
+					}
+				}
 			}
 			if err != nil {
 				b.logger.Debug("account selection failed", "error", err)
@@ -180,16 +222,44 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 		}
 
 		// Check if on consent page
-		if strings.Contains(pageHTML, "consent") || strings.Contains(pageHTML, "Allow") {
+		if strings.Contains(pageHTML, "consent") || strings.Contains(pageHTML, "Allow") ||
+			strings.Contains(pageHTML, "permission") || strings.Contains(pageHTML, "authorize") {
 			b.logger.Debug("handling consent page")
-			// Try to click Allow/Continue button
-			err = chromedp.Run(taskCtx,
-				chromedp.Click(`button[type="submit"], input[type="submit"], button:contains("Allow"), button:contains("Continue")`,
-					chromedp.ByQuery,
-					chromedp.NodeVisible),
-			)
+
+			// Try multiple selector strategies for consent buttons
+			consentSelectors := []string{
+				// Standard form submissions
+				`button[type="submit"]`,
+				`input[type="submit"]`,
+				// Google consent buttons
+				`#submit_approve_access`,
+				`button[data-idom-class="nCP5yc"]`, // Google's "Allow" button
+				`div[role="button"][data-value="approve"]`,
+				// Text-based fallbacks
+				`button[aria-label*="Allow"]`,
+				`button[aria-label*="Continue"]`,
+				`button[aria-label*="Accept"]`,
+				// Generic button patterns
+				`button.primary`,
+				`button.submit`,
+				`input[value="Allow"]`,
+				`input[value="Continue"]`,
+				`input[value="Accept"]`,
+			}
+
+			for _, selector := range consentSelectors {
+				err = chromedp.Run(taskCtx,
+					chromedp.Click(selector,
+						chromedp.ByQuery,
+						chromedp.NodeVisible),
+				)
+				if err == nil {
+					b.logger.Debug("clicked consent button", "selector", selector)
+					break
+				}
+			}
 			if err != nil {
-				b.logger.Debug("consent click failed", "error", err)
+				b.logger.Debug("consent click failed with all selectors", "last_error", err)
 			}
 			time.Sleep(2 * time.Second)
 			continue
@@ -250,12 +320,18 @@ func truncateURL(url string, maxLen int) string {
 }
 
 // findChrome locates the Chrome executable on the system.
+// Prefers Chrome Canary (newer features) over stable Chrome.
 func findChrome() string {
 	switch runtime.GOOS {
 	case "darwin":
 		paths := []string{
+			// Prefer Canary for latest features
+			"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
 			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			// User-level installations
+			os.Getenv("HOME") + "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+			os.Getenv("HOME") + "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		}
 		for _, p := range paths {
 			if _, err := os.Stat(p); err == nil {
@@ -264,10 +340,14 @@ func findChrome() string {
 		}
 	case "linux":
 		paths := []string{
+			"/usr/bin/google-chrome-unstable", // Canary/Dev channel
+			"/usr/bin/google-chrome-beta",
 			"/usr/bin/google-chrome",
 			"/usr/bin/google-chrome-stable",
 			"/usr/bin/chromium",
 			"/usr/bin/chromium-browser",
+			// Snap installations
+			"/snap/bin/chromium",
 		}
 		for _, p := range paths {
 			if _, err := os.Stat(p); err == nil {
@@ -275,18 +355,27 @@ func findChrome() string {
 			}
 		}
 		// Try which
-		if path, err := exec.LookPath("google-chrome"); err == nil {
-			return path
-		}
-		if path, err := exec.LookPath("chromium"); err == nil {
-			return path
+		for _, name := range []string{"google-chrome-unstable", "google-chrome", "chromium"} {
+			if path, err := exec.LookPath(name); err == nil {
+				return path
+			}
 		}
 	case "windows":
+		// Get local app data for Canary
+		localAppData := os.Getenv("LOCALAPPDATA")
 		paths := []string{
+			// Canary (user-level)
+			localAppData + `\Google\Chrome SxS\Application\chrome.exe`,
+			// Stable (system-level)
 			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
 			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+			// Stable (user-level)
+			localAppData + `\Google\Chrome\Application\chrome.exe`,
 		}
 		for _, p := range paths {
+			if p == "" {
+				continue
+			}
 			if _, err := os.Stat(p); err == nil {
 				return p
 			}
@@ -294,4 +383,14 @@ func findChrome() string {
 	}
 
 	return "" // Let chromedp find it
+}
+
+// IsChromeAvailable checks if Chrome/Chromium is available on the system.
+func IsChromeAvailable() bool {
+	return findChrome() != ""
+}
+
+// GetChromePath returns the detected Chrome path, or empty string if not found.
+func GetChromePath() string {
+	return findChrome()
 }
