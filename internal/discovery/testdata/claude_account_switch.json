@@ -1,0 +1,8 @@
+{
+  "claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-different-account-XXXX",
+    "refreshToken": "sk-ant-ort01-different-refresh-ZZZZ",
+    "expiresAt": 1737792000000,
+    "subscriptionType": "claude_max_2025"
+  }
+}

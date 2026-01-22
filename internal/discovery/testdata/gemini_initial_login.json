@@ -1,0 +1,6 @@
+{
+  "type": "authorized_user",
+  "email": "gemini-user@example.com",
+  "project_id": "gemini-project-123",
+  "quota_project_id": "gemini-quota-456"
+}
