@@ -84,7 +84,7 @@ func runAlias(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !profileExists {
-		return fmt.Errorf("profile %s/%s not found", tool, profile)
+		return fmt.Errorf("profile %s/%s not found; run 'caam ls %s' to see available profiles", tool, profile, tool)
 	}
 
 	// If no alias provided, show current aliases

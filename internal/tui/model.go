@@ -2977,20 +2977,20 @@ func (m Model) statusModeIndicator() string {
 
 // statusKeyHints returns the key hints for the status bar right segment.
 func (m Model) statusKeyHints(layout layoutSpec) string {
+	hint := func(key, action string) string {
+		return m.styles.StatusText.Render("[") +
+			m.styles.StatusKey.Render(key) +
+			m.styles.StatusText.Render(":"+action+"]")
+	}
+
 	var hints string
 	switch {
 	case m.width < 70:
-		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help")
+		hints = hint("tab", "provider")
 	case m.width < 100:
-		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
-		hints += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" provider")
+		hints = hint("tab", "provider") + " " + hint("/", "search")
 	default:
-		hints = m.styles.StatusKey.Render("q") + m.styles.StatusText.Render(" quit  ")
-		hints += m.styles.StatusKey.Render("?") + m.styles.StatusText.Render(" help  ")
-		hints += m.styles.StatusKey.Render("tab") + m.styles.StatusText.Render(" provider  ")
-		hints += m.styles.StatusKey.Render("enter") + m.styles.StatusText.Render(" activate")
+		hints = hint("tab", "provider") + " " + hint("enter", "activate") + " " + hint("/", "search")
 	}
 
 	if m.debugEnabled() {

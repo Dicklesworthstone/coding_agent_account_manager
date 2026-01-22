@@ -200,7 +200,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		// If no active profile, try to select one
 		profiles, err := vault.List(tool)
 		if err != nil || len(profiles) == 0 {
-			return fmt.Errorf("no profiles found for %s", tool)
+			return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 		}
 		res, err := selector.Select(tool, profiles, "")
 		if err != nil {

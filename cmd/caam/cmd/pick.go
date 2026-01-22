@@ -84,7 +84,7 @@ func runPick(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(filtered) == 0 {
-		return fmt.Errorf("no profiles found for %s", tool)
+		return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
 
 	sort.Strings(filtered)
@@ -233,5 +233,5 @@ func pickWithPrompt(cmd *cobra.Command, tool string, profiles []string, cfg *con
 		}
 	}
 
-	return "", fmt.Errorf("profile not found: %s", name)
+	return "", fmt.Errorf("profile not found: %s; run 'caam ls %s' to see available profiles", name, tool)
 }

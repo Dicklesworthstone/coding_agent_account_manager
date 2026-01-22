@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -212,8 +213,9 @@ func runPoolList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("%-10s %-20s %-12s %-20s\n", "PROVIDER", "PROFILE", "STATUS", "EXPIRY")
-	fmt.Printf("%-10s %-20s %-12s %-20s\n", "--------", "-------", "------", "------")
+	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "PROVIDER\tPROFILE\tSTATUS\tEXPIRY")
+	_, _ = fmt.Fprintln(tw, "--------\t-------\t------\t------")
 
 	for _, p := range profiles {
 		expiry := "-"
@@ -225,9 +227,10 @@ func runPoolList(cmd *cobra.Command, args []string) error {
 				expiry = ttl.Round(time.Minute).String()
 			}
 		}
-		fmt.Printf("%-10s %-20s %-12s %-20s\n",
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
 			p.Provider, p.ProfileName, p.Status.String(), expiry)
 	}
+	_ = tw.Flush()
 
 	return nil
 }

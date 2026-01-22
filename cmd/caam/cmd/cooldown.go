@@ -264,31 +264,9 @@ func resolveProviderProfile(input string) (provider string, profile string, err 
 		return "", "", fmt.Errorf("detect active profile for %s: %w", tool, err)
 	}
 	if strings.TrimSpace(active) == "" {
-		return "", "", fmt.Errorf("no active profile detected for %s (provide provider/name)", tool)
+		return "", "", fmt.Errorf("no active profile detected for %s; provide provider/name or run 'caam activate %s <profile>'", tool, tool)
 	}
 	return tool, active, nil
-}
-
-func formatDurationShort(d time.Duration) string {
-	if d <= 0 {
-		return "0m"
-	}
-
-	d = d.Round(time.Minute)
-	if d < time.Minute {
-		return "<1m"
-	}
-
-	hours := int(d.Hours())
-	mins := int(d.Minutes()) % 60
-	switch {
-	case hours <= 0:
-		return fmt.Sprintf("%dm", mins)
-	case mins == 0:
-		return fmt.Sprintf("%dh", hours)
-	default:
-		return fmt.Sprintf("%dh%dm", hours, mins)
-	}
 }
 
 func confirmProceed(r io.Reader, w io.Writer) (bool, error) {

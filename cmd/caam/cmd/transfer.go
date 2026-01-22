@@ -98,7 +98,7 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 		entries, err := os.ReadDir(v.BasePath())
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil, fmt.Errorf("vault is empty")
+				return nil, fmt.Errorf("vault is empty; create profiles with 'caam backup <tool> <name>'")
 			}
 			return nil, fmt.Errorf("read vault: %w", err)
 		}
@@ -171,7 +171,7 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 		dirPath := v.ProfilePath(tool, profile)
 		if st, err := os.Stat(dirPath); err != nil || !st.IsDir() {
 			if os.IsNotExist(err) {
-				return nil, fmt.Errorf("profile %s/%s not found in vault", tool, profile)
+				return nil, fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", tool, profile, tool)
 			}
 			if err != nil {
 				return nil, fmt.Errorf("stat profile: %w", err)

@@ -1546,19 +1546,21 @@ func TestStatusKeyHints(t *testing.T) {
 	m.width = 60
 	hints := m.statusKeyHints(layout)
 	plainHints := ansi.Strip(hints)
-	if !strings.Contains(plainHints, "quit") {
-		t.Errorf("expected 'quit' in narrow hints, got %q", plainHints)
-	}
-	if !strings.Contains(plainHints, "help") {
-		t.Errorf("expected 'help' in narrow hints, got %q", plainHints)
+	plainHints = strings.ReplaceAll(plainHints, " ", "")
+	if !strings.Contains(plainHints, "[tab:provider]") {
+		t.Errorf("expected '[tab:provider]' in narrow hints, got %q", plainHints)
 	}
 
 	// Test wide width
 	m.width = 120
 	hints = m.statusKeyHints(layout)
 	plainHints = ansi.Strip(hints)
-	if !strings.Contains(plainHints, "activate") {
-		t.Errorf("expected 'activate' in wide hints, got %q", plainHints)
+	plainHints = strings.ReplaceAll(plainHints, " ", "")
+	if !strings.Contains(plainHints, "[enter:activate]") {
+		t.Errorf("expected '[enter:activate]' in wide hints, got %q", plainHints)
+	}
+	if !strings.Contains(plainHints, "[/:search]") {
+		t.Errorf("expected '[/:search]' in wide hints, got %q", plainHints)
 	}
 }
 

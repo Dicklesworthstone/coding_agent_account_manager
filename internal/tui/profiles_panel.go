@@ -271,9 +271,7 @@ func (p *ProfilesPanel) View() string {
 	title := p.styles.Title.Render(capitalizeFirst(p.provider) + " Profiles")
 
 	if len(p.profiles) == 0 {
-		empty := p.styles.Empty.Render(
-			fmt.Sprintf("No profiles saved for %s\n\nUse 'caam backup %s <email>' to save a profile",
-				p.provider, p.provider))
+		empty := p.styles.Empty.Render(emptyProfilesMessage(p.provider))
 		inner := lipgloss.JoinVertical(lipgloss.Left, title, empty)
 		if p.width > 0 {
 			return p.styles.Border.Width(p.width - 2).Render(inner)
@@ -437,6 +435,11 @@ func (p *ProfilesPanel) View() string {
 		return p.styles.Border.Width(p.width - 2).Render(inner)
 	}
 	return p.styles.Border.Render(inner)
+}
+
+func emptyProfilesMessage(provider string) string {
+	label := capitalizeFirst(provider)
+	return fmt.Sprintf("📭 No profiles for %s yet\n\nRun: caam backup %s <email>", label, provider)
 }
 
 // formatRelativeTime formats a time as a relative string (e.g., "2h ago", "1d ago").

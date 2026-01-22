@@ -340,7 +340,7 @@ func ensureVaultProfileDir(tool, profile string) error {
 	st, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("profile %s/%s not found in vault", tool, profile)
+			return fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", tool, profile, tool)
 		}
 		return fmt.Errorf("stat profile: %w", err)
 	}

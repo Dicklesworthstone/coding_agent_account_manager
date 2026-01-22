@@ -74,10 +74,10 @@ func runRename(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !oldExists {
-		return fmt.Errorf("source profile %s/%s not found", tool, oldName)
+		return fmt.Errorf("source profile %s/%s not found; run 'caam ls %s' to see available profiles", tool, oldName, tool)
 	}
 	if newExists {
-		return fmt.Errorf("destination profile %s/%s already exists", tool, newName)
+		return fmt.Errorf("destination profile %s/%s already exists; choose a different name or delete it with 'caam delete %s %s'", tool, newName, tool, newName)
 	}
 
 	// Prevent renaming system profiles to non-system names (preserves safety)
