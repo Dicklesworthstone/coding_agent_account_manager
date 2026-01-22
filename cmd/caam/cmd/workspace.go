@@ -194,7 +194,7 @@ func runWorkspaceDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if !cfg.DeleteWorkspace(workspaceName) {
-		return fmt.Errorf("workspace '%s' not found", workspaceName)
+		return fmt.Errorf("workspace '%s' not found; run 'caam workspace ls' to see available workspaces", workspaceName)
 	}
 
 	if err := cfg.Save(); err != nil {
@@ -277,7 +277,7 @@ func runWorkspaceList(cmd *cobra.Command, args []string) error {
 func switchWorkspace(cfg *config.Config, workspaceName string) error {
 	profiles := cfg.GetWorkspace(workspaceName)
 	if profiles == nil {
-		return fmt.Errorf("workspace '%s' not found", workspaceName)
+		return fmt.Errorf("workspace '%s' not found; run 'caam workspace ls' to see available workspaces", workspaceName)
 	}
 
 	// Initialize vault if needed

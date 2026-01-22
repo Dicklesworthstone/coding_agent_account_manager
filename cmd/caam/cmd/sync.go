@@ -283,7 +283,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		// Filter to specific machine
 		m := state.Pool.GetMachineByName(machineName)
 		if m == nil {
-			return fmt.Errorf("machine %q not found in pool", machineName)
+			return fmt.Errorf("machine %q not found in pool; run 'caam sync ls' to see available machines", machineName)
 		}
 		machines = []*sync.Machine{m}
 	}
@@ -510,7 +510,7 @@ func runSyncRemove(cmd *cobra.Command, args []string) error {
 
 	machine := state.Pool.GetMachineByName(name)
 	if machine == nil {
-		return fmt.Errorf("machine %q not found in pool", name)
+		return fmt.Errorf("machine %q not found in pool; run 'caam sync ls' to see available machines", name)
 	}
 
 	force, _ := cmd.Flags().GetBool("force")
@@ -554,7 +554,7 @@ func runSyncTest(cmd *cobra.Command, args []string) error {
 		name := args[0]
 		m := state.Pool.GetMachineByName(name)
 		if m == nil {
-			return fmt.Errorf("machine %q not found in pool", name)
+			return fmt.Errorf("machine %q not found in pool; run 'caam sync ls' to see available machines", name)
 		}
 		machines = []*sync.Machine{m}
 	}

@@ -125,7 +125,7 @@ func listAliases(cfg *config.Config, jsonOutput bool) error {
 
 func removeAlias(cfg *config.Config, alias string, jsonOutput bool) error {
 	if !cfg.RemoveAlias(alias) {
-		return fmt.Errorf("alias %q not found", alias)
+		return fmt.Errorf("alias %q not found; run 'caam alias ls' to see existing aliases", alias)
 	}
 
 	if err := cfg.Save(); err != nil {
