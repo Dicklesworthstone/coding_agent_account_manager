@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -274,13 +275,51 @@ func (u *UsagePanel) renderBar(percentage float64, width int) string {
 		percentage = 1
 	}
 
-	filled := int(percentage * float64(width))
-	if filled > width {
-		filled = width
+	const unitsPerCell = 8
+	blocks := []rune{' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
+
+	totalUnits := int(math.Round(percentage * float64(width*unitsPerCell)))
+	if totalUnits < 0 {
+		totalUnits = 0
 	}
-	if filled < 0 {
-		filled = 0
+	if totalUnits > width*unitsPerCell {
+		totalUnits = width * unitsPerCell
 	}
 
-	return u.styles.BarFill.Render(strings.Repeat("█", filled)) + strings.Repeat(" ", width-filled)
+	palette := u.theme.Palette
+	low := lipgloss.NewStyle().Foreground(palette.Success)
+	mid := lipgloss.NewStyle().Foreground(palette.Warning)
+	high := lipgloss.NewStyle().Foreground(palette.Danger)
+
+	var b strings.Builder
+	b.Grow(width)
+
+	remaining := totalUnits
+	for i := 0; i < width; i++ {
+		units := 0
+		if remaining >= unitsPerCell {
+			units = unitsPerCell
+		} else if remaining > 0 {
+			units = remaining
+		}
+		remaining -= units
+
+		ch := blocks[units]
+		if units == 0 {
+			b.WriteRune(' ')
+			continue
+		}
+
+		pos := float64(i+1) / float64(width)
+		switch {
+		case pos <= 0.5:
+			b.WriteString(low.Render(string(ch)))
+		case pos <= 0.8:
+			b.WriteString(mid.Render(string(ch)))
+		default:
+			b.WriteString(high.Render(string(ch)))
+		}
+	}
+
+	return b.String()
 }

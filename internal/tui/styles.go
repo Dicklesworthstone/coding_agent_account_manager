@@ -477,6 +477,13 @@ type Styles struct {
 	// Input styles
 	InputCursor lipgloss.Style
 
+	// Field styles for dialogs
+	FieldLabel        lipgloss.Style
+	FieldLabelFocused lipgloss.Style
+	FieldRequired     lipgloss.Style
+	FieldError        lipgloss.Style
+	FieldHint         lipgloss.Style
+
 	// Search bar styles
 	SearchBar       lipgloss.Style
 	SearchPrompt    lipgloss.Style
@@ -615,6 +622,25 @@ func NewStyles(theme Theme) Styles {
 		InputCursor: lipgloss.NewStyle().
 			Foreground(p.Accent).
 			Bold(true),
+
+		FieldLabel: lipgloss.NewStyle().
+			Foreground(p.Text),
+
+		FieldLabelFocused: lipgloss.NewStyle().
+			Foreground(p.Accent).
+			Bold(true),
+
+		FieldRequired: lipgloss.NewStyle().
+			Foreground(p.Danger).
+			Bold(true),
+
+		FieldError: lipgloss.NewStyle().
+			Foreground(p.Danger).
+			Italic(true),
+
+		FieldHint: lipgloss.NewStyle().
+			Foreground(p.Muted).
+			Italic(true),
 
 		SearchBar: lipgloss.NewStyle().
 			Padding(0, 1).

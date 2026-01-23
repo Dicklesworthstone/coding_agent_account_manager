@@ -54,7 +54,8 @@ func init() {
 	setupDistributedCmd.Flags().String("wezterm-config", "", "path to wezterm.lua (default: auto-detect)")
 	setupDistributedCmd.Flags().Bool("use-tailscale", true, "prefer Tailscale IPs when available")
 	setupDistributedCmd.Flags().Bool("dry-run", false, "show what would be done without making changes")
-	setupDistributedCmd.Flags().Bool("yes", false, "skip confirmation prompt")
+	setupDistributedCmd.Flags().Bool("force", false, "skip confirmation prompt")
+	setupDistributedCmd.Flags().Bool("yes", false, "skip confirmation prompt (alias for --force)")
 	setupDistributedCmd.Flags().Bool("print-script", false, "print a pasteable setup script and exit")
 	setupDistributedCmd.Flags().Int("local-port", 7891, "port for local auth-agent")
 	setupDistributedCmd.Flags().Int("remote-port", 7890, "port for remote coordinators")
@@ -69,6 +70,8 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	noTailscale, _ := cmd.Flags().GetBool("no-tailscale")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	assumeYes, _ := cmd.Flags().GetBool("yes")
+	force, _ := cmd.Flags().GetBool("force")
+	assumeYes = assumeYes || force
 	printScript, _ := cmd.Flags().GetBool("print-script")
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")

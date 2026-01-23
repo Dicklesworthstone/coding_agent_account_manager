@@ -100,7 +100,8 @@ func init() {
 	weztermCmd.AddCommand(weztermRecoverCmd)
 
 	weztermLoginAllCmd.Flags().Bool("all", false, "broadcast to all panes (skip matching)")
-	weztermLoginAllCmd.Flags().Bool("yes", false, "skip confirmation prompt")
+	weztermLoginAllCmd.Flags().Bool("force", false, "skip confirmation prompt")
+	weztermLoginAllCmd.Flags().Bool("yes", false, "skip confirmation prompt (alias for --force)")
 	weztermLoginAllCmd.Flags().Bool("dry-run", false, "show target panes without sending")
 	weztermLoginAllCmd.Flags().Bool("subscription", false, "also send '1' to choose subscription login")
 	weztermLoginAllCmd.Flags().String("match", "", "regex pattern to match panes (overrides default)")
@@ -110,7 +111,8 @@ func init() {
 
 	weztermRecoverCmd.Flags().Bool("status", false, "show status and exit (no interaction)")
 	weztermRecoverCmd.Flags().Bool("auto", false, "auto-advance all panes one step")
-	weztermRecoverCmd.Flags().Bool("yes", false, "skip confirmation for auto mode")
+	weztermRecoverCmd.Flags().Bool("force", false, "skip confirmation for auto mode")
+	weztermRecoverCmd.Flags().Bool("yes", false, "skip confirmation (alias for --force)")
 	weztermRecoverCmd.Flags().Bool("watch", false, "continuously watch and refresh (with --status)")
 	weztermRecoverCmd.Flags().Duration("interval", 2*time.Second, "refresh interval for watch mode")
 	weztermRecoverCmd.Flags().String("resume-prompt", "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n", "prompt to inject after successful auth")
@@ -151,6 +153,8 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 
 	all, _ := cmd.Flags().GetBool("all")
 	yes, _ := cmd.Flags().GetBool("yes")
+	force, _ := cmd.Flags().GetBool("force")
+	yes = yes || force
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	subscription, _ := cmd.Flags().GetBool("subscription")
 	matchOverride, _ := cmd.Flags().GetString("match")
@@ -720,6 +724,8 @@ func runWeztermRecover(cmd *cobra.Command, args []string) error {
 	statusOnly, _ := cmd.Flags().GetBool("status")
 	autoMode, _ := cmd.Flags().GetBool("auto")
 	yes, _ := cmd.Flags().GetBool("yes")
+	forceFlag, _ := cmd.Flags().GetBool("force")
+	yes = yes || forceFlag
 	watchMode, _ := cmd.Flags().GetBool("watch")
 	interval, _ := cmd.Flags().GetDuration("interval")
 	resumePrompt, _ := cmd.Flags().GetString("resume-prompt")

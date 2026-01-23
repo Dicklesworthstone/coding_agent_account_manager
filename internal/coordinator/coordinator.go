@@ -69,6 +69,10 @@ type Config struct {
 	// ResumeCooldown is the minimum time between resume prompt injections per pane.
 	// This prevents duplicate resume prompts if the state detection triggers multiple times.
 	ResumeCooldown time.Duration
+
+	// PaneClient allows injecting a custom pane client (useful for tests).
+	// If nil, one is selected based on Backend.
+	PaneClient PaneClient
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -128,8 +132,11 @@ func New(config Config) *Coordinator {
 		config.Logger = slog.Default()
 	}
 
-	// Select pane client based on backend configuration
-	paneClient := selectPaneClient(config.Backend, config.Logger)
+	// Select pane client based on backend configuration, unless provided
+	paneClient := config.PaneClient
+	if paneClient == nil {
+		paneClient = selectPaneClient(config.Backend, config.Logger)
+	}
 
 	return &Coordinator{
 		config:     config,
@@ -335,6 +342,8 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		if tracker.TimeSinceStateChange() > c.config.StateTimeout {
 			c.logger.Info("resetting failed pane after timeout",
 				"pane_id", tracker.PaneID)
+			
+			c.cleanupRequest(tracker.GetRequestID())
 			tracker.Reset()
 		}
 	}
@@ -509,6 +518,8 @@ func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneT
 		c.logger.Warn("auth pending timeout",
 			"pane_id", tracker.PaneID,
 			"request_id", tracker.GetRequestID())
+		
+		c.cleanupRequest(tracker.GetRequestID())
 		tracker.SetErrorMessage("auth timeout")
 		tracker.SetState(StateFailed)
 
@@ -567,6 +578,8 @@ func (c *Coordinator) handleAwaitingConfirmState(ctx context.Context, tracker *P
 	if tracker.TimeSinceStateChange() > c.config.StateTimeout {
 		c.logger.Warn("awaiting confirm timeout",
 			"pane_id", tracker.PaneID)
+		
+		c.cleanupRequest(tracker.GetRequestID())
 		tracker.SetErrorMessage("confirmation timeout")
 		tracker.SetState(StateFailed)
 	}
@@ -717,4 +730,14 @@ func (c *Coordinator) GetTrackers() []*PaneTracker {
 // Returns "wezterm" (preferred) or "tmux" (fallback).
 func (c *Coordinator) Backend() string {
 	return c.paneClient.Backend()
+}
+
+// cleanupRequest removes a request from the tracking map.
+func (c *Coordinator) cleanupRequest(requestID string) {
+	if requestID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.requests, requestID)
 }

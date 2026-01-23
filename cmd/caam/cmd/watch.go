@@ -34,7 +34,7 @@ Examples:
   caam watch
 
   # Watch only Claude auth files
-  caam watch --providers claude
+  caam watch --provider claude
 
   # Watch with verbose logging
   caam watch --verbose`,
@@ -50,7 +50,7 @@ var (
 func init() {
 	rootCmd.AddCommand(watchCmd)
 	watchCmd.Flags().BoolVar(&watchOnce, "once", false, "Scan once and exit (no daemon)")
-	watchCmd.Flags().StringSliceVar(&watchProviders, "providers", nil, "Providers to watch (default: all)")
+	watchCmd.Flags().StringSliceVar(&watchProviders, "provider", nil, "Providers to watch (default: all)")
 	watchCmd.Flags().BoolVar(&watchVerbose, "verbose", false, "Verbose output")
 }
 

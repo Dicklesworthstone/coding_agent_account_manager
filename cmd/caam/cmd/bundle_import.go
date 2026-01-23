@@ -46,7 +46,7 @@ Examples:
   caam bundle import ~/backup.enc.zip                # Encrypted (prompts)
   caam bundle import ~/backup.zip --mode merge       # Add new only
   caam bundle import ~/backup.zip --mode replace     # Overwrite all
-  caam bundle import ~/backup.zip --providers claude # Only Claude`,
+  caam bundle import ~/backup.zip --provider claude  # Only Claude`,
 	Args: cobra.ExactArgs(1),
 	RunE: runBundleImport,
 }
@@ -72,7 +72,7 @@ func init() {
 	bundleImportCmd.Flags().Bool("skip-sync", false, "Don't import sync configuration")
 
 	// Filtering
-	bundleImportCmd.Flags().StringSlice("providers", nil, "Only import specific providers (claude,codex,gemini)")
+	bundleImportCmd.Flags().StringSlice("provider", nil, "Only import specific providers (claude,codex,gemini)")
 	bundleImportCmd.Flags().StringSlice("profiles", nil, "Only import profiles matching patterns")
 
 	// Output
@@ -131,7 +131,7 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 	opts.SkipSync, _ = cmd.Flags().GetBool("skip-sync")
 
 	// Filtering
-	opts.ProviderFilter, _ = cmd.Flags().GetStringSlice("providers")
+	opts.ProviderFilter, _ = cmd.Flags().GetStringSlice("provider")
 	opts.ProfileFilter, _ = cmd.Flags().GetStringSlice("profiles")
 
 	// Set paths

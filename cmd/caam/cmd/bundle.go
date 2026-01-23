@@ -42,7 +42,7 @@ Bundles use zip format with SHA-256 checksums and optional AES-256-GCM encryptio
 Examples:
   caam bundle export                      # Export all profiles
   caam bundle export -e                   # Export with encryption
-  caam bundle export --providers claude   # Export only Claude profiles
+  caam bundle export --provider claude    # Export only Claude profiles
   caam bundle export --dry-run            # Preview what would be exported`,
 }
 
@@ -61,7 +61,7 @@ Encryption:
   Encrypted bundles have .enc.zip extension and require the password to import.
 
 Filtering:
-  --providers: Only include specific providers (claude, codex, gemini)
+  --provider: Only include specific providers (claude, codex, gemini)
   --profiles: Only include profiles matching patterns (e.g., "work", "alice")
 
 Optional content (included by default, can be excluded):
@@ -76,7 +76,7 @@ Examples:
   caam bundle export -o /backup               # Export to specific directory
   caam bundle export -e                       # Export with encryption (prompted)
   caam bundle export -e -p "secret123"        # Export with password
-  caam bundle export --providers claude,codex # Only Claude and Codex
+  caam bundle export --provider claude,codex  # Only Claude and Codex
   caam bundle export --profiles "work,team"   # Only matching profiles
   caam bundle export --dry-run                # Preview without creating`,
 	RunE: runBundleExport,
@@ -96,7 +96,7 @@ func init() {
 	bundleExportCmd.Flags().StringP("password", "p", "", "encryption password (prompted if not provided)")
 
 	// Filtering options
-	bundleExportCmd.Flags().StringSlice("providers", nil, "only include specific providers (claude,codex,gemini)")
+	bundleExportCmd.Flags().StringSlice("provider", nil, "only include specific providers (claude,codex,gemini)")
 	bundleExportCmd.Flags().StringSlice("profiles", nil, "only include profiles matching patterns")
 
 	// Content inclusion options (defaults match bundle.DefaultExportOptions)
@@ -154,7 +154,7 @@ func runBundleExport(cmd *cobra.Command, args []string) error {
 	}
 
 	// Filtering options
-	opts.ProviderFilter, _ = cmd.Flags().GetStringSlice("providers")
+	opts.ProviderFilter, _ = cmd.Flags().GetStringSlice("provider")
 	opts.ProfileFilter, _ = cmd.Flags().GetStringSlice("profiles")
 
 	// Content inclusion options

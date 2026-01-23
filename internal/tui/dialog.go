@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"log/slog"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -8,6 +9,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// ValidationFunc is a function that validates a field value.
+// Returns an error message if invalid, or empty string if valid.
+type ValidationFunc func(value string) string
 
 // DialogResult represents the outcome of a dialog interaction.
 type DialogResult int
@@ -51,6 +56,9 @@ type TextInputDialog struct {
 	title       string
 	prompt      string
 	placeholder string
+	hint        string         // Optional hint text shown below input
+	validate    ValidationFunc // Optional validation function
+	error       string         // Current validation error
 	input       textinput.Model
 	result      DialogResult
 	keys        DialogKeyMap
@@ -58,6 +66,7 @@ type TextInputDialog struct {
 	width       int
 	height      int
 	focused     bool
+	debug       bool // Enable debug logging
 }
 
 // NewTextInputDialog creates a new text input dialog.
@@ -103,6 +112,40 @@ func (d *TextInputDialog) SetStyles(styles Styles) {
 	d.input.Cursor.Style = styles.InputCursor
 }
 
+// SetHint sets the hint text displayed below the input.
+func (d *TextInputDialog) SetHint(hint string) {
+	d.hint = hint
+}
+
+// SetValidation sets a custom validation function.
+func (d *TextInputDialog) SetValidation(validate ValidationFunc) {
+	d.validate = validate
+}
+
+// SetDebug enables or disables debug logging.
+func (d *TextInputDialog) SetDebug(debug bool) {
+	d.debug = debug
+}
+
+// Validate runs validation and returns true if valid.
+func (d *TextInputDialog) Validate() bool {
+	d.error = ""
+	if d.validate != nil {
+		d.error = d.validate(d.input.Value())
+		if d.error != "" && d.debug {
+			slog.Debug("text input validation failed",
+				"prompt", d.prompt,
+				"error", d.error)
+		}
+	}
+	return d.error == ""
+}
+
+// GetError returns the current validation error.
+func (d *TextInputDialog) GetError() string {
+	return d.error
+}
+
 // Focus focuses the dialog input.
 func (d *TextInputDialog) Focus() {
 	d.focused = true
@@ -129,6 +172,7 @@ func (d *TextInputDialog) Result() DialogResult {
 func (d *TextInputDialog) Reset() {
 	d.input.Reset()
 	d.result = DialogResultNone
+	d.error = ""
 	d.input.Focus()
 }
 
@@ -145,9 +189,19 @@ func (d *TextInputDialog) Update(msg tea.Msg) (*TextInputDialog, tea.Cmd) {
 			d.result = DialogResultCancel
 			return d, nil
 		case key.Matches(msg, d.keys.Submit):
+			// Validate before submitting
+			if d.validate != nil && !d.Validate() {
+				// Stay open with validation error shown
+				return d, nil
+			}
 			d.result = DialogResultSubmit
 			return d, nil
 		}
+	}
+
+	// Clear error when user types (live validation feedback)
+	if _, ok := msg.(tea.KeyMsg); ok {
+		d.error = ""
 	}
 
 	var cmd tea.Cmd
@@ -166,14 +220,33 @@ func (d *TextInputDialog) View() string {
 		content.WriteString("\n\n")
 	}
 
-	// Prompt
+	// Prompt with focus styling
 	if d.prompt != "" {
-		content.WriteString(d.prompt)
+		if d.focused {
+			content.WriteString(d.styles.FieldLabelFocused.Render(d.prompt))
+		} else {
+			content.WriteString(d.styles.FieldLabel.Render(d.prompt))
+		}
 		content.WriteString("\n\n")
 	}
 
-	// Input field
+	// Input field with focus indicator
+	if d.focused {
+		content.WriteString("▸ ")
+	} else {
+		content.WriteString("  ")
+	}
 	content.WriteString(d.input.View())
+
+	// Show inline validation error or hint
+	if d.error != "" {
+		content.WriteString("\n  ")
+		content.WriteString(d.styles.FieldError.Render("⚠ " + d.error))
+	} else if d.hint != "" && d.focused {
+		content.WriteString("\n  ")
+		content.WriteString(d.styles.FieldHint.Render(d.hint))
+	}
+
 	content.WriteString("\n\n")
 
 	// Help text
@@ -194,16 +267,17 @@ func (d *TextInputDialog) View() string {
 
 // ConfirmDialog is a yes/no confirmation dialog.
 type ConfirmDialog struct {
-	title    string
-	message  string
-	yesLabel string
-	noLabel  string
-	selected int // 0 = no, 1 = yes
-	result   DialogResult
-	keys     DialogKeyMap
-	styles   Styles
-	width    int
-	focused  bool
+	title       string
+	message     string
+	yesLabel    string
+	noLabel     string
+	destructive bool // If true, styles "yes" as a destructive/danger action
+	selected    int  // 0 = no, 1 = yes
+	result      DialogResult
+	keys        DialogKeyMap
+	styles      Styles
+	width       int
+	focused     bool
 }
 
 // NewConfirmDialog creates a new confirmation dialog.
@@ -226,6 +300,11 @@ func NewConfirmDialog(title, message string) *ConfirmDialog {
 func (d *ConfirmDialog) SetLabels(yes, no string) {
 	d.yesLabel = yes
 	d.noLabel = no
+}
+
+// SetDestructive marks this as a destructive confirmation (styles affirmative button as danger).
+func (d *ConfirmDialog) SetDestructive(destructive bool) {
+	d.destructive = destructive
 }
 
 // SetWidth sets the dialog width.
@@ -364,6 +443,8 @@ type FieldDefinition struct {
 	Placeholder string
 	Value       string
 	Required    bool
+	Hint        string         // Optional help text shown below field
+	Validate    ValidationFunc // Optional validation function
 }
 
 // MultiFieldDialog is a dialog with multiple input fields.
@@ -371,17 +452,20 @@ type MultiFieldDialog struct {
 	title     string
 	fields    []FieldDefinition
 	inputs    []textinput.Model
-	focused   int // Currently focused field index
+	errors    []string // Validation errors for each field
+	focused   int      // Currently focused field index
 	result    DialogResult
 	keys      DialogKeyMap
 	styles    Styles
 	width     int
 	isFocused bool
+	debug     bool // Enable debug logging for validation
 }
 
 // NewMultiFieldDialog creates a new multi-field dialog.
 func NewMultiFieldDialog(title string, fields []FieldDefinition) *MultiFieldDialog {
 	inputs := make([]textinput.Model, len(fields))
+	errors := make([]string, len(fields))
 	for i, field := range fields {
 		ti := textinput.New()
 		ti.Placeholder = field.Placeholder
@@ -398,13 +482,20 @@ func NewMultiFieldDialog(title string, fields []FieldDefinition) *MultiFieldDial
 		title:     title,
 		fields:    fields,
 		inputs:    inputs,
+		errors:    errors,
 		focused:   0,
 		result:    DialogResultNone,
 		keys:      DefaultDialogKeyMap(),
 		styles:    DefaultStyles(),
 		width:     60,
 		isFocused: true,
+		debug:     false,
 	}
+}
+
+// SetDebug enables or disables debug logging for validation.
+func (d *MultiFieldDialog) SetDebug(debug bool) {
+	d.debug = debug
 }
 
 // SetWidth sets the dialog width.
@@ -470,6 +561,7 @@ func (d *MultiFieldDialog) Reset() {
 		d.inputs[i].SetValue(d.fields[i].Value)
 		d.inputs[i].Blur()
 	}
+	d.ClearErrors()
 	d.focused = 0
 	d.result = DialogResultNone
 	if len(d.inputs) > 0 {
@@ -477,24 +569,107 @@ func (d *MultiFieldDialog) Reset() {
 	}
 }
 
-// Validate checks if all required fields have values.
+// Validate checks if all required fields have values and runs custom validators.
+// Returns true if all validations pass, false otherwise.
+// Updates the errors slice with any validation error messages.
 func (d *MultiFieldDialog) Validate() bool {
+	valid := true
 	for i, field := range d.fields {
-		if field.Required && strings.TrimSpace(d.inputs[i].Value()) == "" {
+		d.errors[i] = ""
+		value := d.inputs[i].Value()
+
+		// Check required field
+		if field.Required && strings.TrimSpace(value) == "" {
+			d.errors[i] = "This field is required"
+			valid = false
+			if d.debug {
+				slog.Debug("validation failed: required field empty",
+					"field", field.Label,
+					"index", i)
+			}
+			continue
+		}
+
+		// Run custom validator if present
+		if field.Validate != nil {
+			if errMsg := field.Validate(value); errMsg != "" {
+				d.errors[i] = errMsg
+				valid = false
+				if d.debug {
+					slog.Debug("validation failed: custom validator",
+						"field", field.Label,
+						"index", i,
+						"error", errMsg)
+				}
+			}
+		}
+	}
+	return valid
+}
+
+// ValidateField validates a single field by index and updates its error state.
+func (d *MultiFieldDialog) ValidateField(index int) bool {
+	if index < 0 || index >= len(d.fields) {
+		return true
+	}
+
+	field := d.fields[index]
+	value := d.inputs[index].Value()
+	d.errors[index] = ""
+
+	// Check required field
+	if field.Required && strings.TrimSpace(value) == "" {
+		d.errors[index] = "This field is required"
+		if d.debug {
+			slog.Debug("field validation failed: required field empty",
+				"field", field.Label,
+				"index", index)
+		}
+		return false
+	}
+
+	// Run custom validator if present
+	if field.Validate != nil {
+		if errMsg := field.Validate(value); errMsg != "" {
+			d.errors[index] = errMsg
+			if d.debug {
+				slog.Debug("field validation failed: custom validator",
+					"field", field.Label,
+					"index", index,
+					"error", errMsg)
+			}
 			return false
 		}
 	}
+
 	return true
 }
 
+// GetError returns the validation error for a field by index.
+func (d *MultiFieldDialog) GetError(index int) string {
+	if index < 0 || index >= len(d.errors) {
+		return ""
+	}
+	return d.errors[index]
+}
+
+// ClearErrors clears all validation errors.
+func (d *MultiFieldDialog) ClearErrors() {
+	for i := range d.errors {
+		d.errors[i] = ""
+	}
+}
+
 // focusField focuses a specific field by index.
+// Validates the current field before moving to the next.
 func (d *MultiFieldDialog) focusField(index int) {
 	if index < 0 || index >= len(d.inputs) {
 		return
 	}
 
-	// Blur current field
+	// Validate and blur current field
 	if d.focused >= 0 && d.focused < len(d.inputs) {
+		d.ValidateField(d.focused)
 		d.inputs[d.focused].Blur()
 	}
 
@@ -572,12 +747,43 @@ func (d *MultiFieldDialog) View() string {
 
 	// Fields
 	for i, field := range d.fields {
-		label := field.Label
-		if field.Required {
-			label += " *"
+		isFocused := i == d.focused && d.isFocused
+		hasError := d.errors[i] != ""
+
+		// Build label with styling
+		var labelBuilder strings.Builder
+		if isFocused {
+			labelBuilder.WriteString(d.styles.FieldLabelFocused.Render(field.Label))
+		} else {
+			labelBuilder.WriteString(d.styles.FieldLabel.Render(field.Label))
 		}
-		content.WriteString(label + "\n")
+
+		// Add required indicator with red color
+		if field.Required {
+			labelBuilder.WriteString(" ")
+			labelBuilder.WriteString(d.styles.FieldRequired.Render("*"))
+		}
+
+		content.WriteString(labelBuilder.String() + "\n")
+
+		// Input field with focus indicator
+		if isFocused {
+			content.WriteString("▸ ")
+		} else {
+			content.WriteString("  ")
+		}
 		content.WriteString(d.inputs[i].View())
+
+		// Show inline validation error below field
+		if hasError {
+			content.WriteString("\n  ")
+			content.WriteString(d.styles.FieldError.Render("⚠ " + d.errors[i]))
+		} else if field.Hint != "" && isFocused {
+			// Show hint only when focused and no error
+			content.WriteString("\n  ")
+			content.WriteString(d.styles.FieldHint.Render(field.Hint))
+		}
+
 		if i < len(d.fields)-1 {
 			content.WriteString("\n\n")
 		}
@@ -586,6 +792,7 @@ func (d *MultiFieldDialog) View() string {
 
 	// Help text
 	help := d.styles.StatusKey.Render("tab") + " next field  " +
+		d.styles.StatusKey.Render("↑↓") + " navigate  " +
 		d.styles.StatusKey.Render("enter") + " submit  " +
 		d.styles.StatusKey.Render("esc") + " cancel"
 	content.WriteString(help)

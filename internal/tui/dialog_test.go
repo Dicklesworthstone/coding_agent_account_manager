@@ -640,3 +640,220 @@ func TestDefaultCommands(t *testing.T) {
 		}
 	}
 }
+
+// Test inline validation for TextInputDialog
+func TestTextInputDialog_Validation(t *testing.T) {
+	d := NewTextInputDialog("Test", "Enter email:")
+	d.SetValidation(func(value string) string {
+		if !strings.Contains(value, "@") {
+			return "Must be a valid email address"
+		}
+		return ""
+	})
+
+	// Set invalid value
+	d.SetValue("invalid")
+
+	// Try to submit - should fail validation
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	d, _ = d.Update(msg)
+
+	// Should still be open (result = None)
+	if d.Result() != DialogResultNone {
+		t.Errorf("expected DialogResultNone after failed validation, got %v", d.Result())
+	}
+
+	// Error should be set
+	if d.GetError() == "" {
+		t.Error("expected validation error to be set")
+	}
+
+	// Set valid value
+	d.SetValue("test@example.com")
+	d, _ = d.Update(msg)
+
+	if d.Result() != DialogResultSubmit {
+		t.Errorf("expected DialogResultSubmit after valid input, got %v", d.Result())
+	}
+}
+
+func TestTextInputDialog_HintDisplay(t *testing.T) {
+	d := NewTextInputDialog("Test", "Enter name:")
+	d.SetHint("e.g., John Doe")
+
+	view := d.View()
+
+	// Hint should be visible when focused
+	if !strings.Contains(view, "John Doe") {
+		t.Error("expected view to contain hint text when focused")
+	}
+}
+
+func TestTextInputDialog_ValidationErrorCleared(t *testing.T) {
+	d := NewTextInputDialog("Test", "Enter value:")
+	d.SetValidation(func(value string) string {
+		if value == "" {
+			return "Value is required"
+		}
+		return ""
+	})
+
+	// Trigger validation failure
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	d, _ = d.Update(msg)
+
+	if d.GetError() == "" {
+		t.Error("expected validation error")
+	}
+
+	// Type a character - error should be cleared
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+
+	if d.GetError() != "" {
+		t.Error("expected error to be cleared after typing")
+	}
+}
+
+// Test inline validation for MultiFieldDialog
+func TestMultiFieldDialog_InlineValidation(t *testing.T) {
+	fields := []FieldDefinition{
+		{
+			Label:    "Email",
+			Required: true,
+			Validate: func(value string) string {
+				if !strings.Contains(value, "@") {
+					return "Invalid email format"
+				}
+				return ""
+			},
+		},
+		{Label: "Name"},
+	}
+	d := NewMultiFieldDialog("User Info", fields)
+
+	// Empty required field - should fail
+	if d.Validate() {
+		t.Error("expected validation to fail for empty required field")
+	}
+
+	// Check error message
+	if d.GetError(0) != "This field is required" {
+		t.Errorf("expected 'This field is required', got %q", d.GetError(0))
+	}
+
+	// Type invalid email
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+
+	if d.Validate() {
+		t.Error("expected validation to fail for invalid email")
+	}
+
+	if d.GetError(0) != "Invalid email format" {
+		t.Errorf("expected 'Invalid email format', got %q", d.GetError(0))
+	}
+}
+
+func TestMultiFieldDialog_ValidateField(t *testing.T) {
+	fields := []FieldDefinition{
+		{
+			Label:    "Email",
+			Required: true,
+			Validate: func(value string) string {
+				if !strings.Contains(value, "@") {
+					return "Invalid email"
+				}
+				return ""
+			},
+		},
+	}
+	d := NewMultiFieldDialog("Test", fields)
+
+	// Validate empty field
+	if d.ValidateField(0) {
+		t.Error("expected field validation to fail")
+	}
+
+	// Out of bounds should return true
+	if !d.ValidateField(-1) {
+		t.Error("expected out of bounds to return true")
+	}
+	if !d.ValidateField(100) {
+		t.Error("expected out of bounds to return true")
+	}
+}
+
+func TestMultiFieldDialog_FieldHint(t *testing.T) {
+	fields := []FieldDefinition{
+		{
+			Label: "Email",
+			Hint:  "Enter your work email",
+		},
+	}
+	d := NewMultiFieldDialog("Test", fields)
+
+	view := d.View()
+
+	// Hint should be visible when field is focused
+	if !strings.Contains(view, "work email") {
+		t.Error("expected view to contain field hint")
+	}
+}
+
+func TestMultiFieldDialog_ClearErrors(t *testing.T) {
+	fields := []FieldDefinition{
+		{Label: "Field1", Required: true},
+		{Label: "Field2", Required: true},
+	}
+	d := NewMultiFieldDialog("Test", fields)
+
+	// Trigger validation to set errors
+	d.Validate()
+
+	if d.GetError(0) == "" || d.GetError(1) == "" {
+		t.Error("expected errors to be set after validation")
+	}
+
+	// Clear errors
+	d.ClearErrors()
+
+	if d.GetError(0) != "" || d.GetError(1) != "" {
+		t.Error("expected errors to be cleared")
+	}
+}
+
+func TestMultiFieldDialog_DebugLogging(t *testing.T) {
+	fields := []FieldDefinition{
+		{Label: "Field1", Required: true},
+	}
+	d := NewMultiFieldDialog("Test", fields)
+	d.SetDebug(true)
+
+	// Just verify it doesn't panic with debug enabled
+	d.Validate()
+	d.ValidateField(0)
+}
+
+func TestTextInputDialog_DebugLogging(t *testing.T) {
+	d := NewTextInputDialog("Test", "Enter:")
+	d.SetDebug(true)
+	d.SetValidation(func(value string) string {
+		return "error"
+	})
+
+	// Just verify it doesn't panic with debug enabled
+	d.Validate()
+}
+
+func TestConfirmDialog_Destructive(t *testing.T) {
+	d := NewConfirmDialog("Delete", "Delete this file?")
+	d.SetDestructive(true)
+
+	// Just verify it doesn't panic
+	view := d.View()
+	if view == "" {
+		t.Error("expected non-empty view")
+	}
+}
