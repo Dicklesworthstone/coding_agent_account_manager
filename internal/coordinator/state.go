@@ -251,14 +251,15 @@ func (t *PaneTracker) ClearAllCooldowns() {
 
 // Patterns for detecting Claude Code states.
 var Patterns = struct {
-	RateLimit       *regexp.Regexp
-	SelectMethod    *regexp.Regexp
-	OAuthURL        *regexp.Regexp
-	PastePrompt     *regexp.Regexp
-	LoginSuccess    *regexp.Regexp
-	LoginFailed     *regexp.Regexp
-	OptionOne       *regexp.Regexp
-	UsageLimitReset *regexp.Regexp
+	RateLimit        *regexp.Regexp
+	SelectMethod     *regexp.Regexp
+	OAuthURL         *regexp.Regexp
+	PastePrompt      *regexp.Regexp
+	LoginSuccess     *regexp.Regexp
+	LoginFailed      *regexp.Regexp
+	OptionOne        *regexp.Regexp
+	UsageLimitReset  *regexp.Regexp
+	CompactingBanner *regexp.Regexp
 }{
 	// "You've hit your limit · resets 2pm (America/New_York)"
 	RateLimit: regexp.MustCompile(`You've hit your limit.*resets`),
@@ -283,6 +284,11 @@ var Patterns = struct {
 
 	// Extract reset time from rate limit message
 	UsageLimitReset: regexp.MustCompile(`resets\s+(\d+[ap]m)`),
+
+	// "Conversation compacted · ctrl+o for history" or similar variants
+	// Matches with optional box-drawing characters, middot/bullet separators,
+	// and various whitespace. Also handles "Conversation was compacted" variants.
+	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|]*ctrl\+?o`),
 }
 
 // StripANSI removes ANSI escape codes from terminal output for pattern matching.
@@ -354,4 +360,39 @@ func ExtractOAuthURL(output string) string {
 	// being captured as part of the URL (e.g., trailing \x1b[0m)
 	normalizedOutput := StripANSI(output)
 	return Patterns.OAuthURL.FindString(normalizedOutput)
+}
+
+// DetectCompactingBanner checks if the output contains a Claude Code compacting banner.
+// Returns true if detected, along with the matched text (useful for logging/debugging).
+// The detection is performed on ANSI-stripped output to handle colored terminal output.
+//
+// Matches variants like:
+//   - "Conversation compacted · ctrl+o for history"
+//   - "Conversation was compacted • ctrl+o for history"
+//   - Box-drawing decorated versions with various separators
+func DetectCompactingBanner(output string) (detected bool, matchedText string) {
+	normalizedOutput := StripANSI(output)
+	match := Patterns.CompactingBanner.FindString(normalizedOutput)
+	if match != "" {
+		return true, match
+	}
+	return false, ""
+}
+
+// DetectCompactingBannerWithPattern allows using a custom regex pattern for detection.
+// This enables configuration-driven pattern overrides for edge cases.
+// If customPattern is nil, falls back to the default Patterns.CompactingBanner.
+func DetectCompactingBannerWithPattern(output string, customPattern *regexp.Regexp) (detected bool, matchedText string) {
+	normalizedOutput := StripANSI(output)
+
+	pattern := customPattern
+	if pattern == nil {
+		pattern = Patterns.CompactingBanner
+	}
+
+	match := pattern.FindString(normalizedOutput)
+	if match != "" {
+		return true, match
+	}
+	return false, ""
 }

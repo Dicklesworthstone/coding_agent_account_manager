@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -797,6 +798,394 @@ func TestDetectState_OAuthURLMetadata(t *testing.T) {
 }
 
 // TestOAuthURLPattern_Regex tests the regex pattern directly
+// =============================================================================
+// Compacting Banner Detection Tests (caam-wgd8)
+// =============================================================================
+
+func TestDetectCompactingBanner(t *testing.T) {
+	tests := []struct {
+		name         string
+		output       string
+		wantDetected bool
+		wantContains string // Substring that should be in matched text
+		desc         string
+	}{
+		{
+			name:         "standard banner with middot",
+			output:       "Conversation compacted · ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Standard Claude Code compacting banner",
+		},
+		{
+			name:         "banner with bullet point",
+			output:       "Conversation compacted • ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Variant with bullet point separator",
+		},
+		{
+			name:         "banner with hyphen separator",
+			output:       "Conversation compacted - ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Variant with hyphen separator",
+		},
+		{
+			name:         "banner with pipe separator",
+			output:       "Conversation compacted | ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Variant with pipe separator",
+		},
+		{
+			name:         "banner with 'was compacted' variant",
+			output:       "Conversation was compacted · ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation was compacted",
+			desc:         "Alternative phrasing with 'was'",
+		},
+		{
+			name:         "banner with extra whitespace",
+			output:       "Conversation   compacted   ·   ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation",
+			desc:         "Banner with extra whitespace between words",
+		},
+		{
+			name:         "banner with ctrl+o (plus sign)",
+			output:       "Conversation compacted · ctrl+o for history",
+			wantDetected: true,
+			wantContains: "ctrl+o",
+			desc:         "ctrl+o with plus sign",
+		},
+		{
+			name:         "banner with ctrlo (no plus)",
+			output:       "Conversation compacted · ctrlo for history",
+			wantDetected: true,
+			wantContains: "ctrlo",
+			desc:         "ctrlo without plus sign",
+		},
+		{
+			name:         "case insensitive - uppercase",
+			output:       "CONVERSATION COMPACTED · CTRL+O for history",
+			wantDetected: true,
+			wantContains: "CONVERSATION COMPACTED",
+			desc:         "All uppercase should match (case insensitive)",
+		},
+		{
+			name:         "case insensitive - mixed case",
+			output:       "ConVersation ComPacted · Ctrl+O for history",
+			wantDetected: true,
+			wantContains: "ConVersation ComPacted",
+			desc:         "Mixed case should match",
+		},
+		{
+			name:         "no match - unrelated text",
+			output:       "Normal terminal output here",
+			wantDetected: false,
+			wantContains: "",
+			desc:         "Unrelated text should not match",
+		},
+		{
+			name:         "no match - partial text",
+			output:       "Conversation compacted",
+			wantDetected: false,
+			wantContains: "",
+			desc:         "Partial match without ctrl+o should not match",
+		},
+		{
+			name:         "no match - ctrl+o without compacted",
+			output:       "Press ctrl+o for history",
+			wantDetected: false,
+			wantContains: "",
+			desc:         "ctrl+o alone should not match",
+		},
+		{
+			name:         "banner in multiline output",
+			output:       "Some previous output\nConversation compacted · ctrl+o for history\nSome following output",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Banner embedded in multiline output",
+		},
+		{
+			name:         "banner at end of output",
+			output:       "Long conversation history here...\n\nConversation compacted · ctrl+o for history",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Banner at end of output",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detected, matchedText := DetectCompactingBanner(tt.output)
+			if detected != tt.wantDetected {
+				t.Errorf("DetectCompactingBanner() detected = %v, want %v\nDescription: %s", detected, tt.wantDetected, tt.desc)
+			}
+			if tt.wantDetected && tt.wantContains != "" {
+				if matchedText == "" || !contains(matchedText, tt.wantContains) {
+					t.Errorf("DetectCompactingBanner() matchedText = %q, want to contain %q", matchedText, tt.wantContains)
+				}
+			}
+			t.Logf("fixture=%s detected=%v matched_length=%d", tt.name, detected, len(matchedText))
+		})
+	}
+}
+
+func TestDetectCompactingBanner_WithANSI(t *testing.T) {
+	tests := []struct {
+		name         string
+		output       string
+		wantDetected bool
+		desc         string
+	}{
+		{
+			name:         "banner with color codes",
+			output:       "\x1b[36mConversation compacted\x1b[0m · ctrl+o for history",
+			wantDetected: true,
+			desc:         "Banner with cyan color codes",
+		},
+		{
+			name:         "banner with bold",
+			output:       "\x1b[1mConversation compacted · ctrl+o for history\x1b[0m",
+			wantDetected: true,
+			desc:         "Banner with bold formatting",
+		},
+		{
+			name:         "banner with 256-color",
+			output:       "\x1b[38;5;208mConversation compacted · ctrl+o for history\x1b[0m",
+			wantDetected: true,
+			desc:         "Banner with 256-color foreground",
+		},
+		{
+			name:         "banner with RGB color",
+			output:       "\x1b[38;2;100;150;200mConversation compacted · ctrl+o for history\x1b[0m",
+			wantDetected: true,
+			desc:         "Banner with true-color (RGB) formatting",
+		},
+		{
+			name:         "banner with cursor movement",
+			output:       "\x1b[2K\x1b[1GConversation compacted · ctrl+o for history",
+			wantDetected: true,
+			desc:         "Banner after cursor clear and move",
+		},
+		{
+			name:         "banner with stacked ANSI codes",
+			output:       "\x1b[1m\x1b[4m\x1b[36mConversation compacted\x1b[0m\x1b[0m · ctrl+o for history\x1b[0m",
+			wantDetected: true,
+			desc:         "Banner with multiple stacked ANSI codes",
+		},
+		{
+			name: "banner in styled terminal box",
+			output: "\x1b[36m╭───────────────────────────────────────╮\x1b[0m\n" +
+				"\x1b[36m│\x1b[0m Conversation compacted · ctrl+o for history \x1b[36m│\x1b[0m\n" +
+				"\x1b[36m╰───────────────────────────────────────╯\x1b[0m",
+			wantDetected: true,
+			desc:         "Banner in styled terminal box with box-drawing characters",
+		},
+		{
+			name:         "banner with ANSI in middle of text",
+			output:       "Conversation \x1b[1mcompacted\x1b[0m · ctrl+o for history",
+			wantDetected: true,
+			desc:         "ANSI codes within banner text",
+		},
+		{
+			name:         "complex terminal output with banner",
+			output:       "\x1b[2J\x1b[H\x1b[?25l\x1b[1;1HConversation compacted · ctrl+o for history\x1b[?25h",
+			wantDetected: true,
+			desc:         "Banner with screen clear and cursor visibility codes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detected, matchedText := DetectCompactingBanner(tt.output)
+			if detected != tt.wantDetected {
+				t.Errorf("DetectCompactingBanner() detected = %v, want %v\nDescription: %s", detected, tt.wantDetected, tt.desc)
+			}
+			t.Logf("fixture=%s detected=%v matched=%q", tt.name, detected, matchedText)
+		})
+	}
+}
+
+func TestDetectCompactingBanner_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name         string
+		output       string
+		wantDetected bool
+		desc         string
+	}{
+		{
+			name:         "empty string",
+			output:       "",
+			wantDetected: false,
+			desc:         "Empty string should not match",
+		},
+		{
+			name:         "only whitespace",
+			output:       "   \n\t\n   ",
+			wantDetected: false,
+			desc:         "Whitespace only should not match",
+		},
+		{
+			name:         "banner-like but wrong order",
+			output:       "ctrl+o for history · Conversation compacted",
+			wantDetected: false,
+			desc:         "Reversed order should not match",
+		},
+		{
+			name:         "typo in 'compacted'",
+			output:       "Conversation compactd · ctrl+o for history",
+			wantDetected: false,
+			desc:         "Typo in 'compacted' should not match",
+		},
+		{
+			name:         "very long output with banner",
+			output:       string(make([]byte, 10000)) + "Conversation compacted · ctrl+o for history" + string(make([]byte, 10000)),
+			wantDetected: true,
+			desc:         "Banner in very long output should still be found",
+		},
+		{
+			name:         "multiple banners",
+			output:       "Conversation compacted · ctrl+o for history\nConversation compacted · ctrl+o for history",
+			wantDetected: true,
+			desc:         "Multiple banners - first one should match",
+		},
+		{
+			name:         "unicode whitespace around banner",
+			output:       "\u00A0Conversation compacted · ctrl+o for history\u00A0",
+			wantDetected: true,
+			desc:         "Non-breaking spaces around banner",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detected, _ := DetectCompactingBanner(tt.output)
+			if detected != tt.wantDetected {
+				t.Errorf("DetectCompactingBanner() detected = %v, want %v\nDescription: %s", detected, tt.wantDetected, tt.desc)
+			}
+		})
+	}
+}
+
+func TestDetectCompactingBannerWithPattern(t *testing.T) {
+	customPattern := regexp.MustCompile(`(?i)custom\s+compacting\s+message`)
+
+	tests := []struct {
+		name         string
+		output       string
+		pattern      *regexp.Regexp
+		wantDetected bool
+		desc         string
+	}{
+		{
+			name:         "nil pattern uses default",
+			output:       "Conversation compacted · ctrl+o for history",
+			pattern:      nil,
+			wantDetected: true,
+			desc:         "nil pattern should fall back to default",
+		},
+		{
+			name:         "custom pattern matches",
+			output:       "Custom compacting message here",
+			pattern:      customPattern,
+			wantDetected: true,
+			desc:         "Custom pattern should match custom text",
+		},
+		{
+			name:         "custom pattern does not match default text",
+			output:       "Conversation compacted · ctrl+o for history",
+			pattern:      customPattern,
+			wantDetected: false,
+			desc:         "Custom pattern should not match default banner",
+		},
+		{
+			name:         "default pattern does not match custom text",
+			output:       "Custom compacting message here",
+			pattern:      nil,
+			wantDetected: false,
+			desc:         "Default pattern should not match custom text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detected, _ := DetectCompactingBannerWithPattern(tt.output, tt.pattern)
+			if detected != tt.wantDetected {
+				t.Errorf("DetectCompactingBannerWithPattern() detected = %v, want %v\nDescription: %s", detected, tt.wantDetected, tt.desc)
+			}
+		})
+	}
+}
+
+func TestCompactingBannerPattern_Regex(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantMatch bool
+		desc      string
+	}{
+		{
+			name:      "exact standard format",
+			input:     "Conversation compacted · ctrl+o for history",
+			wantMatch: true,
+			desc:      "Standard format matches",
+		},
+		{
+			name:      "without 'for history' suffix",
+			input:     "Conversation compacted · ctrl+o",
+			wantMatch: true,
+			desc:      "Pattern only requires up to ctrl+o",
+		},
+		{
+			name:      "conversation alone",
+			input:     "Conversation",
+			wantMatch: false,
+			desc:      "Just 'Conversation' should not match",
+		},
+		{
+			name:      "compacted alone",
+			input:     "compacted",
+			wantMatch: false,
+			desc:      "Just 'compacted' should not match",
+		},
+		{
+			name:      "different casing",
+			input:     "conversation COMPACTED · CTRL+O",
+			wantMatch: true,
+			desc:      "Mixed case should match due to (?i) flag",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test on ANSI-stripped output (as the detection functions do)
+			normalizedInput := StripANSI(tt.input)
+			match := Patterns.CompactingBanner.MatchString(normalizedInput)
+			if match != tt.wantMatch {
+				t.Errorf("CompactingBanner.MatchString(%q) = %v, want %v\nDescription: %s", tt.input, match, tt.wantMatch, tt.desc)
+			}
+		})
+	}
+}
+
+// contains is a helper function for checking substring presence
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
 func TestOAuthURLPattern_Regex(t *testing.T) {
 	tests := []struct {
 		name       string

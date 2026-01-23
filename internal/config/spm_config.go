@@ -16,20 +16,21 @@ import (
 // SPMConfig holds Smart Profile Management configuration.
 // This is stored in YAML format at ~/.caam/config.yaml
 type SPMConfig struct {
-	Version       int                        `yaml:"version"`
-	Health        HealthConfig               `yaml:"health"`
-	Analytics     AnalyticsConfig            `yaml:"analytics"`
-	Runtime       RuntimeConfig              `yaml:"runtime"`
-	Project       ProjectConfig              `yaml:"project"`
-	Stealth       StealthConfig              `yaml:"stealth"`
-	Safety        SafetyConfig               `yaml:"safety"`
-	Alerts        AlertConfig                `yaml:"alerts"`
-	Handoff       HandoffConfig              `yaml:"handoff"`
-	RateLimits    RateLimitPatternsConfig    `yaml:"rate_limits"`
-	LoginPatterns LoginPatternsConfig        `yaml:"login_patterns"`
-	Subscriptions map[string]SubscriptionConfig `yaml:"subscriptions,omitempty"`
-	Daemon        DaemonConfig               `yaml:"daemon"`
-	TUI           TUIConfig                  `yaml:"tui"`
+	Version             int                          `yaml:"version"`
+	Health              HealthConfig                 `yaml:"health"`
+	Analytics           AnalyticsConfig              `yaml:"analytics"`
+	Runtime             RuntimeConfig                `yaml:"runtime"`
+	Project             ProjectConfig                `yaml:"project"`
+	Stealth             StealthConfig                `yaml:"stealth"`
+	Safety              SafetyConfig                 `yaml:"safety"`
+	Alerts              AlertConfig                  `yaml:"alerts"`
+	Handoff             HandoffConfig                `yaml:"handoff"`
+	RateLimits          RateLimitPatternsConfig      `yaml:"rate_limits"`
+	LoginPatterns       LoginPatternsConfig          `yaml:"login_patterns"`
+	Subscriptions       map[string]SubscriptionConfig `yaml:"subscriptions,omitempty"`
+	Daemon              DaemonConfig                 `yaml:"daemon"`
+	TUI                 TUIConfig                    `yaml:"tui"`
+	CompactionReminder  CompactionReminderConfig     `yaml:"compaction_reminder"`
 }
 
 // TUIConfig holds TUI appearance and behavior preferences.
@@ -209,6 +210,28 @@ type AuthPoolConfig struct {
 	MaxConcurrentRefresh  int      `yaml:"max_concurrent_refresh"`
 	RefreshRetryDelay     Duration `yaml:"refresh_retry_delay"`
 	MaxRefreshRetries     int      `yaml:"max_refresh_retries"`
+}
+
+// CompactionReminderConfig holds settings for auto-injecting AGENTS.md reminders
+// when Claude Code outputs its "Conversation compacted" banner.
+type CompactionReminderConfig struct {
+	// Enabled controls whether the compaction reminder feature is active.
+	// Default: false (opt-in feature)
+	Enabled bool `yaml:"enabled"`
+
+	// Prompt is the text injected after compaction is detected.
+	// Default: "Reread AGENTS.md so it's still fresh in your mind."
+	Prompt string `yaml:"prompt"`
+
+	// Cooldown is the minimum time between reminder injections per pane.
+	// Prevents spam if compaction is detected repeatedly.
+	// Default: 10m
+	Cooldown Duration `yaml:"cooldown"`
+
+	// RegexOverride allows customizing the compaction detection pattern.
+	// If empty, uses the default pattern that matches Claude's compacting banner.
+	// Default: "" (use built-in pattern)
+	RegexOverride string `yaml:"regex_override,omitempty"`
 }
 
 // Duration is a time.Duration that supports YAML marshaling/unmarshaling
@@ -414,6 +437,12 @@ func DefaultSPMConfig() *SPMConfig {
 			ShowKeyHints:  true,
 			Density:       "cozy",
 			NoTUI:         false,
+		},
+		CompactionReminder: CompactionReminderConfig{
+			Enabled:       false, // Opt-in feature
+			Prompt:        "Reread AGENTS.md so it's still fresh in your mind.",
+			Cooldown:      Duration(10 * time.Minute),
+			RegexOverride: "", // Use built-in pattern
 		},
 	}
 }
@@ -644,6 +673,19 @@ func (c *SPMConfig) Validate() error {
 	validDensities := map[string]bool{"cozy": true, "compact": true, "": true}
 	if !validDensities[c.TUI.Density] {
 		return fmt.Errorf("tui.density must be one of: cozy, compact")
+	}
+
+	// CompactionReminder validation
+	if c.CompactionReminder.Cooldown.Duration() < 0 {
+		return fmt.Errorf("compaction_reminder.cooldown cannot be negative")
+	}
+	if c.CompactionReminder.Cooldown.Duration() < time.Minute && c.CompactionReminder.Enabled {
+		return fmt.Errorf("compaction_reminder.cooldown should be at least 1 minute when enabled")
+	}
+	if c.CompactionReminder.RegexOverride != "" {
+		if _, err := regexp.Compile(c.CompactionReminder.RegexOverride); err != nil {
+			return fmt.Errorf("invalid regex in compaction_reminder.regex_override: %w", err)
+		}
 	}
 
 	return nil

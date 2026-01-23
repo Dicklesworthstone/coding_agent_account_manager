@@ -62,6 +62,7 @@ var (
 	coordinatorPollMs       int
 	coordinatorResumePrompt string
 	coordinatorVerbose      bool
+	coordinatorJSONLogs     bool
 	coordinatorBackend      string
 	coordinatorConfigPath   string
 )
@@ -74,7 +75,8 @@ func init() {
 	coordinatorCmd.Flags().StringVar(&coordinatorResumePrompt, "resume-prompt",
 		"proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
 		"Text to inject after successful auth")
-	coordinatorCmd.Flags().BoolVar(&coordinatorVerbose, "verbose", false, "Verbose output")
+	coordinatorCmd.Flags().BoolVar(&coordinatorVerbose, "verbose", false, "Verbose output (debug level)")
+	coordinatorCmd.Flags().BoolVar(&coordinatorJSONLogs, "json", false, "Output logs in JSON format")
 	coordinatorCmd.Flags().StringVar(&coordinatorBackend, "backend", "auto",
 		"Terminal multiplexer backend: wezterm (preferred), tmux, or auto")
 	coordinatorCmd.Flags().StringVar(&coordinatorConfigPath, "config", "", "Path to JSON config file")
@@ -86,9 +88,16 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	if coordinatorVerbose {
 		logLevel = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
+
+	// Choose log format: JSON or text
+	var logHandler slog.Handler
+	logOpts := &slog.HandlerOptions{Level: logLevel}
+	if coordinatorJSONLogs {
+		logHandler = slog.NewJSONHandler(os.Stderr, logOpts)
+	} else {
+		logHandler = slog.NewTextHandler(os.Stderr, logOpts)
+	}
+	logger := slog.New(logHandler)
 
 	config := coordinator.DefaultConfig()
 	apiPort := coordinatorPort
