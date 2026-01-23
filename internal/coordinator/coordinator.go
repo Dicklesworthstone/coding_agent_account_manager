@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,21 +75,41 @@ type Config struct {
 	// PaneClient allows injecting a custom pane client (useful for tests).
 	// If nil, one is selected based on Backend.
 	PaneClient PaneClient
+
+	// CompactionReminderEnabled enables auto-injection of reminder after compaction.
+	CompactionReminderEnabled bool
+
+	// CompactionReminderPrompt is the text to inject after compaction is detected.
+	// Default: "Reread AGENTS.md so it's still fresh in your mind."
+	CompactionReminderPrompt string
+
+	// CompactionReminderCooldown is the minimum time between reminder injections per pane.
+	// This prevents spam if compaction is detected repeatedly.
+	// Default: 10m
+	CompactionReminderCooldown time.Duration
+
+	// CompactionReminderRegex allows a custom regex pattern for compaction detection.
+	// If nil, uses the default Patterns.CompactingBanner.
+	CompactionReminderRegex *regexp.Regexp
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		Backend:              BackendAuto, // Try WezTerm first, fall back to tmux
-		PollInterval:         500 * time.Millisecond,
-		AuthTimeout:          60 * time.Second,
-		StateTimeout:         30 * time.Second,
-		OutputLines:          100,
-		ResumePrompt:         "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
-		LocalAgentURL:        "http://localhost:7890",
-		LoginCooldown:        5 * time.Second,
-		MethodSelectCooldown: 2 * time.Second,
-		ResumeCooldown:       10 * time.Second,
+		Backend:                    BackendAuto, // Try WezTerm first, fall back to tmux
+		PollInterval:               500 * time.Millisecond,
+		AuthTimeout:                60 * time.Second,
+		StateTimeout:               30 * time.Second,
+		OutputLines:                100,
+		ResumePrompt:               "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
+		LocalAgentURL:              "http://localhost:7890",
+		LoginCooldown:              5 * time.Second,
+		MethodSelectCooldown:       2 * time.Second,
+		ResumeCooldown:             10 * time.Second,
+		CompactionReminderEnabled:  false, // Opt-in feature
+		CompactionReminderPrompt:   "Reread AGENTS.md so it's still fresh in your mind.\n",
+		CompactionReminderCooldown: 10 * time.Minute,
+		CompactionReminderRegex:    nil, // Use default Patterns.CompactingBanner
 	}
 }
 
@@ -428,7 +450,84 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 				"action", "inject_success")
 			tracker.SetCooldown("login", c.config.LoginCooldown)
 		}
+		return // Don't check for compaction if rate limited
 	}
+
+	// Check for compaction reminder (only if enabled and not rate limited)
+	c.handleCompactionReminder(ctx, tracker, output)
+}
+
+// handleCompactionReminder checks for Claude's compaction banner and injects a reminder.
+// This is called from handleIdleState when the pane is not in a rate-limited state.
+func (c *Coordinator) handleCompactionReminder(ctx context.Context, tracker *PaneTracker, output string) {
+	// Skip if feature is disabled
+	if !c.config.CompactionReminderEnabled {
+		return
+	}
+
+	// Detect compaction banner using configured or default pattern
+	compacted, matchedText := DetectCompactingBannerWithPattern(output, c.config.CompactionReminderRegex)
+	if !compacted {
+		return
+	}
+
+	c.logger.Debug("compaction banner detected",
+		"pane_id", tracker.PaneID,
+		"state", StateIdle.String(),
+		"matched_text", matchedText,
+		"action", "compaction_detected")
+
+	// Check if reminder already appears in recent output (prevent duplicate injection)
+	if c.config.CompactionReminderPrompt != "" && strings.Contains(output, strings.TrimSpace(c.config.CompactionReminderPrompt)) {
+		c.logger.Debug("action skipped - reminder already present",
+			"pane_id", tracker.PaneID,
+			"state", StateIdle.String(),
+			"blocked_action", "compaction_reminder_inject",
+			"reason", "reminder_already_in_output",
+			"action", "compaction_skip")
+		return
+	}
+
+	// Check per-pane cooldown to prevent spam
+	if tracker.IsOnCooldown("compaction") {
+		c.logger.Debug("action blocked by cooldown",
+			"pane_id", tracker.PaneID,
+			"state", StateIdle.String(),
+			"blocked_action", "compaction_reminder_inject",
+			"cooldown_remaining", tracker.CooldownRemaining("compaction"),
+			"action", "cooldown_skip")
+		return
+	}
+
+	// Inject the reminder prompt
+	prompt := c.config.CompactionReminderPrompt
+	if !strings.HasSuffix(prompt, "\n") {
+		prompt += "\n"
+	}
+
+	c.logger.Info("compaction reminder injection starting",
+		"pane_id", tracker.PaneID,
+		"state", StateIdle.String(),
+		"action", "inject_compaction_reminder")
+
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, prompt, true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateIdle.String(),
+			"inject_type", "compaction_reminder",
+			"error", err,
+			"action", "inject_failed")
+		return
+	}
+
+	// Set cooldown to prevent repeated injections
+	tracker.SetCooldown("compaction", c.config.CompactionReminderCooldown)
+	c.logger.Debug("injection succeeded",
+		"pane_id", tracker.PaneID,
+		"state", StateIdle.String(),
+		"inject_type", "compaction_reminder",
+		"cooldown_set", c.config.CompactionReminderCooldown,
+		"action", "inject_success")
 }
 
 func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneTracker, output string) {

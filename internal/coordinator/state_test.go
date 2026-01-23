@@ -1259,3 +1259,183 @@ func TestOAuthURLPattern_Regex(t *testing.T) {
 		})
 	}
 }
+
+// Test compaction reminder injection logic
+func TestCoordinator_CompactionReminderInjection(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Test reminder prompt"
+	cfg.CompactionReminderCooldown = 10 * time.Minute
+	cfg.PaneClient = client
+
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = ""
+	coord.trackers[1] = tracker
+
+	ctx := context.Background()
+
+	// Call handleIdleState which should detect compaction and inject
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	// Check that prompt was injected
+	client.mu.Lock()
+	sent := client.sent
+	client.mu.Unlock()
+
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 injection, got %d: %v", len(sent), sent)
+	}
+	if sent[0] != "Test reminder prompt\n" {
+		t.Errorf("expected prompt with newline, got %q", sent[0])
+	}
+}
+
+func TestCoordinator_CompactionReminderDisabled(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = false // Explicitly disabled
+	cfg.PaneClient = client
+
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = ""
+	coord.trackers[1] = tracker
+
+	ctx := context.Background()
+
+	// Call handleIdleState - should NOT inject because feature is disabled
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	client.mu.Lock()
+	sent := client.sent
+	client.mu.Unlock()
+
+	if len(sent) != 0 {
+		t.Fatalf("expected no injections when disabled, got %d: %v", len(sent), sent)
+	}
+}
+
+func TestCoordinator_CompactionReminderCooldown(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Test reminder"
+	cfg.CompactionReminderCooldown = 10 * time.Minute
+	cfg.PaneClient = client
+
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = ""
+	coord.trackers[1] = tracker
+
+	ctx := context.Background()
+
+	// First injection should succeed
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	client.mu.Lock()
+	count1 := len(client.sent)
+	client.mu.Unlock()
+
+	if count1 != 1 {
+		t.Fatalf("expected 1 injection on first call, got %d", count1)
+	}
+
+	// Second call should be blocked by cooldown
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	client.mu.Lock()
+	count2 := len(client.sent)
+	client.mu.Unlock()
+
+	if count2 != 1 {
+		t.Fatalf("expected still 1 injection (cooldown should block), got %d", count2)
+	}
+}
+
+func TestCoordinator_CompactionReminderSkipsIfAlreadyPresent(t *testing.T) {
+	prompt := "Reread AGENTS.md so it's still fresh in your mind."
+	client := &fakePaneClient{
+		panes: []Pane{{PaneID: 1}},
+		// Output contains both compaction banner AND the reminder already
+		output: "Conversation compacted · ctrl+o for history\n" + prompt,
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = prompt
+	cfg.CompactionReminderCooldown = 10 * time.Minute
+	cfg.PaneClient = client
+
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = ""
+	coord.trackers[1] = tracker
+
+	ctx := context.Background()
+
+	// Should NOT inject because reminder is already in output
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	client.mu.Lock()
+	sent := client.sent
+	client.mu.Unlock()
+
+	if len(sent) != 0 {
+		t.Fatalf("expected no injections when reminder already present, got %d: %v", len(sent), sent)
+	}
+}
+
+func TestCoordinator_CompactionReminderDoesNotTriggerOnRateLimit(t *testing.T) {
+	client := &fakePaneClient{
+		panes: []Pane{{PaneID: 1}},
+		// Output has BOTH rate limit AND compaction banner
+		output: "You've hit your limit · resets 2pm\nConversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Test reminder"
+	cfg.PaneClient = client
+
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = ""
+	coord.trackers[1] = tracker
+
+	ctx := context.Background()
+
+	// Call handleIdleState - rate limit takes precedence
+	coord.handleIdleState(ctx, tracker, client.output)
+
+	client.mu.Lock()
+	sent := client.sent
+	client.mu.Unlock()
+
+	// Should inject /login, not the compaction reminder
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 injection, got %d: %v", len(sent), sent)
+	}
+	if sent[0] != "/login\n" {
+		t.Errorf("expected /login injection (rate limit takes precedence), got %q", sent[0])
+	}
+}
