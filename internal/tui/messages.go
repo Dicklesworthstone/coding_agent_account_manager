@@ -21,6 +21,11 @@ type badgeExpiredMsg struct {
 	key string
 }
 
+type badgeFadeMsg struct {
+	key   string
+	level int
+}
+
 type projectContextLoadedMsg struct {
 	cwd      string
 	resolved *project.Resolved

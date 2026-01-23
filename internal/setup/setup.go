@@ -140,7 +140,7 @@ func (o *Orchestrator) Discover(ctx context.Context) error {
 	if configPath == "" {
 		configPath = wezterm.FindConfigPath()
 		if configPath == "" {
-			return fmt.Errorf("WezTerm config not found. Try --wezterm-config flag")
+			return fmt.Errorf("WezTerm config not found; specify path with --wezterm-config or create ~/.wezterm.lua")
 		}
 	}
 
@@ -154,7 +154,7 @@ func (o *Orchestrator) Discover(ctx context.Context) error {
 	o.weztermConfig = cfg
 
 	if len(cfg.SSHDomains) == 0 {
-		return fmt.Errorf("no SSH domains found in WezTerm config")
+		return fmt.Errorf("no SSH domains found in WezTerm config; add ssh_domains entries to your WezTerm config file")
 	}
 
 	o.logger.Info("found SSH domains", "count", len(cfg.SSHDomains))

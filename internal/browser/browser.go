@@ -107,7 +107,7 @@ func (c *ChromeLauncher) Open(url string) error {
 	}
 
 	if chromePath == "" {
-		return fmt.Errorf("chrome not found")
+		return fmt.Errorf("chrome not found; install Google Chrome or Chromium from https://google.com/chrome or run 'caam doctor --auto'")
 	}
 
 	args := []string{}
@@ -197,7 +197,7 @@ func (f *FirefoxLauncher) Open(url string) error {
 	}
 
 	if firefoxPath == "" {
-		return fmt.Errorf("firefox not found")
+		return fmt.Errorf("firefox not found; install from https://www.mozilla.org/firefox/")
 	}
 
 	args := []string{}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestModel_loadProfiles_LoadsFromVault(t *testing.T) {
@@ -55,7 +56,7 @@ func TestModel_BADGES_AddAndExpire(t *testing.T) {
 	}})
 	m = model.(Model)
 
-	if got := m.badgeFor("claude", "alice@example.com"); got != "NEW" {
+	if got := ansi.Strip(m.badgeFor("claude", "alice@example.com")); got != "NEW" {
 		t.Fatalf("badgeFor() = %q, want %q", got, "NEW")
 	}
 

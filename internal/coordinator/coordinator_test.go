@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -787,5 +788,284 @@ func TestE2EAuthTimeout(t *testing.T) {
 	}
 	if failedPaneID != 1 {
 		t.Errorf("expected OnAuthFailed to be called with pane 1, got %d", failedPaneID)
+	}
+}
+
+// =============================================================================
+// Compaction Reminder Injection Tests (caam-6dqi)
+// =============================================================================
+
+// TestCompactionReminderInjection tests that reminder is injected when enabled and compaction detected.
+func TestCompactionReminderInjection(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "Some output\nConversation compacted · ctrl+o for history\nMore output",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reread AGENTS.md so it's still fresh in your mind."
+	cfg.CompactionReminderCooldown = 100 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should detect compaction and inject reminder
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send, got %d: %v", len(sent), sent)
+	}
+	if !strings.Contains(sent[0], "AGENTS.md") {
+		t.Errorf("expected reminder to contain 'AGENTS.md', got %q", sent[0])
+	}
+}
+
+// TestCompactionReminderDisabled tests no injection when feature is disabled.
+func TestCompactionReminderDisabled(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "Some output\nConversation compacted · ctrl+o for history\nMore output",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = false // Explicitly disabled (default)
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should NOT inject reminder when disabled
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 0 {
+		t.Errorf("expected no sends when disabled, got %d: %v", len(sent), sent)
+	}
+}
+
+// TestCompactionReminderCooldown tests that cooldown prevents duplicate injections.
+func TestCompactionReminderCooldown(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reread AGENTS.md"
+	cfg.CompactionReminderCooldown = 100 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// First poll should inject
+	coord.pollPanes(ctx)
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send on first poll, got %d", len(sent))
+	}
+
+	// Reset output to trigger re-detection (simulate new compaction event)
+	tracker := coord.trackers[1]
+	tracker.mu.Lock()
+	tracker.LastOutput = "" // Force re-evaluation
+	tracker.mu.Unlock()
+
+	// Second poll within cooldown should NOT inject again
+	coord.pollPanes(ctx)
+	sent = client.sentText()
+	if len(sent) != 1 {
+		t.Errorf("expected cooldown to prevent second injection, got %d sends", len(sent))
+	}
+
+	// Wait for cooldown to expire
+	time.Sleep(150 * time.Millisecond)
+
+	// Reset output again
+	tracker.mu.Lock()
+	tracker.LastOutput = ""
+	tracker.mu.Unlock()
+
+	// Third poll after cooldown should inject again
+	coord.pollPanes(ctx)
+	sent = client.sentText()
+	if len(sent) != 2 {
+		t.Errorf("expected injection after cooldown, got %d sends", len(sent))
+	}
+}
+
+// TestCompactionReminderAlreadyPresent tests no injection if reminder text already in output.
+func TestCompactionReminderAlreadyPresent(t *testing.T) {
+	reminderText := "Reread AGENTS.md so it's still fresh in your mind."
+	client := &fakePaneClient{
+		panes: []Pane{{PaneID: 1, Title: "claude-code"}},
+		// Output already contains the reminder text
+		output: "Some output\nConversation compacted · ctrl+o for history\n" + reminderText + "\nMore output",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = reminderText
+	cfg.CompactionReminderCooldown = 10 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should NOT inject because reminder already present in output
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 0 {
+		t.Errorf("expected no sends when reminder already present, got %d: %v", len(sent), sent)
+	}
+}
+
+// TestCompactionReminderNoCompaction tests no injection when no compaction banner detected.
+func TestCompactionReminderNoCompaction(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "Normal terminal output without compaction banner",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reread AGENTS.md"
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should NOT inject because no compaction detected
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 0 {
+		t.Errorf("expected no sends without compaction banner, got %d: %v", len(sent), sent)
+	}
+}
+
+// TestCompactionReminderWithANSI tests injection with ANSI-formatted compaction banner.
+func TestCompactionReminderWithANSI(t *testing.T) {
+	client := &fakePaneClient{
+		panes: []Pane{{PaneID: 1, Title: "claude-code"}},
+		// Output with ANSI color codes
+		output: "\x1b[36mConversation compacted\x1b[0m · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reread AGENTS.md"
+	cfg.CompactionReminderCooldown = 100 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should detect compaction despite ANSI codes and inject reminder
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send with ANSI-formatted banner, got %d: %v", len(sent), sent)
+	}
+	if !strings.Contains(sent[0], "AGENTS.md") {
+		t.Errorf("expected reminder to contain 'AGENTS.md', got %q", sent[0])
+	}
+}
+
+// TestCompactionReminderNotInjectedWhenRateLimited tests no compaction injection during rate limit.
+func TestCompactionReminderNotInjectedWhenRateLimited(t *testing.T) {
+	client := &fakePaneClient{
+		panes: []Pane{{PaneID: 1, Title: "claude-code"}},
+		// Output with BOTH rate limit AND compaction banner
+		output: "You've hit your limit on Claude usage today. This resets 2pm\n" +
+			"Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reread AGENTS.md"
+	cfg.LoginCooldown = 10 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should detect rate limit and inject /login, NOT the compaction reminder
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send, got %d: %v", len(sent), sent)
+	}
+	if sent[0] != "/login\n" {
+		t.Errorf("expected /login injection, got %q", sent[0])
+	}
+	// Verify no compaction reminder was sent
+	for _, s := range sent {
+		if strings.Contains(s, "AGENTS.md") {
+			t.Errorf("should not inject compaction reminder when rate limited, got %q", s)
+		}
+	}
+}
+
+// TestCompactionReminderCustomPattern tests custom regex pattern for detection.
+func TestCompactionReminderCustomPattern(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "CUSTOM_COMPACTION_EVENT_12345",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Custom reminder"
+	cfg.CompactionReminderCooldown = 100 * time.Millisecond
+	cfg.CompactionReminderRegex = regexp.MustCompile(`CUSTOM_COMPACTION_EVENT_\d+`)
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+
+	// Poll should detect custom pattern and inject reminder
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send with custom pattern, got %d: %v", len(sent), sent)
+	}
+	if !strings.Contains(sent[0], "Custom reminder") {
+		t.Errorf("expected custom reminder text, got %q", sent[0])
+	}
+}
+
+// TestCompactionReminderPromptNewline tests that newline is appended to prompt.
+func TestCompactionReminderPromptNewline(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1, Title: "claude-code"}},
+		output: "Conversation compacted · ctrl+o for history",
+	}
+
+	cfg := DefaultConfig()
+	cfg.CompactionReminderEnabled = true
+	cfg.CompactionReminderPrompt = "Reminder without newline" // No trailing \n
+	cfg.CompactionReminderCooldown = 100 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+
+	ctx := context.Background()
+	coord.pollPanes(ctx)
+
+	sent := client.sentText()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 send, got %d", len(sent))
+	}
+	// Verify newline was appended
+	if !strings.HasSuffix(sent[0], "\n") {
+		t.Errorf("expected prompt to end with newline, got %q", sent[0])
 	}
 }

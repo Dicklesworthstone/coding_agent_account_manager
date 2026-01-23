@@ -160,7 +160,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	case <-ctx.Done():
 		signal.Stop(sigChan)
 		fmt.Printf("\nTimeout after %v waiting for login to complete.\n", timeout)
-		return fmt.Errorf("login timed out")
+		return fmt.Errorf("login timed out; retry with 'caam add %s' or use --timeout to increase wait time", tool)
 	}
 
 	// Step 4: Check if auth files appeared

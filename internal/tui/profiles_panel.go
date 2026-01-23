@@ -9,6 +9,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ProfileInfo represents a profile with all displayable information.
@@ -595,9 +596,10 @@ func formatNameWithBadge(name, badge string, width int) string {
 		return ""
 	}
 
-	badgeRunes := utf8.RuneCountInString(badge)
+	badgePlain := ansi.Strip(badge)
+	badgeRunes := utf8.RuneCountInString(badgePlain)
 	if badgeRunes >= width {
-		return truncate(badge, width)
+		return truncate(badgePlain, width)
 	}
 
 	nameWidth := width - 1 - badgeRunes

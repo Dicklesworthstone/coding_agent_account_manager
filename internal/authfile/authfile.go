@@ -286,7 +286,7 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	}
 
 	if backedUp == 0 {
-		return fmt.Errorf("no auth files found to backup for %s", tool)
+		return fmt.Errorf("no auth files found to backup for %s; ensure you're logged in first with '%s' or 'caam add %s'", tool, tool, tool)
 	}
 	if len(missingRequired) > 0 {
 		if !(fileSet.AllowOptionalOnly && !requiredFound && optionalFound) {
@@ -488,7 +488,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	}
 
 	if _, err := os.Stat(profileDir); os.IsNotExist(err) {
-		return fmt.Errorf("profile %s/%s not found in vault", fileSet.Tool, profile)
+		return fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", fileSet.Tool, profile, fileSet.Tool)
 	}
 
 	restored := 0

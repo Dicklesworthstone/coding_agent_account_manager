@@ -32,7 +32,7 @@ func (n *DesktopNotifier) Available() bool {
 
 func (n *DesktopNotifier) Notify(alert *Alert) error {
 	if !n.Available() {
-		return fmt.Errorf("desktop notifications not available")
+		return fmt.Errorf("desktop notifications not available; install notify-send (Linux) or ensure osascript is available (macOS)")
 	}
 
 	title := alert.Title

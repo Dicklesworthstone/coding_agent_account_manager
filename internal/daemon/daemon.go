@@ -525,7 +525,7 @@ func (d *Daemon) acquirePIDLock() error {
 			if IsProcessRunning(pid) && pid != os.Getpid() {
 				health.UnlockFile(f)
 				f.Close()
-				return fmt.Errorf("daemon already running (pid %d)", pid)
+				return fmt.Errorf("daemon already running (pid %d); stop it with 'caam daemon stop' first", pid)
 			}
 		}
 	}

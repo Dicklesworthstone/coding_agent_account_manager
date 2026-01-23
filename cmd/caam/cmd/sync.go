@@ -872,7 +872,7 @@ func runSyncEdit(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if editor == "" {
-		return fmt.Errorf("no editor found - set $EDITOR environment variable")
+		return fmt.Errorf("no editor found; set $EDITOR environment variable (e.g., 'export EDITOR=vim' or 'export EDITOR=nano')")
 	}
 
 	// Open editor

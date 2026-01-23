@@ -106,7 +106,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 
 	remoteMachines := orch.GetRemoteMachines()
 	if len(remoteMachines) == 0 {
-		return fmt.Errorf("no remote machines to setup")
+		return fmt.Errorf("no remote machines to setup; add SSH domains to WezTerm config or specify hosts with --remote")
 	}
 
 	if printScript {

@@ -871,7 +871,7 @@ func TestBadgeFor(t *testing.T) {
 	// Test with nil badges
 	m.badges = nil
 	badge := m.badgeFor("claude", "test")
-	if badge != "" {
+	if ansi.Strip(badge) != "" {
 		t.Errorf("expected empty badge for nil badges, got %q", badge)
 	}
 
@@ -880,21 +880,21 @@ func TestBadgeFor(t *testing.T) {
 		"claude/expired": {badge: "OLD", expiry: time.Now().Add(-1 * time.Hour)},
 	}
 	badge = m.badgeFor("claude", "expired")
-	if badge != "" {
+	if ansi.Strip(badge) != "" {
 		t.Errorf("expected empty badge for expired, got %q", badge)
 	}
 
 	// Test with valid badge
 	m.badges["claude/new"] = profileBadge{badge: "NEW", expiry: time.Now().Add(1 * time.Hour)}
 	badge = m.badgeFor("claude", "new")
-	if badge != "NEW" {
+	if ansi.Strip(badge) != "NEW" {
 		t.Errorf("expected 'NEW' badge, got %q", badge)
 	}
 
 	// Test with zero expiry (never expires)
 	m.badges["claude/permanent"] = profileBadge{badge: "PERM", expiry: time.Time{}}
 	badge = m.badgeFor("claude", "permanent")
-	if badge != "PERM" {
+	if ansi.Strip(badge) != "PERM" {
 		t.Errorf("expected 'PERM' badge for zero expiry, got %q", badge)
 	}
 }

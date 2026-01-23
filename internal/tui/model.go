@@ -252,27 +252,27 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 	}
 
 	return Model{
-		providers:      providers,
-		activeProvider: 0,
-		profiles:       make(map[string][]Profile),
-		selected:       0,
-		state:          stateList,
-		keys:           defaultKeyMap(),
-		styles:         NewStyles(theme),
-		providerPanel:  NewProviderPanelWithTheme(providers, theme),
-		profilesPanel:  profilesPanel,
-		detailPanel:    NewDetailPanelWithTheme(theme),
-		usagePanel:     NewUsagePanelWithTheme(theme),
-		syncPanel:      NewSyncPanelWithTheme(theme),
-		vaultPath:      authfile.DefaultVaultPath(),
-		badges:         make(map[string]profileBadge),
-		runtime:        runtime,
-		cwd:            cwd,
-		profileStore:   profile.NewStore(profile.DefaultStorePath()),
-		profileMeta:    make(map[string]map[string]*profile.Profile),
-		vaultMeta:      make(map[string]map[string]vaultProfileMeta),
-		projectStore:   project.NewStore(""),
-		healthStorage:  health.NewStorage(""),
+		providers:       providers,
+		activeProvider:  0,
+		profiles:        make(map[string][]Profile),
+		selected:        0,
+		state:           stateList,
+		keys:            defaultKeyMap(),
+		styles:          NewStyles(theme),
+		providerPanel:   NewProviderPanelWithTheme(providers, theme),
+		profilesPanel:   profilesPanel,
+		detailPanel:     NewDetailPanelWithTheme(theme),
+		usagePanel:      NewUsagePanelWithTheme(theme),
+		syncPanel:       NewSyncPanelWithTheme(theme),
+		vaultPath:       authfile.DefaultVaultPath(),
+		badges:          make(map[string]profileBadge),
+		runtime:         runtime,
+		cwd:             cwd,
+		profileStore:    profile.NewStore(profile.DefaultStorePath()),
+		profileMeta:     make(map[string]map[string]*profile.Profile),
+		vaultMeta:       make(map[string]map[string]vaultProfileMeta),
+		projectStore:    project.NewStore(""),
+		healthStorage:   health.NewStorage(""),
 		helpRenderer:    NewHelpRenderer(theme),
 		theme:           theme,
 		activitySpinner: NewSpinnerWithTheme(theme, ""),
@@ -625,27 +625,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.badges, badgeKey(msg.event.Provider, msg.event.Profile))
 		}
 
-		var badgeCmd tea.Cmd
+		var badgeCmds []tea.Cmd
 		if msg.event.Type == watcher.EventProfileAdded {
 			if m.badges == nil {
 				m.badges = make(map[string]profileBadge)
 			}
 			key := badgeKey(msg.event.Provider, msg.event.Profile)
+			expiry := time.Now().Add(badgeLifetime)
 			m.badges[key] = profileBadge{
-				badge:  "NEW",
-				expiry: time.Now().Add(5 * time.Second),
+				badge:     "NEW",
+				expiry:    expiry,
+				fadeLevel: 0,
 			}
-			badgeCmd = tea.Tick(5*time.Second, func(time.Time) tea.Msg {
-				return badgeExpiredMsg{key: key}
-			})
+			badgeCmds = badgeFadeCommands(key, m.theme.ReducedMotion)
 		}
 
 		m.statusMsg = fmt.Sprintf("Profile %s/%s %s", msg.event.Provider, msg.event.Profile, eventTypeVerb(msg.event.Type))
 		cmds := []tea.Cmd{m.loadProfiles, m.watchProfiles()}
-		if badgeCmd != nil {
-			cmds = append(cmds, badgeCmd)
+		if len(badgeCmds) > 0 {
+			cmds = append(cmds, badgeCmds...)
 		}
 		return m, tea.Batch(cmds...)
+
+	case badgeFadeMsg:
+		if m.badges != nil {
+			if b, ok := m.badges[msg.key]; ok {
+				if msg.level > b.fadeLevel {
+					b.fadeLevel = msg.level
+					m.badges[msg.key] = b
+				}
+			}
+		}
+		m.syncProfilesPanel()
+		return m, nil
 
 	case badgeExpiredMsg:
 		delete(m.badges, msg.key)
@@ -3263,8 +3275,9 @@ func runStartupCleanup(spmCfg *config.SPMConfig) {
 }
 
 type profileBadge struct {
-	badge  string
-	expiry time.Time
+	badge     string
+	expiry    time.Time
+	fadeLevel int
 }
 
 func badgeKey(provider, profile string) string {
@@ -3283,7 +3296,60 @@ func (m Model) badgeFor(provider, profile string) string {
 	if !b.expiry.IsZero() && time.Now().After(b.expiry) {
 		return ""
 	}
-	return b.badge
+	return renderBadge(m.theme, b.badge, b.fadeLevel)
+}
+
+const (
+	badgeLifetime  = 5 * time.Second
+	badgeFadeSteps = 2
+	badgeFadeStep  = 1 * time.Second
+)
+
+func badgeFadeCommands(key string, reducedMotion bool) []tea.Cmd {
+	cmds := []tea.Cmd{}
+	if !reducedMotion && badgeFadeSteps > 0 && badgeFadeStep > 0 {
+		fadeStart := badgeLifetime - time.Duration(badgeFadeSteps)*badgeFadeStep
+		if fadeStart < 0 {
+			fadeStart = 0
+		}
+		for i := 1; i <= badgeFadeSteps; i++ {
+			delay := fadeStart + time.Duration(i-1)*badgeFadeStep
+			level := i
+			if delay <= 0 {
+				continue
+			}
+			cmds = append(cmds, tea.Tick(delay, func(time.Time) tea.Msg {
+				return badgeFadeMsg{key: key, level: level}
+			}))
+		}
+	}
+	cmds = append(cmds, tea.Tick(badgeLifetime, func(time.Time) tea.Msg {
+		return badgeExpiredMsg{key: key}
+	}))
+	return cmds
+}
+
+func renderBadge(theme Theme, label string, level int) string {
+	if strings.TrimSpace(label) == "" {
+		return ""
+	}
+	if theme.NoColor {
+		if level > 0 {
+			return strings.ToLower(label)
+		}
+		return label
+	}
+
+	style := lipgloss.NewStyle().Bold(true).Foreground(theme.Palette.Accent)
+	switch {
+	case level <= 0:
+		// Full-intensity badge.
+	case level == 1:
+		style = style.Foreground(theme.Palette.Info).Faint(true)
+	default:
+		style = style.Foreground(theme.Palette.Muted).Faint(true)
+	}
+	return style.Render(label)
 }
 
 // refreshContext holds state to preserve across profile refresh operations.

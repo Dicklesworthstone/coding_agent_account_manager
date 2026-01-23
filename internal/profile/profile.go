@@ -592,13 +592,13 @@ func (s *Store) Delete(provider, name string) error {
 
 	// Check if profile exists
 	if _, err := os.Stat(profilePath); os.IsNotExist(err) {
-		return fmt.Errorf("profile %s/%s not found", provider, name)
+		return fmt.Errorf("profile %s/%s not found; run 'caam profile ls %s' to see available profiles", provider, name, provider)
 	}
 
 	// Check if locked
 	lockPath := filepath.Join(profilePath, ".lock")
 	if _, err := os.Stat(lockPath); err == nil {
-		return fmt.Errorf("cannot delete locked profile %s/%s", provider, name)
+		return fmt.Errorf("cannot delete locked profile %s/%s; unlock it first or stop the process using it", provider, name)
 	}
 
 	return os.RemoveAll(profilePath)

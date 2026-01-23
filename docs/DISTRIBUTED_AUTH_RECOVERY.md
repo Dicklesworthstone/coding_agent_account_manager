@@ -270,6 +270,127 @@ GET /status
 - `internal/coordinator/wezterm.go` - WezTerm CLI integration
 - `internal/coordinator/api.go` - HTTP API server
 
+## WezTerm Recovery Commands (Operator Guide)
+
+This section documents the on-host `caam wezterm ...` commands that work directly
+against WezTerm panes. These do not require the distributed agent/coordinator setup
+and are ideal for batch recovery on a single host.
+
+### Prereqs
+
+- WezTerm installed and `wezterm cli` available in PATH on the host where panes live.
+- Commands read recent pane output via `wezterm cli get-text`. Output is normalized by
+  stripping ANSI/OSC escapes and box-drawing characters before matching.
+
+### Pane Matching & Safety
+
+By default, `login-all` and `oauth-urls` scan each pane and match in this order:
+
+1. **Rate-limit markers** ("you've hit your limit", "rate limit", `429`, etc.)
+2. **Tool markers** (e.g., "claude", "codex", "gemini")
+
+Overrides and safety flags:
+
+- `--match <regex>`: custom regex applied to normalized pane output.
+- `--all`: bypass matching and target every pane.
+- `--dry-run`: show targets without sending input (login-all only).
+- `--yes` / `--force`: required in non-interactive shells (login-all, recover --auto).
+
+### Quick Recipes
+
+1) **Identify targets** (no writes):
+
+```bash
+caam wezterm recover --status
+caam wezterm login-all claude --dry-run
+```
+
+2) **Inject `/login`** (optionally select subscription):
+
+```bash
+caam wezterm login-all claude --subscription --yes
+```
+
+3) **Extract OAuth URLs (copy-friendly report)**:
+
+```bash
+caam wezterm oauth-urls claude
+```
+
+Output format is tab-separated:
+
+```
+<pane_id>\t<scanned_at_rfc3339>\t<oauth_url>\t# <pane_title>
+```
+
+4) **Drive recovery state machine**:
+
+```bash
+# Interactive UI
+caam wezterm recover
+
+# One-shot auto-advance (single step per run)
+caam wezterm recover --auto --yes
+
+# Watch status refresh
+caam wezterm recover --status --watch --interval 2s
+```
+
+### Recovery States & Actions
+
+`caam wezterm recover` reports each pane in one of these states:
+
+- **IDLE**: no action needed
+- **RATE_LIMITED**: safe to inject `/login`
+- **AWAITING_SELECT**: prompt shown → inject `1` (subscription)
+- **AWAITING_URL**: OAuth URL detected → waiting for code
+- **CODE_READY**: code available → inject code
+- **RESUMING**: login success → inject resume prompt
+- **FAILED**: error detected → retry
+
+Interactive key bindings:
+
+- `r`: refresh
+- `l`: inject `/login` to RATE_LIMITED panes
+- `s`: select subscription (`1`) on AWAITING_SELECT panes
+- `c`: inject codes to CODE_READY panes
+- `p`: inject resume prompt to RESUMING panes
+- `a`: auto-advance all panes one step
+- `q`: quit
+
+### Resume Prompt Configuration
+
+- Local recovery: `caam wezterm recover --resume-prompt "..."`
+- Distributed coordinator: `caam auth-coordinator --resume-prompt "..."`
+
+The default resume prompt includes the AGENTS reminder and trailing newline.
+
+### Compaction Reminder (Coordinator Only)
+
+The distributed coordinator can optionally inject a reminder when Claude shows the
+compaction banner ("Conversation compacted · ctrl+o for history").
+
+As of **January 23, 2026**, this is an internal coordinator config (no CLI flag yet).
+Config fields in `internal/coordinator.Config`:
+
+- `CompactionReminderEnabled`
+- `CompactionReminderPrompt`
+- `CompactionReminderCooldown`
+- `CompactionReminderRegex`
+
+This is tracked under **caam-imtg**. Until the CLI wiring lands, use the resume
+prompt to ensure the AGENTS reminder is injected after successful auth.
+
+### Debugging & Troubleshooting
+
+- Set `CAAM_DEBUG=1` to emit JSON debug logs (pane scans, match reasons, URL counts).
+- Common errors:
+  - `wezterm CLI not found in PATH` → install WezTerm or fix PATH
+  - `no wezterm panes found` → ensure mux server is running / correct host
+  - `no panes matched (use --all to force)` → adjust `--match` or use `--all`
+  - `non-interactive session: use --yes or --dry-run` → add `--yes`
+
+
 ### Local Component: auth-agent
 
 #### Command

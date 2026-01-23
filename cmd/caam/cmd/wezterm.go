@@ -148,7 +148,7 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, err := weztermLookupFunc("wezterm"); err != nil {
-		return fmt.Errorf("wezterm CLI not found in PATH")
+		return fmt.Errorf("wezterm CLI not found in PATH; install from https://wezfurlong.org/wezterm/install/")
 	}
 
 	all, _ := cmd.Flags().GetBool("all")
@@ -166,7 +166,7 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if len(panes) == 0 {
-		return fmt.Errorf("no wezterm panes found")
+		return fmt.Errorf("no wezterm panes found; start wezterm first or use 'wezterm cli list-clients' to verify")
 	}
 
 	var matcher *regexp.Regexp
@@ -256,7 +256,7 @@ func runWeztermOAuthReport(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, err := weztermLookupFunc("wezterm"); err != nil {
-		return fmt.Errorf("wezterm CLI not found in PATH")
+		return fmt.Errorf("wezterm CLI not found in PATH; install from https://wezfurlong.org/wezterm/install/")
 	}
 
 	all, _ := cmd.Flags().GetBool("all")
@@ -269,7 +269,7 @@ func runWeztermOAuthReport(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if len(panes) == 0 {
-		return fmt.Errorf("no wezterm panes found")
+		return fmt.Errorf("no wezterm panes found; start wezterm first or use 'wezterm cli list-clients' to verify")
 	}
 
 	var matcher *regexp.Regexp
@@ -718,7 +718,7 @@ func detectRecoverState(text string) (RecoverState, string, string) {
 
 func runWeztermRecover(cmd *cobra.Command, args []string) error {
 	if _, err := weztermLookupFunc("wezterm"); err != nil {
-		return fmt.Errorf("wezterm CLI not found in PATH")
+		return fmt.Errorf("wezterm CLI not found in PATH; install from https://wezfurlong.org/wezterm/install/")
 	}
 
 	statusOnly, _ := cmd.Flags().GetBool("status")
