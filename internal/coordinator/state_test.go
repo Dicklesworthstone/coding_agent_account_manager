@@ -448,3 +448,425 @@ func TestExtractOAuthURL_WithANSI(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// OAuth URL Extraction Unit Tests - Multiline Fixtures (caam-6sao.4)
+// =============================================================================
+
+func TestExtractOAuthURL_MultilineFixtures(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected string
+		desc     string
+	}{
+		{
+			name: "URL on single line",
+			output: `Please visit the following URL to complete authentication:
+https://claude.ai/oauth/authorize?code_challenge=abc123&code_challenge_method=S256&client_id=claude-code&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&response_type=code&scope=openid%20profile%20email
+Waiting for authentication...`,
+			expected: "https://claude.ai/oauth/authorize?code_challenge=abc123&code_challenge_method=S256&client_id=claude-code&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&response_type=code&scope=openid%20profile%20email",
+			desc:     "Full URL with multiple query params should be extracted completely",
+		},
+		{
+			name: "URL with complex query params",
+			output: `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
+			expected: "https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef",
+			desc:     "URL with special characters in query params",
+		},
+		{
+			name: "URL with URL-encoded values",
+			output: `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
+			expected: "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email",
+			desc:     "URL with percent-encoded values preserved",
+		},
+		{
+			name:     "URL followed by punctuation",
+			output:   "Visit https://claude.ai/oauth/authorize?code=abc. Then paste the code here.",
+			expected: "https://claude.ai/oauth/authorize?code=abc.",
+			desc:     "URL followed by period - regex captures trailing dot (cleanURL would strip it)",
+		},
+		{
+			name:     "URL in parentheses",
+			output:   "(Open https://claude.ai/oauth/authorize?token=xyz in browser)",
+			expected: "https://claude.ai/oauth/authorize?token=xyz",
+			desc:     "URL within parentheses - should not capture closing paren",
+		},
+		{
+			name:     "URL in angle brackets",
+			output:   "Link: <https://claude.ai/oauth/authorize?id=123>",
+			expected: "https://claude.ai/oauth/authorize?id=123>",
+			desc:     "URL in angle brackets - regex may capture trailing bracket",
+		},
+		{
+			name: "Multiple URLs in output",
+			output: `Primary: https://claude.ai/oauth/authorize?code=primary
+Alternative: https://claude.ai/oauth/authorize?code=alternate`,
+			expected: "https://claude.ai/oauth/authorize?code=primary",
+			desc:     "Multiple URLs - should extract first one (FindString behavior)",
+		},
+		{
+			name:     "URL with no query params",
+			output:   "Go to https://claude.ai/oauth/authorize?",
+			expected: "",
+			desc:     "URL with empty query string - regex requires at least one char after ?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := ExtractOAuthURL(tt.output)
+			if url != tt.expected {
+				t.Errorf("ExtractOAuthURL() = %q, want %q\nDescription: %s", url, tt.expected, tt.desc)
+			}
+			// Log extraction success for structured test output
+			t.Logf("fixture=%s extraction_success=%v url_length=%d", tt.name, url == tt.expected, len(url))
+		})
+	}
+}
+
+func TestExtractOAuthURL_ANSIDecorated(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected string
+		desc     string
+	}{
+		{
+			name:     "URL with bold ANSI",
+			output:   "\x1b[1mhttps://claude.ai/oauth/authorize?bold=true\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?bold=true",
+			desc:     "Bold styled URL",
+		},
+		{
+			name:     "URL with underline ANSI",
+			output:   "\x1b[4mhttps://claude.ai/oauth/authorize?underline=true\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?underline=true",
+			desc:     "Underlined URL",
+		},
+		{
+			name:     "URL with 256-color ANSI",
+			output:   "\x1b[38;5;33mhttps://claude.ai/oauth/authorize?color=256\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?color=256",
+			desc:     "256-color foreground styled URL",
+		},
+		{
+			name:     "URL with RGB ANSI",
+			output:   "\x1b[38;2;100;150;200mhttps://claude.ai/oauth/authorize?rgb=true\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?rgb=true",
+			desc:     "True-color (RGB) styled URL",
+		},
+		{
+			name:     "URL with cursor movement codes",
+			output:   "\x1b[2K\x1b[1Ghttps://claude.ai/oauth/authorize?cursor=move",
+			expected: "https://claude.ai/oauth/authorize?cursor=move",
+			desc:     "URL after cursor movement/clear codes",
+		},
+		{
+			name:     "URL with multiple ANSI codes",
+			output:   "\x1b[1m\x1b[4m\x1b[36mhttps://claude.ai/oauth/authorize?multi=style\x1b[0m\x1b[0m\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?multi=style",
+			desc:     "URL with stacked ANSI codes",
+		},
+		{
+			name:     "URL with ANSI in query params",
+			output:   "https://claude.ai/oauth/authorize?foo=\x1b[32mbar\x1b[0m&baz=qux",
+			expected: "https://claude.ai/oauth/authorize?foo=bar&baz=qux",
+			desc:     "ANSI codes stripped before extraction - full URL preserved",
+		},
+		{
+			name:     "URL split by ANSI reset",
+			output:   "\x1b[36mhttps://claude.ai/oauth/authorize\x1b[0m?code=abc",
+			expected: "https://claude.ai/oauth/authorize?code=abc",
+			desc:     "ANSI codes stripped first - full URL extracted intact",
+		},
+		{
+			name: "Complex terminal output with URL",
+			output: "\x1b[2J\x1b[H\x1b[?25l\x1b[1;1H\x1b[36m╭───────────────────────────────────────╮\x1b[0m\n" +
+				"\x1b[36m│\x1b[0m Please visit this URL:              \x1b[36m│\x1b[0m\n" +
+				"\x1b[36m│\x1b[0m https://claude.ai/oauth/authorize?a=b \x1b[36m│\x1b[0m\n" +
+				"\x1b[36m╰───────────────────────────────────────╯\x1b[0m",
+			expected: "https://claude.ai/oauth/authorize?a=b",
+			desc:     "URL in styled terminal box UI",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := ExtractOAuthURL(tt.output)
+			if url != tt.expected {
+				t.Errorf("ExtractOAuthURL() = %q, want %q\nDescription: %s", url, tt.expected, tt.desc)
+			}
+			t.Logf("fixture=%s extraction_success=%v url_length=%d", tt.name, url == tt.expected, len(url))
+		})
+	}
+}
+
+func TestExtractOAuthURL_TrailingPunctuation(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		expectedRaw string
+		desc        string
+	}{
+		{
+			name:        "trailing period",
+			output:      "Go to https://claude.ai/oauth/authorize?x=1.",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1.",
+			desc:        "Period after URL",
+		},
+		{
+			name:        "trailing comma",
+			output:      "URL is https://claude.ai/oauth/authorize?x=1, then paste code",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1,",
+			desc:        "Comma after URL",
+		},
+		{
+			name:        "trailing semicolon",
+			output:      "https://claude.ai/oauth/authorize?x=1; # comment",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1;",
+			desc:        "Semicolon after URL",
+		},
+		{
+			name:        "trailing colon",
+			output:      "See https://claude.ai/oauth/authorize?x=1: important!",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1:",
+			desc:        "Colon after URL",
+		},
+		{
+			name:        "trailing exclamation",
+			output:      "Click https://claude.ai/oauth/authorize?x=1!",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1!",
+			desc:        "Exclamation after URL",
+		},
+		{
+			name:        "trailing paren",
+			output:      "(see https://claude.ai/oauth/authorize?x=1)",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1)",
+			desc:        "Closing paren after URL",
+		},
+		{
+			name:        "trailing bracket",
+			output:      "[https://claude.ai/oauth/authorize?x=1]",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1]",
+			desc:        "Closing bracket after URL",
+		},
+		{
+			name:        "trailing brace",
+			output:      "{url: https://claude.ai/oauth/authorize?x=1}",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1}",
+			desc:        "Closing brace after URL",
+		},
+		{
+			name:        "trailing angle bracket",
+			output:      "<https://claude.ai/oauth/authorize?x=1>",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1>",
+			desc:        "Closing angle bracket after URL",
+		},
+		{
+			name:        "multiple trailing punctuation",
+			output:      "URL: https://claude.ai/oauth/authorize?x=1...",
+			expectedRaw: "https://claude.ai/oauth/authorize?x=1...",
+			desc:        "Multiple periods after URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := ExtractOAuthURL(tt.output)
+			if url != tt.expectedRaw {
+				t.Errorf("ExtractOAuthURL() = %q, want %q\nDescription: %s", url, tt.expectedRaw, tt.desc)
+			}
+			t.Logf("fixture=%s extraction_success=%v url_length=%d", tt.name, url == tt.expectedRaw, len(url))
+		})
+	}
+}
+
+func TestExtractOAuthURL_QueryParamPreservation(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected string
+		desc     string
+	}{
+		{
+			name:     "standard OAuth params",
+			output:   "https://claude.ai/oauth/authorize?response_type=code&client_id=claude-code&redirect_uri=http%3A%2F%2Flocalhost%3A8080&scope=openid",
+			expected: "https://claude.ai/oauth/authorize?response_type=code&client_id=claude-code&redirect_uri=http%3A%2F%2Flocalhost%3A8080&scope=openid",
+			desc:     "Standard OAuth 2.0 query params",
+		},
+		{
+			name:     "PKCE params",
+			output:   "https://claude.ai/oauth/authorize?code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256",
+			expected: "https://claude.ai/oauth/authorize?code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256",
+			desc:     "PKCE code challenge params with Base64URL characters",
+		},
+		{
+			name:     "state param with special chars",
+			output:   "https://claude.ai/oauth/authorize?state=abc123_XYZ-789",
+			expected: "https://claude.ai/oauth/authorize?state=abc123_XYZ-789",
+			desc:     "State param with underscores and hyphens",
+		},
+		{
+			name:     "nonce param",
+			output:   "https://claude.ai/oauth/authorize?nonce=f8a7d6c5b4e3a2b1",
+			expected: "https://claude.ai/oauth/authorize?nonce=f8a7d6c5b4e3a2b1",
+			desc:     "Nonce param with hex string",
+		},
+		{
+			name:     "plus-encoded spaces",
+			output:   "https://claude.ai/oauth/authorize?scope=openid+profile+email",
+			expected: "https://claude.ai/oauth/authorize?scope=openid+profile+email",
+			desc:     "Scope with plus-encoded spaces",
+		},
+		{
+			name:     "percent-encoded special chars",
+			output:   "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback%3Ffoo%3Dbar",
+			expected: "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback%3Ffoo%3Dbar",
+			desc:     "Nested percent-encoded URL in redirect_uri",
+		},
+		{
+			name:     "empty param value",
+			output:   "https://claude.ai/oauth/authorize?empty=&foo=bar",
+			expected: "https://claude.ai/oauth/authorize?empty=&foo=bar",
+			desc:     "Param with empty value",
+		},
+		{
+			name:     "param without value",
+			output:   "https://claude.ai/oauth/authorize?flag&foo=bar",
+			expected: "https://claude.ai/oauth/authorize?flag&foo=bar",
+			desc:     "Boolean flag param without equals sign",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := ExtractOAuthURL(tt.output)
+			if url != tt.expected {
+				t.Errorf("ExtractOAuthURL() = %q, want %q\nDescription: %s", url, tt.expected, tt.desc)
+			}
+			t.Logf("fixture=%s extraction_success=%v url_length=%d", tt.name, url == tt.expected, len(url))
+		})
+	}
+}
+
+func TestDetectState_OAuthURLMetadata(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		wantState   PaneState
+		wantURL     string
+		desc        string
+	}{
+		{
+			name:      "extracts URL to metadata",
+			output:    "Open https://claude.ai/oauth/authorize?code=test123 in browser",
+			wantState: StateAwaitingURL,
+			wantURL:   "https://claude.ai/oauth/authorize?code=test123",
+			desc:      "URL should be stored in metadata",
+		},
+		{
+			name:      "URL with ANSI preserved in metadata",
+			output:    "\x1b[32mhttps://claude.ai/oauth/authorize?ansi=true\x1b[0m",
+			wantState: StateAwaitingURL,
+			wantURL:   "https://claude.ai/oauth/authorize?ansi=true\x1b[0m",
+			desc:      "URL extracted from original output - trailing ANSI captured (regex [^\\s]+ matches escape codes)",
+		},
+		{
+			name:      "paste prompt with URL",
+			output:    "https://claude.ai/oauth/authorize?x=1\nPaste code here if prompted >",
+			wantState: StateAwaitingURL,
+			wantURL:   "https://claude.ai/oauth/authorize?x=1",
+			desc:      "Paste prompt state extracts URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, metadata := DetectState(tt.output)
+			if state != tt.wantState {
+				t.Errorf("DetectState() state = %v, want %v\nDescription: %s", state, tt.wantState, tt.desc)
+			}
+			if gotURL := metadata["oauth_url"]; gotURL != tt.wantURL {
+				t.Errorf("DetectState() metadata[oauth_url] = %q, want %q\nDescription: %s", gotURL, tt.wantURL, tt.desc)
+			}
+			t.Logf("fixture=%s state_correct=%v url_correct=%v url_length=%d",
+				tt.name, state == tt.wantState, metadata["oauth_url"] == tt.wantURL, len(metadata["oauth_url"]))
+		})
+	}
+}
+
+// TestOAuthURLPattern_Regex tests the regex pattern directly
+func TestOAuthURLPattern_Regex(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantMatch  bool
+		wantFull   string
+		desc       string
+	}{
+		{
+			name:      "basic authorize URL",
+			input:     "https://claude.ai/oauth/authorize?code=abc",
+			wantMatch: true,
+			wantFull:  "https://claude.ai/oauth/authorize?code=abc",
+			desc:      "Simple URL matches",
+		},
+		{
+			name:      "URL without query string",
+			input:     "https://claude.ai/oauth/authorize",
+			wantMatch: false,
+			wantFull:  "",
+			desc:      "URL without query requires at least ?",
+		},
+		{
+			name:      "URL with just question mark",
+			input:     "https://claude.ai/oauth/authorize?",
+			wantMatch: false,
+			wantFull:  "",
+			desc:      "URL with empty query string - regex requires at least one char after ?",
+		},
+		{
+			name:      "URL in text",
+			input:     "Please open https://claude.ai/oauth/authorize?x=1 now",
+			wantMatch: true,
+			wantFull:  "https://claude.ai/oauth/authorize?x=1",
+			desc:      "URL extracted from surrounding text",
+		},
+		{
+			name:      "wrong domain",
+			input:     "https://example.com/oauth/authorize?code=abc",
+			wantMatch: false,
+			wantFull:  "",
+			desc:      "Non-claude domain should not match",
+		},
+		{
+			name:      "http instead of https",
+			input:     "http://claude.ai/oauth/authorize?code=abc",
+			wantMatch: false,
+			wantFull:  "",
+			desc:      "HTTP (non-secure) should not match",
+		},
+		{
+			name:      "wrong path",
+			input:     "https://claude.ai/api/authorize?code=abc",
+			wantMatch: false,
+			wantFull:  "",
+			desc:      "Wrong path should not match",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			match := Patterns.OAuthURL.FindString(tt.input)
+			gotMatch := match != ""
+			if gotMatch != tt.wantMatch {
+				t.Errorf("OAuthURL.Match(%q) = %v, want %v\nDescription: %s", tt.input, gotMatch, tt.wantMatch, tt.desc)
+			}
+			if match != tt.wantFull {
+				t.Errorf("OAuthURL.FindString(%q) = %q, want %q", tt.input, match, tt.wantFull)
+			}
+			t.Logf("fixture=%s match=%v extracted_length=%d", tt.name, gotMatch, len(match))
+		})
+	}
+}
