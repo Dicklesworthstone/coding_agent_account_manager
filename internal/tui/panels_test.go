@@ -573,8 +573,9 @@ func TestProfilesPanel_View_Empty(t *testing.T) {
 
 	view := panel.View()
 
-	if !strings.Contains(view, "No profiles saved") {
-		t.Error("Empty panel should show 'No profiles saved' message")
+	// Empty state message is "No profiles for <provider> yet"
+	if !strings.Contains(view, "No profiles for") {
+		t.Error("Empty panel should show 'No profiles for' message")
 	}
 }
 

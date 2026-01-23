@@ -1162,8 +1162,9 @@ func TestRenderStatusBar(t *testing.T) {
 	m.statusMsg = ""
 	m.width = 50
 	view = m.renderStatusBar(layoutSpec{Mode: layoutCompact})
-	if !strings.Contains(view, "quit") {
-		t.Errorf("expected 'quit' hint in narrow view, got %q", view)
+	// Narrow view shows only provider hint, not quit
+	if !strings.Contains(view, "provider") {
+		t.Errorf("expected 'provider' hint in narrow view, got %q", view)
 	}
 
 	// Test with medium width (70-99)
@@ -1192,7 +1193,7 @@ func TestStatusBarSeveritySnapshots(t *testing.T) {
 	m.width = 120
 
 	// Status bar now has 3 segments: mode indicator | center message | key hints
-	// The format is: " CLAUDE  message  q quit ? help tab provider enter activate"
+	// The format is: " CLAUDE  message  [ tab  :provider] [ enter  :activate] [ /  :search]"
 	tests := []struct {
 		name    string
 		message string
@@ -1202,19 +1203,19 @@ func TestStatusBarSeveritySnapshots(t *testing.T) {
 			name:    "success",
 			message: "Exported",
 			want: "" +
-				"  CLAUDE   Exported                                             q   quit   ?   help   tab   provider   enter   activate",
+				"  CLAUDE   Exported                                                 [ tab  :provider] [ enter  :activate] [ /  :search]",
 		},
 		{
 			name:    "warning",
 			message: "No profile selected",
 			want: "" +
-				"  CLAUDE   No profile selected                                  q   quit   ?   help   tab   provider   enter   activate",
+				"  CLAUDE   No profile selected                                      [ tab  :provider] [ enter  :activate] [ /  :search]",
 		},
 		{
 			name:    "error",
 			message: "Export failed",
 			want: "" +
-				"  CLAUDE   Export failed                                        q   quit   ?   help   tab   provider   enter   activate",
+				"  CLAUDE   Export failed                                            [ tab  :provider] [ enter  :activate] [ /  :search]",
 		},
 	}
 
@@ -1606,9 +1607,9 @@ func TestRenderStatusBarThreeSegments(t *testing.T) {
 		t.Errorf("expected CLAUDE mode indicator in status bar, got %q", plainBar)
 	}
 
-	// Should contain key hints
-	if !strings.Contains(plainBar, "quit") {
-		t.Errorf("expected 'quit' key hint in status bar, got %q", plainBar)
+	// Should contain key hints (new format: [key:action])
+	if !strings.Contains(plainBar, "provider") {
+		t.Errorf("expected 'provider' key hint in status bar, got %q", plainBar)
 	}
 
 	// Add a status message and verify layout
@@ -1620,8 +1621,8 @@ func TestRenderStatusBarThreeSegments(t *testing.T) {
 	if !strings.Contains(plainBar, "CLAUDE") {
 		t.Errorf("expected CLAUDE mode indicator with status message, got %q", plainBar)
 	}
-	if !strings.Contains(plainBar, "quit") {
-		t.Errorf("expected 'quit' hint with status message, got %q", plainBar)
+	if !strings.Contains(plainBar, "tab") {
+		t.Errorf("expected 'tab' hint with status message, got %q", plainBar)
 	}
 	// Should have status message
 	if !strings.Contains(plainBar, "Test status") {
