@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 // unixController implements Controller for Unix systems (Linux, macOS, BSD).
@@ -134,7 +135,7 @@ func (c *unixController) ReadOutput() (string, error) {
 	if nread > 0 {
 		return string(buf[:nread]), nil
 	}
-	
+
 	if err != nil {
 		if os.IsTimeout(err) {
 			return "", nil // No data available within timeout
@@ -167,6 +168,7 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 
 	var line []byte
 	buf := make([]byte, 1)
+	fd := int(ptmx.Fd())
 
 	for {
 		// Check context cancellation first
@@ -176,9 +178,16 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 		default:
 		}
 
-		// Set a short deadline to check context periodically
-		if err := ptmx.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-			return string(line), fmt.Errorf("set read deadline: %w", err)
+		pollFd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pollFd, 100)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return string(line), fmt.Errorf("poll pty: %w", err)
+		}
+		if n == 0 {
+			continue
 		}
 
 		nread, err := ptmx.Read(buf)
@@ -188,7 +197,7 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 				return string(line), nil
 			}
 		}
-		
+
 		if err != nil {
 			if err == io.EOF {
 				return string(line), io.EOF
@@ -248,7 +257,7 @@ func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Reg
 				return string(output), nil
 			}
 		}
-		
+
 		if err != nil {
 			if err == io.EOF {
 				return string(output), io.EOF
