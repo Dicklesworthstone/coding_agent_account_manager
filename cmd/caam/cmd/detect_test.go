@@ -9,12 +9,8 @@ import (
 )
 
 func TestCheckPaths(t *testing.T) {
-	// Create temp directory for testing
-	tmpDir, err := os.MkdirTemp("", "caam-detect-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
+	// Create temp directory for testing using t.TempDir() for automatic cleanup
+	tmpDir := t.TempDir()
 
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "test-auth.json")

@@ -62,10 +62,9 @@ func TestServeHelpOutput(t *testing.T) {
 	serveCmd.SetOut(&buf)
 	serveCmd.SetErr(&buf)
 
-	// Run help
-	serveCmd.SetArgs([]string{"--help"})
-	if err := serveCmd.Execute(); err != nil {
-		// Help returns nil error
+	// Use Help() directly to get the serve command's help output
+	if err := serveCmd.Help(); err != nil {
+		t.Fatalf("Help() returned error: %v", err)
 	}
 
 	output := buf.String()
