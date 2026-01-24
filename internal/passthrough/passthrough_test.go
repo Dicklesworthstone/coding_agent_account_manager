@@ -261,6 +261,35 @@ func TestSetupPassthroughs(t *testing.T) {
 		}
 	})
 
+	t.Run("skips existing directories", func(t *testing.T) {
+		conflictDir := filepath.Join(pseudoHome, ".conflictdir")
+		srcDir := filepath.Join(realHome, ".conflictdir")
+
+		if err := os.MkdirAll(srcDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(conflictDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+
+		m2 := &Manager{
+			passthroughs: []string{".conflictdir"},
+			realHome:     realHome,
+		}
+
+		if err := m2.SetupPassthroughs(pseudoHome); err != nil {
+			t.Fatalf("SetupPassthroughs() error = %v", err)
+		}
+
+		info, err := os.Lstat(conflictDir)
+		if err != nil {
+			t.Fatalf("lstat error = %v", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			t.Error("should not replace existing directory with symlink")
+		}
+	})
+
 	t.Run("creates nested parent directories", func(t *testing.T) {
 		nestedSrc := filepath.Join(realHome, ".config", "nested", "file")
 		if err := os.MkdirAll(filepath.Dir(nestedSrc), 0700); err != nil {

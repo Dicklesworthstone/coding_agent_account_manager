@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,6 +69,15 @@ func TestGetProfilesWithNilVault(t *testing.T) {
 	}
 }
 
+func TestGetProfilesWithUnknownTool(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	_, err := h.GetProfiles("unknown-tool")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Errorf("GetProfiles() expected unknown tool error, got %v", err)
+	}
+}
+
 func TestGetUsageWithNilDeps(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
@@ -114,6 +124,20 @@ func TestActivateWithUnknownTool(t *testing.T) {
 	}
 }
 
+func TestActivateWithMissingProfile(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	req := ActivateRequest{
+		Tool:    "codex",
+		Profile: "",
+	}
+
+	_, err := h.Activate(req)
+	if err == nil || !strings.Contains(err.Error(), "profile is required") {
+		t.Errorf("Activate() expected profile required error, got %v", err)
+	}
+}
+
 func TestBackupWithUnknownTool(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
@@ -125,6 +149,65 @@ func TestBackupWithUnknownTool(t *testing.T) {
 	_, err := h.Backup(req)
 	if err == nil {
 		t.Error("Backup() expected error for unknown tool")
+	}
+}
+
+func TestBackupWithMissingProfile(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	req := BackupRequest{
+		Tool:    "codex",
+		Profile: "",
+	}
+
+	_, err := h.Backup(req)
+	if err == nil || !strings.Contains(err.Error(), "profile is required") {
+		t.Errorf("Backup() expected profile required error, got %v", err)
+	}
+}
+
+func TestDeleteProfileWithUnknownTool(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	err := h.DeleteProfile("unknown", "test")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Errorf("DeleteProfile() expected unknown tool error, got %v", err)
+	}
+}
+
+func TestDeleteProfileWithMissingProfile(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	err := h.DeleteProfile("codex", "")
+	if err == nil || !strings.Contains(err.Error(), "profile is required") {
+		t.Errorf("DeleteProfile() expected profile required error, got %v", err)
+	}
+}
+
+func TestDeleteProfileWithNilVault(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	err := h.DeleteProfile("codex", "test")
+	if err == nil {
+		t.Error("DeleteProfile() expected error with nil vault")
+	}
+}
+
+func TestGetProfileWithUnknownTool(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	_, err := h.GetProfile("unknown-tool", "test")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Errorf("GetProfile() expected unknown tool error, got %v", err)
+	}
+}
+
+func TestGetProfileWithNilVault(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	_, err := h.GetProfile("codex", "test")
+	if err == nil {
+		t.Error("GetProfile() expected error with nil vault")
 	}
 }
 

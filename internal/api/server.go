@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +33,8 @@ type Server struct {
 	sseMu        sync.RWMutex
 	eventCh      chan Event
 	shutdownOnce sync.Once
+	shutdownCh   chan struct{}
+	closed       atomic.Bool
 }
 
 // Config holds server configuration.
@@ -62,6 +67,9 @@ func NewServer(cfg Config, handlers *Handlers) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if handlers == nil {
+		return nil, fmt.Errorf("handlers cannot be nil")
+	}
 
 	s := &Server{
 		port:       cfg.Port,
@@ -70,6 +78,7 @@ func NewServer(cfg Config, handlers *Handlers) (*Server, error) {
 		handlers:   handlers,
 		sseClients: make(map[chan Event]struct{}),
 		eventCh:    make(chan Event, 100),
+		shutdownCh: make(chan struct{}),
 	}
 
 	// Load or generate token
@@ -92,7 +101,10 @@ func (s *Server) loadOrGenerateToken() (string, error) {
 	// Try to read existing token
 	data, err := os.ReadFile(s.tokenPath)
 	if err == nil && len(data) > 0 {
-		return string(data), nil
+		token := strings.TrimSpace(string(data))
+		if token != "" {
+			return token, nil
+		}
 	}
 
 	// Generate new token
@@ -159,7 +171,8 @@ func (s *Server) Start() error {
 // Stop gracefully stops the server.
 func (s *Server) Stop(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
-		close(s.eventCh)
+		s.closed.Store(true)
+		close(s.shutdownCh)
 	})
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
@@ -174,6 +187,9 @@ func (s *Server) Port() int {
 
 // Emit sends an event to all SSE clients.
 func (s *Server) Emit(event Event) {
+	if s.closed.Load() {
+		return
+	}
 	select {
 	case s.eventCh <- event:
 	default:
@@ -184,16 +200,21 @@ func (s *Server) Emit(event Event) {
 
 // broadcastEvents sends events to all SSE clients.
 func (s *Server) broadcastEvents() {
-	for event := range s.eventCh {
-		s.sseMu.RLock()
-		for clientCh := range s.sseClients {
-			select {
-			case clientCh <- event:
-			default:
-				// Client slow, skip
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		case event := <-s.eventCh:
+			s.sseMu.RLock()
+			for clientCh := range s.sseClients {
+				select {
+				case clientCh <- event:
+				default:
+					// Client slow, skip
+				}
 			}
+			s.sseMu.RUnlock()
 		}
-		s.sseMu.RUnlock()
 	}
 }
 
@@ -250,7 +271,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		token := auth[len(prefix):]
-		if token != s.token {
+		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) != 1 {
 			s.jsonError(w, http.StatusUnauthorized, "invalid token")
 			return
 		}

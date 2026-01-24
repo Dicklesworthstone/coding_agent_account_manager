@@ -157,7 +157,7 @@ func (h *Handlers) GetStatus() (*StatusResponse, error) {
 			LoggedIn: hasAuth,
 		}
 
-		if hasAuth {
+		if hasAuth && h.vault != nil {
 			activeProfile, err := h.vault.ActiveProfile(fileSet)
 			if err == nil && activeProfile != "" {
 				ts.ActiveProfile = activeProfile
@@ -174,21 +174,24 @@ func (h *Handlers) GetStatus() (*StatusResponse, error) {
 
 // GetProfiles returns profiles, optionally filtered by tool.
 func (h *Handlers) GetProfiles(tool string) (*ProfilesResponse, error) {
-	if h.vault == nil {
-		return nil, fmt.Errorf("vault not available")
-	}
-
 	resp := &ProfilesResponse{
 		Profiles: []ProfileInfo{},
 	}
 
 	if tool != "" {
+		getFileSet, ok := tools[tool]
+		if !ok {
+			return nil, fmt.Errorf("unknown tool: %s", tool)
+		}
+		if h.vault == nil {
+			return nil, fmt.Errorf("vault not available")
+		}
 		profiles, err := h.vault.List(tool)
 		if err != nil {
 			return nil, err
 		}
 
-		fileSet := tools[tool]()
+		fileSet := getFileSet()
 		activeProfile, _ := h.vault.ActiveProfile(fileSet)
 
 		for _, name := range profiles {
@@ -203,13 +206,20 @@ func (h *Handlers) GetProfiles(tool string) (*ProfilesResponse, error) {
 			resp.Profiles = append(resp.Profiles, pi)
 		}
 	} else {
+		if h.vault == nil {
+			return nil, fmt.Errorf("vault not available")
+		}
 		allProfiles, err := h.vault.ListAll()
 		if err != nil {
 			return nil, err
 		}
 
 		for tool, profiles := range allProfiles {
-			fileSet := tools[tool]()
+			getFileSet, ok := tools[tool]
+			if !ok {
+				continue
+			}
+			fileSet := getFileSet()
 			activeProfile, _ := h.vault.ActiveProfile(fileSet)
 
 			for _, name := range profiles {
@@ -232,6 +242,12 @@ func (h *Handlers) GetProfiles(tool string) (*ProfilesResponse, error) {
 
 // GetProfile returns a single profile.
 func (h *Handlers) GetProfile(tool, name string) (*ProfileInfo, error) {
+	if _, ok := tools[tool]; !ok {
+		return nil, fmt.Errorf("unknown tool: %s", tool)
+	}
+	if h.vault == nil {
+		return nil, fmt.Errorf("vault not available")
+	}
 	profiles, err := h.vault.List(tool)
 	if err != nil {
 		return nil, err
@@ -263,6 +279,15 @@ func (h *Handlers) GetProfile(tool, name string) (*ProfileInfo, error) {
 
 // DeleteProfile deletes a profile.
 func (h *Handlers) DeleteProfile(tool, name string) error {
+	if _, ok := tools[tool]; !ok {
+		return fmt.Errorf("unknown tool: %s", tool)
+	}
+	if name == "" {
+		return fmt.Errorf("profile is required")
+	}
+	if h.vault == nil {
+		return fmt.Errorf("vault not available")
+	}
 	if authfile.IsSystemProfile(name) {
 		return fmt.Errorf("cannot delete system profile: %s/%s", tool, name)
 	}
@@ -279,6 +304,9 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 
 	if h.healthStore == nil {
 		return resp, nil
+	}
+	if h.vault == nil {
+		return nil, fmt.Errorf("vault not available")
 	}
 
 	// Get all health data
@@ -329,6 +357,12 @@ func (h *Handlers) Activate(req ActivateRequest) (*ActivateResponse, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown tool: %s", req.Tool)
 	}
+	if req.Profile == "" {
+		return nil, fmt.Errorf("profile is required")
+	}
+	if h.vault == nil {
+		return nil, fmt.Errorf("vault not available")
+	}
 
 	fileSet := getFileSet()
 
@@ -367,6 +401,12 @@ func (h *Handlers) Backup(req BackupRequest) (*BackupResponse, error) {
 	getFileSet, ok := tools[req.Tool]
 	if !ok {
 		return nil, fmt.Errorf("unknown tool: %s", req.Tool)
+	}
+	if req.Profile == "" {
+		return nil, fmt.Errorf("profile is required")
+	}
+	if h.vault == nil {
+		return nil, fmt.Errorf("vault not available")
 	}
 
 	fileSet := getFileSet()

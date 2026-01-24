@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ type CoordinatorEndpoint struct {
 	Name        string    `json:"name"`         // Short name: "csd", "css", "trj"
 	URL         string    `json:"url"`          // Base URL: http://100.x.x.x:7890
 	DisplayName string    `json:"display_name"` // Human-friendly name
+	Token       string    `json:"token,omitempty"`
 	LastCheck   time.Time `json:"-"`
 	IsHealthy   bool      `json:"-"`
 	LastError   string    `json:"-"`
@@ -138,6 +140,15 @@ func (a *MultiAgent) Start(ctx context.Context) error {
 	a.doneCh = make(chan struct{})
 	a.mu.Unlock()
 
+	// Pre-flight check: ensure Chrome is available
+	if !IsChromeAvailable() {
+		a.mu.Lock()
+		a.running = false
+		close(a.doneCh)
+		a.mu.Unlock()
+		return fmt.Errorf("Chrome/Chromium not found. Install Chrome or run 'caam doctor --auto' for guided installation")
+	}
+
 	// Initialize browser
 	a.browser = NewBrowser(BrowserConfig{
 		UserDataDir: a.config.ChromeUserDataDir,
@@ -152,8 +163,18 @@ func (a *MultiAgent) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /accounts", a.handleAccounts)
 	mux.HandleFunc("POST /auth", a.handleAuth)
 
+	addr := fmt.Sprintf("127.0.0.1:%d", a.config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		a.mu.Lock()
+		a.running = false
+		close(a.doneCh)
+		a.mu.Unlock()
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+
 	a.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", a.config.Port),
+		Addr:         addr,
 		Handler:      a.withLogging(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 120 * time.Second,
@@ -165,9 +186,9 @@ func (a *MultiAgent) Start(ctx context.Context) error {
 	// Start HTTP server
 	go func() {
 		a.logger.Info("starting multi-coordinator agent",
-			"port", a.config.Port,
+			"addr", addr,
 			"coordinators", len(a.config.Coordinators))
-		if err := a.server.ListenAndServe(); err != http.ErrServerClosed {
+		if err := a.server.Serve(listener); err != http.ErrServerClosed {
 			a.logger.Error("HTTP server error", "error", err)
 		}
 	}()
@@ -254,6 +275,9 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 		coord.SetHealth(false, err.Error())
 		return
 	}
+	if coord.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+coord.Token)
+	}
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
@@ -266,6 +290,14 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		coord.SetHealth(false, fmt.Sprintf("status %d", resp.StatusCode))
+		a.logger.Debug("coordinator returned non-200",
+			"coordinator", coord.Name,
+			"status", resp.StatusCode)
+		return
+	}
+
 	coord.SetHealth(true, "")
 
 	var pending []struct {
@@ -276,6 +308,7 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
+		coord.SetHealth(false, err.Error())
 		a.logger.Debug("failed to decode pending requests",
 			"coordinator", coord.Name,
 			"error", err)
@@ -372,6 +405,9 @@ func (a *MultiAgent) sendAuthComplete(ctx context.Context, coord *CoordinatorEnd
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if coord.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+coord.Token)
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -505,8 +541,36 @@ func (a *MultiAgent) saveUsage() {
 	}
 
 	dir := filepath.Dir(a.usagePath)
-	os.MkdirAll(dir, 0700)
-	os.WriteFile(a.usagePath, data, 0600)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		a.logger.Warn("failed to create usage dir", "error", err)
+		return
+	}
+
+	tmpFile, err := os.CreateTemp(dir, "account_usage.*.tmp")
+	if err != nil {
+		a.logger.Warn("failed to create temp usage file", "error", err)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath) // Clean up on error; no-op after successful rename
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return
+	}
+
+	if err := os.Rename(tmpPath, a.usagePath); err != nil {
+		a.logger.Warn("failed to rename usage file", "error", err)
+	}
 }
 
 func (a *MultiAgent) withLogging(next http.Handler) http.Handler {
@@ -536,11 +600,11 @@ func (a *MultiAgent) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := map[string]interface{}{
-		"running":             a.running,
-		"coordinator_count":   len(a.config.Coordinators),
+		"running":              a.running,
+		"coordinator_count":    len(a.config.Coordinators),
 		"healthy_coordinators": healthyCount,
-		"account_count":       accountCount,
-		"strategy":            a.config.AccountStrategy,
+		"account_count":        accountCount,
+		"strategy":             a.config.AccountStrategy,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

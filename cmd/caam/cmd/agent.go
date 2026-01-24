@@ -53,14 +53,15 @@ Examples:
 }
 
 var (
-	agentPort          int
-	agentCoordinator   string
-	agentAccounts      []string
-	agentStrategy      string
-	agentChromeProfile string
-	agentHeadless      bool
-	agentVerbose       bool
-	agentConfigPath    string
+	agentPort             int
+	agentCoordinator      string
+	agentCoordinatorToken string
+	agentAccounts         []string
+	agentStrategy         string
+	agentChromeProfile    string
+	agentHeadless         bool
+	agentVerbose          bool
+	agentConfigPath       string
 )
 
 func init() {
@@ -69,6 +70,8 @@ func init() {
 	agentCmd.Flags().IntVar(&agentPort, "port", 7891, "HTTP server port")
 	agentCmd.Flags().StringVar(&agentCoordinator, "coordinator", "http://localhost:7890",
 		"Coordinator URL (via SSH tunnel)")
+	agentCmd.Flags().StringVar(&agentCoordinatorToken, "coordinator-token", "",
+		"Coordinator auth token (shared secret)")
 	agentCmd.Flags().StringSliceVar(&agentAccounts, "accounts", nil,
 		"Google account emails for rotation (comma-separated)")
 	agentCmd.Flags().StringVar(&agentStrategy, "strategy", "lru",
@@ -105,6 +108,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	config := agent.DefaultConfig()
 	config.Port = agentPort
 	config.CoordinatorURL = agentCoordinator
+	config.CoordinatorToken = agentCoordinatorToken
 	config.PollInterval = 2 * time.Second
 	config.ChromeUserDataDir = agentChromeProfile
 	config.Headless = agentHeadless
@@ -301,6 +305,7 @@ type agentFileConfig struct {
 	Port             int                          `json:"port"`
 	CoordinatorURL   string                       `json:"coordinator_url"`
 	Coordinator      string                       `json:"coordinator"`
+	CoordinatorToken string                       `json:"coordinator_token"`
 	PollInterval     string                       `json:"poll_interval"`
 	ChromeProfile    string                       `json:"chrome_profile"`
 	Headless         bool                         `json:"headless"`
@@ -367,6 +372,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 	}
 	cfg.Accounts = raw.Accounts
 	cfg.CoordinatorURL = firstNonEmpty(raw.CoordinatorURL, raw.Coordinator)
+	cfg.CoordinatorToken = raw.CoordinatorToken
 
 	return false, cfg, agent.MultiConfig{}, nil
 }

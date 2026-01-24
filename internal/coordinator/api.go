@@ -2,10 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -14,6 +16,7 @@ type APIServer struct {
 	coordinator *Coordinator
 	server      *http.Server
 	logger      *slog.Logger
+	token       string
 }
 
 // NewAPIServer creates a new API server.
@@ -25,24 +28,50 @@ func NewAPIServer(coordinator *Coordinator, port int, logger *slog.Logger) *APIS
 	api := &APIServer{
 		coordinator: coordinator,
 		logger:      logger,
+		token:       "",
+	}
+	if coordinator != nil {
+		api.token = strings.TrimSpace(coordinator.config.AuthToken)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", api.handleHealth)
-	mux.HandleFunc("GET /status", api.handleStatus)
-	mux.HandleFunc("GET /auth/pending", api.handleGetPending)
-	mux.HandleFunc("POST /auth/complete", api.handleComplete)
-	mux.HandleFunc("POST /auth/submit", api.handleComplete) // alias
-	mux.HandleFunc("GET /panes", api.handleListPanes)
+	mux.HandleFunc("GET /status", api.authMiddleware(api.handleStatus))
+	mux.HandleFunc("GET /auth/pending", api.authMiddleware(api.handleGetPending))
+	mux.HandleFunc("POST /auth/complete", api.authMiddleware(api.handleComplete))
+	mux.HandleFunc("POST /auth/submit", api.authMiddleware(api.handleComplete)) // alias
+	mux.HandleFunc("GET /panes", api.authMiddleware(api.handleListPanes))
 
 	api.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
+		Addr:         fmt.Sprintf("127.0.0.1:%d", port),
 		Handler:      api.withLogging(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
 	return api
+}
+
+func (a *APIServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	token := strings.TrimSpace(a.token)
+	if token == "" {
+		return next
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		provided := strings.TrimSpace(auth[len(prefix):])
+		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Start begins serving the API.

@@ -62,6 +62,10 @@ type Config struct {
 	// LocalAgentURL is the URL of the local auth agent.
 	LocalAgentURL string
 
+	// AuthToken is an optional shared secret required by the coordinator API.
+	// When set, clients must send "Authorization: Bearer <token>".
+	AuthToken string
+
 	// LoginCooldown is the minimum time between /login injections per pane.
 	LoginCooldown time.Duration
 
@@ -402,7 +406,7 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		if tracker.TimeSinceStateChange() > c.config.StateTimeout {
 			c.logger.Info("resetting failed pane after timeout",
 				"pane_id", tracker.PaneID)
-			
+
 			c.cleanupRequest(tracker.GetRequestID())
 			tracker.Reset()
 		}

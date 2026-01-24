@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -70,6 +71,42 @@ func TestLoadOrGenerateToken(t *testing.T) {
 	}
 	if token2 != token1 {
 		t.Errorf("second call returned different token")
+	}
+}
+
+func TestLoadOrGenerateTokenIgnoresWhitespace(t *testing.T) {
+	tmpDir := t.TempDir()
+	tokenPath := filepath.Join(tmpDir, "subdir", ".api_token")
+
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0700); err != nil {
+		t.Fatalf("mkdir token dir: %v", err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("  \n\t"), 0600); err != nil {
+		t.Fatalf("write whitespace token: %v", err)
+	}
+
+	s := &Server{tokenPath: tokenPath}
+	token, err := s.loadOrGenerateToken()
+	if err != nil {
+		t.Fatalf("loadOrGenerateToken() error = %v", err)
+	}
+	if len(token) != 64 {
+		t.Errorf("token length = %d, want 64", len(token))
+	}
+
+	data, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatalf("read token file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != token {
+		t.Errorf("token file not updated, got %q want %q", got, token)
+	}
+}
+
+func TestNewServerWithNilHandlers(t *testing.T) {
+	cfg := DefaultConfig()
+	if _, err := NewServer(cfg, nil); err == nil {
+		t.Error("NewServer() expected error with nil handlers")
 	}
 }
 
@@ -245,6 +282,34 @@ func TestCORSMiddleware(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEmitAfterStopDoesNotPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	handlers := &Handlers{}
+
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, handlers)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := server.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Emit() panicked after Stop(): %v", r)
+		}
+	}()
+
+	server.Emit(Event{Type: "test", Timestamp: time.Now()})
 }
 
 func TestEventBroadcast(t *testing.T) {

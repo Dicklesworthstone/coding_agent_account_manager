@@ -20,7 +20,7 @@ func TestLoadAgentConfigMulti(t *testing.T) {
   "chrome_profile": "/tmp/profile",
   "accounts": ["a@example.com", "b@example.com"],
   "coordinators": [
-    {"name": "csd", "url": "http://100.64.0.1:7890", "display_name": "CSD"}
+    {"name": "csd", "url": "http://100.64.0.1:7890", "display_name": "CSD", "token": "abc123"}
   ]
 }`)
 	if err := os.WriteFile(path, data, 0600); err != nil {
@@ -49,6 +49,9 @@ func TestLoadAgentConfigMulti(t *testing.T) {
 	if len(multiCfg.Coordinators) != 1 || multiCfg.Coordinators[0].URL == "" {
 		t.Fatalf("expected one coordinator, got %+v", multiCfg.Coordinators)
 	}
+	if multiCfg.Coordinators[0].Token != "abc123" {
+		t.Fatalf("Coordinator token = %q, want %q", multiCfg.Coordinators[0].Token, "abc123")
+	}
 }
 
 func TestLoadAgentConfigSingle(t *testing.T) {
@@ -61,7 +64,8 @@ func TestLoadAgentConfigSingle(t *testing.T) {
   "strategy": "round_robin",
   "chrome_profile": "/tmp/profile",
   "accounts": ["a@example.com", "b@example.com"],
-  "coordinator_url": "http://localhost:7890"
+  "coordinator_url": "http://localhost:7890",
+  "coordinator_token": "shhh"
 }`)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -88,5 +92,8 @@ func TestLoadAgentConfigSingle(t *testing.T) {
 	}
 	if cfg.CoordinatorURL != "http://localhost:7890" {
 		t.Fatalf("CoordinatorURL = %q, want %q", cfg.CoordinatorURL, "http://localhost:7890")
+	}
+	if cfg.CoordinatorToken != "shhh" {
+		t.Fatalf("CoordinatorToken = %q, want %q", cfg.CoordinatorToken, "shhh")
 	}
 }

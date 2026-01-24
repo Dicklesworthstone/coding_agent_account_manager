@@ -92,6 +92,9 @@ func (w *Watcher) Start(ctx context.Context) error {
 		return fmt.Errorf("watcher already running")
 	}
 	w.watching = true
+	// Recreate channels for this run (in case of restart after Stop)
+	w.stopCh = make(chan struct{})
+	w.doneCh = make(chan struct{})
 	w.mu.Unlock()
 
 	// Add watches for all auth file directories
@@ -128,10 +131,17 @@ func (w *Watcher) Stop() error {
 		w.mu.Unlock()
 		return nil
 	}
+	w.watching = false
+	stopCh := w.stopCh
+	doneCh := w.doneCh
 	w.mu.Unlock()
 
-	close(w.stopCh)
-	<-w.doneCh
+	select {
+	case <-stopCh:
+	default:
+		close(stopCh)
+	}
+	<-doneCh
 	return w.watcher.Close()
 }
 

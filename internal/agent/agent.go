@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,9 @@ type Config struct {
 
 	// CoordinatorURL is the URL of the remote coordinator.
 	CoordinatorURL string
+
+	// CoordinatorToken is an optional shared secret for coordinator API calls.
+	CoordinatorToken string
 
 	// PollInterval is how often to poll for pending requests.
 	PollInterval time.Duration
@@ -76,16 +80,16 @@ type AccountUsage struct {
 
 // Agent handles OAuth completion for the coordinator.
 type Agent struct {
-	config        Config
-	logger        *slog.Logger
-	server        *http.Server
-	browser       *Browser
-	accountUsage  map[string]*AccountUsage
-	usagePath     string
-	mu            sync.RWMutex
-	stopCh        chan struct{}
-	doneCh        chan struct{}
-	running       bool
+	config       Config
+	logger       *slog.Logger
+	server       *http.Server
+	browser      *Browser
+	accountUsage map[string]*AccountUsage
+	usagePath    string
+	mu           sync.RWMutex
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+	running      bool
 
 	// Callbacks
 	OnAuthStart    func(url, account string)
@@ -133,6 +137,10 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Pre-flight check: ensure Chrome is available
 	if !IsChromeAvailable() {
+		a.mu.Lock()
+		a.running = false
+		close(a.doneCh)
+		a.mu.Unlock()
 		return fmt.Errorf("Chrome/Chromium not found. Install Chrome or run 'caam doctor --auto' for guided installation")
 	}
 
@@ -152,8 +160,18 @@ func (a *Agent) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /auth", a.handleAuth)
 	mux.HandleFunc("GET /accounts", a.handleAccounts)
 
+	addr := fmt.Sprintf("127.0.0.1:%d", a.config.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		a.mu.Lock()
+		a.running = false
+		close(a.doneCh)
+		a.mu.Unlock()
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+
 	a.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", a.config.Port),
+		Addr:         addr,
 		Handler:      a.withLogging(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 120 * time.Second, // Long timeout for OAuth
@@ -169,8 +187,8 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	// Start HTTP server
 	go func() {
-		a.logger.Info("starting agent HTTP server", "port", a.config.Port)
-		if err := a.server.ListenAndServe(); err != http.ErrServerClosed {
+		a.logger.Info("starting agent HTTP server", "addr", addr)
+		if err := a.server.Serve(listener); err != http.ErrServerClosed {
 			a.logger.Error("HTTP server error", "error", err)
 		}
 	}()
@@ -241,13 +259,22 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	if a.config.CoordinatorToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		a.logger.Debug("failed to reach coordinator", "error", err)
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		a.logger.Debug("coordinator returned non-200", "status", resp.StatusCode)
+		return
+	}
 
 	var pending []struct {
 		ID        string    `json:"id"`
@@ -330,8 +357,12 @@ func (a *Agent) sendAuthComplete(ctx context.Context, requestID, code, account, 
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if a.config.CoordinatorToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		a.logger.Error("failed to send auth complete", "error", err)
 		return

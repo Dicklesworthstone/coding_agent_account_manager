@@ -107,10 +107,15 @@ func (m *Manager) SetupPassthroughs(pseudoHome string) error {
 			return fmt.Errorf("create parent dir for %s: %w", relPath, err)
 		}
 
-		// Remove existing file/symlink if present
-		if _, err := os.Lstat(linkPath); err == nil {
-			if err := os.Remove(linkPath); err != nil {
-				return fmt.Errorf("remove existing %s: %w", relPath, err)
+		// Remove existing file/symlink if present. If a real directory exists,
+		// keep it to avoid destructive behavior in the profile home.
+		if info, err := os.Lstat(linkPath); err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				if err := os.Remove(linkPath); err != nil {
+					return fmt.Errorf("remove existing %s: %w", relPath, err)
+				}
+			} else {
+				continue
 			}
 		}
 

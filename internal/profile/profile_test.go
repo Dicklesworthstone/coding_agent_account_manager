@@ -551,6 +551,25 @@ func TestStoreCreate(t *testing.T) {
 	}
 }
 
+func TestStoreAllowsPlusInName(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewStore(tmpDir)
+
+	prof, err := store.Create("codex", "work+tag", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if prof.Name != "work+tag" {
+		t.Errorf("Name = %q, want %q", prof.Name, "work+tag")
+	}
+
+	metaPath := filepath.Join(tmpDir, "codex", "work+tag", "profile.json")
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		t.Error("expected profile.json to exist for work+tag")
+	}
+}
+
 func TestStoreRejectsUnsafeSegments(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewStore(tmpDir)

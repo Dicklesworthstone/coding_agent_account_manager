@@ -390,6 +390,31 @@ func TestAPIStatusEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPITokenAuth(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AuthToken = "secret-token"
+	coord := New(cfg)
+	coord.paneClient = &fakePaneClient{}
+
+	api := NewAPIServer(coord, 0, nil)
+	handler := api.authMiddleware(api.handleStatus)
+
+	req := httptest.NewRequest("GET", "/status", nil)
+	w := httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/status", nil)
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w = httptest.NewRecorder()
+	handler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+}
+
 // TestAPIGetPendingEndpoint tests the /auth/pending endpoint.
 func TestAPIGetPendingEndpoint(t *testing.T) {
 	cfg := DefaultConfig()

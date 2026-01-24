@@ -65,6 +65,7 @@ var (
 	coordinatorJSONLogs     bool
 	coordinatorBackend      string
 	coordinatorConfigPath   string
+	coordinatorAuthToken    string
 )
 
 func init() {
@@ -80,6 +81,7 @@ func init() {
 	coordinatorCmd.Flags().StringVar(&coordinatorBackend, "backend", "auto",
 		"Terminal multiplexer backend: wezterm (preferred), tmux, or auto")
 	coordinatorCmd.Flags().StringVar(&coordinatorConfigPath, "config", "", "Path to JSON config file")
+	coordinatorCmd.Flags().StringVar(&coordinatorAuthToken, "auth-token", "", "Auth token for coordinator API (shared secret)")
 }
 
 func runCoordinator(cmd *cobra.Command, args []string) error {
@@ -126,6 +128,11 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	}
 	if cmd.Flags().Changed("port") {
 		apiPort = coordinatorPort
+	}
+	if cmd.Flags().Changed("auth-token") {
+		config.AuthToken = coordinatorAuthToken
+	} else if envToken := strings.TrimSpace(os.Getenv("CAAM_COORDINATOR_TOKEN")); envToken != "" {
+		config.AuthToken = envToken
 	}
 
 	config.Logger = logger
@@ -180,6 +187,9 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Backend: %s\n", coord.Backend())
 	fmt.Printf("  API: http://localhost:%d\n", apiPort)
 	fmt.Printf("  Poll interval: %dms\n", int(config.PollInterval.Milliseconds()))
+	if config.AuthToken != "" {
+		fmt.Println("  Auth: token required")
+	}
 	if coord.Backend() == "tmux" {
 		fmt.Println("\nNote: Using tmux fallback. WezTerm is recommended for better integration.")
 	}
@@ -229,6 +239,7 @@ type coordinatorFileConfig struct {
 	ResumeCooldown string `json:"resume_cooldown"`
 	OutputLines    int    `json:"output_lines"`
 	Backend        string `json:"backend"`
+	AuthToken      string `json:"auth_token"`
 }
 
 func loadCoordinatorConfig(path string) (coordinator.Config, int, error) {
@@ -287,6 +298,9 @@ func loadCoordinatorConfig(path string) (coordinator.Config, int, error) {
 			return coordinator.Config{}, 0, err
 		}
 		cfg.Backend = backend
+	}
+	if raw.AuthToken != "" {
+		cfg.AuthToken = raw.AuthToken
 	}
 
 	return cfg, apiPort, nil
