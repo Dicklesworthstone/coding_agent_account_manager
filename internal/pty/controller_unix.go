@@ -189,6 +189,13 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 		if n == 0 {
 			continue
 		}
+		revents := pollFd[0].Revents
+		if revents&(unix.POLLERR|unix.POLLNVAL) != 0 && revents&unix.POLLIN == 0 {
+			return string(line), fmt.Errorf("pty poll error: revents=%d", revents)
+		}
+		if revents&unix.POLLHUP != 0 && revents&unix.POLLIN == 0 {
+			return string(line), io.EOF
+		}
 
 		nread, err := ptmx.Read(buf)
 		if nread > 0 {
