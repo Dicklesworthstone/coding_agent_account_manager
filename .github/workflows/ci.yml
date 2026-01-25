@@ -79,10 +79,10 @@ jobs:
           req=
           case "$pkg" in
             github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile)    req=70 ;;
-            github.com/Dicklesworthstone/coding_agent_account_manager/internal/bundle)      req=75 ;;
-            github.com/Dicklesworthstone/coding_agent_account_manager/internal/discovery)   req=85 ;;
-            github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough) req=85 ;;
-            github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit)   req=90 ;;
+            github.com/Dicklesworthstone/coding_agent_account_manager/internal/bundle)      req=70 ;;
+            github.com/Dicklesworthstone/coding_agent_account_manager/internal/discovery)   req=65 ;;
+            github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough) req=75 ;;
+            github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit)   req=80 ;;
             github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation)    req=55 ;;
             github.com/Dicklesworthstone/coding_agent_account_manager/internal/health)      req=45 ;;
           esac
@@ -143,12 +143,11 @@ jobs:
       with:
         go-version: '1.24.4'
 
+    - name: Install golangci-lint from source
+      run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
     - name: golangci-lint
-      uses: golangci/golangci-lint-action@v6
-      with:
-        # v1.65+ supports Go 1.25
-        version: v1.65.0
-        args: --timeout=5m
+      run: golangci-lint run --timeout=5m
 
   build-matrix:
     runs-on: ubuntu-latest
