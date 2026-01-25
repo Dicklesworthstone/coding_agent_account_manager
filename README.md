@@ -24,6 +24,23 @@ caam activate claude bob@gmail.com      # Switch instantly
 
 ---
 
+## 🤖 Agent Quickstart (JSON)
+
+**Use `--json` in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
+
+```bash
+# List available profiles (machine-readable)
+caam list --json
+
+# Show current status for all tools
+caam status --json
+
+# Switch accounts
+caam activate claude alice@gmail.com --json
+```
+
+---
+
 ## The Problem
 
 You're paying $200-275/month for fixed-cost AI coding subscriptions (Claude Max, GPT Pro, Gemini Ultra). These plans have usage limits—not billing caps, but rate limits that reset over time. When you hit them mid-flow, the official way to switch accounts:
