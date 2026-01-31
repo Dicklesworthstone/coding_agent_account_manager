@@ -38,7 +38,7 @@ Examples:
 		// Validate provider using centralized metadata
 		meta, ok := provider.GetProviderMeta(tool)
 		if !ok {
-			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini, cursor)", tool)
 		}
 
 		// Allow custom URL override

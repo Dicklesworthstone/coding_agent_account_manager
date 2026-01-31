@@ -302,7 +302,7 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 		if !validProviders[providerFilter] {
 			return robotError(cmd, "status", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", providerFilter),
-				"valid providers: codex, claude, gemini",
+				"valid providers: codex, claude, gemini, cursor",
 				[]string{"caam robot status claude", "caam robot status codex", "caam robot status gemini"})
 		}
 		providersToCheck = []string{providerFilter}
@@ -628,7 +628,7 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "next", "INVALID_PROVIDER",
 			fmt.Sprintf("unknown provider: %s", provider),
-			"valid providers: codex, claude, gemini",
+			"valid providers: codex, claude, gemini, cursor",
 			nil)
 	}
 
@@ -809,7 +809,7 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "act", "INVALID_PROVIDER",
 			fmt.Sprintf("unknown provider: %s", provider),
-			"valid providers: codex, claude, gemini",
+			"valid providers: codex, claude, gemini, cursor",
 			nil)
 	}
 
@@ -1094,7 +1094,7 @@ func runRobotWatch(cmd *cobra.Command, args []string) error {
 		if _, ok := tools[providerFilter]; !ok {
 			return robotError(cmd, "watch", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", providerFilter),
-				"valid providers: codex, claude, gemini",
+				"valid providers: codex, claude, gemini, cursor",
 				nil)
 		}
 	}
@@ -1377,7 +1377,7 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "limits", "INVALID_PROVIDER",
 			fmt.Sprintf("unknown provider: %s", provider),
-			"valid providers: codex, claude, gemini",
+			"valid providers: codex, claude, gemini, cursor",
 			nil)
 	}
 
@@ -1506,7 +1506,7 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "precheck", "INVALID_PROVIDER",
 			fmt.Sprintf("unknown provider: %s", provider),
-			"valid providers: codex, claude, gemini",
+			"valid providers: codex, claude, gemini, cursor",
 			nil)
 	}
 
@@ -1690,7 +1690,7 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 		if _, ok := tools[provider]; !ok {
 			return robotError(cmd, "validate", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", provider),
-				"valid providers: codex, claude, gemini",
+				"valid providers: codex, claude, gemini, cursor",
 				nil)
 		}
 		providersToCheck = []string{provider}

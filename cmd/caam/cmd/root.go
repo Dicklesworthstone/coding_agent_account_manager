@@ -29,6 +29,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tui"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
@@ -53,6 +54,7 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"codex":  authfile.CodexAuthFiles,
 	"claude": authfile.ClaudeAuthFiles,
 	"gemini": authfile.GeminiAuthFiles,
+	"cursor": authfile.CursorAuthFiles,
 }
 
 // getDB returns the global database connection, initializing it if necessary.
@@ -77,7 +79,7 @@ var rootCmd = &cobra.Command{
 	Short: "Coding Agent Account Manager - instant auth switching",
 	Long: `caam (Coding Agent Account Manager) manages auth files for AI coding CLIs
 to enable instant account switching for "all you can eat" subscription plans
-(GPT Pro, Claude Max, Gemini Ultra).
+(GPT Pro, Claude Max, Gemini Ultra, Cursor Pro).
 
 When you hit usage limits on one account, switch to another in under a second:
 
@@ -91,6 +93,7 @@ Supported tools:
   - codex   (OpenAI Codex CLI / GPT Pro)
   - claude  (Anthropic Claude Code / Claude Max)
   - gemini  (Google Gemini CLI / Gemini Ultra)
+  - cursor  (Cursor CLI / Cursor Pro)
 
 Advanced: Profile isolation for simultaneous sessions:
   caam profile add codex work
@@ -124,6 +127,7 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		registry.Register(codex.New())
 		registry.Register(claude.New())
 		registry.Register(gemini.New())
+		registry.Register(cursor.New())
 
 		// Initialize runner
 		runner = exec.NewRunner(registry)
@@ -599,7 +603,7 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool))
+		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool))
 	}
 
 	fileSet := getFileSet()

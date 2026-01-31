@@ -56,7 +56,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	// Validate tool
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool)
 	}
 
 	// Ensure vault is initialized

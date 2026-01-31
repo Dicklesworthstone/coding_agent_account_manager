@@ -79,7 +79,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		toolFilter = strings.ToLower(args[0])
 		if _, ok := tools[toolFilter]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", toolFilter)
+			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", toolFilter)
 		}
 	}
 

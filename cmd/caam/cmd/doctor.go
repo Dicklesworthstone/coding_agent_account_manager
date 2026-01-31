@@ -85,7 +85,7 @@ var doctorCmd = &cobra.Command{
 	Long: `Runs diagnostic checks on your caam installation and reports any issues.
 
 Checks performed:
-  - CLI tools: Are codex, claude, gemini installed and in PATH?
+  - CLI tools: Are codex, claude, gemini, cursor installed and in PATH?
   - Dependencies: Are optional tools (gum, wezterm, tailscale, playwright, etc.) available?
   - Data directories: Do vault/profiles directories exist with correct permissions?
   - Config: Is the configuration valid?

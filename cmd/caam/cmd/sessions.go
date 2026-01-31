@@ -74,7 +74,7 @@ Examples:
 
 func init() {
 	rootCmd.AddCommand(sessionsCmd)
-	sessionsCmd.Flags().String("provider", "", "filter by provider (codex, claude, gemini)")
+	sessionsCmd.Flags().String("provider", "", "filter by provider (codex, claude, gemini, cursor)")
 	sessionsCmd.Flags().Bool("json", false, "output in JSON format")
 }
 

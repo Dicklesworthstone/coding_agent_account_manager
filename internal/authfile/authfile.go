@@ -157,6 +157,24 @@ func GeminiAuthFiles() AuthFileSet {
 	}
 }
 
+// CursorAuthFiles returns the auth files for Cursor CLI.
+// Cursor stores OAuth credentials in ~/.cursor/cli-config.json.
+func CursorAuthFiles() AuthFileSet {
+	homeDir, _ := os.UserHomeDir()
+
+	return AuthFileSet{
+		Tool: "cursor",
+		Files: []AuthFileSpec{
+			{
+				Tool:        "cursor",
+				Path:        filepath.Join(homeDir, ".cursor", "cli-config.json"),
+				Description: "Cursor CLI config with OAuth credentials",
+				Required:    true,
+			},
+		},
+	}
+}
+
 // GetAuthFileSet returns the AuthFileSet for the given provider name.
 func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 	switch strings.ToLower(provider) {
@@ -166,6 +184,8 @@ func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 		return CodexAuthFiles(), true
 	case "gemini":
 		return GeminiAuthFiles(), true
+	case "cursor":
+		return CursorAuthFiles(), true
 	default:
 		return AuthFileSet{}, false
 	}

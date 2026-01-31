@@ -46,7 +46,7 @@ var projectSetCmd = &cobra.Command{
 		profileName := args[1]
 
 		if _, ok := tools[tool]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool)
 		}
 		if projectStore == nil {
 			return fmt.Errorf("project store not initialized")
@@ -205,7 +205,7 @@ var projectRemoveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool)
 		}
 		if projectStore == nil {
 			return fmt.Errorf("project store not initialized")

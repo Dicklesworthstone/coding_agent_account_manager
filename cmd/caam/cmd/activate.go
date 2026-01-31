@@ -109,7 +109,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool))
+		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool))
 	}
 
 	// Ensure vault is initialized before using it

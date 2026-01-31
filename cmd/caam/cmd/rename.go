@@ -50,7 +50,7 @@ func runRename(cmd *cobra.Command, args []string) error {
 
 	// Validate tool
 	if _, ok := tools[tool]; !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini, cursor)", tool)
 	}
 
 	// Initialize vault if needed
