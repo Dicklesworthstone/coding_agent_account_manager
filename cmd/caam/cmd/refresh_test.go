@@ -149,7 +149,7 @@ func TestRefreshSingle_SkipsWhenUnsupported(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	// No oauth_credentials.json present, so refresh should be treated as unsupported and skipped.
+	// No oauth_creds.json present, so refresh should be treated as unsupported and skipped.
 	if err := refreshSingle(context.Background(), "gemini", "main", 10*time.Minute, false, false, true); err != nil {
 		t.Fatalf("refreshSingle() error = %v", err)
 	}
@@ -209,7 +209,7 @@ func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalIndent() error = %v", err)
 	}
-	oauthCredPath := filepath.Join(profileDir, "oauth_credentials.json")
+	oauthCredPath := filepath.Join(profileDir, "oauth_creds.json")
 	if err := os.WriteFile(oauthCredPath, adcRaw, 0600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}

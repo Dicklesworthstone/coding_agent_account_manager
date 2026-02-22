@@ -143,6 +143,8 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		authPath := filepath.Join(vaultPath, "auth.json")
 		expInfo, err = health.ParseCodexExpiry(authPath)
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 

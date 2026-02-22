@@ -474,7 +474,7 @@ func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, er
 		return nil, fmt.Errorf("codex auth not found")
 
 	case "gemini":
-		if strings.HasSuffix(path, "settings.json") || strings.HasSuffix(path, "oauth_credentials.json") {
+		if strings.HasSuffix(path, "settings.json") || strings.HasSuffix(path, "oauth_creds.json") {
 			return identity.ExtractFromGeminiConfig(path)
 		}
 		// Check default location

@@ -127,13 +127,16 @@ func refreshCodex(ctx context.Context, vaultPath string) error {
 }
 
 func refreshGemini(ctx context.Context, provider, profile string, store *health.Storage, vaultPath string) error {
+	// Migrate legacy vault filename before reading.
+	_ = authfile.MigrateGeminiVaultDir(vaultPath)
+
 	info, err := health.ParseGeminiExpiry(vaultPath)
 	if err != nil {
 		return fmt.Errorf("parse gemini auth: %w", err)
 	}
 
 	settingsPath := filepath.Join(vaultPath, "settings.json")
-	oauthCredPath := filepath.Join(vaultPath, "oauth_credentials.json")
+	oauthCredPath := filepath.Join(vaultPath, "oauth_creds.json")
 
 	var adc *ADC
 	for _, candidate := range []string{oauthCredPath, settingsPath} {
@@ -152,7 +155,7 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 	}
 
 	if adc == nil {
-		return &UnsupportedError{Provider: provider, Reason: "missing oauth client credentials (expected oauth_credentials.json with client_id/client_secret/refresh_token)"}
+		return &UnsupportedError{Provider: provider, Reason: "missing oauth client credentials (expected oauth_creds.json with client_id/client_secret/refresh_token)"}
 	}
 
 	resp, err := RefreshGeminiToken(ctx, adc.ClientID, adc.ClientSecret, adc.RefreshToken)

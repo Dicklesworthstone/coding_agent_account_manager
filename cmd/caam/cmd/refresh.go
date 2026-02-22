@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
@@ -312,6 +313,8 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 	case "codex":
 		return health.ParseCodexExpiry(filepath.Join(vaultPath, "auth.json"))
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		return health.ParseGeminiExpiry(vaultPath)
 	default:
 		return nil, fmt.Errorf("refresh not supported for tool: %s", tool)

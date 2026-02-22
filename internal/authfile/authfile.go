@@ -142,7 +142,7 @@ func GeminiAuthFiles() AuthFileSet {
 			// Additional auth files that may store tokens
 			{
 				Tool:        "gemini",
-				Path:        filepath.Join(geminiHome, "oauth_credentials.json"),
+				Path:        filepath.Join(geminiHome, "oauth_creds.json"),
 				Description: "Gemini CLI OAuth credentials cache",
 				Required:    false,
 			},
@@ -480,6 +480,34 @@ func (v *Vault) BackupOriginal(fileSet AuthFileSet) (bool, error) {
 	return true, nil
 }
 
+// MigrateGeminiVaultDir renames oauth_credentials.json to oauth_creds.json in a
+// vault profile directory if the old name exists and the new name does not.
+// CAAM previously stored "oauth_credentials.json" but Gemini CLI reads "oauth_creds.json".
+// This is a no-op if the directory already has the new name or has no OAuth file.
+func MigrateGeminiVaultDir(dir string) error {
+	oldName := filepath.Join(dir, "oauth_credentials.json")
+	newName := filepath.Join(dir, "oauth_creds.json")
+	if _, err := os.Stat(oldName); err != nil {
+		if os.IsNotExist(err) {
+			return nil // old file doesn't exist, nothing to migrate
+		}
+		return err // permission or I/O error
+	}
+	if _, err := os.Stat(newName); err == nil {
+		// New file already exists; remove legacy file to avoid confusion.
+		_ = os.Remove(oldName)
+		return nil
+	}
+	if err := os.Rename(oldName, newName); err != nil {
+		// Handle race: another process may have completed the migration.
+		if _, statErr := os.Stat(newName); statErr == nil {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // Restore copies backed-up auth files to their original locations.
 func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
@@ -489,6 +517,13 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 
 	if _, err := os.Stat(profileDir); os.IsNotExist(err) {
 		return fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", fileSet.Tool, profile, fileSet.Tool)
+	}
+
+	// Migrate legacy Gemini OAuth filename in vault.
+	if fileSet.Tool == "gemini" {
+		if err := MigrateGeminiVaultDir(profileDir); err != nil {
+			return fmt.Errorf("vault migration (oauth_credentials.json -> oauth_creds.json): %w", err)
+		}
 	}
 
 	restored := 0

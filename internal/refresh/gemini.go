@@ -124,7 +124,7 @@ func UpdateGeminiAuth(path string, resp *GoogleTokenResponse) error {
 		updated = true
 	}
 
-	// If no nested structure found, or if we want to support flat files too (like oauth_credentials.json),
+	// If no nested structure found, or if we want to support flat files too (like oauth_creds.json),
 	// we check if we should update the top level.
 	// If we updated a nested object, we shouldn't update top level unless it ALSO has token fields.
 	// But usually it's one or the other.

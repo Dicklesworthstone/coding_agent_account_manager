@@ -125,7 +125,7 @@ This creates unnecessary friction in the critical first-use experience.
 **Why:**
 - Claude: `~/.claude.json`, `~/.config/claude-code/auth.json`, `~/.claude/settings.json` (apiKeyHelper)
 - Codex: `~/.codex/auth.json` (file store enforced)
-- Gemini: `~/.gemini/settings.json`, `~/.gemini/oauth_credentials.json`, `~/.gemini/.env` (API key)
+- Gemini: `~/.gemini/settings.json`, `~/.gemini/oauth_creds.json`, `~/.gemini/.env` (API key)
 - Detection enables import and status reporting
 
 **Design Decisions:**

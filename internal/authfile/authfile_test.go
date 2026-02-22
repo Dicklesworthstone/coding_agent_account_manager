@@ -409,6 +409,111 @@ func TestVaultRestore(t *testing.T) {
 	})
 }
 
+func TestMigrateGeminiVaultDir(t *testing.T) {
+	t.Run("renames old file to new", func(t *testing.T) {
+		dir := t.TempDir()
+		oldPath := filepath.Join(dir, "oauth_credentials.json")
+		newPath := filepath.Join(dir, "oauth_creds.json")
+		if err := os.WriteFile(oldPath, []byte(`{"client_id":"x"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateGeminiVaultDir(dir); err != nil {
+			t.Fatalf("MigrateGeminiVaultDir() error = %v", err)
+		}
+		if _, err := os.Stat(newPath); err != nil {
+			t.Errorf("new file should exist: %v", err)
+		}
+		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+			t.Errorf("old file should not exist after rename")
+		}
+	})
+
+	t.Run("no-op when new file already exists", func(t *testing.T) {
+		dir := t.TempDir()
+		oldPath := filepath.Join(dir, "oauth_credentials.json")
+		newPath := filepath.Join(dir, "oauth_creds.json")
+		if err := os.WriteFile(oldPath, []byte(`old`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(newPath, []byte(`new`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateGeminiVaultDir(dir); err != nil {
+			t.Fatalf("MigrateGeminiVaultDir() error = %v", err)
+		}
+		data, _ := os.ReadFile(newPath)
+		if string(data) != "new" {
+			t.Errorf("new file should be unchanged, got %q", data)
+		}
+	})
+
+	t.Run("no-op when no old file", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := MigrateGeminiVaultDir(dir); err != nil {
+			t.Fatalf("MigrateGeminiVaultDir() error = %v", err)
+		}
+	})
+
+	t.Run("idempotent", func(t *testing.T) {
+		dir := t.TempDir()
+		oldPath := filepath.Join(dir, "oauth_credentials.json")
+		newPath := filepath.Join(dir, "oauth_creds.json")
+		if err := os.WriteFile(oldPath, []byte(`{"client_id":"x"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// Run twice
+		if err := MigrateGeminiVaultDir(dir); err != nil {
+			t.Fatal(err)
+		}
+		if err := MigrateGeminiVaultDir(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(newPath)
+		if string(data) != `{"client_id":"x"}` {
+			t.Errorf("content should survive double migration, got %q", data)
+		}
+	})
+}
+
+func TestVaultRestore_MigratesGeminiFilename(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+
+	// Create vault profile with OLD filename
+	profileDir := filepath.Join(vaultDir, "gemini", "testprofile")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldContent := []byte(`{"client_id":"test","client_secret":"s","refresh_token":"r"}`)
+	if err := os.WriteFile(filepath.Join(profileDir, "oauth_credentials.json"), oldContent, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(vaultDir)
+	authFile := filepath.Join(authDir, ".gemini", "oauth_creds.json")
+	fileSet := AuthFileSet{
+		Tool: "gemini",
+		Files: []AuthFileSpec{
+			{Tool: "gemini", Path: authFile, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+
+	if err := v.Restore(fileSet, "testprofile"); err != nil {
+		t.Fatalf("Restore() error = %v", err)
+	}
+
+	// Verify the file was restored to the NEW name location
+	restored, err := os.ReadFile(authFile)
+	if err != nil {
+		t.Fatalf("restored file should exist at new path: %v", err)
+	}
+	if string(restored) != string(oldContent) {
+		t.Errorf("restored content = %q, want %q", restored, oldContent)
+	}
+}
+
 func TestVaultList(t *testing.T) {
 	t.Run("empty vault returns empty list", func(t *testing.T) {
 		tmpDir := t.TempDir()

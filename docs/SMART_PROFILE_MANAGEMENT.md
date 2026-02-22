@@ -467,7 +467,7 @@ Options considered:
 ```
 
 ### Google Gemini
-- Auth files: `~/.gemini/settings.json`, `~/.gemini/oauth_credentials.json`
+- Auth files: `~/.gemini/settings.json`, `~/.gemini/oauth_creds.json`
 - API key mode: `~/.gemini/.env`
 - Vertex AI ADC: `~/.config/gcloud/application_default_credentials.json`
 - Token endpoint: `https://oauth2.googleapis.com/token`

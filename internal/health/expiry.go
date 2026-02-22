@@ -248,7 +248,7 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 //
 // Gemini CLI stores auth in:
 //   - ~/.gemini/settings.json
-//   - ~/.gemini/oauth_credentials.json (optional)
+//   - ~/.gemini/oauth_creds.json (optional)
 //
 // Note: Google OAuth tokens via ADC may not include expiry in the file itself.
 // The expiry is typically short-lived and requires refresh.
@@ -272,8 +272,8 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		return info, nil
 	}
 
-	// Try oauth_credentials.json
-	oauthPath := filepath.Join(authDir, "oauth_credentials.json")
+	// Try oauth_creds.json
+	oauthPath := filepath.Join(authDir, "oauth_creds.json")
 	info, err = parseOAuthFile(oauthPath)
 	if err == nil {
 		info.Source = oauthPath

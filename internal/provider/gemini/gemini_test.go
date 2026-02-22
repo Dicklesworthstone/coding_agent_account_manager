@@ -113,16 +113,16 @@ func TestAuthFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("second file is oauth_credentials.json and optional", func(t *testing.T) {
+	t.Run("second file is oauth_creds.json and optional", func(t *testing.T) {
 		p := New()
 		files := p.AuthFiles()
 
 		file := files[1]
-		if !strings.HasSuffix(file.Path, "oauth_credentials.json") {
-			t.Errorf("AuthFiles()[1].Path = %q, should end with oauth_credentials.json", file.Path)
+		if !strings.HasSuffix(file.Path, "oauth_creds.json") {
+			t.Errorf("AuthFiles()[1].Path = %q, should end with oauth_creds.json", file.Path)
 		}
 		if file.Required {
-			t.Error("oauth_credentials.json should be optional")
+			t.Error("oauth_creds.json should be optional")
 		}
 	})
 
@@ -980,13 +980,13 @@ func TestDetectExistingAuth(t *testing.T) {
 		}
 	})
 
-	t.Run("detects oauth_credentials.json", func(t *testing.T) {
+	t.Run("detects oauth_creds.json", func(t *testing.T) {
 		home, _ := setupEnv(t)
 		p := New()
 
 		geminiDir := filepath.Join(home, ".gemini")
 		os.MkdirAll(geminiDir, 0700)
-		path := filepath.Join(geminiDir, "oauth_credentials.json")
+		path := filepath.Join(geminiDir, "oauth_creds.json")
 		writeJSON(t, path, map[string]interface{}{"access_token": "valid"})
 
 		detection, err := p.DetectExistingAuth()

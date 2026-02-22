@@ -2053,9 +2053,11 @@ func vaultIdentityEmail(provider, profileDir string) string {
 	case "claude":
 		id, _ = identity.ExtractFromClaudeCredentials(filepath.Join(profileDir, ".credentials.json"))
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(profileDir)
 		id, _ = identity.ExtractFromGeminiConfig(filepath.Join(profileDir, "settings.json"))
 		if id == nil {
-			id, _ = identity.ExtractFromGeminiConfig(filepath.Join(profileDir, "oauth_credentials.json"))
+			id, _ = identity.ExtractFromGeminiConfig(filepath.Join(profileDir, "oauth_creds.json"))
 		}
 	}
 	if id == nil {

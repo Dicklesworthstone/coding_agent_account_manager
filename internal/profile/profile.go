@@ -133,7 +133,7 @@ func (p *Profile) LoadIdentity() {
 	case "gemini":
 		candidates := []string{
 			filepath.Join(p.HomePath(), ".gemini", "settings.json"),
-			filepath.Join(p.HomePath(), ".gemini", "oauth_credentials.json"),
+			filepath.Join(p.HomePath(), ".gemini", "oauth_creds.json"),
 		}
 		if strings.EqualFold(p.AuthMode, "vertex-adc") {
 			candidates = append(candidates, filepath.Join(p.BasePath, "gcloud", "application_default_credentials.json"))

@@ -707,6 +707,8 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	case "codex":
 		expiryInfo, err = health.ParseCodexExpiry(filepath.Join(vaultPath, "auth.json"))
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 

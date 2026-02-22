@@ -123,8 +123,8 @@ func TestRefreshProfile_Gemini_Extended(t *testing.T) {
 	initialSettings := `{"accessToken": "old-gemini-access"}`
 	require.NoError(t, os.WriteFile(settingsPath, []byte(initialSettings), 0600))
 	
-	// Gemini needs oauth_credentials.json for client info
-	credsPath := filepath.Join(profileDir, "oauth_credentials.json")
+	// Gemini needs oauth_creds.json for client info
+	credsPath := filepath.Join(profileDir, "oauth_creds.json")
 	credsContent := `{"client_id": "test-id", "client_secret": "test-secret", "refresh_token": "gemini-refresh"}`
 	require.NoError(t, os.WriteFile(credsPath, []byte(credsContent), 0600))
 	

@@ -397,12 +397,12 @@ func TestParseGeminiExpiry(t *testing.T) {
 	}
 }
 
-func TestParseGeminiExpiry_OAuthCredentialsFileWithoutSettingsReturnsNoExpiry(t *testing.T) {
+func TestParseGeminiExpiry_OAuthCredsFileWithoutSettingsReturnsNoExpiry(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	// oauth_credentials.json exists but contains no expiry/refresh token.
+	// oauth_creds.json exists but contains no expiry/refresh token.
 	// This should surface as ErrNoExpiry (not ErrNoAuthFile).
-	oauthPath := filepath.Join(tmpDir, "oauth_credentials.json")
+	oauthPath := filepath.Join(tmpDir, "oauth_creds.json")
 	if err := os.WriteFile(oauthPath, []byte(`{}`), 0600); err != nil {
 		t.Fatalf("failed to write test file: %v", err)
 	}

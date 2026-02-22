@@ -485,9 +485,11 @@ func (h *Handlers) getProfileIdentity(tool, name string) *identity.Identity {
 	case "claude":
 		id, err = identity.ExtractFromClaudeCredentials(vaultPath + "/.credentials.json")
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		id, err = identity.ExtractFromGeminiConfig(vaultPath + "/settings.json")
 		if err != nil {
-			id, err = identity.ExtractFromGeminiConfig(vaultPath + "/oauth_credentials.json")
+			id, err = identity.ExtractFromGeminiConfig(vaultPath + "/oauth_creds.json")
 		}
 	}
 

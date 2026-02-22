@@ -243,6 +243,8 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		authPath := filepath.Join(vaultPath, "auth.json")
 		expInfo, err = health.ParseCodexExpiry(authPath)
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 
@@ -283,9 +285,11 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 		normalizeIdentityPlan(id)
 		return id
 	case "gemini":
+		// Migrate legacy vault filename before reading.
+		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		candidates := []string{
 			filepath.Join(vaultPath, "settings.json"),
-			filepath.Join(vaultPath, "oauth_credentials.json"),
+			filepath.Join(vaultPath, "oauth_creds.json"),
 		}
 		for _, path := range candidates {
 			id, err := identity.ExtractFromGeminiConfig(path)

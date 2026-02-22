@@ -132,7 +132,7 @@ Uses fsnotify to watch auth file changes:
 - `~/.config/claude-code/auth.json`
 - `~/.codex/auth.json`
 - `~/.gemini/settings.json`
-- `~/.gemini/oauth_credentials.json`
+- `~/.gemini/oauth_creds.json`
 
 On file change:
 1. Debounce (wait 500ms for writes to settle)

@@ -466,7 +466,7 @@ func (i *VaultImporter) compareFreshness(provider, profile, localPath, bundlePat
 	case "codex":
 		authFileNames = []string{"auth.json"}
 	case "gemini":
-		authFileNames = []string{"settings.json", "oauth_credentials.json"}
+		authFileNames = []string{"settings.json", "oauth_creds.json", "oauth_credentials.json"}
 	default:
 		return nil, nil
 	}

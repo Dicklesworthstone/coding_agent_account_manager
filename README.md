@@ -145,7 +145,7 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 |------|--------------|---------------|
 | **Claude Code** | OAuth: `~/.claude.json` + `~/.config/claude-code/auth.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
-| **Gemini CLI** | OAuth: `~/.gemini/settings.json` (+ `oauth_credentials.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
+| **Gemini CLI** | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 
 ### Claude Code (Claude Max)
 
@@ -182,7 +182,7 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 **Auth Files:**
 - `~/.gemini/settings.json`
-- `~/.gemini/oauth_credentials.json` (OAuth cache)
+- `~/.gemini/oauth_creds.json` (OAuth cache)
 - `~/.gemini/.env` (API key mode)
 
 **Login Command:** Start `gemini`, select "Login with Google" or use `/auth` to switch modes

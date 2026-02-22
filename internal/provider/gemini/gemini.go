@@ -87,7 +87,7 @@ func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 			Required:    true,
 		},
 		{
-			Path:        filepath.Join(geminiHome(), "oauth_credentials.json"),
+			Path:        filepath.Join(geminiHome(), "oauth_creds.json"),
 			Description: "Gemini CLI OAuth credentials cache",
 			Required:    false,
 		},
@@ -297,7 +297,8 @@ func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
 	paths := []string{
 		filepath.Join(geminiDir, ".env"),
 		filepath.Join(geminiDir, "settings.json"),
-		filepath.Join(geminiDir, "oauth_credentials.json"),
+		filepath.Join(geminiDir, "oauth_creds.json"),
+		filepath.Join(geminiDir, "oauth_credentials.json"), // legacy CAAM filename
 	}
 	for _, path := range paths {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -343,7 +344,7 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 	default:
 		// Check for cached Google login tokens
 		settingsPath := filepath.Join(prof.HomePath(), ".gemini", "settings.json")
-		oauthPath := filepath.Join(prof.HomePath(), ".gemini", "oauth_credentials.json")
+		oauthPath := filepath.Join(prof.HomePath(), ".gemini", "oauth_creds.json")
 		if _, err := os.Stat(settingsPath); err == nil {
 			status.LoggedIn = true
 		} else if _, err := os.Stat(oauthPath); err == nil {
@@ -402,7 +403,7 @@ func xdgConfigHome() string {
 // DetectExistingAuth detects existing Gemini authentication files in standard locations.
 // Locations checked:
 // - ~/.gemini/settings.json (main settings with OAuth state)
-// - ~/.gemini/oauth_credentials.json (OAuth credentials cache)
+// - ~/.gemini/oauth_creds.json (OAuth credentials cache)
 // - ~/.gemini/.env (API key)
 // - ~/.config/gcloud/application_default_credentials.json (Vertex AI ADC)
 func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
@@ -449,7 +450,7 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 				},
 			},
 			{
-				path:        filepath.Join(baseDir, "oauth_credentials.json"),
+				path:        filepath.Join(baseDir, "oauth_creds.json"),
 				description: "Gemini CLI OAuth credentials cache" + suffix,
 				validator: func(data []byte) (bool, string) {
 					var parsed map[string]interface{}
@@ -739,7 +740,7 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 	// Check auth files exist
 	geminiDir := filepath.Join(prof.HomePath(), ".gemini")
 	settingsPath := filepath.Join(geminiDir, "settings.json")
-	oauthPath := filepath.Join(geminiDir, "oauth_credentials.json")
+	oauthPath := filepath.Join(geminiDir, "oauth_creds.json")
 	envPath := filepath.Join(geminiDir, ".env")
 
 	settingsExists := fileExistsGemini(settingsPath)
@@ -778,19 +779,19 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 		return result, nil
 	}
 
-	// Check oauth_credentials.json if it exists (has expiry info)
+	// Check oauth_creds.json if it exists (has expiry info)
 	if oauthExists {
 		data, err := os.ReadFile(oauthPath)
 		if err != nil {
 			result.Valid = false
-			result.Error = fmt.Sprintf("cannot read oauth_credentials.json: %v", err)
+			result.Error = fmt.Sprintf("cannot read oauth_creds.json: %v", err)
 			return result, nil
 		}
 
 		var oauthData map[string]interface{}
 		if err := json.Unmarshal(data, &oauthData); err != nil {
 			result.Valid = false
-			result.Error = fmt.Sprintf("invalid JSON in oauth_credentials.json: %v", err)
+			result.Error = fmt.Sprintf("invalid JSON in oauth_creds.json: %v", err)
 			return result, nil
 		}
 

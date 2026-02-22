@@ -188,7 +188,7 @@ func getAgentSpecs() []AgentSpec {
 			AuthPaths: func() []PathSpec {
 				return []PathSpec{
 					{filepath.Join(homeDir, ".gemini", "settings.json"), "OAuth/settings"},
-					{filepath.Join(homeDir, ".gemini", "oauth_credentials.json"), "OAuth credentials"},
+					{filepath.Join(homeDir, ".gemini", "oauth_creds.json"), "OAuth credentials"},
 					{filepath.Join(homeDir, ".gemini", ".env"), "API key (env mode)"},
 				}
 			},
