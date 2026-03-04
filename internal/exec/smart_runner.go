@@ -103,6 +103,43 @@ func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
 
 // Run executes the command with smart handoff capabilities.
 func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
+	// Claude Code is a full TUI application that manages its own terminal.
+	// The nested PTY wrapper conflicts with its terminal handling, causing hangs.
+	// Bypass SmartRunner entirely but still log the session for analytics.
+	if opts.Provider.ID() == "claude" {
+		r.currentProfile = opts.Profile.Name
+		if r.db != nil {
+			_ = r.db.Log(caamdb.Event{
+				Type:        caamdb.EventActivate,
+				Provider:    opts.Provider.ID(),
+				ProfileName: r.currentProfile,
+				Timestamp:   time.Now(),
+			})
+			startTime := time.Now()
+			defer func() {
+				duration := time.Since(startTime)
+				finalCode := 0
+				if err != nil {
+					var exitErr *ExitCodeError
+					if errors.As(err, &exitErr) {
+						finalCode = exitErr.Code
+					} else {
+						finalCode = 1
+					}
+				}
+				_ = r.db.RecordWrapSession(caamdb.WrapSession{
+					Provider:        opts.Provider.ID(),
+					ProfileName:     r.currentProfile,
+					StartedAt:       startTime,
+					EndedAt:         time.Now(),
+					DurationSeconds: int(duration.Seconds()),
+					ExitCode:        finalCode,
+				})
+			}()
+		}
+		return r.Runner.Run(ctx, opts)
+	}
+
 	// Initialize rate limit detector
 	detector, err := ratelimit.NewDetector(
 		ratelimit.ProviderFromString(opts.Provider.ID()),
@@ -117,12 +154,6 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	r.loginHandler = handoff.GetHandler(opts.Provider.ID())
 	if r.loginHandler == nil {
 		// Fallback to basic runner if no login handler (can't do handoff)
-		return r.Runner.Run(ctx, opts)
-	}
-
-	// Claude Code is a full TUI application that manages its own terminal.
-	// The nested PTY wrapper conflicts with its terminal handling, causing hangs.
-	if opts.Provider.ID() == "claude" {
 		return r.Runner.Run(ctx, opts)
 	}
 
