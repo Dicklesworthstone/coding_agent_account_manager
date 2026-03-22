@@ -12,6 +12,7 @@ package authfile
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -767,14 +768,17 @@ func (v *Vault) CopyProfile(tool, srcProfile, dstProfile string) error {
 }
 
 // ActiveProfile returns which profile is currently active (if any).
-// It compares the current auth files with vault backups using content hashing.
+// It compares the current auth files with vault backups using stable identity
+// hashing. For tools like Claude and Codex, only identity-bearing fields are
+// hashed so that volatile metadata (e.g., changelogLastFetched, numStartups)
+// does not break profile detection.
 func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	profiles, err := v.List(fileSet.Tool)
 	if err != nil {
 		return "", err
 	}
 
-	// Hash the current auth files.
+	// Hash the current auth files using stable identity extraction.
 	// Prefer required files for matching; optional files can change frequently
 	// (e.g., settings/session files) and should not break profile detection.
 	currentHashes := make(map[string]string)
@@ -784,7 +788,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}
-		hash, err := hashFile(spec.Path)
+		hash, err := stableFileHash(fileSet.Tool, spec.Path)
 		if err != nil {
 			continue
 		}
@@ -814,7 +818,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 		for filename, currentHash := range currentHashes {
 			backupPath := filepath.Join(profileDir, filename)
-			backupHash, err := hashFile(backupPath)
+			backupHash, err := stableFileHash(fileSet.Tool, backupPath)
 			if err != nil {
 				matches = false
 				break
@@ -924,6 +928,320 @@ func hashFile(path string) (string, error) {
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// stableFileHash returns a hash of only the identity-bearing fields in an auth
+// file, ignoring volatile metadata that tools write after activation. This
+// prevents profile detection from breaking when tools modify non-auth fields.
+//
+// Falls back to whole-file hashing if identity extraction fails or is not
+// implemented for the given tool.
+func stableFileHash(tool, path string) (string, error) {
+	switch tool {
+	case "claude":
+		return stableClaudeHash(path)
+	case "codex":
+		return stableCodexHash(path)
+	default:
+		return hashFile(path)
+	}
+}
+
+// stableClaudeHash extracts identity-bearing fields from Claude auth files and
+// hashes only those fields. This handles two file types:
+//
+//   - .credentials.json: contains claudeAiOauth with accessToken and
+//     refreshToken (the actual auth identity)
+//   - .claude.json: settings file with oauthAccount (identity) mixed with
+//     volatile fields like changelogLastFetched, numStartups, tipsHistory
+//
+// For .credentials.json, we hash the accessToken and refreshToken.
+// For .claude.json, we hash the oauthAccount field only.
+// For other files (settings.json, auth.json), we fall back to whole-file hash.
+func stableClaudeHash(path string) (string, error) {
+	base := filepath.Base(path)
+
+	switch base {
+	case ".credentials.json":
+		return hashClaudeCredentials(path)
+	case ".claude.json":
+		return hashClaudeSettings(path)
+	default:
+		return hashFile(path)
+	}
+}
+
+// hashClaudeCredentials hashes the identity-bearing fields from Claude's
+// .credentials.json: the accessToken and refreshToken from claudeAiOauth.
+// These tokens uniquely identify the authenticated account. Volatile fields
+// like expiresAt are excluded since they change on token refresh without
+// changing the account identity.
+func hashClaudeCredentials(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		// Not valid JSON; fall back to whole-file hash
+		return hashFile(path)
+	}
+
+	oauth, ok := root["claudeAiOauth"].(map[string]interface{})
+	if !ok {
+		// No claudeAiOauth section; fall back to whole-file hash
+		return hashFile(path)
+	}
+
+	// Extract stable identity fields: accessToken and refreshToken uniquely
+	// identify the authenticated session/account.
+	identityFields := map[string]interface{}{}
+	for _, key := range []string{"accessToken", "refreshToken"} {
+		if v, exists := oauth[key]; exists {
+			identityFields[key] = v
+		}
+	}
+
+	if len(identityFields) == 0 {
+		return hashFile(path)
+	}
+
+	// Deterministic JSON serialization for hashing
+	canonical, err := json.Marshal(identityFields)
+	if err != nil {
+		return hashFile(path)
+	}
+
+	h := sha256.New()
+	h.Write([]byte("claude:credentials:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashClaudeSettings hashes only the identity-bearing oauthAccount field from
+// Claude's .claude.json settings file. This file contains many volatile fields
+// (changelogLastFetched, numStartups, tipsHistory, etc.) that change
+// frequently and would break profile detection if included in the hash.
+func hashClaudeSettings(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return hashFile(path)
+	}
+
+	// oauthAccount is the identity-bearing field in .claude.json.
+	// All other top-level fields are volatile session/UI state.
+	identityFields := map[string]interface{}{}
+	for _, key := range []string{"oauthAccount", "userID"} {
+		if v, exists := root[key]; exists {
+			identityFields[key] = v
+		}
+	}
+
+	if len(identityFields) == 0 {
+		// No identity fields found; the file is purely volatile settings.
+		// Return a fixed sentinel hash so all settings-only files match,
+		// preventing settings drift from breaking profile detection.
+		h := sha256.New()
+		h.Write([]byte("claude:settings:no-identity"))
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+
+	canonical, err := json.Marshal(identityFields)
+	if err != nil {
+		return hashFile(path)
+	}
+
+	h := sha256.New()
+	h.Write([]byte("claude:settings:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// stableCodexHash extracts a stable identity from Codex auth files by parsing
+// JWT tokens and hashing the identity claims (email, account_id, organization).
+// This solves the dedup problem where multiple named profiles with different
+// token strings (due to refresh) actually represent the same OpenAI account.
+//
+// Falls back to whole-file hash if JWT parsing fails.
+func stableCodexHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return hashFile(path)
+	}
+
+	// Try to extract stable identity from JWT tokens.
+	// Codex stores tokens in various fields; check all candidates.
+	identity := extractCodexIdentity(auth)
+	if identity != "" {
+		h := sha256.New()
+		h.Write([]byte("codex:identity:"))
+		h.Write([]byte(identity))
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+
+	// JWT parsing failed; fall back to whole-file hash
+	return hashFile(path)
+}
+
+// extractCodexIdentity extracts a stable identity string from Codex auth data
+// by decoding JWT tokens and extracting email/account claims. Returns empty
+// string if no identity can be determined.
+func extractCodexIdentity(auth map[string]interface{}) string {
+	// Ordered by preference: id_token has richer claims than access_token
+	tokenFields := []string{"id_token", "idToken"}
+	nestedTokenFields := []string{"id_token", "idToken", "access_token", "accessToken"}
+
+	// Check top-level token fields
+	for _, field := range tokenFields {
+		if token := jsonString(auth, field); token != "" {
+			if id := identityFromJWT(token); id != "" {
+				return id
+			}
+		}
+	}
+
+	// Check nested tokens object
+	if tokens, ok := auth["tokens"].(map[string]interface{}); ok {
+		for _, field := range nestedTokenFields {
+			if token := jsonString(tokens, field); token != "" {
+				if id := identityFromJWT(token); id != "" {
+					return id
+				}
+			}
+		}
+	}
+
+	// Check top-level access tokens as last resort
+	for _, field := range []string{"access_token", "accessToken", "token"} {
+		if token := jsonString(auth, field); token != "" {
+			if id := identityFromJWT(token); id != "" {
+				return id
+			}
+		}
+	}
+
+	return ""
+}
+
+// identityFromJWT decodes a JWT token (without signature verification) and
+// extracts a stable identity string from its claims. Returns empty string if
+// the token is not a valid JWT or contains no identity claims.
+func identityFromJWT(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return ""
+	}
+
+	// Decode the payload segment
+	payload, err := decodeBase64Segment(parts[1])
+	if err != nil {
+		return ""
+	}
+
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+
+	// Build stable identity from claims, checking known namespaces too.
+	// OpenAI/Codex tokens nest some claims under "https://api.openai.com/auth".
+	claimMaps := []map[string]interface{}{claims}
+	for _, ns := range []string{"https://api.openai.com/auth", "https://api.openai.com/profile"} {
+		if nested, ok := claims[ns].(map[string]interface{}); ok {
+			claimMaps = append(claimMaps, nested)
+		}
+	}
+
+	var email, accountID, org string
+	for _, m := range claimMaps {
+		if email == "" {
+			for _, key := range []string{"email", "preferred_username", "upn"} {
+				if v := jsonString(m, key); v != "" {
+					email = v
+					break
+				}
+			}
+		}
+		if accountID == "" {
+			for _, key := range []string{"sub", "account_id", "accountId", "user_id", "userId"} {
+				if v := jsonString(m, key); v != "" {
+					accountID = v
+					break
+				}
+			}
+		}
+		if org == "" {
+			for _, key := range []string{"organization", "org", "org_name"} {
+				if v := jsonString(m, key); v != "" {
+					org = v
+					break
+				}
+			}
+		}
+	}
+
+	// Build a canonical identity string from whatever we found.
+	// At minimum we need email or accountID to have a useful identity.
+	if email == "" && accountID == "" {
+		return ""
+	}
+
+	// Deterministic format: "email|accountID|org"
+	return email + "|" + accountID + "|" + org
+}
+
+// decodeBase64Segment decodes a base64url-encoded JWT segment, handling
+// missing padding.
+func decodeBase64Segment(s string) ([]byte, error) {
+	// Add padding if needed
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+
+	// Try URL encoding first (standard for JWTs), then standard encoding
+	if decoded, err := base64DecodeURL(s); err == nil {
+		return decoded, nil
+	}
+	return base64DecodeStd(s)
+}
+
+// jsonString extracts a string value from a map, returning empty string if
+// the key doesn't exist or isn't a string.
+func jsonString(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+func base64DecodeURL(s string) ([]byte, error) {
+	return base64.URLEncoding.DecodeString(s)
+}
+
+func base64DecodeStd(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }
 
 func (v *Vault) safeToolDir(tool string) (string, error) {
