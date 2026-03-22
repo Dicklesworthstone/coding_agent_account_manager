@@ -10,7 +10,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ## [Unreleased] — since v0.1.10 (2026-01-21)
 
-> 66 commits on `main` after v0.1.10, spanning 2026-01-21 through 2026-03-04.
+> 67 commits on `main` after v0.1.10, spanning 2026-01-21 through 2026-03-21.
 
 ### New Providers
 
@@ -22,6 +22,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Compaction reminder config and `trace-login` command ([`f35556d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f35556d51d7a6a2fa7199402bf3c6a6821eb9b44))
 - Structured logging with `run_id` correlation and token redaction ([`ce6a06e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ce6a06ecd176e445ddec18d7689c88e6a4d7d4df))
 - Improved coordinator state management ([`9d296b9`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9d296b91cc6f1bb26c4172f57f7ceb2b2e94d73d))
+- Hardened coordinator/agent API behavior ([`4896870`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/489687067776f42a5eb1f445e17cfe2b19adbab2))
 
 ### API Server
 
@@ -31,7 +32,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 - Major improvements to profile and detail panels ([`0dc4c8b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0dc4c8ba969fb4b6bbd613436685ed75f58e15fa))
 - Progress indicator component ([`d8cf246`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d8cf246fb09439334d519c2ac304067586e5fa8e))
-- Updated dialogs and CLI tweaks ([`3d98146`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3d98146f2fedd8941a3b5fa57f3250ce6384e4af))
+- Updated dialogs, coordinator, and CLI tweaks ([`3d98146`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3d98146f2fedd8941a3b5fa57f3250ce6384e4af))
 
 ### CLI Commands
 
@@ -39,15 +40,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - `caam wezterm recover` — batch rate-limit recovery ([`3822027`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/38220272af2458a723593555e19464daacc34056))
 - Alias/rename workflow for auto-generated profiles ([`a03e7f4`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/a03e7f4055e3106f9667b730d8d0d6e489808c6b))
 
-### Installer
+### Claude Provider Hardening
+
+- Disable Claude email extraction from opaque tokens (CLAUDE-001/002) ([`5a9bebd`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5a9bebd7a23d47ca4286bcc5be82cbdcee1fe748))
+- Disable Claude token refresh (CLAUDE-006) — tokens are managed by Claude Code itself ([`1ca325c`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1ca325c7fecf1850f514305cc2dda88ef21aa5b0))
+- Show `n/a` for unavailable Claude identity ([`1649777`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1649777d6675dc85a34d3c9a574f3484e0c0dcb9))
+- ANSI-normalized login detection and resume cooldown ([`84183bf`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/84183bfc7692fa31d606b55f5218ccbe38852a68))
+- Claude limitation regression tests and doc fixes ([`9861cc1`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9861cc11735c6e290d5da9f49f837f37b371b4d6))
+
+### Installer & Distribution
 
 - Hardened `install.sh` with gum UX, idempotency, and rollback ([`11cd441`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/11cd4416da79318940b2a14f74f80dd17f1fad48))
 - Tailscale discovery with resilient parsing and warnings ([`aefe257`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/aefe2573980dfe6e68b954691c367bdd625ea887))
+- ACFS notification workflow for installer changes ([`1589a72`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1589a72b923d4fc0bc478abcc9b567073ff2a083))
 
-### Security
+### Profile Detection
 
-- Hardened coordinator/agent API behavior ([`4896870`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/489687067776f42a5eb1f445e17cfe2b19adbab2))
-- Coordinator auth token documentation ([`84c71a7`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/84c71a777683d68cc5bac26dfde06d5abba3b856))
+- Stable identity hashing for profile detection ([`c4d61bc`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/c4d61bc6d81faa225c71e966ad5372ad003dd36c))
 
 ### Bug Fixes
 
@@ -58,16 +67,13 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - PTY: handle poll HUP/error states cleanly ([`9c034d3`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9c034d381162e3354e383f65065f9e0e396d2089))
 - PTY: keep ReadLine responsive under context cancel ([`21f9adc`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/21f9adcf50221e4ca6892af7d68993b8a13c433f))
 - Drain PTY buffer on exit to prevent stdout/stderr loss ([`b50886b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/b50886b89cfd42ec77261a15644b5774b574efea))
-- Disable Claude email extraction from opaque tokens (CLAUDE-001/002) ([`5a9bebd`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5a9bebd7a23d47ca4286bcc5be82cbdcee1fe748))
-- Disable Claude token refresh (CLAUDE-006) — tokens are managed by Claude Code itself ([`1ca325c`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1ca325c7fecf1850f514305cc2dda88ef21aa5b0))
-- Show `n/a` for unavailable Claude identity ([`1649777`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1649777d6675dc85a34d3c9a574f3484e0c0dcb9))
-- ANSI-normalized login detection and resume cooldown ([`84183bf`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/84183bfc7692fa31d606b55f5218ccbe38852a68))
 - Improved OAuth account selector robustness; reduced token logging ([`17b65f4`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/17b65f4a6e01115084adc11f193d9cdc30928610))
+- Improved auth token health checks and expiry detection ([`ac3ab4c`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ac3ab4c6f6adf3e04514c109e36f01aa8866f73b))
 
 ### CI & Tooling
 
 - Align Go toolchain, fix golangci-lint version, harden flaky PTY tests ([`9d21baa`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9d21baa0b9ff013fad3ec239886f817215b0e2d5), [`9443281`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/944328117170794fa6afaaa8dbf0e661ef4cad0b))
-- ACFS notification workflow for installer changes ([`1589a72`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1589a72b923d4fc0bc478abcc9b567073ff2a083))
+- Improved CI workflow configuration for better test reliability ([`2414831`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/241483137fe4fadef8a373382d4ed7bf35c600cd))
 
 ### License
 
@@ -79,7 +85,6 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Discovery parser fixture corpus ([`0b3b46f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0b3b46fd073fe90052335762529a925418cdfa5a))
 - Identity extraction fixture tests ([`e9c7fbf`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e9c7fbf6ac2915471694fd966f91c335f4010687))
 - Browser automation unit tests ([`a74c723`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/a74c723b7016fd16def8e2faf8eee840fd3186f7))
-- Claude limitation regression tests ([`9861cc1`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9861cc11735c6e290d5da9f49f837f37b371b4d6))
 
 ---
 
@@ -87,15 +92,25 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 > Release: <https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/tag/v0.1.10> (Latest)
 >
-> Tags v0.1.6 through v0.1.10 were rapid-fire fixes to the GoReleaser pipeline on the same day as v0.1.5. Only v0.1.10 produced a successful published release.
+> Tags v0.1.6 through v0.1.10 were rapid-fire fixes to the GoReleaser pipeline on the same day as v0.1.5. Only v0.1.10 produced a successful published release. Tags v0.1.6–v0.1.9 are GoReleaser iteration artifacts with no independent content.
 
 ### Release Pipeline Fixes (v0.1.6 through v0.1.10)
 
 - Write release manifest outside `dist/` directory ([`d6ee7a9`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d6ee7a9c549a8d4e23ed61a73a4e4e4de6f3d73a)) — **v0.1.10**
 - Fix goreleaser manifest generation ([`3b920ad`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3b920adf200c944501b242a3fdbe2413986d70cb)) — v0.1.9
 - Fix goreleaser manifest heredoc ([`ac0cbe2`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ac0cbe207aad1114e015301b2bf9246a3b52803e)) — v0.1.8
-- Fix goreleaser manifest hook YAML ([`f11506d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f11506deaa12a33e4a28ec98392b68d79b76ecfc)) — v0.1.7
+- Fix goreleaser manifest hook YAML ([`f11506d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f11506deaa12a33e4a28ec98392b68d79b76ecfc)) — v0.1.7 (Draft)
 - Fix goreleaser manifest hook ([`f87d071`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f87d07134a8cc30bb2ee67150fe16c94eccf6953)) — v0.1.6
+
+### Release Artifacts (v0.1.10)
+
+- `caam_0.1.10_darwin_amd64.tar.gz`
+- `caam_0.1.10_darwin_arm64.tar.gz`
+- `caam_0.1.10_linux_amd64.tar.gz`
+- `caam_0.1.10_linux_arm64.tar.gz`
+- `caam_0.1.10_windows_amd64.zip`
+- `SHA256SUMS` + `SHA256SUMS.sig` (cosign-signed)
+- `release-manifest.json`
 
 ---
 
@@ -112,18 +127,12 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Glamour markdown rendering for help view ([`9604f6d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9604f6d2e214ad2eba829aed791e42a66802281a))
 - SPM config panel and enhanced TUI styles ([`37edbdc`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/37edbdc9f3be4039d934f5697223c24143a5fc50))
 - Account status display in authfile panel ([`8a93157`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8a93157baf7ef5e59c5d1e053a46bb5c93b92180))
-- Updated TUI styles ([`8fbfb8f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8fbfb8fa00bb3900476ca7d43c472c1afdd710b2))
+- TUI preferences config ([`6e78b77`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6e78b77f323f1460a03ecb19dbffd8a7a4144f45))
 
 ### Release Engineering
 
 - Cosign-signed release assets ([`f3bd102`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f3bd102d2c6103257aea1248bafbf93b1f9d2247))
 - Enhanced release workflow and documentation ([`2dd286e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/2dd286eeee18ac4c4db1e91363086d21b72e2bbf))
-
-### Testing
-
-- WezTerm CLI test harness ([`e691c9f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e691c9fd451b7a69d4ef6eebb4bce771aeeb15a4))
-- Pane discovery unit tests and matcher fixtures ([`12ca517`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/12ca5172f53d153cf39e639ab433fb7bc4325ebf))
-- Spinner test coverage improvements ([`69c413d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/69c413d81b68e2907ec8ca122c9a1c58e9a379da))
 
 ### Bug Fixes
 
@@ -131,6 +140,13 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Standardize warning message capitalization ([`9272814`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/927281444be3ab68ebf0d14061137c00f09f315a))
 - Use global DB singleton; add `UseGlobalEnv` option ([`a6b97ab`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/a6b97ab3052432a53c4f5901fc9174618e993982))
 - 64KB buffer limits to stream observers; optimize detector locking ([`e17b501`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e17b501d240812ecf8aee0cd5e0aecbdcc191622))
+- 64KB buffer limit to lineObserverWriter ([`ed28379`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ed28379588f4c4d3d19a01f91f51b01902d69166))
+
+### Testing
+
+- WezTerm CLI test harness ([`e691c9f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e691c9fd451b7a69d4ef6eebb4bce771aeeb15a4))
+- Pane discovery unit tests and matcher fixtures ([`12ca517`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/12ca5172f53d153cf39e639ab433fb7bc4325ebf))
+- Spinner test coverage improvements ([`69c413d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/69c413d81b68e2907ec8ca122c9a1c58e9a379da))
 
 ### Documentation
 
@@ -143,7 +159,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 > Release: <https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/tag/v0.1.4>
 >
-> 26 commits since v0.1.1 (includes v0.1.2 and v0.1.3 changes). Security hardening and reliability focus.
+> 26 commits since v0.1.3. Subsumes v0.1.2 and v0.1.3 content. Security hardening and reliability focus.
 
 ### Security Hardening
 
@@ -165,7 +181,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Prevent false positive login detection with negative patterns ([`5adb109`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5adb109c8109a426d1dc4601d6b7bada559a099c))
 - Atomic writes in `mergeJSONFile` to prevent corruption ([`5443095`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/544309528dadc7b5d7664cef6bc23370f1bfffd2))
 - Refine prediction engine and Gemini refresh ([`924f30a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/924f30a8245bc8df94f592d2816fcd36e6ffe3ed))
-- Fix unix select build for Go 1.25 ([`f56fcc7`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f56fcc7c2e0404107c8cf1b1db5ee03a8e27e30c))
+- Fix unix select build for Go 1.25 ([`f56fcc7`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f56fcc7c2e0404107c8cf1b1db5ee03a8e27e30c)) — v0.1.2
+- TUI PID file write fix ([`ae087b2`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ae087b2e65748061e4ebcd5cfdcd0faf241421fd))
 
 ### Refactoring
 
@@ -173,11 +190,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Remove unused `WritePIDFile` function ([`d1d0640`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d1d06404d41c23bf85adbce7f03c74cb46ed7773))
 - Clean up regex and remove duplicate provider helpers ([`30756fc`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/30756fce75dee383f29fa41506c42949398fc1a5))
 
+### Minor Tags Within This Range
+
+- **v0.1.2** (2026-01-13) — Fix unix select build for Go 1.25 ([`f56fcc7`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f56fcc7c2e0404107c8cf1b1db5ee03a8e27e30c)). Published release.
+- **v0.1.3** (2026-01-14) — Close bead caam-m9rk ([`2b4c04a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/2b4c04a590f60022d5d5189778bda391caed081e)). Published release. Adds non-interactive distributed setup.
+
 ---
 
 ## [v0.1.1] — 2026-01-13
 
-> Tag only (no published GitHub Release). 176 commits since v0.1.0. Massive feature expansion.
+> Tag only (no published GitHub Release). 176 commits since v0.1.0. Massive feature expansion covering distributed infrastructure, robot mode, usage intelligence, and comprehensive test coverage.
 
 ### Distributed Auth Recovery
 
@@ -191,11 +213,14 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Robot mode CLI for coding agents ([`345e354`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/345e354641893bd9df70454725d8236c8f6b497b))
 - Major overhaul with quick-start guide and new commands ([`7dbfac3`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/7dbfac3397e968fc52008924413dc1f9e529b335))
 
-### Auth Pool
+### Auth Pool & Daemon
 
 - Authentication pool management package ([`52ecaae`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/52ecaaebb2b5fb3d7e45d3adaae16913280691de))
 - Auth pool integrated with daemon ([`6c96921`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6c96921313e9d970c81092547abc99f74cd08160))
 - Improved auth pool monitoring and health tracking ([`e6c083a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e6c083abb225adfe040d0151533690356f9645c1))
+- Automatic vault backup scheduler ([`9e70253`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9e702533484ad082d72fc3b586439b0e8e65d0aa))
+- Backup scheduling configuration ([`ba078be`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ba078bef351b7b64a8eeffdb2755622488631616))
+- SIGHUP reload support ([`1c9e216`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1c9e21621a90c4151bbb8ab2c3eb359bf94cd7af))
 
 ### Usage Intelligence
 
@@ -206,6 +231,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Smart recommendations, forecasting, and precheck ([`fb3e54a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/fb3e54a92a7d26afb5b25be7c1b73849edef264b))
 - Real-time rate limit tracking for smart rotation ([`5d3a39f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5d3a39f723840afaa2c592afbbe0bb1b07cd3d52))
 - Cost tokens subcommand for token cost analysis ([`e74d252`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e74d2521bf07c624ccec4ab6e7da3261c87576b9))
+- Cost tracking for AI CLI wrap sessions ([`003104b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/003104bd4719bbf1a5c256582bc48ffcadd907c1))
 
 ### Monitoring & Observability
 
@@ -223,7 +249,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Claude JSONL log scanner ([`aea54ce`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/aea54ce0628fcce5f1eca2f571086f3875d8d051))
 - Internal logs package structure ([`3b54bdb`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3b54bdb94161fe44374558df9b9eaee4631ba81b))
 
-### CLI
+### CLI Commands
 
 - `caam validate` command for token validation ([`84342ed`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/84342ed45d9cd43c469a26dbe12a58f209b98518))
 - `doctor --validate` flag ([`fe93b03`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/fe93b03f9387252ed37aa81e07bd2ed857fdba70))
@@ -234,17 +260,10 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 ### TUI
 
 - Profile editing and sync panel dialogs ([`6001b4b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6001b4b79e3d6151e760834f574222a32780915e))
-- TUI component unit tests ([`194e8ee`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/194e8ee1ddf8f9461c3805ac20ef2052369590f2))
 
-### Sync
+### Sync & Token Freshness
 
 - Improved token freshness detection and SSH discovery ([`2ee2189`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/2ee21898c280dd3e5c15b855e3ede5a2afcdcf25))
-
-### Daemon
-
-- Automatic vault backup scheduler ([`9e70253`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9e702533484ad082d72fc3b586439b0e8e65d0aa))
-- Backup scheduling configuration ([`ba078be`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ba078bef351b7b64a8eeffdb2755622488631616))
-- SIGHUP reload support ([`1c9e216`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1c9e21621a90c4151bbb8ab2c3eb359bf94cd7af))
 
 ### Distribution
 
@@ -265,6 +284,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Fix race conditions in authpool concurrency ([`0b27813`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0b27813834cdd14027873fc7d04dd49a6c35e070))
 - Cross-platform and reliability improvements ([`2d99bd5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/2d99bd5f563f646d7c34ab0d1db13ef599a469b3))
 - Proactive token expiry warnings with path fix ([`4cba461`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/4cba4611ab7aea29a7f0e6c4090be04622dd4a31))
+- Profile locking for transient profiles ([`8bc20c2`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8bc20c27e58b3b2f82ad90d36f282d81994723aa))
+- EPERM handling in process detection and log file leak ([`0a087b5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0a087b56c4569f5118a13f853ce8d2020eeacfac))
 
 ### Testing
 
@@ -273,16 +294,17 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - SmartRunner E2E test ([`bc00759`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/bc00759b7e653f254d8757a1af219d9371e6da12))
 - AuthPool + SmartRunner + Prediction integration tests ([`5ffaa7a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5ffaa7a7e23551fcd9f1e9b88ac6078b55d4116e))
 - Monitor and precheck E2E tests ([`edf72ed`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/edf72edb020e8b3c359eb7fd3b1533bc0b573d66))
-- Stealth package coverage raised from 38% to 95% ([`6ed88fe`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6ed88fe5988a56e6cc28b134326fc4bb32f0f438))
-- Health package coverage raised from 73.9% to 85.6% ([`b63f449`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/b63f449ceb493ce6c243a46adde6860718006203))
-- Authwatch package coverage raised from 63.8% to 84.2% ([`f6be56d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f6be56d1e1461f7d37b55f7374272ae390fcb5f4))
-- Watcher package coverage raised from 61.7% to 84.7% ([`1d373ee`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1d373eef22694fa8ffc501725672cf25b151436d))
-- Wrap package coverage raised from 72.0% to 77.1% ([`6351b0b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6351b0bbca68dc8f5a69da628b5ae952fc3ab69f))
-- Warnings package coverage raised from 49.4% to 92.1% ([`1de1c48`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1de1c48d0aaaf94c06e8d08776ba4037cf4ec9ab))
-- Daemon package coverage raised from 57% to 76.2% ([`9577ac4`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9577ac4687ddc82fd79c6e6ead5dda6aff752ee4))
+- Stealth package coverage: 38% to 95% ([`6ed88fe`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6ed88fe5988a56e6cc28b134326fc4bb32f0f438))
+- Health package coverage: 73.9% to 85.6% ([`b63f449`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/b63f449ceb493ce6c243a46adde6860718006203))
+- Authwatch package coverage: 63.8% to 84.2% ([`f6be56d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f6be56d1e1461f7d37b55f7374272ae390fcb5f4))
+- Watcher package coverage: 61.7% to 84.7% ([`1d373ee`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1d373eef22694fa8ffc501725672cf25b151436d))
+- Wrap package coverage: 72.0% to 77.1% ([`6351b0b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6351b0bbca68dc8f5a69da628b5ae952fc3ab69f))
+- Warnings package coverage: 49.4% to 92.1% ([`1de1c48`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1de1c48d0aaaf94c06e8d08776ba4037cf4ec9ab))
+- Daemon package coverage: 57% to 76.2% ([`9577ac4`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9577ac4687ddc82fd79c6e6ead5dda6aff752ee4))
 - JWT parsing and burn rate benchmarks ([`1883c03`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1883c0386d22a970a13986210129e3b0e2daf7a5))
 - CI safety checks preventing tests from corrupting real auth files ([`89ce145`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/89ce145157cdf997b47c74b11e876247919b4eac))
 - ExtendedHarness with JSON export and perf regression detection ([`4212848`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/4212848717cfbe589fc4862435d0cddf1940f620))
+- TUI component unit tests ([`194e8ee`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/194e8ee1ddf8f9461c3805ac20ef2052369590f2))
 
 ---
 
@@ -292,12 +314,13 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 >
 > Initial public release. 358 commits from project inception (2025-12-17) to release.
 
-### Core Capabilities
+### Core Account Switching
 
 - **Sub-100ms account switching** for Claude Code, Codex CLI, and Gemini CLI
 - **Vault-based profile management** — `backup`, `activate`, `status`, `ls`, `delete`, `clear`, `paths` commands
 - **Isolated profile system** — `profile add`, `profile ls`, `exec`, `login` for parallel sessions with pseudo-HOME isolation
 - **Content-hash-based active profile detection** via SHA-256 comparison against vault
+- Export/import for vault transfer ([`9ecbf12`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9ecbf12ca188ff744c3e4b8d5a554b7e43c7a531))
 
 ### Smart Profile Management
 
@@ -307,7 +330,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Smart profile rotation with `--auto` flag ([`ff66e8a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ff66e8aff66e8111aed35933f820056ed75076a2))
 - Cooldown tracking and enforcement on activate ([`44bd3de`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/44bd3ded0ef8d50dfd205bce1a3e7906e207d603))
 - Penalty tracking with exponential decay ([`04415cd`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/04415cd4fc7dbdff3d87381701abe46c714ebf72))
-- Proactive token refresh (Codex/Gemini only) ([`35d1205`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/35d120552ec899319f0a3d2f1e36b2a8654177eb))
+- Proactive token refresh for Codex and Gemini ([`35d1205`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/35d120552ec899319f0a3d2f1e36b2a8654177eb))
 
 ### Stealth & Safety
 
@@ -328,40 +351,39 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Keyboard navigation and actions ([`cec6aa9`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/cec6aa955dc60b36487f10e940ba8e52a0313749))
 - Search/filter mode ([`260f2de`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/260f2de82384874532d4931ae8c66096866ceaab))
 - Hot reload via fsnotify profile watcher ([`a75c8f5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/a75c8f56f2bccededff031d832451fec6180ad65), [`3020169`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/30201696085422cd688996f558643e3ce22047c1))
-- Usage analytics TUI panel ([`d4d9c5e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d4d9c5e822d7561d03ddf0b27376d80ffdfb952b))
-- Project context in TUI ([`3682ec8`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3682ec89f96c58c489d6a56a519fe9217799844c))
+- Usage analytics panel ([`d4d9c5e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d4d9c5e822d7561d03ddf0b27376d80ffdfb952b))
+- Project context display ([`3682ec8`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3682ec89f96c58c489d6a56a519fe9217799844c))
 - Signal handler, PID file, and reload command ([`d373866`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d373866f7b8c16a0a45228226d4b094949276593))
 - Sync panel and export/import functionality ([`decd06f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/decd06f46e545c7b0cd67a17c242526473f654f1))
-- Dialog components for text input, confirmation, multi-field ([`d643d35`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d643d3567af414366bd30dacf7cc85f4c29d9099))
+- Dialog components (text input, confirmation, multi-field) ([`d643d35`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d643d3567af414366bd30dacf7cc85f4c29d9099))
 - Open account page in browser via `w` key ([`37a46d8`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/37a46d8dcd6848352da5f31eb574d9e4bc2848dc))
 
 ### CLI Commands
 
-- `caam init` — first-time setup wizard ([`cf8c01e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/cf8c01e24e7aa63c31e2cbbca1742f85d5a49e07))
+- `caam init` — first-time setup wizard with auth discovery ([`cf8c01e`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/cf8c01e24e7aa63c31e2cbbca1742f85d5a49e07), [`9d6f1df`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9d6f1df004bb53e606bd35bbaa6c174837533285))
 - `caam doctor` — diagnostics ([`1f66ebf`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1f66ebfb50c2927a1b27174df0e1545aa9fc3fe6))
 - `caam open` — launch provider account pages ([`c71d433`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/c71d433f799a93fbed9e2a30f7b4ff245f54245a))
 - `caam env` — shell integration ([`83b34dc`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/83b34dcf23f78b464ae13d2ca64fbb96944f5e1b))
+- `caam shell init` — shell integration hooks ([`044ad93`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/044ad938ba42cf7ed4facad99bb23a1049528409))
 - `caam sessions`, `caam use`, `caam which` ([`23ce9d0`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/23ce9d004301a2c5265d8c81f7467d7543c72d0a))
 - `caam uninstall` — restore originals and clean up ([`1ef2d05`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1ef2d05171a2ddb734f24073b2b72f50543554c2))
 - `caam verify` — profile token validation ([`f5a3738`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f5a373860b3fc898c8d037dd5d75804735a0ef47))
 - `caam next` — one-command profile rotation preview ([`a7402fa`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/a7402faab82c2747e01cef3b627ddce87eda7ad9))
 - `caam history` — activity log with filtering and `--json` ([`78a4e3a`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/78a4e3aa2e7fd7f5be4a762e5a3340fa84d5964c), [`00626af`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/00626afa8cb168bdce71fc7751c6c78cc2f4c4b2))
-- `caam shell init` — shell integration ([`044ad93`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/044ad938ba42cf7ed4facad99bb23a1049528409))
 - `caam wrap` — auto rate limit detection and profile rotation ([`2f31113`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/2f311133cdbf92be7de599ef93c3ab3bddf37115))
 - `caam profile unlock` — stale lock detection ([`75f5ceb`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/75f5cebd57cda233f99db669f79e44fc7eba15b1))
 - Profile aliases and fuzzy matching ([`3a854ac`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3a854ac8f3dfc279a3d445fc8c5939c18e3cc830))
 - One-command account capture ([`495ca62`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/495ca6236aa8d480ea578c1f408d557479aefb12))
 - `--json` flag across `activate`, `backup`, `ls`, `status`, `cooldown list`, `project list` ([`60d5ff8`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/60d5ff8aadd19407c05048e88037b5e1291c656c), [`cba06db`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/cba06db66d284437f97fd6698139fd07654546b2), [`906ea7d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/906ea7d52d47ccc6431b5bdf730f74bea35427c3))
-- Workspace command for switching all tools at once ([`e93b4da`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e93b4dad8eb109aca1e5b2a48608972cb16979e4))
-- Browser profile auto-detection for init wizard ([`1fa09e2`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1fa09e204d91774e1089bde145246e321ca6eeb2))
-- Init wizard with auth discovery ([`9d6f1df`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9d6f1df004bb53e606bd35bbaa6c174837533285))
-- Auth file watcher for external change detection ([`8ba0e54`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8ba0e54fcd068c8d9fc93c619ac4b73e4a8fe154))
-- Export/import for vault transfer ([`9ecbf12`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9ecbf12ca188ff744c3e4b8d5a554b7e43c7a531))
-- Project association CLI and activate lookup ([`48486ed`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/48486edb0f670a98493a56c90aab24d304592ec7))
-- Manual refresh command ([`72c9d55`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/72c9d55c1d0f61a8ccb49d5aafb10e83d4f5c711))
-- Usage analytics CLI ([`3dca33b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3dca33b1330c2db49415f6a829a9d90d4769f1c1))
+- `caam workspace` — switch all tools at once ([`e93b4da`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e93b4dad8eb109aca1e5b2a48608972cb16979e4))
+- `caam usage` analytics CLI ([`3dca33b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3dca33b1330c2db49415f6a829a9d90d4769f1c1))
 - Auth detection CLI and profile description support ([`58816be`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/58816befb3539a8ba57d8fef72d5956b1be0e124))
 - Auth import command ([`d690d49`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/d690d490216eb263e76645d18127076d795a174c))
+- Browser profile auto-detection for init wizard ([`1fa09e2`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1fa09e204d91774e1089bde145246e321ca6eeb2))
+- Auth file watcher for external change detection ([`8ba0e54`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8ba0e54fcd068c8d9fc93c619ac4b73e4a8fe154))
+- Project association CLI and activate lookup ([`48486ed`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/48486edb0f670a98493a56c90aab24d304592ec7))
+- Manual refresh command ([`72c9d55`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/72c9d55c1d0f61a8ccb49d5aafb10e83d4f5c711))
+- Cooldown TTL in status output ([`1049cb8`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1049cb86f0b6b75890a231c837f0316546b62628))
 
 ### Sync & Bundle
 
@@ -373,7 +395,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ### Database & Storage
 
-- SQLite database with migrations ([`1608ac5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1608ac5e7c62b334a2271b19c5429f196e896ece))
+- Embedded SQLite database with migrations ([`1608ac5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1608ac5e7c62b334a2271b19c5429f196e896ece))
 - Activity event logging ([`c3ec77b`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/c3ec77b85762e21813cc4e7d55c2e37a6b586460))
 - Data retention and automatic cleanup ([`49c72d1`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/49c72d161aee8af846ae2f63a1687c7f5e53f6d7))
 - Prevent data loss when retention days is 0 ([`8dc29cd`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8dc29cdcc741d831a5cf8b7630e1fb53107689ac))
@@ -399,10 +421,8 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 - Environment deduplication and atomic file sync ([`9a45c01`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9a45c0167260848ff482151b19f88f0f85b515b2))
 - Windows command injection fix and URL punctuation UX fix ([`f61c564`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f61c564c847b587df8142b1d47ff67ee15e00514))
 - Glob association bug fix and profile save atomicity ([`6a6591f`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/6a6591f15f01f0d54506194f4b59c92f938fbe54))
-- EPERM handling in process detection; fix log file leak ([`0a087b5`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0a087b56c4569f5118a13f853ce8d2020eeacfac))
 - POSIX paths for remote SFTP operations ([`904afbf`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/904afbf83711ec8b11498b169232482db88d7b41))
 - Buffered teeWriter output for reliable rate limit detection ([`0dd11f0`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0dd11f0bf2bdf5bd6cfd05ff698ad9d8dbc3b988))
-- Debouncer memory leak fix ([`5aa0973`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5aa0973ca82f5cd8dfb3a6647d8f3345cdbf5ab4))
 
 ### Testing (v0.1.0)
 
@@ -414,7 +434,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 ### Infrastructure
 
 - Lock file with PID validation ([`e163485`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e1634857d9dd1551a5432a627506244f0dc513d4))
-- Charm library dependencies (Bubble Tea, Lip Gloss, Glamour) ([`3ffb4b6`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3ffb4b6e1cc4e3f3b45ec7bbab2b4c39e8f1f94c))
+- Charm library dependencies (Bubble Tea, Lip Gloss, Glamour) ([`3ffb4b6`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/3ffb4b6c1639133255fb2dc1a7e264be027d2f20))
 - Install script ([`e034bf4`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/e034bf48a2e1b34f604a086c47590a5a3af369b5))
 
 ---
