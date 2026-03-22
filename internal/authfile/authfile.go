@@ -930,6 +930,15 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// hashBytes returns a SHA-256 hex digest of raw bytes. Used as a fallback
+// when identity extraction fails but we already have the file data in memory,
+// avoiding a second disk read (TOCTOU race) that hashFile would require.
+func hashBytes(data []byte) string {
+	h := sha256.New()
+	h.Write(data)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // stableFileHash returns a hash of only the identity-bearing fields in an auth
 // file, ignoring volatile metadata that tools write after activation. This
 // prevents profile detection from breaking when tools modify non-auth fields.
@@ -984,14 +993,14 @@ func hashClaudeCredentials(path string) (string, error) {
 
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		// Not valid JSON; fall back to whole-file hash
-		return hashFile(path)
+		// Not valid JSON; fall back to hashing the bytes we already read
+		return hashBytes(data), nil
 	}
 
 	oauth, ok := root["claudeAiOauth"].(map[string]interface{})
 	if !ok {
-		// No claudeAiOauth section; fall back to whole-file hash
-		return hashFile(path)
+		// No claudeAiOauth section; fall back to hashing the bytes we already read
+		return hashBytes(data), nil
 	}
 
 	// Extract stable identity fields: accessToken and refreshToken uniquely
@@ -1004,13 +1013,13 @@ func hashClaudeCredentials(path string) (string, error) {
 	}
 
 	if len(identityFields) == 0 {
-		return hashFile(path)
+		return hashBytes(data), nil
 	}
 
 	// Deterministic JSON serialization for hashing
 	canonical, err := json.Marshal(identityFields)
 	if err != nil {
-		return hashFile(path)
+		return hashBytes(data), nil
 	}
 
 	h := sha256.New()
@@ -1031,7 +1040,7 @@ func hashClaudeSettings(path string) (string, error) {
 
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		return hashFile(path)
+		return hashBytes(data), nil
 	}
 
 	// oauthAccount is the identity-bearing field in .claude.json.
@@ -1054,7 +1063,7 @@ func hashClaudeSettings(path string) (string, error) {
 
 	canonical, err := json.Marshal(identityFields)
 	if err != nil {
-		return hashFile(path)
+		return hashBytes(data), nil
 	}
 
 	h := sha256.New()
@@ -1077,7 +1086,7 @@ func stableCodexHash(path string) (string, error) {
 
 	var auth map[string]interface{}
 	if err := json.Unmarshal(data, &auth); err != nil {
-		return hashFile(path)
+		return hashBytes(data), nil
 	}
 
 	// Try to extract stable identity from JWT tokens.
@@ -1090,8 +1099,8 @@ func stableCodexHash(path string) (string, error) {
 		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 
-	// JWT parsing failed; fall back to whole-file hash
-	return hashFile(path)
+	// JWT parsing failed; fall back to hashing bytes we already read
+	return hashBytes(data), nil
 }
 
 // extractCodexIdentity extracts a stable identity string from Codex auth data
