@@ -937,6 +937,38 @@ func checkAuthFiles() []CheckResult {
 				Details: "Login with the tool first, then use 'caam backup' to save",
 			})
 		}
+
+		// Check vault profile token expiry for all non-system profiles.
+		// This catches profiles that have drifted into expired/unusable state
+		// (e.g., refresh_token_reused) which the basic auth file check misses.
+		vaultProfiles, err := vault.List(tool)
+		if err == nil {
+			for _, profileName := range vaultProfiles {
+				if authfile.IsSystemProfile(profileName) {
+					continue
+				}
+				ph := buildProfileHealth(tool, profileName)
+				if ph == nil || ph.TokenExpiresAt.IsZero() {
+					continue // Unknown expiry, skip
+				}
+				name := fmt.Sprintf("%s/%s token", tool, profileName)
+				if ph.TokenExpiresAt.Before(time.Now()) {
+					results = append(results, CheckResult{
+						Name:    name,
+						Status:  "fail",
+						Message: "token expired",
+						Details: fmt.Sprintf("Expired at %s; re-login with 'caam login %s %s'", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),
+					})
+				} else if time.Until(ph.TokenExpiresAt) < 15*time.Minute {
+					results = append(results, CheckResult{
+						Name:    name,
+						Status:  "warn",
+						Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
+						Details: fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName),
+					})
+				}
+			}
+		}
 	}
 
 	return results

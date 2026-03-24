@@ -811,7 +811,13 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		return "", nil // No relevant auth files present
 	}
 
-	// Compare with each profile
+	// Compare with each profile.
+	// Prefer user-named profiles over system profiles (_backup_*, _original,
+	// _auto_backup_*). System profiles can share the same identity as a named
+	// profile (same account re-authenticated), and because they sort
+	// alphabetically before most user names (underscore < lowercase letters),
+	// they would otherwise shadow the intended named profile.
+	var systemMatch string
 	for _, profile := range profiles {
 		profileDir := v.ProfilePath(fileSet.Tool, profile)
 		matches := true
@@ -830,11 +836,16 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		}
 
 		if matches {
-			return profile, nil
+			if !IsSystemProfile(profile) {
+				return profile, nil // Prefer user-named profiles
+			}
+			if systemMatch == "" {
+				systemMatch = profile // Remember first system match as fallback
+			}
 		}
 	}
 
-	return "", nil // No matching profile found
+	return systemMatch, nil // Fall back to system profile, or "" if no match
 }
 
 // HasAuthFiles checks if the tool currently has auth files present.
