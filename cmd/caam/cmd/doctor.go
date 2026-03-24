@@ -980,17 +980,26 @@ func checkAuthFiles() []CheckResult {
 	return results
 }
 
-// normalizeIdentity extracts the primary identifier (email) from an identity
-// string and lowercases it for case-insensitive comparison.
-// identityFromJWT returns "email|accountID|org" — this extracts just the email.
+// normalizeIdentity extracts the primary identifier from an identity string
+// and lowercases it for case-insensitive comparison.
+// identityFromJWT returns "email|accountID|org" — this extracts the email,
+// falling back to accountID if email is empty.
 // Plain email strings are returned lowercased as-is.
 func normalizeIdentity(id string) string {
 	if id == "" {
 		return ""
 	}
-	// identityFromJWT returns "email|accountID|org" — extract just the email
-	if idx := strings.Index(id, "|"); idx >= 0 {
-		id = id[:idx]
+	// identityFromJWT returns "email|accountID|org" — extract the best identifier
+	if strings.Contains(id, "|") {
+		parts := strings.SplitN(id, "|", 3)
+		// Prefer email (parts[0]), fall back to accountID (parts[1])
+		if parts[0] != "" {
+			return strings.ToLower(parts[0])
+		}
+		if len(parts) > 1 && parts[1] != "" {
+			return strings.ToLower(parts[1])
+		}
+		return ""
 	}
 	return strings.ToLower(id)
 }
