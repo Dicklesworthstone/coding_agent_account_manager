@@ -969,6 +969,94 @@ func checkAuthFiles() []CheckResult {
 				}
 			}
 		}
+
+		// Check for duplicate identities between named and system/backup profiles.
+		// This catches the confusing scenario where a backup profile shares the
+		// same underlying account as a named profile, which can cause the active
+		// profile to unexpectedly flip to the backup after re-authentication.
+		results = append(results, checkDuplicateIdentities(tool)...)
+	}
+
+	return results
+}
+
+// checkDuplicateIdentities detects when named and system/backup profiles share
+// the same identity subject (email/account). This is not inherently broken but
+// causes confusion: after re-auth, the active profile may flip to the backup
+// instead of the named profile the user expects.
+func checkDuplicateIdentities(tool string) []CheckResult {
+	var results []CheckResult
+
+	profiles, err := vault.List(tool)
+	if err != nil || len(profiles) < 2 {
+		return results
+	}
+
+	// Extract identity for each profile, grouping by identity string.
+	// identityGroups maps identity -> list of profile names with that identity.
+	type profileInfo struct {
+		name     string
+		isSystem bool
+	}
+	identityGroups := make(map[string][]profileInfo)
+
+	for _, prof := range profiles {
+		identity := vault.ProfileIdentity(tool, prof)
+		if identity == "" {
+			continue // Cannot determine identity, skip
+		}
+		identityGroups[identity] = append(identityGroups[identity], profileInfo{
+			name:     prof,
+			isSystem: authfile.IsSystemProfile(prof),
+		})
+	}
+
+	// For each identity group that has both named and system profiles, emit a warning.
+	for identity, group := range identityGroups {
+		if len(group) < 2 {
+			continue
+		}
+
+		var named, system []string
+		for _, p := range group {
+			if p.isSystem {
+				system = append(system, p.name)
+			} else {
+				named = append(named, p.name)
+			}
+		}
+
+		if len(named) == 0 || len(system) == 0 {
+			continue // All named or all system -- not the problematic case
+		}
+
+		// Format a human-readable identity label.
+		// The identity string may be "email|accountID|org" from JWT extraction,
+		// or a plain email/account string from settings files.
+		identityLabel := identity
+		if parts := strings.SplitN(identity, "|", 3); len(parts) == 3 {
+			// JWT-extracted format: "email|accountID|org"
+			if parts[0] != "" {
+				identityLabel = parts[0]
+			} else if parts[1] != "" {
+				identityLabel = parts[1]
+			}
+		}
+
+		for _, sysProf := range system {
+			results = append(results, CheckResult{
+				Name:   fmt.Sprintf("%s/%s identity", tool, sysProf),
+				Status: "warn",
+				Message: fmt.Sprintf("shares identity with named profile(s): %s",
+					strings.Join(named, ", ")),
+				Details: fmt.Sprintf(
+					"Identity: %s\n"+
+						"Backup profile %q has the same account as %s.\n"+
+						"This can cause the active profile to flip to the backup after re-auth.\n"+
+						"Consider removing the backup: 'caam delete --force %s %s'",
+					identityLabel, sysProf, strings.Join(named, ", "), tool, sysProf),
+			})
+		}
 	}
 
 	return results

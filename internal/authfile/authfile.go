@@ -1338,3 +1338,127 @@ func validateVaultSegment(kind, val string) (string, error) {
 
 	return val, nil
 }
+
+// ProfileIdentity returns a human-readable identity string for a vault profile
+// by reading its auth files and extracting identity-bearing claims (e.g., email,
+// account ID). Returns empty string if the identity cannot be determined.
+//
+// This is used by the doctor command to detect when a named profile and a
+// system/backup profile share the same underlying account.
+func (v *Vault) ProfileIdentity(tool, profile string) string {
+	profileDir := v.ProfilePath(tool, profile)
+
+	switch tool {
+	case "codex":
+		return v.codexProfileIdentity(profileDir)
+	case "claude":
+		return v.claudeProfileIdentity(profileDir)
+	case "gemini":
+		return v.geminiProfileIdentity(profileDir)
+	default:
+		return ""
+	}
+}
+
+// codexProfileIdentity extracts identity from a Codex vault profile by parsing
+// JWT tokens in auth.json and extracting email/account claims.
+func (v *Vault) codexProfileIdentity(profileDir string) string {
+	authPath := filepath.Join(profileDir, "auth.json")
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		return ""
+	}
+
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return ""
+	}
+
+	return extractCodexIdentity(auth)
+}
+
+// claudeProfileIdentity extracts identity from a Claude vault profile.
+// It checks .claude.json for the oauthAccount field (typically email),
+// then falls back to .credentials.json JWT parsing.
+func (v *Vault) claudeProfileIdentity(profileDir string) string {
+	// Try .claude.json first -- has oauthAccount field
+	settingsPath := filepath.Join(profileDir, ".claude.json")
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		var root map[string]interface{}
+		if err := json.Unmarshal(data, &root); err == nil {
+			if acct := jsonString(root, "oauthAccount"); acct != "" {
+				return acct
+			}
+			if uid := jsonString(root, "userID"); uid != "" {
+				return uid
+			}
+		}
+	}
+
+	// Try .credentials.json -- parse JWT from claudeAiOauth.accessToken
+	credsPath := filepath.Join(profileDir, ".credentials.json")
+	if data, err := os.ReadFile(credsPath); err == nil {
+		var root map[string]interface{}
+		if err := json.Unmarshal(data, &root); err == nil {
+			if oauth, ok := root["claudeAiOauth"].(map[string]interface{}); ok {
+				// Try to extract identity from the access token JWT
+				for _, key := range []string{"accessToken", "idToken"} {
+					if token := jsonString(oauth, key); token != "" {
+						if id := identityFromJWT(token); id != "" {
+							return id
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+// geminiProfileIdentity extracts identity from a Gemini vault profile by
+// reading settings.json or oauth_creds.json for email/account information.
+func (v *Vault) geminiProfileIdentity(profileDir string) string {
+	// Try settings.json
+	settingsPath := filepath.Join(profileDir, "settings.json")
+	if data, err := os.ReadFile(settingsPath); err == nil {
+		var root map[string]interface{}
+		if err := json.Unmarshal(data, &root); err == nil {
+			// Gemini stores identity in various fields depending on version
+			for _, key := range []string{"email", "account", "user_email"} {
+				if v := jsonString(root, key); v != "" {
+					return v
+				}
+			}
+			// Check nested auth object
+			if auth, ok := root["auth"].(map[string]interface{}); ok {
+				for _, key := range []string{"email", "account"} {
+					if v := jsonString(auth, key); v != "" {
+						return v
+					}
+				}
+			}
+		}
+	}
+
+	// Try oauth_creds.json
+	credsPath := filepath.Join(profileDir, "oauth_creds.json")
+	if data, err := os.ReadFile(credsPath); err == nil {
+		var root map[string]interface{}
+		if err := json.Unmarshal(data, &root); err == nil {
+			for _, key := range []string{"email", "account", "client_email"} {
+				if v := jsonString(root, key); v != "" {
+					return v
+				}
+			}
+			// Check for JWT id_token
+			if token := jsonString(root, "id_token"); token != "" {
+				if id := identityFromJWT(token); id != "" {
+					return id
+				}
+			}
+		}
+	}
+
+	return ""
+}
