@@ -980,6 +980,21 @@ func checkAuthFiles() []CheckResult {
 	return results
 }
 
+// normalizeIdentity extracts the primary identifier (email) from an identity
+// string and lowercases it for case-insensitive comparison.
+// identityFromJWT returns "email|accountID|org" — this extracts just the email.
+// Plain email strings are returned lowercased as-is.
+func normalizeIdentity(id string) string {
+	if id == "" {
+		return ""
+	}
+	// identityFromJWT returns "email|accountID|org" — extract just the email
+	if idx := strings.Index(id, "|"); idx >= 0 {
+		id = id[:idx]
+	}
+	return strings.ToLower(id)
+}
+
 // checkDuplicateIdentities detects when named and system/backup profiles share
 // the same identity subject (email/account). This is not inherently broken but
 // causes confusion: after re-auth, the active profile may flip to the backup
@@ -1001,7 +1016,7 @@ func checkDuplicateIdentities(tool string) []CheckResult {
 	identityGroups := make(map[string][]profileInfo)
 
 	for _, prof := range profiles {
-		identity := vault.ProfileIdentity(tool, prof)
+		identity := normalizeIdentity(vault.ProfileIdentity(tool, prof))
 		if identity == "" {
 			continue // Cannot determine identity, skip
 		}
@@ -1030,18 +1045,8 @@ func checkDuplicateIdentities(tool string) []CheckResult {
 			continue // All named or all system -- not the problematic case
 		}
 
-		// Format a human-readable identity label.
-		// The identity string may be "email|accountID|org" from JWT extraction,
-		// or a plain email/account string from settings files.
+		// Identity is already normalized (email only, lowercased).
 		identityLabel := identity
-		if parts := strings.SplitN(identity, "|", 3); len(parts) == 3 {
-			// JWT-extracted format: "email|accountID|org"
-			if parts[0] != "" {
-				identityLabel = parts[0]
-			} else if parts[1] != "" {
-				identityLabel = parts[1]
-			}
-		}
 
 		for _, sysProf := range system {
 			results = append(results, CheckResult{

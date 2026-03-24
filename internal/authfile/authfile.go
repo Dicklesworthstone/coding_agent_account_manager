@@ -1426,15 +1426,15 @@ func (v *Vault) geminiProfileIdentity(profileDir string) string {
 		if err := json.Unmarshal(data, &root); err == nil {
 			// Gemini stores identity in various fields depending on version
 			for _, key := range []string{"email", "account", "user_email"} {
-				if v := jsonString(root, key); v != "" {
-					return v
+				if val := jsonString(root, key); val != "" {
+					return val
 				}
 			}
 			// Check nested auth object
 			if auth, ok := root["auth"].(map[string]interface{}); ok {
 				for _, key := range []string{"email", "account"} {
-					if v := jsonString(auth, key); v != "" {
-						return v
+					if val := jsonString(auth, key); val != "" {
+						return val
 					}
 				}
 			}
@@ -1447,8 +1447,8 @@ func (v *Vault) geminiProfileIdentity(profileDir string) string {
 		var root map[string]interface{}
 		if err := json.Unmarshal(data, &root); err == nil {
 			for _, key := range []string{"email", "account", "client_email"} {
-				if v := jsonString(root, key); v != "" {
-					return v
+				if val := jsonString(root, key); val != "" {
+					return val
 				}
 			}
 			// Check for JWT id_token
