@@ -1138,6 +1138,20 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 
 	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
 		name := fmt.Sprintf("%s/%s token", tool, profileName)
+		errMsg := err.Error()
+		// Distinguish network/timeout errors from actual auth rejections.
+		// Network errors should be warnings (tokens may be fine), not failures.
+		if strings.Contains(errMsg, "request failed:") || strings.Contains(errMsg, "context deadline exceeded") {
+			return &CheckResult{
+				Name:    name,
+				Status:  "warn",
+				Message: "could not verify token (network error)",
+				Details: fmt.Sprintf(
+					"Live API probe for %s/%s failed with: %s\n"+
+						"This may be a transient network issue. The token may still be valid.",
+					tool, profileName, errMsg),
+			}
+		}
 		return &CheckResult{
 			Name:   name,
 			Status: "fail",
