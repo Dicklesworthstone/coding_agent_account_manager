@@ -190,6 +190,9 @@ func refreshTool(ctx context.Context, tool string, threshold time.Duration, dryR
 			continue
 		}
 
+		// Sync refreshed auth to isolated profile to prevent token drift.
+		syncVaultToIsolated(tool, profile)
+
 		refreshed++
 		if !quiet {
 			ttl := refreshedTTL(tool, profile)
@@ -248,6 +251,9 @@ func refreshSingle(ctx context.Context, tool, profile string, threshold time.Dur
 		}
 		return err
 	}
+
+	// Sync refreshed auth to isolated profile to prevent token drift.
+	syncVaultToIsolated(tool, profile)
 
 	if !quiet {
 		ttl := refreshedTTL(tool, profile)
@@ -354,4 +360,22 @@ func ensureVaultProfileDir(tool, profile string) error {
 		return fmt.Errorf("profile path is not a directory: %s", path)
 	}
 	return nil
+}
+
+// syncVaultToIsolated propagates refreshed vault auth files to the corresponding
+// isolated profile directory. This prevents token drift where the vault gets a
+// new refresh token but the isolated profile retains the old (now-consumed) one,
+// causing refresh_token_reused errors.
+func syncVaultToIsolated(tool, profile string) {
+	if profileStore == nil {
+		return
+	}
+	prof, err := profileStore.Load(tool, profile)
+	if err != nil {
+		return // No isolated profile for this vault profile; that's fine
+	}
+	// Best-effort sync: log but don't fail the refresh operation.
+	if err := refresh.SyncVaultToIsolatedProfile(tool, profile, vault, prof.BasePath); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: failed to sync refreshed token to isolated profile: %v\n", err)
+	}
 }

@@ -73,6 +73,10 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	}
 
 	if err != nil {
+		// Wrap refresh_token_reused with profile context for actionable error messages.
+		if errors.Is(err, ErrRefreshTokenReused) {
+			return &RefreshTokenReusedError{Provider: provider, Profile: profile}
+		}
 		return err
 	}
 
@@ -300,4 +304,65 @@ func snapshotMatchesProfile(fileSet authfile.AuthFileSet, vault *authfile.Vault,
 // might return unexpectedly large error responses.
 func readLimitedBody(r io.Reader) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, maxErrorBodySize))
+}
+
+// SyncVaultToIsolatedProfile copies updated auth files from the vault profile
+// to the corresponding isolated profile directory. This prevents token drift
+// where the vault copy gets refreshed but the isolated profile retains a stale
+// (already-consumed) refresh token.
+//
+// For Codex, this copies vault/<profile>/auth.json -> isolated/<profile>/codex_home/auth.json.
+// For other providers, this is a no-op (they don't use isolated profile directories
+// in the same way).
+//
+// isolatedProfileDir is the base directory of the isolated profile (e.g.,
+// ~/.local/share/caam/profiles/codex/<name>).
+// Returns nil if the isolated profile doesn't exist or has no codex_home.
+func SyncVaultToIsolatedProfile(provider, profile string, vault *authfile.Vault, isolatedProfileDir string) error {
+	if vault == nil || isolatedProfileDir == "" {
+		return nil
+	}
+
+	switch provider {
+	case "codex":
+		return syncCodexVaultToIsolated(vault, provider, profile, isolatedProfileDir)
+	default:
+		// Other providers don't have isolated codex_home directories to sync.
+		return nil
+	}
+}
+
+// syncCodexVaultToIsolated copies the vault's auth.json to the isolated profile's
+// codex_home/auth.json, keeping both copies in sync after a token refresh.
+func syncCodexVaultToIsolated(vault *authfile.Vault, provider, profile, isolatedProfileDir string) error {
+	vaultAuthPath := filepath.Join(vault.ProfilePath(provider, profile), "auth.json")
+	isolatedAuthPath := filepath.Join(isolatedProfileDir, "codex_home", "auth.json")
+
+	// Only sync if both the vault auth and the isolated codex_home directory exist.
+	// If the isolated profile doesn't have a codex_home yet, don't create one --
+	// that's the job of 'caam profile add' or 'caam login'.
+	if _, err := os.Stat(vaultAuthPath); err != nil {
+		return nil // Vault auth doesn't exist; nothing to sync
+	}
+	isolatedDir := filepath.Dir(isolatedAuthPath)
+	if _, err := os.Stat(isolatedDir); err != nil {
+		return nil // Isolated codex_home doesn't exist; skip
+	}
+
+	data, err := os.ReadFile(vaultAuthPath)
+	if err != nil {
+		return fmt.Errorf("read vault auth for sync: %w", err)
+	}
+
+	// Write atomically to prevent partial writes from corrupting the auth file.
+	tmpPath := isolatedAuthPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("write isolated auth temp: %w", err)
+	}
+	if err := os.Rename(tmpPath, isolatedAuthPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename isolated auth: %w", err)
+	}
+
+	return nil
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 // CheckResult represents the result of a single diagnostic check.
@@ -948,10 +949,15 @@ func checkAuthFiles() []CheckResult {
 					continue
 				}
 				ph := buildProfileHealth(tool, profileName)
-				if ph == nil || ph.TokenExpiresAt.IsZero() {
-					continue // Unknown expiry, skip
-				}
 				name := fmt.Sprintf("%s/%s token", tool, profileName)
+				if ph == nil || ph.TokenExpiresAt.IsZero() {
+					// Cannot determine expiry: probe the token with a live API
+					// call to detect broken/reused tokens that look valid on disk.
+					if result := probeVaultToken(tool, profileName); result != nil {
+						results = append(results, *result)
+					}
+					continue
+				}
 				if ph.TokenExpiresAt.Before(time.Now()) {
 					results = append(results, CheckResult{
 						Name:    name,
@@ -966,6 +972,16 @@ func checkAuthFiles() []CheckResult {
 						Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
 						Details: fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName),
 					})
+				} else {
+					// Token not expired and not expiring soon -- still probe Codex
+					// tokens with a live API call to catch refresh_token_reused state
+					// where the access token appears valid by expiry but the refresh
+					// token has been consumed, making the profile a ticking time bomb.
+					if tool == "codex" {
+						if result := probeVaultToken(tool, profileName); result != nil {
+							results = append(results, *result)
+						}
+					}
 				}
 			}
 		}
@@ -1074,6 +1090,67 @@ func checkDuplicateIdentities(tool string) []CheckResult {
 	}
 
 	return results
+}
+
+// probeVaultToken performs a lightweight live API call to verify that a vault
+// profile's access token actually works. This catches the scenario from issue #14
+// where doctor reports "OK" based on JWT expiry alone, but the token is actually
+// unusable because the refresh token has been consumed (refresh_token_reused).
+//
+// Currently only supports Codex profiles (GET /v1/me).
+// Returns nil if the probe succeeds or the tool is not supported for probing.
+func probeVaultToken(tool, profileName string) *CheckResult {
+	if tool != "codex" {
+		return nil // Only Codex has a lightweight verification endpoint
+	}
+
+	vaultPath := vault.ProfilePath(tool, profileName)
+	authPath := filepath.Join(vaultPath, "auth.json")
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		return nil // Can't read auth file; other checks will catch this
+	}
+
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil
+	}
+
+	// Extract access token (try nested tokens first, then root)
+	accessToken := ""
+	if tokens, ok := auth["tokens"].(map[string]interface{}); ok {
+		if t, ok := tokens["access_token"].(string); ok {
+			accessToken = t
+		}
+	}
+	if accessToken == "" {
+		if t, ok := auth["access_token"].(string); ok {
+			accessToken = t
+		}
+	}
+	if accessToken == "" {
+		return nil // No access token to probe
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
+		name := fmt.Sprintf("%s/%s token", tool, profileName)
+		return &CheckResult{
+			Name:   name,
+			Status: "fail",
+			Message: "access token rejected by API",
+			Details: fmt.Sprintf(
+				"The stored access token for %s/%s was rejected by the Codex API.\n"+
+					"This usually means the refresh token was consumed by another process\n"+
+					"(refresh_token_reused). Re-authenticate with: 'caam login %s %s'",
+				tool, profileName, tool, profileName),
+		}
+	}
+
+	return nil // Token is valid
 }
 
 // checkTokenValidation validates auth tokens for all profiles.

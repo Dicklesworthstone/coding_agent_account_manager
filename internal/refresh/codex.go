@@ -61,6 +61,11 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 		if err != nil {
 			return nil, fmt.Errorf("codex refresh error %d (failed to read body: %v)", resp.StatusCode, err)
 		}
+		// Detect refresh_token_reused and return a structured error with
+		// actionable guidance instead of a raw API dump.
+		if resp.StatusCode == http.StatusUnauthorized && IsRefreshTokenReused(string(body)) {
+			return nil, ErrRefreshTokenReused
+		}
 		return nil, fmt.Errorf("codex refresh error %d: %s", resp.StatusCode, string(body))
 	}
 
