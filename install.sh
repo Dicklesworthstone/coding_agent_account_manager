@@ -761,26 +761,32 @@ verify_release_assets() {
     fi
 
     if ! command -v cosign >/dev/null 2>&1; then
-        error "cosign is required to verify release signatures."
-        error ""
-        error "Install cosign:"
-        error "  macOS:        brew install cosign"
-        error "  Ubuntu/Debian: sudo apt install cosign"
-        error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
-        error ""
-        error "Or bypass verification (not recommended for security):"
-        error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
-        return 1
-    fi
-
-    local identity="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/tags/${version}"
-    if ! cosign verify-blob \
-        --bundle "$signature_path" \
-        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-        --certificate-identity "$identity" \
-        "$checksums_path" >/dev/null 2>&1; then
-        print_error "Signature verification failed."
-        return 1
+        if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
+            print_warn "cosign not found — skipping signature verification (CI/non-interactive mode)."
+            print_warn "Install cosign for signature verification in production."
+            # Fall through to checksum-only verification below
+        else
+            error "cosign is required to verify release signatures."
+            error ""
+            error "Install cosign:"
+            error "  macOS:        brew install cosign"
+            error "  Ubuntu/Debian: sudo apt install cosign"
+            error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
+            error ""
+            error "Or bypass verification (not recommended for security):"
+            error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
+            return 1
+        fi
+    else
+        local identity="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/tags/${version}"
+        if ! cosign verify-blob \
+            --bundle "$signature_path" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity "$identity" \
+            "$checksums_path" >/dev/null 2>&1; then
+            print_error "Signature verification failed."
+            return 1
+        fi
     fi
 
     if [ -z "$asset_name" ]; then
