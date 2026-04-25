@@ -33,9 +33,13 @@ stealth:
 	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0600))
 	
 	// Setup vault with 3 profiles
-	// When CAAM_HOME is set, vault path is CAAM_HOME/data/vault (not CAAM_HOME/vault)
+	// When CAAM_HOME is set, vault path is CAAM_HOME/data/vault (not CAAM_HOME/vault).
+	// XDG_DATA_HOME must point somewhere disjoint from CAAM_HOME or the data
+	// migrator refuses with "CAAM_HOME data path is within legacy data path".
+	xdgDataDir := filepath.Join(rootDir, "xdg-data")
+	require.NoError(t, os.MkdirAll(xdgDataDir, 0755))
 	vaultDir := filepath.Join(configDir, "data", "vault")
-	h.SetEnv("XDG_DATA_HOME", rootDir)
+	h.SetEnv("XDG_DATA_HOME", xdgDataDir)
 	h.SetEnv("CAAM_HOME", configDir)
 	
 	createProfile := func(name string) {
@@ -77,7 +81,7 @@ homeDir := filepath.Join(rootDir, "home")
 	
 env := os.Environ()
 	env = append(env, "GO_WANT_CLI_HELPER=1")
-	env = append(env, fmt.Sprintf("XDG_DATA_HOME=%s", rootDir))
+	env = append(env, fmt.Sprintf("XDG_DATA_HOME=%s", xdgDataDir))
 	env = append(env, fmt.Sprintf("CAAM_HOME=%s", configDir))
 	env = append(env, fmt.Sprintf("HOME=%s", homeDir))
 	
