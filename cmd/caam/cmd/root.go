@@ -77,8 +77,9 @@ func getDB() (*caamdb.DB, error) {
 
 // rootCmd represents the base command.
 var rootCmd = &cobra.Command{
-	Use:   "caam",
-	Short: "Coding Agent Account Manager - instant auth switching",
+	Use:     "caam",
+	Version: version.Info(),
+	Short:   "Coding Agent Account Manager - instant auth switching",
 	Long: `caam (Coding Agent Account Manager) manages auth files for AI coding CLIs
 to enable instant account switching for "all you can eat" subscription plans
 (GPT Pro, Claude Max, Gemini Ultra).
@@ -541,6 +542,14 @@ func truncateDescription(desc string, maxLen int) string {
 }
 
 func init() {
+	// Cobra wires `--version` / `-v` automatically once rootCmd.Version
+	// is set. Override the default template (which prefixes with the
+	// command name and produces "caam caam 0.1.x ...") so `caam --version`
+	// emits exactly the same string as the legacy `caam version`
+	// subcommand. Common probes (`<tool> --version`) need this — see
+	// ntm's `deps -v` health check.
+	rootCmd.SetVersionTemplate("{{.Version}}\n")
+
 	// Core commands (auth file swapping - PRIMARY)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(backupCmd)
