@@ -77,7 +77,8 @@ func getDB() (*caamdb.DB, error) {
 
 // rootCmd represents the base command.
 var rootCmd = &cobra.Command{
-	Use:   "caam",
+	Use:     "caam",
+	Version: version.Info(),
 	Short: "Coding Agent Account Manager - instant auth switching",
 	Long: `caam (Coding Agent Account Manager) manages auth files for AI coding CLIs
 to enable instant account switching for "all you can eat" subscription plans
@@ -541,6 +542,9 @@ func truncateDescription(desc string, maxLen int) string {
 }
 
 func init() {
+	// Make `caam --version` and `caam -v` print the same string as `caam version`.
+	rootCmd.SetVersionTemplate("{{.Version}}\n")
+
 	// Core commands (auth file swapping - PRIMARY)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(backupCmd)
