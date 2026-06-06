@@ -61,12 +61,21 @@ func cursorHome() string {
 }
 
 // AuthFiles returns the auth file specifications for Cursor.
+//
+// cursor-agent now stores credentials in ~/.cursor/cli-config.json under the
+// "authInfo" key; older versions used ~/.cursor/auth.json. Both are kept so
+// account switching works across cursor-agent versions.
 func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 	home := cursorHome()
 	return []provider.AuthFileSpec{
 		{
+			Path:        filepath.Join(home, "cli-config.json"),
+			Description: "Cursor CLI auth (authInfo)",
+			Required:    false,
+		},
+		{
 			Path:        filepath.Join(home, "auth.json"),
-			Description: "Cursor CLI auth credentials",
+			Description: "Cursor CLI auth credentials (legacy)",
 			Required:    false,
 		},
 		{
@@ -75,6 +84,30 @@ func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 			Required:    false,
 		},
 	}
+}
+
+// hasAuthInfo reports whether the file at path is a Cursor cli-config.json that
+// contains a non-empty "authInfo" object. The cli-config.json file also holds
+// non-secret permission/config data, so merely being valid JSON is not enough
+// to consider the account "logged in".
+func hasAuthInfo(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return false
+	}
+	raw, ok := parsed["authInfo"]
+	if !ok {
+		return false
+	}
+	var authInfo map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &authInfo); err != nil {
+		return false
+	}
+	return len(authInfo) > 0
 }
 
 // PrepareProfile sets up the profile directory structure.
@@ -125,6 +158,15 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 	}
 
 	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
+
+	// Primary: cli-config.json with a non-empty authInfo object.
+	cliConfigPath := filepath.Join(cursorDir, "cli-config.json")
+	if hasAuthInfo(cliConfigPath) {
+		status.LoggedIn = true
+		return status, nil
+	}
+
+	// Legacy: presence of auth.json.
 	authPath := filepath.Join(cursorDir, "auth.json")
 	if _, err := os.Stat(authPath); err == nil {
 		status.LoggedIn = true
@@ -150,42 +192,63 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	}
 
 	home := cursorHome()
-	authPath := filepath.Join(home, "auth.json")
 
+	// Primary: cli-config.json. "Logged in" requires a non-empty authInfo
+	// object (the file also holds non-secret permission/config data).
+	cliConfigPath := filepath.Join(home, "cli-config.json")
+	cliLoc := provider.AuthLocation{
+		Path:        cliConfigPath,
+		Description: "Cursor CLI auth (authInfo)",
+	}
+	if info, err := os.Stat(cliConfigPath); err != nil {
+		if !os.IsNotExist(err) {
+			cliLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
+		}
+	} else {
+		cliLoc.Exists = true
+		cliLoc.LastModified = info.ModTime()
+		cliLoc.FileSize = info.Size()
+		if hasAuthInfo(cliConfigPath) {
+			cliLoc.IsValid = true
+		} else {
+			cliLoc.ValidationError = "no non-empty authInfo object"
+		}
+	}
+	detection.Locations = append(detection.Locations, cliLoc)
+	if cliLoc.Exists && cliLoc.IsValid && detection.Primary == nil {
+		detection.Found = true
+		locCopy := cliLoc
+		detection.Primary = &locCopy
+	}
+
+	// Legacy: auth.json (presence + valid JSON).
+	authPath := filepath.Join(home, "auth.json")
 	authLoc := provider.AuthLocation{
 		Path:        authPath,
-		Description: "Cursor CLI auth credentials",
+		Description: "Cursor CLI auth credentials (legacy)",
 	}
-
-	info, err := os.Stat(authPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			authLoc.Exists = false
-		} else {
+	if info, err := os.Stat(authPath); err != nil {
+		if !os.IsNotExist(err) {
 			authLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
 		}
-		detection.Locations = append(detection.Locations, authLoc)
-		return detection, nil
-	}
-
-	authLoc.Exists = true
-	authLoc.LastModified = info.ModTime()
-	authLoc.FileSize = info.Size()
-
-	data, err := os.ReadFile(authPath)
-	if err != nil {
-		authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
 	} else {
-		var parsed map[string]interface{}
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			authLoc.ValidationError = fmt.Sprintf("invalid JSON: %v", err)
+		authLoc.Exists = true
+		authLoc.LastModified = info.ModTime()
+		authLoc.FileSize = info.Size()
+		data, err := os.ReadFile(authPath)
+		if err != nil {
+			authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
 		} else {
-			authLoc.IsValid = true
+			var parsed map[string]interface{}
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				authLoc.ValidationError = fmt.Sprintf("invalid JSON: %v", err)
+			} else {
+				authLoc.IsValid = true
+			}
 		}
 	}
-
 	detection.Locations = append(detection.Locations, authLoc)
-	if authLoc.Exists && authLoc.IsValid {
+	if authLoc.Exists && authLoc.IsValid && detection.Primary == nil {
 		detection.Found = true
 		locCopy := authLoc
 		detection.Primary = &locCopy
@@ -228,10 +291,19 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 	}
 
 	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
+
+	// Primary: cli-config.json must contain a non-empty authInfo object.
+	cliConfigPath := filepath.Join(cursorDir, "cli-config.json")
+	if hasAuthInfo(cliConfigPath) {
+		result.Valid = true
+		return result, nil
+	}
+
+	// Legacy: auth.json with valid JSON.
 	authPath := filepath.Join(cursorDir, "auth.json")
 	if _, err := os.Stat(authPath); os.IsNotExist(err) {
 		result.Valid = false
-		result.Error = "auth.json not found"
+		result.Error = "no Cursor auth found (cli-config.json authInfo empty/missing and auth.json not found)"
 		return result, nil
 	}
 

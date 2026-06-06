@@ -145,6 +145,7 @@ func (p *Profile) LoadIdentity() {
 		}, identity.ExtractFromGenericAuth)
 	case "cursor":
 		id = loadIdentityFromPaths([]string{
+			filepath.Join(p.HomePath(), ".cursor", "cli-config.json"),
 			filepath.Join(p.HomePath(), ".cursor", "auth.json"),
 		}, identity.ExtractFromGenericAuth)
 	}

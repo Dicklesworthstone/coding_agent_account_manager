@@ -191,8 +191,14 @@ func CursorAuthFiles() AuthFileSet {
 		Files: []AuthFileSpec{
 			{
 				Tool:        "cursor",
+				Path:        filepath.Join(homeDir, ".cursor", "cli-config.json"),
+				Description: "Cursor CLI auth (authInfo)",
+				Required:    false,
+			},
+			{
+				Tool:        "cursor",
 				Path:        filepath.Join(homeDir, ".cursor", "auth.json"),
-				Description: "Cursor CLI auth credentials",
+				Description: "Cursor CLI auth credentials (legacy)",
 				Required:    false,
 			},
 			{

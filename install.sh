@@ -249,8 +249,23 @@ make_tmp_dir() {
 
 trap cleanup_tmp_dirs EXIT
 
+# Returns 0 if the given directory is a version-manager shim/managed dir that
+# tools like pyenv/asdf/rbenv/nvm rehash and wipe. Installing into these would
+# cause the caam binary to be deleted on the next rehash.
+is_shim_dir() {
+    case "$1" in
+        */shims|*/.pyenv/*|*/.asdf/*|*/.rbenv/*|*/.nvm/*|*/.nodenv/*|*/.goenv/*) return 0 ;;
+    esac
+    return 1
+}
+
 default_install_dir() {
     if [ -n "${INSTALL_DIR:-}" ]; then
+        if is_shim_dir "$INSTALL_DIR"; then
+            warn "INSTALL_DIR ($INSTALL_DIR) looks like a version-manager shim directory."
+            warn "Tools like pyenv/asdf/rbenv periodically rehash and wipe these dirs, which would delete caam."
+            warn "Consider setting INSTALL_DIR to ~/.local/bin instead."
+        fi
         echo "$INSTALL_DIR"
         return
     fi
@@ -263,14 +278,32 @@ default_install_dir() {
         fi
     done
 
-    # Fall back to the first writable entry in PATH
+    # Fall back to the first writable entry in PATH, skipping version-manager
+    # shim directories (e.g. ~/.pyenv/shims) which get wiped on rehash.
     IFS=: read -r -a path_entries <<<"${PATH:-}"
     for dir in "${path_entries[@]}"; do
+        if is_shim_dir "$dir"; then
+            continue
+        fi
         if [ -d "$dir" ] && [ -w "$dir" ]; then
             echo "$dir"
             return
         fi
     done
+
+    # Prefer ~/.local/bin (creating it if needed) over the bare /usr/local/bin
+    # default, since it's user-writable and not managed by any version manager.
+    local local_bin="${HOME:-}/.local/bin"
+    if [ -n "${HOME:-}" ]; then
+        if [ -d "$local_bin" ] && [ -w "$local_bin" ]; then
+            echo "$local_bin"
+            return
+        fi
+        if mkdir -p "$local_bin" 2>/dev/null && [ -w "$local_bin" ]; then
+            echo "$local_bin"
+            return
+        fi
+    fi
 
     echo "/usr/local/bin"
 }
