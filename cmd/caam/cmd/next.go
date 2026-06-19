@@ -84,6 +84,12 @@ func runNext(cmd *cobra.Command, args []string) error {
 		}
 		// Single profile case: just activate it
 		if !dryRun {
+			// Re-snapshot outgoing profile's rotated tokens first (see activate.go).
+			if currentProfile != "" && currentProfile != profiles[0] {
+				if err := vault.ResnapshotOutgoing(fileSet, currentProfile, profiles[0]); err != nil && !quiet {
+					fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
+				}
+			}
 			if err := vault.Restore(fileSet, profiles[0]); err != nil {
 				return fmt.Errorf("activate failed: %w", err)
 			}
@@ -174,6 +180,14 @@ func runNext(cmd *cobra.Command, args []string) error {
 					tool, selection.Selected, formatDurationShort(remaining))
 			}
 			return fmt.Errorf("selected profile is in cooldown; use --force to override")
+		}
+	}
+
+	// Re-snapshot outgoing profile's rotated tokens before clobbering the live
+	// file (refresh-token rotation safety; see activate.go / ResnapshotOutgoing).
+	if currentProfile != "" && currentProfile != selection.Selected {
+		if err := vault.ResnapshotOutgoing(fileSet, currentProfile, selection.Selected); err != nil && !quiet {
+			fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
 		}
 	}
 

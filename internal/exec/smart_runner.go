@@ -264,7 +264,7 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	monitorCtx, cancelMonitor := context.WithCancel(ctx)
 	defer cancelMonitor()
 	monitorDone := make(chan struct{})
-	
+
 	var observer func(string)
 	if capture != nil {
 		observer = capture.ObserveLine
@@ -374,6 +374,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 
 	// 4. Swap auth files
 	r.setState(SwappingAuth)
+	// Re-snapshot the outgoing profile's (possibly rotated) tokens before we
+	// clobber the live auth file. Codex/ChatGPT rotate refresh tokens in place
+	// while a profile is active; skipping this leaves the vault copy stale and a
+	// later restore would replay a consumed refresh_token, bricking the account.
+	// Non-fatal.
+	if r.currentProfile != "" && r.currentProfile != nextProfile {
+		if err := r.vault.ResnapshotOutgoing(fileSet, r.currentProfile, nextProfile); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not re-snapshot outgoing profile %s: %v\n", r.currentProfile, err)
+		}
+	}
 	if err := r.vault.Restore(fileSet, nextProfile); err != nil {
 		r.failWithManual("auth swap failed: %v", err)
 		return

@@ -323,6 +323,22 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Re-snapshot the OUTGOING profile's (possibly rotated) tokens back into its
+	// own vault dir before we clobber the live file. Codex/ChatGPT rotate OAuth
+	// refresh tokens in place while a profile is active; without this, the
+	// vault copy of the outgoing profile goes stale and a later restore replays
+	// an already-consumed refresh_token, tripping reuse detection and bricking
+	// the account. Non-fatal: a failure here must never block the switch.
+	if outgoing, _ := vault.ActiveProfile(fileSet); outgoing != "" && outgoing != profileName {
+		if err := vault.ResnapshotOutgoing(fileSet, outgoing, profileName); err != nil {
+			if !jsonOutput {
+				fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", outgoing, err)
+			}
+		} else if !jsonOutput {
+			fmt.Printf("Re-snapshotted outgoing profile %s (token rotation safety)\n", outgoing)
+		}
+	}
+
 	// Stealth: optional delay before the actual switch happens.
 	// Skip stealth delay in JSON mode as it's for interactive use
 	if spmCfg.Stealth.SwitchDelay.Enabled && !jsonOutput {

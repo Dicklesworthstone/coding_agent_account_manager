@@ -16,21 +16,21 @@ import (
 // SPMConfig holds Smart Profile Management configuration.
 // This is stored in YAML format at ~/.caam/config.yaml
 type SPMConfig struct {
-	Version             int                          `yaml:"version"`
-	Health              HealthConfig                 `yaml:"health"`
-	Analytics           AnalyticsConfig              `yaml:"analytics"`
-	Runtime             RuntimeConfig                `yaml:"runtime"`
-	Project             ProjectConfig                `yaml:"project"`
-	Stealth             StealthConfig                `yaml:"stealth"`
-	Safety              SafetyConfig                 `yaml:"safety"`
-	Alerts              AlertConfig                  `yaml:"alerts"`
-	Handoff             HandoffConfig                `yaml:"handoff"`
-	RateLimits          RateLimitPatternsConfig      `yaml:"rate_limits"`
-	LoginPatterns       LoginPatternsConfig          `yaml:"login_patterns"`
-	Subscriptions       map[string]SubscriptionConfig `yaml:"subscriptions,omitempty"`
-	Daemon              DaemonConfig                 `yaml:"daemon"`
-	TUI                 TUIConfig                    `yaml:"tui"`
-	CompactionReminder  CompactionReminderConfig     `yaml:"compaction_reminder"`
+	Version            int                           `yaml:"version"`
+	Health             HealthConfig                  `yaml:"health"`
+	Analytics          AnalyticsConfig               `yaml:"analytics"`
+	Runtime            RuntimeConfig                 `yaml:"runtime"`
+	Project            ProjectConfig                 `yaml:"project"`
+	Stealth            StealthConfig                 `yaml:"stealth"`
+	Safety             SafetyConfig                  `yaml:"safety"`
+	Alerts             AlertConfig                   `yaml:"alerts"`
+	Handoff            HandoffConfig                 `yaml:"handoff"`
+	RateLimits         RateLimitPatternsConfig       `yaml:"rate_limits"`
+	LoginPatterns      LoginPatternsConfig           `yaml:"login_patterns"`
+	Subscriptions      map[string]SubscriptionConfig `yaml:"subscriptions,omitempty"`
+	Daemon             DaemonConfig                  `yaml:"daemon"`
+	TUI                TUIConfig                     `yaml:"tui"`
+	CompactionReminder CompactionReminderConfig      `yaml:"compaction_reminder"`
 }
 
 // TUIConfig holds TUI appearance and behavior preferences.
@@ -206,10 +206,10 @@ type DaemonConfig struct {
 
 // AuthPoolConfig holds auth pool settings.
 type AuthPoolConfig struct {
-	Enabled               bool     `yaml:"enabled"`
-	MaxConcurrentRefresh  int      `yaml:"max_concurrent_refresh"`
-	RefreshRetryDelay     Duration `yaml:"refresh_retry_delay"`
-	MaxRefreshRetries     int      `yaml:"max_refresh_retries"`
+	Enabled              bool     `yaml:"enabled"`
+	MaxConcurrentRefresh int      `yaml:"max_concurrent_refresh"`
+	RefreshRetryDelay    Duration `yaml:"refresh_retry_delay"`
+	MaxRefreshRetries    int      `yaml:"max_refresh_retries"`
 }
 
 // CompactionReminderConfig holds settings for auto-injecting AGENTS.md reminders
@@ -347,8 +347,8 @@ func DefaultSPMConfig() *SPMConfig {
 		},
 		Alerts: AlertConfig{
 			Enabled:           true,
-			WarningThreshold:  70,  // 70% usage triggers warning
-			CriticalThreshold: 85,  // 85% usage triggers critical
+			WarningThreshold:  70, // 70% usage triggers warning
+			CriticalThreshold: 85, // 85% usage triggers critical
 			Notifications: NotificationConfig{
 				Terminal: true,
 				Desktop:  true,
@@ -356,10 +356,16 @@ func DefaultSPMConfig() *SPMConfig {
 			},
 		},
 		Handoff: HandoffConfig{
-			AutoTrigger:      true,                       // Auto-trigger by default
-			DebounceDelay:    Duration(2 * time.Second),  // Wait 2s before triggering
-			MaxRetries:       1,                          // One retry per session
-			FallbackToManual: true,                       // Show manual instructions on failure
+			// Auto-trigger is OFF by default. Automatic account ping-pong on
+			// every rate-limit detection is unsafe for Codex/ChatGPT, whose
+			// OAuth refresh tokens rotate in place: an unattended auto-handoff
+			// can replay a stale token and brick an account (see issue #19).
+			// Opt in explicitly via config when the safe-restore guards are
+			// understood and desired.
+			AutoTrigger:      false,
+			DebounceDelay:    Duration(2 * time.Second), // Wait 2s before triggering
+			MaxRetries:       1,                         // One retry per session
+			FallbackToManual: true,                      // Show manual instructions on failure
 		},
 		RateLimits: RateLimitPatternsConfig{
 			Claude: []string{
@@ -780,7 +786,7 @@ func (c *SPMConfig) ApplyEnvOverrides() {
 			c.Daemon.Verbose = b
 		}
 	}
-	
+
 	// Health
 	if v := os.Getenv("CAAM_HEALTH_REFRESH_THRESHOLD"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {

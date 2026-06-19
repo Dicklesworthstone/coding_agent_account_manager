@@ -520,6 +520,52 @@ func (v *Vault) BackupCurrent(fileSet AuthFileSet) (string, error) {
 	return backupName, nil
 }
 
+// ResnapshotOutgoing re-captures the live auth files of the currently-active
+// profile back into its own vault directory BEFORE a switch overwrites them.
+//
+// Rationale (Codex/ChatGPT refresh-token rotation): while a profile is active,
+// the tool silently rotates its OAuth tokens in place. The vault snapshot taken
+// at backup/login time goes stale the moment the first rotation lands. If we
+// switch away (clobbering the live file) without re-snapshotting, the stale
+// vault copy now holds an already-consumed refresh_token; the NEXT time that
+// profile is restored, presenting it trips the IdP's reuse detection and
+// revokes the whole token family.
+//
+// Guards (all skip silently, returning nil):
+//   - empty/missing outgoing profile (unknown live state)
+//   - system profiles (_original, _backup_*, _auto_backup_* — immutable)
+//   - the target profile we are about to switch TO (would be pointless/racey)
+//   - no live auth files present
+//
+// Errors are returned to the caller but are intended to be treated as
+// NON-FATAL (a failed re-snapshot must never block a switch).
+func (v *Vault) ResnapshotOutgoing(fileSet AuthFileSet, outgoing, target string) error {
+	outgoing = strings.TrimSpace(outgoing)
+	target = strings.TrimSpace(target)
+
+	if outgoing == "" || outgoing == target {
+		return nil
+	}
+	if IsSystemProfile(outgoing) {
+		return nil // immutable safety artifacts; never rewrite
+	}
+	if !HasAuthFiles(fileSet) {
+		return nil // nothing live to capture
+	}
+
+	// Only re-snapshot if the outgoing profile still actually exists in the
+	// vault (don't resurrect a deleted profile).
+	profileDir, err := v.safeProfileDir(fileSet.Tool, outgoing)
+	if err != nil {
+		return err
+	}
+	if st, err := os.Stat(profileDir); err != nil || !st.IsDir() {
+		return nil
+	}
+
+	return v.Backup(fileSet, outgoing)
+}
+
 // RotateAutoBackups removes old auto-backup profiles to stay within the limit.
 // Backups are sorted by timestamp (oldest first) and oldest are deleted.
 // A maxBackups of 0 means unlimited (no rotation).
@@ -664,6 +710,25 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(spec.Path), 0700); err != nil {
 			return fmt.Errorf("create parent dir for %s: %w", spec.Path, err)
+		}
+
+		// Freshness guard (Codex/ChatGPT refresh-token rotation safety):
+		// If the LIVE auth file is the SAME OpenAI identity as this snapshot but
+		// was refreshed more recently, the snapshot's refresh_token has already
+		// been rotated out (consumed). Restoring it verbatim would trip the
+		// IdP's reuse detection and revoke the whole token family, bricking the
+		// account. In that case, leave the live file untouched. Different
+		// identity / missing live file / older-or-equal live / unparseable
+		// timestamps all fall through to the normal verbatim copy, so genuine
+		// cross-account switches and non-codex restores are never blocked.
+		if fileSet.Tool == "codex" && codexLiveIsNewer(spec.Path, srcPath) {
+			restored++
+			if spec.Required {
+				requiredFound = true
+			} else {
+				optionalFound = true
+			}
+			continue
 		}
 
 		// Copy from vault to original location
@@ -1461,6 +1526,144 @@ func (v *Vault) codexProfileIdentity(profileDir string) string {
 	}
 
 	return extractCodexIdentity(auth)
+}
+
+// codexFreshness returns a "how recently were these tokens refreshed" timestamp
+// for a Codex auth.json blob, and whether a usable timestamp was found.
+//
+// ChatGPT/Codex OAuth uses refresh-token rotation with reuse detection: each
+// refresh mints a new refresh_token and invalidates the previous one. The live
+// ~/.codex/auth.json is therefore the authoritative copy of the current token
+// family; a vault snapshot taken before a rotation holds an already-consumed
+// refresh_token. Presenting that stale token revokes the whole family and
+// bricks the account until interactive re-login.
+//
+// We derive freshness from, in order of preference:
+//  1. the top-level "last_refresh" field that the Codex CLI writes (RFC3339), and
+//  2. the maximum JWT "iat" (issued-at) claim across the id_token/access_token.
+//
+// Returns (zeroTime, false) when no timestamp can be parsed, so callers treat
+// an unparseable file as "unknown" and fall back to the normal copy.
+func codexFreshness(data []byte) (time.Time, bool) {
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return time.Time{}, false
+	}
+
+	best := time.Time{}
+	found := false
+
+	// 1. Top-level last_refresh (the field the Codex CLI updates on rotation).
+	if ts := jsonString(auth, "last_refresh"); ts != "" {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			best = t
+			found = true
+		} else if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			best = t
+			found = true
+		}
+	}
+
+	// 2. JWT iat claims from whatever tokens are present.
+	tokenSources := []map[string]interface{}{auth}
+	if tokens, ok := auth["tokens"].(map[string]interface{}); ok {
+		tokenSources = append(tokenSources, tokens)
+	}
+	for _, src := range tokenSources {
+		for _, field := range []string{"id_token", "idToken", "access_token", "accessToken"} {
+			token := jsonString(src, field)
+			if token == "" {
+				continue
+			}
+			if iat, ok := jwtIssuedAt(token); ok {
+				if !found || iat.After(best) {
+					best = iat
+					found = true
+				}
+			}
+		}
+	}
+
+	return best, found
+}
+
+// jwtIssuedAt decodes a JWT (without signature verification) and returns its
+// "iat" (issued-at) claim as a time.Time. Returns (zeroTime, false) if the
+// token is malformed or has no numeric iat claim.
+func jwtIssuedAt(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return time.Time{}, false
+	}
+	payload, err := decodeBase64Segment(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return time.Time{}, false
+	}
+	iat, ok := claims["iat"]
+	if !ok {
+		return time.Time{}, false
+	}
+	// JSON numbers decode to float64; some encoders may emit a string.
+	switch v := iat.(type) {
+	case float64:
+		return time.Unix(int64(v), 0).UTC(), true
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return time.Unix(n, 0).UTC(), true
+		}
+	case string:
+		if n, err := time.Parse(time.RFC3339, v); err == nil {
+			return n, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// codexLiveIsNewer reports whether the LIVE codex auth file at livePath holds
+// the same OpenAI identity as the incoming vault snapshot AND was refreshed
+// strictly more recently. When true, the restore path must NOT clobber the live
+// file: doing so would replay an already-rotated (consumed) refresh_token and
+// trip the IdP's reuse detection, revoking the whole token family.
+//
+// Conservative by construction: any uncertainty (missing/unreadable live file,
+// different identity, equal-or-older live timestamp, or an unparseable
+// timestamp on either side) returns false so the normal verbatim copy proceeds.
+// Real cross-account switches (different identity) and first-time restores
+// (no live file) are therefore never blocked.
+func codexLiveIsNewer(livePath, snapshotPath string) bool {
+	liveData, err := os.ReadFile(livePath)
+	if err != nil {
+		return false // no live file (or unreadable) -> safe to copy
+	}
+	snapData, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		return false // no snapshot -> nothing to compare; let copy fail/handle
+	}
+
+	// Only guard when it is unambiguously the SAME account. A different identity
+	// is a genuine switch and must overwrite.
+	var liveAuth, snapAuth map[string]interface{}
+	if json.Unmarshal(liveData, &liveAuth) != nil || json.Unmarshal(snapData, &snapAuth) != nil {
+		return false
+	}
+	liveID := extractCodexIdentity(liveAuth)
+	snapID := extractCodexIdentity(snapAuth)
+	if liveID == "" || snapID == "" || liveID != snapID {
+		return false
+	}
+
+	liveTS, liveOK := codexFreshness(liveData)
+	snapTS, snapOK := codexFreshness(snapData)
+	if !liveOK || !snapOK {
+		return false // can't compare -> normal copy
+	}
+
+	// Preserve the live file only when it is STRICTLY newer.
+	return liveTS.After(snapTS)
 }
 
 // claudeProfileIdentity extracts identity from a Claude vault profile.

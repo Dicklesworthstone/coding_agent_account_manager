@@ -1195,8 +1195,10 @@ func TestNewConfigSectionDefaults(t *testing.T) {
 
 	// Test handoff defaults
 	t.Run("Handoff", func(t *testing.T) {
-		if !cfg.Handoff.AutoTrigger {
-			t.Error("Handoff.AutoTrigger should be true by default")
+		// AutoTrigger defaults to false: automatic account ping-pong is unsafe
+		// for Codex/ChatGPT refresh-token rotation (issue #19). Opt-in only.
+		if cfg.Handoff.AutoTrigger {
+			t.Error("Handoff.AutoTrigger should be false by default (refresh-token rotation safety)")
 		}
 		if cfg.Handoff.DebounceDelay.Duration() != 2*time.Second {
 			t.Errorf("Handoff.DebounceDelay = %v, want 2s", cfg.Handoff.DebounceDelay)

@@ -35,12 +35,12 @@ import (
 
 // RobotOutput is the standard response wrapper for all robot commands.
 type RobotOutput struct {
-	Success     bool        `json:"success"`
-	Command     string      `json:"command"`
-	Timestamp   string      `json:"timestamp"`
-	Data        interface{} `json:"data,omitempty"`
-	Error       *RobotError `json:"error,omitempty"`
-	Suggestions []string    `json:"suggestions,omitempty"`
+	Success     bool         `json:"success"`
+	Command     string       `json:"command"`
+	Timestamp   string       `json:"timestamp"`
+	Data        interface{}  `json:"data,omitempty"`
+	Error       *RobotError  `json:"error,omitempty"`
+	Suggestions []string     `json:"suggestions,omitempty"`
 	Timing      *RobotTiming `json:"timing,omitempty"`
 }
 
@@ -60,6 +60,7 @@ type RobotTiming struct {
 // RobotStatusData contains the full status overview.
 type RobotStatusData struct {
 	Version      string              `json:"version"`
+	Capabilities []string            `json:"capabilities,omitempty"`
 	OS           string              `json:"os"`
 	Arch         string              `json:"arch"`
 	VaultPath    string              `json:"vault_path"`
@@ -81,24 +82,24 @@ type RobotStatusSummary struct {
 
 // RobotProviderInfo contains provider-specific status.
 type RobotProviderInfo struct {
-	ID            string               `json:"id"`
-	DisplayName   string               `json:"display_name"`
-	LoggedIn      bool                 `json:"logged_in"`
-	ActiveProfile string               `json:"active_profile,omitempty"`
-	Profiles      []RobotProfileInfo   `json:"profiles"`
-	AuthPaths     []RobotAuthPath      `json:"auth_paths"`
+	ID            string             `json:"id"`
+	DisplayName   string             `json:"display_name"`
+	LoggedIn      bool               `json:"logged_in"`
+	ActiveProfile string             `json:"active_profile,omitempty"`
+	Profiles      []RobotProfileInfo `json:"profiles"`
+	AuthPaths     []RobotAuthPath    `json:"auth_paths"`
 }
 
 // RobotProfileInfo contains profile details optimized for agents.
 type RobotProfileInfo struct {
-	Name           string            `json:"name"`
-	Active         bool              `json:"active"`
-	System         bool              `json:"system"`
-	Email          string            `json:"email,omitempty"`
-	PlanType       string            `json:"plan_type,omitempty"`
-	Health         RobotHealthInfo   `json:"health"`
-	Cooldown       *RobotCooldown    `json:"cooldown,omitempty"`
-	Recommendation string            `json:"recommendation,omitempty"`
+	Name           string          `json:"name"`
+	Active         bool            `json:"active"`
+	System         bool            `json:"system"`
+	Email          string          `json:"email,omitempty"`
+	PlanType       string          `json:"plan_type,omitempty"`
+	Health         RobotHealthInfo `json:"health"`
+	Cooldown       *RobotCooldown  `json:"cooldown,omitempty"`
+	Recommendation string          `json:"recommendation,omitempty"`
 }
 
 // RobotHealthInfo contains health status.
@@ -129,12 +130,12 @@ type RobotAuthPath struct {
 
 // RobotCoordinator contains coordinator status.
 type RobotCoordinator struct {
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	Healthy  bool   `json:"healthy"`
-	Latency  int64  `json:"latency_ms,omitempty"`
-	Error    string `json:"error,omitempty"`
-	Pending  int    `json:"pending_auth_requests"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Healthy bool   `json:"healthy"`
+	Latency int64  `json:"latency_ms,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Pending int    `json:"pending_auth_requests"`
 }
 
 // RobotNextData contains recommended next action.
@@ -157,12 +158,12 @@ type RobotNextProfile struct {
 
 // RobotActResult is the result of an action.
 type RobotActResult struct {
-	Action      string `json:"action"`
-	Provider    string `json:"provider"`
-	Profile     string `json:"profile"`
-	OldProfile  string `json:"old_profile,omitempty"`
-	Success     bool   `json:"success"`
-	Message     string `json:"message"`
+	Action     string `json:"action"`
+	Provider   string `json:"provider"`
+	Profile    string `json:"profile"`
+	OldProfile string `json:"old_profile,omitempty"`
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
 }
 
 var robotCmd = &cobra.Command{
@@ -262,7 +263,6 @@ Use --provider to filter to a specific provider.`,
 	RunE: runRobotWatch,
 }
 
-
 // robotOutput writes a RobotOutput to stdout.
 func robotOutput(cmd *cobra.Command, output RobotOutput) error {
 	output.Timestamp = time.Now().UTC().Format(time.RFC3339)
@@ -309,11 +309,12 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	data := RobotStatusData{
-		Version:   version.Version,
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-		VaultPath: authfile.DefaultVaultPath(),
-		Providers: make([]RobotProviderInfo, 0, len(providersToCheck)),
+		Version:      version.Version,
+		Capabilities: version.Capabilities(),
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		VaultPath:    authfile.DefaultVaultPath(),
+		Providers:    make([]RobotProviderInfo, 0, len(providersToCheck)),
 	}
 
 	if configDir, err := os.UserConfigDir(); err == nil {
@@ -1449,13 +1450,13 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 
 // RobotPrecheckData contains session planning data.
 type RobotPrecheckData struct {
-	Provider    string                  `json:"provider"`
-	Recommended *RobotPrecheckProfile   `json:"recommended,omitempty"`
-	Backups     []RobotPrecheckProfile  `json:"backups"`
-	InCooldown  []RobotCooldownProfile  `json:"in_cooldown"`
-	Alerts      []RobotPrecheckAlert    `json:"alerts,omitempty"`
-	Summary     RobotPrecheckSummary    `json:"summary"`
-	Commands    RobotPrecheckCommands   `json:"commands"`
+	Provider    string                 `json:"provider"`
+	Recommended *RobotPrecheckProfile  `json:"recommended,omitempty"`
+	Backups     []RobotPrecheckProfile `json:"backups"`
+	InCooldown  []RobotCooldownProfile `json:"in_cooldown"`
+	Alerts      []RobotPrecheckAlert   `json:"alerts,omitempty"`
+	Summary     RobotPrecheckSummary   `json:"summary"`
+	Commands    RobotPrecheckCommands  `json:"commands"`
 }
 
 // RobotPrecheckProfile is a profile with recommendation data.
@@ -1795,15 +1796,15 @@ func runRobotDoctor(cmd *cobra.Command, args []string) error {
 
 // RobotPathsData contains auth file paths.
 type RobotPathsData struct {
-	VaultPath  string             `json:"vault_path"`
-	ConfigPath string             `json:"config_path"`
+	VaultPath  string               `json:"vault_path"`
+	ConfigPath string               `json:"config_path"`
 	Providers  []RobotProviderPaths `json:"providers"`
 }
 
 // RobotProviderPaths contains paths for a provider.
 type RobotProviderPaths struct {
-	ID    string           `json:"id"`
-	Files []RobotFilePath  `json:"files"`
+	ID    string          `json:"id"`
+	Files []RobotFilePath `json:"files"`
 }
 
 // RobotFilePath is a single file path.
@@ -1818,8 +1819,8 @@ func runRobotPaths(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 
 	data := RobotPathsData{
-		VaultPath:  authfile.DefaultVaultPath(),
-		Providers:  make([]RobotProviderPaths, 0),
+		VaultPath: authfile.DefaultVaultPath(),
+		Providers: make([]RobotProviderPaths, 0),
 	}
 
 	configDir, err := os.UserConfigDir()
@@ -1870,12 +1871,12 @@ type RobotHistoryData struct {
 
 // RobotHistoryEvent is a single activity event.
 type RobotHistoryEvent struct {
-	Timestamp  string `json:"timestamp"`
-	Provider   string `json:"provider"`
-	Profile    string `json:"profile"`
-	Event      string `json:"event"`
-	Duration   string `json:"duration,omitempty"`
-	Notes      string `json:"notes,omitempty"`
+	Timestamp string `json:"timestamp"`
+	Provider  string `json:"provider"`
+	Profile   string `json:"profile"`
+	Event     string `json:"event"`
+	Duration  string `json:"duration,omitempty"`
+	Notes     string `json:"notes,omitempty"`
 }
 
 func runRobotHistory(cmd *cobra.Command, args []string) error {
