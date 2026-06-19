@@ -27,6 +27,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/agy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
@@ -55,6 +56,7 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"codex":    authfile.CodexAuthFiles,
 	"claude":   authfile.ClaudeAuthFiles,
 	"gemini":   authfile.GeminiAuthFiles,
+	"agy":      authfile.AntigravityAuthFiles,
 	"opencode": authfile.OpenCodeAuthFiles,
 	"cursor":   authfile.CursorAuthFiles,
 }
@@ -131,6 +133,7 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		registry.Register(codex.New())
 		registry.Register(claude.New())
 		registry.Register(gemini.New())
+		registry.Register(agy.New())
 		registry.Register(opencodeprovider.New())
 		registry.Register(cursorprovider.New())
 

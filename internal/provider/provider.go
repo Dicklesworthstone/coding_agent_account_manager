@@ -208,6 +208,12 @@ var providerMetaRegistry = map[string]ProviderMeta{
 		AccountURL:  "https://aistudio.google.com/",
 		Description: "Google AI Studio dashboard",
 	},
+	"agy": {
+		ID:          "agy",
+		DisplayName: "Antigravity (Google)",
+		AccountURL:  "https://antigravity.google/",
+		Description: "Google Antigravity account",
+	},
 	"opencode": {
 		ID:          "opencode",
 		DisplayName: "OpenCode",

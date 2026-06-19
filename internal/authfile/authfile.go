@@ -158,6 +158,64 @@ func GeminiAuthFiles() AuthFileSet {
 	}
 }
 
+// AntigravityAuthFiles returns the auth files for the Antigravity CLI (agy),
+// Google's successor to the legacy Gemini CLI (gmi).
+//
+// agy is authenticated solely by an on-disk OAuth token at
+// ~/.gemini/antigravity-cli/antigravity-oauth-token (this file alone is
+// sufficient; it is NOT device-bound). The active Google account email is
+// recorded in ~/.gemini/google_accounts.json, and the shared Google OAuth creds
+// cache lives at ~/.gemini/oauth_creds.json. The antigravity-cli settings.json
+// carries the default model.
+//
+// Keyring note: agy does NOT use the OS keyring (libsecret) on Linux — the token
+// file is the authoritative credential, so caam backs up files only.
+//
+// Every basename here is unique, so files from the two directories
+// (~/.gemini and ~/.gemini/antigravity-cli) never collide in the vault.
+func AntigravityAuthFiles() AuthFileSet {
+	homeDir, _ := os.UserHomeDir()
+
+	geminiHome := os.Getenv("GEMINI_HOME")
+	if geminiHome == "" {
+		geminiHome = filepath.Join(homeDir, ".gemini")
+	}
+	antigravityHome := filepath.Join(geminiHome, "antigravity-cli")
+
+	return AuthFileSet{
+		Tool: "agy",
+		Files: []AuthFileSpec{
+			{
+				Tool:        "agy",
+				Path:        filepath.Join(antigravityHome, "antigravity-oauth-token"),
+				Description: "Antigravity CLI OAuth token (authoritative agy credential)",
+				Required:    true,
+			},
+			{
+				Tool:        "agy",
+				Path:        filepath.Join(geminiHome, "google_accounts.json"),
+				Description: "Active Google account for Antigravity (google_accounts.json)",
+				Required:    false,
+			},
+			{
+				Tool:        "agy",
+				Path:        filepath.Join(geminiHome, "oauth_creds.json"),
+				Description: "Shared Google OAuth credentials cache (oauth_creds.json)",
+				Required:    false,
+			},
+			{
+				Tool:        "agy",
+				Path:        filepath.Join(antigravityHome, "settings.json"),
+				Description: "Antigravity CLI settings (default model / telemetry)",
+				Required:    false,
+			},
+		},
+		// The token file is required; AllowOptionalOnly is left false so a backup
+		// without the token correctly fails (an account snapshot is meaningless
+		// without the authoritative credential).
+	}
+}
+
 // OpenCodeAuthFiles returns the auth files for OpenCode.
 // OpenCode stores auth in $XDG_DATA_HOME/opencode/auth.json (default ~/.local/share/opencode/auth.json).
 func OpenCodeAuthFiles() AuthFileSet {
@@ -221,6 +279,8 @@ func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 		return CodexAuthFiles(), true
 	case "gemini":
 		return GeminiAuthFiles(), true
+	case "agy", "antigravity":
+		return AntigravityAuthFiles(), true
 	case "opencode", "oc":
 		return OpenCodeAuthFiles(), true
 	case "cursor", "cur":
@@ -1361,9 +1421,29 @@ func (v *Vault) ProfileIdentity(tool, profile string) string {
 		return v.claudeProfileIdentity(profileDir)
 	case "gemini":
 		return v.geminiProfileIdentity(profileDir)
+	case "agy":
+		return v.agyProfileIdentity(profileDir)
 	default:
 		return ""
 	}
+}
+
+// agyProfileIdentity extracts the human-readable identity (active Google account
+// email) from an Antigravity (agy) vault profile by reading google_accounts.json.
+// It never reads the antigravity-oauth-token bytes.
+func (v *Vault) agyProfileIdentity(profileDir string) string {
+	accountsPath := filepath.Join(profileDir, "google_accounts.json")
+	data, err := os.ReadFile(accountsPath)
+	if err != nil {
+		return ""
+	}
+	var parsed struct {
+		Active string `json:"active"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Active
 }
 
 // codexProfileIdentity extracts identity from a Codex vault profile by parsing
