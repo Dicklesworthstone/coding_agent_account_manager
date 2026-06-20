@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -567,5 +568,91 @@ func TestVaultDelete(t *testing.T) {
 	profiles, _ = testVault.List("codex")
 	if len(profiles) != 0 {
 		t.Errorf("Expected 0 profiles after delete, got %d", len(profiles))
+	}
+}
+
+// TestStatus_LoggedInUnprofiled_CrossReferencesSavedProfiles verifies issue #20:
+// when a tool has live auth but the live state matches no saved profile, `status`
+// must agree with `ls` by reporting the count of saved profiles (sourced from the
+// same vault.List the ls command uses), instead of a bare "no matching profile".
+func TestStatus_LoggedInUnprofiled_CrossReferencesSavedProfiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpDir, "xdg-data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, "xdg-config"))
+
+	// Wire the package-global vault used by runStatus to the test vault path.
+	oldVault := vault
+	t.Cleanup(func() { vault = oldVault })
+	vault = authfile.NewVault(authfile.DefaultVaultPath())
+
+	// Create live claude auth (required file present -> HasAuthFiles == true).
+	claudeDir := filepath.Join(tmpDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"token":"original-live"}`), 0600); err != nil {
+		t.Fatalf("write live creds: %v", err)
+	}
+
+	// Save a vault profile from this state, then mutate live auth so it no
+	// longer matches -> ActiveProfile returns "" but List returns the profile.
+	fileSet := tools["claude"]()
+	if err := vault.Backup(fileSet, "saved-one"); err != nil {
+		t.Fatalf("backup profile: %v", err)
+	}
+	if err := os.WriteFile(credPath, []byte(`{"token":"different-now"}`), 0600); err != nil {
+		t.Fatalf("rewrite live creds: %v", err)
+	}
+
+	// Sanity: ls's source reports the saved profile; status's active match is "".
+	saved, err := vault.List("claude")
+	if err != nil || len(saved) == 0 {
+		t.Fatalf("vault.List(claude) = %v, %v; want >=1 profile", saved, err)
+	}
+	if active, _ := vault.ActiveProfile(fileSet); active != "" {
+		t.Fatalf("ActiveProfile = %q; want \"\" (no match) for this setup", active)
+	}
+
+	// Run `caam status claude --json` and capture JSON output.
+	r, w, _ := os.Pipe()
+	oldStdout := os.Stdout
+	os.Stdout = w
+	statusCmd.SetOut(w)
+	if err := statusCmd.Flags().Set("json", "true"); err != nil {
+		t.Fatalf("set json flag: %v", err)
+	}
+	t.Cleanup(func() { _ = statusCmd.Flags().Set("json", "false") })
+
+	runErr := runStatus(statusCmd, []string{"claude"})
+	w.Close()
+	os.Stdout = oldStdout
+	if runErr != nil {
+		t.Fatalf("runStatus error: %v", runErr)
+	}
+
+	rawOut, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read status output: %v", err)
+	}
+
+	var out statusOutput
+	if err := json.Unmarshal(rawOut, &out); err != nil {
+		t.Fatalf("unmarshal status json %q: %v", string(rawOut), err)
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("expected 1 tool in status output, got %d (%s)", len(out.Tools), string(rawOut))
+	}
+	st := out.Tools[0]
+	if !st.LoggedIn {
+		t.Errorf("expected logged_in=true")
+	}
+	if st.ActiveProfile != "" {
+		t.Errorf("expected empty active_profile, got %q", st.ActiveProfile)
+	}
+	if st.SavedProfiles != len(saved) {
+		t.Errorf("status saved_profiles = %d, want %d (must agree with ls); output: %s",
+			st.SavedProfiles, len(saved), string(rawOut))
 	}
 }

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -72,27 +73,30 @@ var configGetCmd = &cobra.Command{
 	Short: "Get a configuration value",
 	Long: `Get a specific configuration value by its key path.
 
-Key paths use dot notation: section.key
+Key paths use dot notation and resolve any key that 'caam config show'
+emits, including nested sections to arbitrary depth.
 
-Available keys:
+Examples of resolvable keys:
   version                             Config version
   health.refresh_threshold            Token refresh threshold (duration)
-  health.warning_threshold            Health warning threshold (duration)
-  health.penalty_decay_rate           Penalty decay rate (0-1)
-  health.penalty_decay_interval       Penalty decay interval (duration)
-  analytics.enabled                   Analytics enabled (bool)
   analytics.retention_days            Detailed log retention (int)
-  analytics.aggregate_retention_days  Aggregate retention (int)
-  analytics.cleanup_on_startup        Cleanup on startup (bool)
   runtime.file_watching               File watching enabled (bool)
-  runtime.reload_on_sighup            Reload on SIGHUP (bool)
-  runtime.pid_file                    PID file enabled (bool)
-  project.enabled                     Project associations enabled (bool)
   project.auto_activate               Auto-activate by CWD (bool)
+  stealth.rotation.enabled            Rotation feature enabled (bool)
+  stealth.rotation.algorithm          smart | round_robin | random
+  stealth.cooldown.default_minutes    Cooldown duration (int)
+  safety.auto_backup_before_switch    always | smart | never
+  alerts.notifications.terminal       Terminal notifications (bool)
+  daemon.auth_pool.max_concurrent_refresh  Max concurrent refresh (int)
+  compaction_reminder.cooldown        Reminder cooldown (duration)
+
+Run 'caam config show' to see the full set of available keys. Addressing an
+intermediate section (e.g. 'stealth.rotation') prints that subtree as YAML.
 
 Examples:
   caam config get health.refresh_threshold
-  caam config get analytics.retention_days`,
+  caam config get stealth.rotation.enabled
+  caam config get stealth.rotation`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key := args[0]
@@ -189,184 +193,133 @@ var configPathCmd = &cobra.Command{
 	},
 }
 
-// getConfigValue retrieves a value from the config by key path.
+// getConfigValue retrieves a value from the config by its dotted key path.
+//
+// It is driven entirely by reflection over the YAML-tagged SPMConfig struct, so
+// it resolves the exact same key space that `config show` (yaml.Marshal of the
+// same struct) emits. Previously `get` used a hand-maintained switch that only
+// covered a subset of sections (health/analytics/runtime/project/alerts/handoff/
+// daemon/tui) and a hardcoded set of nested keys, so paths that `show` printed
+// — notably stealth.rotation.* / stealth.cooldown.* / safety.* / rate_limits.* /
+// login_patterns.* / subscriptions.* / compaction_reminder.* — failed with
+// "unknown nested key" or "unknown section". Reflection keeps the two in lockstep
+// permanently: anything `show` serializes, `get` can read (issue #20).
 func getConfigValue(cfg *config.SPMConfig, key string) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("empty key")
+	}
 	parts := strings.Split(key, ".")
-	if len(parts) < 1 || len(parts) > 3 {
-		return "", fmt.Errorf("invalid key format: %s (use section.key or section.subsection.key)", key)
+	v, err := resolveYAMLPath(reflect.ValueOf(cfg), parts, key)
+	if err != nil {
+		return "", err
 	}
+	return formatConfigScalar(v, key)
+}
 
-	// Handle top-level keys
-	if len(parts) == 1 {
-		switch parts[0] {
-		case "version":
-			return strconv.Itoa(cfg.Version), nil
+// resolveYAMLPath walks a value along a dotted path, matching each path segment
+// against the `yaml:"..."` tag of struct fields (and map keys for map-typed
+// fields). It returns the addressed value or a descriptive error.
+func resolveYAMLPath(v reflect.Value, parts []string, fullKey string) (reflect.Value, error) {
+	for i, part := range parts {
+		// Deref pointers as we descend.
+		for v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
+			}
+			v = v.Elem()
+		}
+
+		switch v.Kind() {
+		case reflect.Struct:
+			// The config.Duration type is a struct-free named int64, but be
+			// defensive: only descend into genuine structs by yaml tag.
+			field, ok := fieldByYAMLTag(v, part)
+			if !ok {
+				if i == 0 {
+					return reflect.Value{}, fmt.Errorf("unknown section: %s", part)
+				}
+				return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
+			}
+			v = field
+		case reflect.Map:
+			// e.g. subscriptions.<name>.plan — map[string]SubscriptionConfig.
+			if v.Type().Key().Kind() != reflect.String {
+				return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
+			}
+			mv := v.MapIndex(reflect.ValueOf(part))
+			if !mv.IsValid() {
+				return reflect.Value{}, fmt.Errorf("unknown key: %s (no such entry %q)", fullKey, part)
+			}
+			v = mv
 		default:
-			return "", fmt.Errorf("unknown key: %s", key)
+			// We still have path segments but hit a scalar/slice — the path
+			// goes deeper than the schema allows.
+			return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
 		}
 	}
+	return v, nil
+}
 
-	section := parts[0]
-	field := parts[1]
-
-	// Handle nested sections (3 parts)
-	if len(parts) == 3 {
-		subfield := parts[2]
-		switch section {
-		case "alerts":
-			if field == "notifications" {
-				return getNotificationsValue(&cfg.Alerts.Notifications, subfield)
+// fieldByYAMLTag returns the struct field whose yaml tag (first comma-separated
+// token) equals name. Falls back to a case-insensitive Go field-name match so
+// that field name lookups also work.
+func fieldByYAMLTag(v reflect.Value, name string) (reflect.Value, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		tag := sf.Tag.Get("yaml")
+		if tag != "" {
+			if comma := strings.IndexByte(tag, ','); comma >= 0 {
+				tag = tag[:comma]
 			}
-		case "daemon":
-			if field == "auth_pool" {
-				return getAuthPoolValue(&cfg.Daemon.AuthPool, subfield)
+			if tag == "-" {
+				continue
+			}
+			if tag == name {
+				return v.Field(i), true
 			}
 		}
-		return "", fmt.Errorf("unknown nested key: %s", key)
+		if strings.EqualFold(sf.Name, name) {
+			return v.Field(i), true
+		}
 	}
-
-	switch section {
-	case "health":
-		return getHealthValue(&cfg.Health, field)
-	case "analytics":
-		return getAnalyticsValue(&cfg.Analytics, field)
-	case "runtime":
-		return getRuntimeValue(&cfg.Runtime, field)
-	case "project":
-		return getProjectValue(&cfg.Project, field)
-	case "alerts":
-		return getAlertsValue(&cfg.Alerts, field)
-	case "handoff":
-		return getHandoffValue(&cfg.Handoff, field)
-	case "daemon":
-		return getDaemonValue(&cfg.Daemon, field)
-	case "tui":
-		return getTUIValue(&cfg.TUI, field)
-	default:
-		return "", fmt.Errorf("unknown section: %s", section)
-	}
+	return reflect.Value{}, false
 }
 
-func getHealthValue(h *config.HealthConfig, field string) (string, error) {
-	switch field {
-	case "refresh_threshold":
-		return h.RefreshThreshold.String(), nil
-	case "warning_threshold":
-		return h.WarningThreshold.String(), nil
-	case "penalty_decay_rate":
-		return fmt.Sprintf("%.2f", h.PenaltyDecayRate), nil
-	case "penalty_decay_interval":
-		return h.PenaltyDecayInterval.String(), nil
-	default:
-		return "", fmt.Errorf("unknown health field: %s", field)
+// formatConfigScalar renders a resolved value to the string form `get` prints.
+// Durations, bools, ints, floats and strings keep their historical formatting;
+// composite values (structs/maps/slices) are rendered as YAML so that
+// addressing an intermediate node (e.g. `stealth.rotation`) yields its subtree
+// rather than an error.
+func formatConfigScalar(v reflect.Value, key string) (string, error) {
+	// config.Duration has a String() method; honor it before generic handling.
+	if d, ok := v.Interface().(config.Duration); ok {
+		return d.String(), nil
 	}
-}
 
-func getAnalyticsValue(a *config.AnalyticsConfig, field string) (string, error) {
-	switch field {
-	case "enabled":
-		return strconv.FormatBool(a.Enabled), nil
-	case "retention_days":
-		return strconv.Itoa(a.RetentionDays), nil
-	case "aggregate_retention_days":
-		return strconv.Itoa(a.AggregateRetentionDays), nil
-	case "cleanup_on_startup":
-		return strconv.FormatBool(a.CleanupOnStartup), nil
+	switch v.Kind() {
+	case reflect.Bool:
+		return strconv.FormatBool(v.Bool()), nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(v.Int(), 10), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return strconv.FormatUint(v.Uint(), 10), nil
+	case reflect.Float32, reflect.Float64:
+		// Preserve the legacy two-decimal rendering for rates like
+		// health.penalty_decay_rate so existing output/tests stay stable.
+		return fmt.Sprintf("%.2f", v.Float()), nil
+	case reflect.String:
+		return v.String(), nil
+	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array, reflect.Ptr:
+		// Composite node: serialize the subtree as YAML (same engine `show`
+		// uses) so `get <section>` and `get <section>.<sub>` both work.
+		data, err := yaml.Marshal(v.Interface())
+		if err != nil {
+			return "", fmt.Errorf("marshal %s: %w", key, err)
+		}
+		return strings.TrimRight(string(data), "\n"), nil
 	default:
-		return "", fmt.Errorf("unknown analytics field: %s", field)
-	}
-}
-
-func getRuntimeValue(r *config.RuntimeConfig, field string) (string, error) {
-	switch field {
-	case "file_watching":
-		return strconv.FormatBool(r.FileWatching), nil
-	case "reload_on_sighup":
-		return strconv.FormatBool(r.ReloadOnSIGHUP), nil
-	case "pid_file":
-		return strconv.FormatBool(r.PIDFile), nil
-	default:
-		return "", fmt.Errorf("unknown runtime field: %s", field)
-	}
-}
-
-func getProjectValue(p *config.ProjectConfig, field string) (string, error) {
-	switch field {
-	case "enabled":
-		return strconv.FormatBool(p.Enabled), nil
-	case "auto_activate":
-		return strconv.FormatBool(p.AutoActivate), nil
-	default:
-		return "", fmt.Errorf("unknown project field: %s", field)
-	}
-}
-
-func getAlertsValue(a *config.AlertConfig, field string) (string, error) {
-	switch field {
-	case "enabled":
-		return strconv.FormatBool(a.Enabled), nil
-	case "warning_threshold":
-		return strconv.Itoa(a.WarningThreshold), nil
-	case "critical_threshold":
-		return strconv.Itoa(a.CriticalThreshold), nil
-	default:
-		return "", fmt.Errorf("unknown alerts field: %s", field)
-	}
-}
-
-func getNotificationsValue(n *config.NotificationConfig, field string) (string, error) {
-	switch field {
-	case "terminal":
-		return strconv.FormatBool(n.Terminal), nil
-	case "desktop":
-		return strconv.FormatBool(n.Desktop), nil
-	case "webhook":
-		return n.Webhook, nil
-	default:
-		return "", fmt.Errorf("unknown notifications field: %s", field)
-	}
-}
-
-func getHandoffValue(h *config.HandoffConfig, field string) (string, error) {
-	switch field {
-	case "auto_trigger":
-		return strconv.FormatBool(h.AutoTrigger), nil
-	case "debounce_delay":
-		return h.DebounceDelay.String(), nil
-	case "max_retries":
-		return strconv.Itoa(h.MaxRetries), nil
-	case "fallback_to_manual":
-		return strconv.FormatBool(h.FallbackToManual), nil
-	default:
-		return "", fmt.Errorf("unknown handoff field: %s", field)
-	}
-}
-
-func getDaemonValue(d *config.DaemonConfig, field string) (string, error) {
-	switch field {
-	case "check_interval":
-		return d.CheckInterval.String(), nil
-	case "refresh_threshold":
-		return d.RefreshThreshold.String(), nil
-	case "verbose":
-		return strconv.FormatBool(d.Verbose), nil
-	default:
-		return "", fmt.Errorf("unknown daemon field: %s", field)
-	}
-}
-
-func getAuthPoolValue(a *config.AuthPoolConfig, field string) (string, error) {
-	switch field {
-	case "enabled":
-		return strconv.FormatBool(a.Enabled), nil
-	case "max_concurrent_refresh":
-		return strconv.Itoa(a.MaxConcurrentRefresh), nil
-	case "refresh_retry_delay":
-		return a.RefreshRetryDelay.String(), nil
-	case "max_refresh_retries":
-		return strconv.Itoa(a.MaxRefreshRetries), nil
-	default:
-		return "", fmt.Errorf("unknown auth_pool field: %s", field)
+		return fmt.Sprintf("%v", v.Interface()), nil
 	}
 }
 

@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // =============================================================================
@@ -434,5 +436,120 @@ func TestParseBool(t *testing.T) {
 				t.Errorf("parseBool(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// =============================================================================
+// Issue #20: `config get` must resolve any nested key `config show` emits.
+// =============================================================================
+
+// TestGetConfigValue_NestedStealthKeys asserts that representative nested keys
+// emitted by `config show` (e.g. stealth.rotation.*) resolve via `config get`.
+// These previously failed with "unknown nested key" because get used a partial
+// hardcoded switch that didn't include the stealth section.
+func TestGetConfigValue_NestedStealthKeys(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"stealth.rotation.enabled", "false"},
+		{"stealth.rotation.algorithm", "smart"},
+		{"stealth.cooldown.enabled", "false"},
+		{"stealth.cooldown.default_minutes", "60"},
+		{"stealth.switch_delay.min_seconds", "5"},
+		{"stealth.switch_delay.max_seconds", "30"},
+		{"safety.auto_backup_before_switch", "smart"},
+		{"safety.max_auto_backups", "5"},
+		{"compaction_reminder.enabled", "false"},
+		{"compaction_reminder.cooldown", "10m0s"},
+		{"alerts.notifications.terminal", "true"},
+		{"daemon.auth_pool.max_concurrent_refresh", "3"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got, err := getConfigValue(cfg, tt.key)
+			if err != nil {
+				t.Fatalf("getConfigValue(%q) unexpected error: %v", tt.key, err)
+			}
+			if got != tt.want {
+				t.Errorf("getConfigValue(%q) = %q, want %q", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetConfigValue_ResolvesEverythingShowEmits is a drift guard: every leaf
+// key that `config show` (yaml.Marshal of *SPMConfig) emits must be resolvable
+// by `config get`. This prevents the two commands from ever diverging again.
+func TestGetConfigValue_ResolvesEverythingShowEmits(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+
+	for _, key := range leafKeys("", root) {
+		if _, err := getConfigValue(cfg, key); err != nil {
+			t.Errorf("config show emits %q but config get cannot resolve it: %v", key, err)
+		}
+	}
+}
+
+// leafKeys walks a decoded YAML map and returns every scalar leaf's dotted path.
+// Sequences (slices) are treated as leaves addressable by their parent key.
+func leafKeys(prefix string, v interface{}) []string {
+	var keys []string
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		if prefix != "" {
+			keys = append(keys, prefix)
+		}
+		return keys
+	}
+	for k, child := range m {
+		path := k
+		if prefix != "" {
+			path = prefix + "." + k
+		}
+		switch cv := child.(type) {
+		case map[string]interface{}:
+			keys = append(keys, leafKeys(path, cv)...)
+		default:
+			keys = append(keys, path)
+		}
+	}
+	return keys
+}
+
+// TestGetConfigValue_UnknownStillErrors ensures the reflection resolver keeps
+// rejecting genuinely unknown keys (so error behavior didn't regress).
+func TestGetConfigValue_UnknownStillErrors(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+	for _, key := range []string{"unknown.section.key", "invalid_section.key", "stealth.rotation.bogus", "stealth.bogus", ""} {
+		if _, err := getConfigValue(cfg, key); err == nil {
+			t.Errorf("getConfigValue(%q) = nil error, want error", key)
+		}
+	}
+}
+
+// TestGetConfigValue_CompositeNodeYAML verifies that addressing an intermediate
+// (non-leaf) node returns its subtree as YAML rather than erroring.
+func TestGetConfigValue_CompositeNodeYAML(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+	got, err := getConfigValue(cfg, "stealth.rotation")
+	if err != nil {
+		t.Fatalf("getConfigValue(stealth.rotation) error: %v", err)
+	}
+	if !strings.Contains(got, "algorithm: smart") || !strings.Contains(got, "enabled: false") {
+		t.Errorf("getConfigValue(stealth.rotation) = %q, want YAML subtree with algorithm/enabled", got)
 	}
 }

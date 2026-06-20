@@ -683,6 +683,10 @@ type statusTool struct {
 	Tool          string             `json:"tool"`
 	LoggedIn      bool               `json:"logged_in"`
 	ActiveProfile string             `json:"active_profile,omitempty"`
+	// SavedProfiles is the number of vault profiles saved for this tool. It is
+	// populated when the tool is logged in but the live auth matches no saved
+	// profile, so JSON consumers can reconcile `status` with `ls` (issue #20).
+	SavedProfiles int                `json:"saved_profiles,omitempty"`
 	Error         string             `json:"error,omitempty"`
 	Health        *statusHealth      `json:"health,omitempty"`
 	Identity      *identity.Identity `json:"identity,omitempty"`
@@ -772,13 +776,28 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 
 		if activeProfile == "" {
+			// Live auth exists but doesn't match any saved vault profile.
+			// Cross-reference the same saved-profile source `caam ls` uses so the
+			// two commands agree: `status` saying "no matching profile" while
+			// `ls` lists saved profiles for the tool is confusing (issue #20).
+			savedProfiles, _ := vault.List(tool)
+			savedCount := len(savedProfiles)
 			if jsonOutput {
 				output.Tools = append(output.Tools, statusTool{
-					Tool:     tool,
-					LoggedIn: true,
+					Tool:          tool,
+					LoggedIn:      true,
+					SavedProfiles: savedCount,
 				})
 			} else {
-				fmt.Printf("%-10s  (logged in, no matching profile)\n", tool)
+				if savedCount > 0 {
+					noun := "profiles"
+					if savedCount == 1 {
+						noun = "profile"
+					}
+					fmt.Printf("%-10s  (logged in; live auth matches no saved profile — %d saved %s available, see `caam ls %s`)\n", tool, savedCount, noun, tool)
+				} else {
+					fmt.Printf("%-10s  (logged in, no matching profile; none saved — save one with `caam add %s <name>`)\n", tool, tool)
+				}
 			}
 			continue
 		}
