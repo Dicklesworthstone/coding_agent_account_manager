@@ -42,6 +42,7 @@ func init() {
 	nextCmd.Flags().Bool("force", false, "activate even if profile is in cooldown")
 	nextCmd.Flags().String("algorithm", "", "override rotation algorithm (smart, round_robin, random)")
 	nextCmd.Flags().Bool("usage-aware", false, "fetch real-time rate limits to inform selection")
+	nextCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	rootCmd.AddCommand(nextCmd)
 }
 
@@ -52,6 +53,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	force, _ := cmd.Flags().GetBool("force")
 	algoOverride, _ := cmd.Flags().GetString("algorithm")
 	usageAware, _ := cmd.Flags().GetBool("usage-aware")
+	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
 
 	// Validate tool
 	getFileSet, ok := tools[tool]
@@ -99,6 +101,15 @@ func runNext(cmd *cobra.Command, args []string) error {
 				fmt.Printf("Would switch to: %s/%s\n", tool, profiles[0])
 			} else {
 				fmt.Printf("Activated %s profile '%s'\n", tool, profiles[0])
+			}
+		}
+		// Codex daemon check (see issue #21): a running codex app-server caches
+		// auth in-process, so the on-disk swap won't apply to it. Skip on
+		// dry-run (nothing was actually switched).
+		if !dryRun {
+			daemonWarn := checkCodexDaemon(tool, reloadDaemon)
+			if !quiet {
+				printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 			}
 		}
 		return nil
@@ -215,6 +226,13 @@ func runNext(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Switched %s to '%s' (%d other profile%s available)\n",
 			tool, selection.Selected, remaining, pluralize(remaining))
 		fmt.Printf("  Run '%s' to start using this account\n", tool)
+	}
+
+	// Codex daemon check (see issue #21): warn (or --reload-daemon restart) a
+	// running codex app-server that has cached the previous account's auth.
+	daemonWarn := checkCodexDaemon(tool, reloadDaemon)
+	if !quiet {
+		printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 	}
 
 	return nil

@@ -247,6 +247,8 @@ wait
 
 **Notes:** Respects `CODEX_HOME`. CAAM enforces file-based auth storage by writing `cli_auth_credentials_store = "file"` to `~/.codex/config.toml` inside the profile.
 
+> **Running a `codex app-server` daemon?** Codex can run as a long-lived daemon (`codex app-server`, also `codex mcp-server`) that caches `auth.json` in memory at startup. Swapping the auth file on disk does **not** change the account that daemon serves until it is restarted. After `caam activate/switch/next codex`, CAAM detects a running daemon and prints a warning. Pass `--reload-daemon` to have CAAM `SIGTERM` the daemon (it respawns with the new auth on next use) — it never kills a daemon silently.
+
 ### Gemini CLI (Google One AI Premium)
 
 **Subscription:** Gemini Ultra ($275/month)

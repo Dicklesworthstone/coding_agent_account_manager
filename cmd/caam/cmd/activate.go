@@ -30,6 +30,7 @@ type activateOutput struct {
 	AutoBackup      string                  `json:"auto_backup,omitempty"`
 	Refreshed       bool                    `json:"refreshed,omitempty"`
 	Rotation        *activateRotationResult `json:"rotation,omitempty"`
+	CodexDaemon     *codexDaemonWarning     `json:"codex_daemon,omitempty"`
 	Error           string                  `json:"error,omitempty"`
 }
 
@@ -78,6 +79,7 @@ func init() {
 	activateCmd.Flags().Bool("force", false, "activate even if the profile is in cooldown")
 	activateCmd.Flags().Bool("auto", false, "auto-select profile using rotation algorithm")
 	activateCmd.Flags().Bool("json", false, "output as JSON")
+	activateCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 }
 
 func runActivate(cmd *cobra.Command, args []string) error {
@@ -385,6 +387,17 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		return emitJSONError(fmt.Errorf("activate failed: %w", err))
 	}
 
+	// Codex daemon check: swapping auth.json on disk does not affect a running
+	// `codex app-server`/`mcp-server`, which caches auth in-process. Detect it
+	// and warn (or, with --reload-daemon, restart it) so the switch isn't a
+	// silent no-op for daemon-backed sessions. See issue #21.
+	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
+	daemonWarn := checkCodexDaemon(tool, reloadDaemon)
+	if daemonWarn.Detected {
+		dw := daemonWarn
+		output.CodexDaemon = &dw
+	}
+
 	if spmCfg.Analytics.Enabled && db != nil {
 		_ = db.LogEvent(caamdb.Event{
 			Type:        caamdb.EventActivate,
@@ -408,6 +421,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Activated %s profile '%s'\n", tool, profileName)
 	fmt.Printf("  Run '%s' to start using this account\n", tool)
+	printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 	return nil
 }
 
