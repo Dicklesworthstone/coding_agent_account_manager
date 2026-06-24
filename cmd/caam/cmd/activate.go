@@ -47,8 +47,12 @@ type activateRotationAlternative struct {
 
 // activateCmd restores auth files from the vault.
 var activateCmd = &cobra.Command{
-	Use:     "activate <tool> [profile-name]",
-	Aliases: []string{"switch", "use"},
+	Use: "activate <tool> [profile-name]",
+	// "switch" is the unambiguous activation alias. "use" is intentionally NOT an
+	// alias here: there is a separate top-level `caam use <provider> <profile>`
+	// command that sets the default profile in config (different semantics), so
+	// advertising it as an activate alias would be misleading.
+	Aliases: []string{"switch"},
 	Short:   "Activate a profile (instant switch)",
 	Long: `Restores auth files from the vault, instantly switching to that account.
 
@@ -100,7 +104,14 @@ func runActivate(cmd *cobra.Command, args []string) error {
 			enc := json.NewEncoder(cmd.OutOrStdout())
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(output)
-			return nil // Error already in JSON
+			// The machine-readable error payload is already on stdout. Return the
+			// underlying error so the process exits non-zero (the README agent
+			// contract is "exit 0 = success"), but silence Cobra's usage dump and
+			// duplicate stderr error print since this is a runtime failure, not a
+			// flag/usage error.
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+			return err
 		}
 		return err
 	}
@@ -111,7 +122,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool))
+		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList()))
 	}
 
 	// Ensure vault is initialized before using it
@@ -399,14 +410,9 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	}
 
 	if spmCfg.Analytics.Enabled && db != nil {
-		_ = db.LogEvent(caamdb.Event{
-			Type:        caamdb.EventActivate,
-			Provider:    tool,
-			ProfileName: profileName,
-			Details: map[string]any{
-				"previous_profile": previousProfile,
-				"selection_source": source,
-			},
+		logProfileSwitch(db, tool, previousProfile, profileName, map[string]any{
+			"previous_profile": previousProfile,
+			"selection_source": source,
 		})
 	}
 
@@ -423,6 +429,48 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Run '%s' to start using this account\n", tool)
 	printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 	return nil
+}
+
+// logProfileSwitch records analytics events for a profile switch. When moving
+// away from a different, non-system outgoing profile it emits a duration-bearing
+// `deactivate` event for that outgoing profile (duration = now - its last
+// activation) so usage analytics accrue active time, then emits the `activate`
+// event for the incoming profile at the same instant. Without the deactivate
+// event, `caam usage` shows zero active hours for ordinary switches (issue #31).
+//
+// System profiles (_original, _backup_*, _auto_backup_*) are skipped as the
+// outgoing profile so they don't pollute user-facing usage stats.
+func logProfileSwitch(db *caamdb.DB, tool, outgoing, incoming string, details map[string]any) {
+	if db == nil {
+		return
+	}
+
+	now := time.Now()
+
+	if outgoing != "" && outgoing != incoming && !authfile.IsSystemProfile(outgoing) {
+		if last, err := db.LastActivation(tool, outgoing); err == nil && !last.IsZero() {
+			if d := now.Sub(last); d > 0 {
+				_ = db.LogEvent(caamdb.Event{
+					Type:        caamdb.EventDeactivate,
+					Provider:    tool,
+					ProfileName: outgoing,
+					Timestamp:   now,
+					Duration:    d,
+					Details: map[string]any{
+						"switched_to": incoming,
+					},
+				})
+			}
+		}
+	}
+
+	_ = db.LogEvent(caamdb.Event{
+		Type:        caamdb.EventActivate,
+		Provider:    tool,
+		ProfileName: incoming,
+		Timestamp:   now,
+		Details:     details,
+	})
 }
 
 func resolveActivateProfile(tool string, spmCfg *config.SPMConfig) (profileName string, source string, err error) {

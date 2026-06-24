@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,6 +62,25 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"cursor":   authfile.CursorAuthFiles,
 }
 
+// supportedTools returns the auth-swap providers (the keys of the tools map),
+// sorted for stable output. This is the single source of truth for "which
+// providers does caam manage auth files for", so help and error messages don't
+// drift from the actual tools map.
+func supportedTools() []string {
+	names := make([]string, 0, len(tools))
+	for name := range tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// supportedToolsList returns the comma-separated supported providers for use in
+// error messages such as "unknown tool: X (supported: ...)".
+func supportedToolsList() string {
+	return strings.Join(supportedTools(), ", ")
+}
+
 // getDB returns the global database connection, initializing it if necessary.
 func getDB() (*caamdb.DB, error) {
 	targetPath := filepath.Clean(caamdb.DefaultPath())
@@ -98,6 +118,7 @@ Supported tools:
   - codex    (OpenAI Codex CLI / GPT Pro)
   - claude   (Anthropic Claude Code / Claude Max)
   - gemini   (Google Gemini CLI / Gemini Ultra)
+  - agy      (Antigravity CLI)
   - opencode (OpenCode)
   - cursor   (Cursor CLI)
 
@@ -563,6 +584,7 @@ func init() {
 	rootCmd.AddCommand(lsCmd)
 	rootCmd.AddCommand(deleteCmd)
 	rootCmd.AddCommand(pathsCmd)
+	pathsCmd.Flags().Bool("json", false, "output as JSON")
 	rootCmd.AddCommand(clearCmd)
 
 	// Profile isolation commands
@@ -636,14 +658,20 @@ func runBackup(cmd *cobra.Command, args []string) error {
 			enc := json.NewEncoder(cmd.OutOrStdout())
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(output)
-			return nil
+			// Keep the JSON error payload on stdout but exit non-zero so callers
+			// branching on exit status see the failure (README agent contract).
+			// Silence the Cobra usage dump and duplicate stderr error for runtime
+			// failures.
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+			return err
 		}
 		return err
 	}
 
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool))
+		return emitJSONError(fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList()))
 	}
 
 	fileSet := getFileSet()
@@ -680,9 +708,9 @@ type statusOutput struct {
 }
 
 type statusTool struct {
-	Tool          string             `json:"tool"`
-	LoggedIn      bool               `json:"logged_in"`
-	ActiveProfile string             `json:"active_profile,omitempty"`
+	Tool          string `json:"tool"`
+	LoggedIn      bool   `json:"logged_in"`
+	ActiveProfile string `json:"active_profile,omitempty"`
 	// SavedProfiles is the number of vault profiles saved for this tool. It is
 	// populated when the tool is logged in but the live auth matches no saved
 	// profile, so JSON consumers can reconcile `status` with `ls` (issue #20).
@@ -1196,6 +1224,20 @@ func init() {
 	deleteCmd.Flags().Bool("force", false, "skip confirmation (required to delete system profiles starting with '_')")
 }
 
+// PathsFileRecord is a single auth-file path record for `paths --json`.
+type PathsFileRecord struct {
+	Path        string `json:"path"`
+	Exists      bool   `json:"exists"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+}
+
+// PathsToolRecord groups auth-file records for one tool for `paths --json`.
+type PathsToolRecord struct {
+	Tool  string            `json:"tool"`
+	Files []PathsFileRecord `json:"files"`
+}
+
 // pathsCmd shows auth file paths for each tool.
 var pathsCmd = &cobra.Command{
 	Use:   "paths [tool]",
@@ -1206,16 +1248,45 @@ Useful for understanding what caam is backing up and for manual troubleshooting.
 
 Examples:
   caam paths           # Show all tools
-  caam paths claude    # Show just Claude`,
+  caam paths claude    # Show just Claude
+  caam paths agy --json # Machine-readable records for one tool`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		toolsToShow := []string{"codex", "claude", "gemini"}
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+
+		// Default to every supported auth-swap tool (not a stale subset) so the
+		// discovery surface matches the tools map (issue #27).
+		toolsToShow := supportedTools()
 		if len(args) > 0 {
 			tool := strings.ToLower(args[0])
 			if _, ok := tools[tool]; !ok {
-				return fmt.Errorf("unknown tool: %s", tool)
+				return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 			}
 			toolsToShow = []string{tool}
+		}
+
+		if jsonOutput {
+			records := make([]PathsToolRecord, 0, len(toolsToShow))
+			for _, tool := range toolsToShow {
+				fileSet := tools[tool]()
+				rec := PathsToolRecord{Tool: tool, Files: make([]PathsFileRecord, 0, len(fileSet.Files))}
+				for _, spec := range fileSet.Files {
+					_, statErr := os.Stat(spec.Path)
+					rec.Files = append(rec.Files, PathsFileRecord{
+						Path:        spec.Path,
+						Exists:      statErr == nil,
+						Required:    spec.Required,
+						Description: spec.Description,
+					})
+				}
+				records = append(records, rec)
+			}
+			data, err := json.MarshalIndent(records, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			return nil
 		}
 
 		for _, tool := range toolsToShow {
