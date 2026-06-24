@@ -26,6 +26,17 @@ Examples:
   caam project show
   caam project list
 `,
+	// Without an explicit RunE, an unknown subcommand (e.g. a typo) silently
+	// printed help and exited 0, which is hard to diagnose in automation. Treat
+	// any leftover args as an unknown subcommand error (non-zero exit); with no
+	// args, show help (still a usage error, non-zero exit).
+	Args: cobra.ArbitraryArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf("unknown project subcommand: %q\nrun 'caam project --help' for available subcommands", args[0])
+		}
+		return cmd.Help()
+	},
 }
 
 func init() {
@@ -46,7 +57,7 @@ var projectSetCmd = &cobra.Command{
 		profileName := args[1]
 
 		if _, ok := tools[tool]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 		}
 		if projectStore == nil {
 			return fmt.Errorf("project store not initialized")
@@ -149,13 +160,40 @@ var projectListCmd = &cobra.Command{
 
 func init() {
 	projectListCmd.Flags().Bool("json", false, "output as JSON")
+	projectShowCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+// ProjectShowProvider is a single resolved provider association for JSON output.
+type ProjectShowProvider struct {
+	Provider string `json:"provider"`
+	Profile  string `json:"profile"`
+	Source   string `json:"source,omitempty"`
+}
+
+// ProjectShowOutput is the JSON output for `project show`/`project get`.
+type ProjectShowOutput struct {
+	Path      string                `json:"path"`
+	Providers []ProjectShowProvider `json:"providers"`
 }
 
 var projectShowCmd = &cobra.Command{
-	Use:   "show",
-	Short: "Show resolved associations for current directory",
-	Args:  cobra.NoArgs,
+	Use: "show [tool]",
+	// "get" is documented in the README; expose it as an alias so the documented
+	// `caam project get [tool]` resolves to the implemented show behavior.
+	Aliases: []string{"get"},
+	Short:   "Show resolved associations for current directory",
+	Args:    cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		jsonOutput, _ := cmd.Flags().GetBool("json")
+
+		var toolFilter string
+		if len(args) == 1 {
+			toolFilter = strings.ToLower(args[0])
+			if _, ok := tools[toolFilter]; !ok {
+				return fmt.Errorf("unknown tool: %s (supported: %s)", toolFilter, supportedToolsList())
+			}
+		}
+
 		if projectStore == nil {
 			return fmt.Errorf("project store not initialized")
 		}
@@ -169,7 +207,37 @@ var projectShowCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if len(resolved.Profiles) == 0 {
+
+		providers := make([]string, 0, len(resolved.Profiles))
+		for provider := range resolved.Profiles {
+			if toolFilter != "" && provider != toolFilter {
+				continue
+			}
+			providers = append(providers, provider)
+		}
+		sort.Strings(providers)
+
+		if jsonOutput {
+			out := ProjectShowOutput{
+				Path:      cwd,
+				Providers: make([]ProjectShowProvider, 0, len(providers)),
+			}
+			for _, provider := range providers {
+				rec := ProjectShowProvider{Provider: provider, Profile: resolved.Profiles[provider]}
+				if src := resolved.Sources[provider]; src != "" && src != cwd {
+					rec.Source = src
+				}
+				out.Providers = append(out.Providers, rec)
+			}
+			data, err := json.MarshalIndent(out, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), string(data))
+			return nil
+		}
+
+		if len(providers) == 0 {
 			fmt.Printf("Project: %s\n", cwd)
 			fmt.Println("No associations.")
 			return nil
@@ -177,12 +245,6 @@ var projectShowCmd = &cobra.Command{
 
 		fmt.Printf("Project: %s\n", cwd)
 		fmt.Println("Associations:")
-
-		providers := make([]string, 0, len(resolved.Profiles))
-		for provider := range resolved.Profiles {
-			providers = append(providers, provider)
-		}
-		sort.Strings(providers)
 
 		for _, provider := range providers {
 			profileName := resolved.Profiles[provider]
@@ -205,7 +267,7 @@ var projectRemoveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 		}
 		if projectStore == nil {
 			return fmt.Errorf("project store not initialized")

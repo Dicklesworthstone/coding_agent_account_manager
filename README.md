@@ -321,7 +321,7 @@ carol@gmail.com
 | `caam rename <tool> <old> <new>` | Copy profile to a new name (non-destructive) |
 | `caam uninstall` | Restore originals from `_original` and remove caam data/config |
 
-**Aliases:** `caam switch` and `caam use` work like `caam activate`
+**Aliases:** `caam switch` is the activation alias and works like `caam activate`. Note that `caam use <provider> <profile>` is a separate command that sets the *default* profile for a provider (it does not switch active auth files).
 
 ### Quick Switch: `pick` + aliases
 
@@ -371,14 +371,15 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 | Command | Description |
 |---------|-------------|
 | `caam activate <tool> --auto` | Auto-select the best profile using rotation algorithm |
-| `caam next <tool>` | Preview which profile rotation would select (dry-run) |
+| `caam next <tool>` | Switch to the next profile in rotation (use `--dry-run` to preview without switching) |
 | `caam run <tool> [-- args]` | Wrap CLI execution with automatic failover on rate limits |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
 | `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
 | `caam cooldown clear --all` | Clear all active cooldowns |
 | `caam project set <tool> <profile>` | Associate current directory with a profile |
-| `caam project get [tool]` | Show project associations for current directory |
+| `caam project show [tool]` | Show resolved associations for current directory (`get` is an alias; `--json` for machine-readable output) |
+| `caam project list` | List all project associations (`--json` supported) |
 
 **Options for `caam run`:**
 - `--max-retries N` — Maximum retry attempts on rate limit (default: 1)
@@ -790,11 +791,29 @@ scoop install dicklesworthstone/caam
 
 ### Alternative: Direct Download
 
-Download the latest release for your platform:
-- [Linux x86_64](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-linux-amd64)
-- [macOS Intel](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-darwin-amd64)
-- [macOS ARM](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-darwin-arm64)
-- [Windows](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam-windows-amd64.exe)
+Releases ship as versioned archives (one `.tar.gz` per Unix platform, a `.zip` for
+Windows) on the [releases page](https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest).
+Download the archive matching your platform, extract it, and put the `caam`
+binary on your `PATH`:
+
+| Platform | Asset |
+|----------|-------|
+| Linux x86_64 | `caam_<version>_linux_amd64.tar.gz` |
+| Linux ARM64 | `caam_<version>_linux_arm64.tar.gz` |
+| macOS Intel | `caam_<version>_darwin_amd64.tar.gz` |
+| macOS ARM | `caam_<version>_darwin_arm64.tar.gz` |
+| Windows x86_64 | `caam_<version>_windows_amd64.zip` |
+
+For example, on Linux x86_64:
+
+```bash
+ver=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+curl -fsSL -o caam.tar.gz "https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam_${ver}_linux_amd64.tar.gz"
+tar -xzf caam.tar.gz && sudo install caam /usr/local/bin/
+```
+
+If you don't want to pick an asset by hand, the install script above downloads,
+verifies, and installs the right archive for your platform automatically.
 
 ### Verify Release Artifacts
 
