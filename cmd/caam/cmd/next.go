@@ -58,7 +58,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	// Validate tool
 	getFileSet, ok := tools[tool]
 	if !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	// Ensure vault is initialized
@@ -207,17 +207,13 @@ func runNext(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("activate failed: %w", err)
 	}
 
-	// Log event
+	// Log event. logProfileSwitch also emits a duration-bearing deactivate event
+	// for the outgoing profile so usage analytics accrue active time (issue #31).
 	if spmCfg.Analytics.Enabled && db != nil {
-		_ = db.LogEvent(caamdb.Event{
-			Type:        caamdb.EventActivate,
-			Provider:    tool,
-			ProfileName: selection.Selected,
-			Details: map[string]any{
-				"previous_profile": currentProfile,
-				"selection_source": "next",
-				"algorithm":        selection.Algorithm,
-			},
+		logProfileSwitch(db, tool, currentProfile, selection.Selected, map[string]any{
+			"previous_profile": currentProfile,
+			"selection_source": "next",
+			"algorithm":        selection.Algorithm,
 		})
 	}
 
