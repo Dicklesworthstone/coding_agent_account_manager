@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -156,10 +157,28 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 		return err
 	}
 
-	// Set up keyboard input for table mode
+	// Set up keyboard input for table mode. The cleanup function restores the
+	// terminal from raw mode; it MUST run on every exit path before we hand
+	// control back to the shell (issue #33). We own cleanup here rather than
+	// leaving it deferred inside the input goroutine, because that goroutine
+	// stays blocked in os.Stdin.Read when we return and would never run its
+	// deferred restore — leaving the terminal in raw mode (no opost/icrnl), which
+	// makes subsequent shell output stair-step until `stty sane`.
 	var inputCh <-chan byte
+	restoreTerminal := func() {}
 	if format == "table" && term.IsTerminal(int(os.Stdin.Fd())) {
-		inputCh = setupKeyboardInput()
+		inputCh, restoreTerminal = setupKeyboardInput()
+	}
+	// Safety net in case of an unexpected return path.
+	defer restoreTerminal()
+
+	// stop restores the terminal first (so the final message and the shell
+	// prompt render with normal output processing) and prints "Monitor stopped."
+	stop := func() {
+		restoreTerminal()
+		if format == "table" {
+			fmt.Fprintln(out, "\nMonitor stopped.")
+		}
 	}
 
 	ticker := time.NewTicker(interval)
@@ -174,9 +193,7 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 	for {
 		select {
 		case <-ctx.Done():
-			if format == "table" {
-				fmt.Fprintln(out, "\nMonitor stopped.")
-			}
+			stop()
 			return nil
 
 		case <-ticker.C:
@@ -191,9 +208,7 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 		case key := <-inputCh:
 			switch key {
 			case 'q', 'Q':
-				if format == "table" {
-					fmt.Fprintln(out, "\nMonitor stopped.")
-				}
+				stop()
 				return nil
 			case 'r', 'R':
 				if err := mon.Refresh(ctx); err != nil {
@@ -223,21 +238,37 @@ func clearScreen(out io.Writer) {
 	fmt.Fprint(out, "\033[2J\033[H")
 }
 
-func setupKeyboardInput() <-chan byte {
+// setupKeyboardInput puts the terminal into raw mode and starts a goroutine that
+// forwards keypresses on the returned channel. It also returns a cleanup
+// function that restores the original terminal state. The caller owns calling
+// cleanup on every exit path: the reader goroutine blocks indefinitely in
+// os.Stdin.Read, so a deferred restore inside the goroutine would not run when
+// the monitor loop returns (issue #33). cleanup is safe to call more than once.
+func setupKeyboardInput() (<-chan byte, func()) {
 	ch := make(chan byte, 1)
 
 	// Try to put terminal in raw mode for key input
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		return ch // Return empty channel if we can't get raw mode
+		// Could not enter raw mode; nothing to restore.
+		return ch, func() {}
+	}
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			_ = term.Restore(fd, oldState)
+		})
 	}
 
 	go func() {
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
 		buf := make([]byte, 1)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil || n == 0 {
+				// Restore on read error/EOF too, in case the owner did not.
+				cleanup()
 				return
 			}
 			select {
@@ -247,5 +278,5 @@ func setupKeyboardInput() <-chan byte {
 		}
 	}()
 
-	return ch
+	return ch, cleanup
 }
