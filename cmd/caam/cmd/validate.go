@@ -2,18 +2,17 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 var validateCmd = &cobra.Command{
@@ -65,148 +64,128 @@ type ValidationOutput struct {
 }
 
 func runValidate(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	// Ensure the vault is initialized (PersistentPreRunE normally does this, but
+	// keep validate robust when invoked directly, e.g. in tests).
+	if vault == nil {
+		vault = authfile.NewVault(authfile.DefaultVaultPath())
+	}
 
-	// Get profile store
-	store := profile.NewStore(profile.DefaultStorePath())
-
-	// Build provider registry
-	registry := provider.NewRegistry()
-	registry.Register(claude.New())
-	registry.Register(codex.New())
-	registry.Register(gemini.New())
-
-	var results []ValidationOutput
-	var err error
-
-	// Determine which profiles to validate
+	// validate operates on the SAME saved-profile source of truth as backup,
+	// activate, and ls: the vault. Previously it read the isolated profile.Store,
+	// so it reported missing/invalid credentials for normal vault-backed profiles
+	// (issue #23).
+	var toolFilter, profileFilter string
 	switch len(args) {
-	case 0:
-		// Validate all profiles
-		results, err = validateAllProfiles(ctx, store, registry, !validateActive)
 	case 1:
-		// Validate all profiles for a specific provider
-		results, err = validateProviderProfiles(ctx, store, registry, args[0], !validateActive)
+		toolFilter = args[0]
 	case 2:
-		// Validate specific profile
-		results, err = validateSingleProfile(ctx, store, registry, args[0], args[1], !validateActive)
+		toolFilter = args[0]
+		profileFilter = args[1]
 	}
 
-	if err != nil {
-		return err
+	if toolFilter != "" {
+		if _, ok := tools[toolFilter]; !ok {
+			return fmt.Errorf("unknown tool: %s (supported: %s)", toolFilter, supportedToolsList())
+		}
 	}
 
-	// Output results
+	// Active validation against saved vault profiles is not implemented; vault
+	// profiles are raw auth files, not isolated profile homes. Surface this on
+	// stderr (diagnostics) and proceed with passive validation rather than
+	// silently pretending to make API calls.
+	if validateActive {
+		fmt.Fprintln(os.Stderr, "note: --active is not supported for saved vault profiles; performing passive validation")
+	}
+
+	results := []ValidationOutput{}
+
+	for _, tool := range supportedTools() {
+		if toolFilter != "" && tool != toolFilter {
+			continue
+		}
+
+		profiles, err := vault.List(tool)
+		if err != nil {
+			continue // No profiles for this tool
+		}
+		sort.Strings(profiles)
+
+		for _, profileName := range profiles {
+			if authfile.IsSystemProfile(profileName) {
+				continue // Skip _original / _backup_* system profiles
+			}
+			if profileFilter != "" && profileName != profileFilter {
+				continue
+			}
+			results = append(results, validateVaultProfile(tool, profileName))
+		}
+	}
+
+	// Output results. Encode empty results as [] (not null) for agent parsing.
 	if validateJSON {
 		return outputJSON(results)
 	}
 	return outputHuman(results)
 }
 
-func validateAllProfiles(ctx context.Context, store *profile.Store, registry *provider.Registry, passive bool) ([]ValidationOutput, error) {
-	var results []ValidationOutput
+// validateVaultProfile passively validates a single saved vault profile. A
+// profile is valid when its auth files are present and parseable. An expired
+// access token does NOT make the profile invalid if a refresh token is present:
+// such profiles are refreshable, and reporting them as hard-expired is
+// misleading (issue #22). Only credentials with no refresh capability are
+// reported as expired/invalid.
+func validateVaultProfile(tool, profileName string) ValidationOutput {
+	out := ValidationOutput{
+		Provider:  tool,
+		Profile:   profileName,
+		Method:    "passive",
+		CheckedAt: time.Now(),
+	}
 
-	for _, prov := range registry.All() {
-		profiles, err := store.List(prov.ID())
-		if err != nil {
-			continue // Skip providers with no profiles
+	info, err := loadExpiryInfo(tool, profileName)
+	if err != nil {
+		switch {
+		case errors.Is(err, health.ErrNoAuthFile):
+			out.Valid = false
+			out.Error = "no auth files found"
+		case errors.Is(err, health.ErrNoExpiry):
+			// Auth files exist but carry no parseable expiry/refresh metadata.
+			// Treat as valid-but-unknown: the credentials are present.
+			out.Valid = true
+		default:
+			out.Valid = false
+			out.Error = err.Error()
 		}
+		return out
+	}
 
-		for _, prof := range profiles {
-			result, err := validateProfile(ctx, prov, prof, passive)
-			if err != nil {
-				result = &ValidationOutput{
-					Provider:  prov.ID(),
-					Profile:   prof.Name,
-					Valid:     false,
-					Method:    methodString(passive),
-					Error:     err.Error(),
-					CheckedAt: time.Now(),
-				}
-			}
-			results = append(results, *result)
+	// Tools without expiry parsing (opencode/cursor/agy) return nil info; the
+	// presence of the vault profile dir is the validation signal for them.
+	if info == nil {
+		out.Valid = true
+		return out
+	}
+
+	expired := !info.ExpiresAt.IsZero() && time.Until(info.ExpiresAt) <= 0
+	switch {
+	case expired && info.HasRefreshToken:
+		// Refreshable: short-lived access token expired but a refresh token
+		// remains. Considered valid/refreshable, not hard-expired. Avoid
+		// presenting the access-token expiry as account expiry (issue #22).
+		out.Valid = true
+		out.ExpiresAt = "refreshable"
+	case expired:
+		out.Valid = false
+		out.Error = "token expired and no refresh token available"
+		out.ExpiresAt = "expired"
+	default:
+		out.Valid = true
+		if !info.ExpiresAt.IsZero() {
+			out.ExpiresAt = formatExpiryTime(info.ExpiresAt)
 		}
 	}
 
-	return results, nil
-}
-
-func validateProviderProfiles(ctx context.Context, store *profile.Store, registry *provider.Registry, providerID string, passive bool) ([]ValidationOutput, error) {
-	prov, ok := registry.Get(providerID)
-	if !ok {
-		return nil, fmt.Errorf("unknown provider: %s", providerID)
-	}
-
-	profiles, err := store.List(providerID)
-	if err != nil {
-		return nil, fmt.Errorf("list profiles: %w", err)
-	}
-
-	var results []ValidationOutput
-	for _, prof := range profiles {
-		result, err := validateProfile(ctx, prov, prof, passive)
-		if err != nil {
-			result = &ValidationOutput{
-				Provider:  prov.ID(),
-				Profile:   prof.Name,
-				Valid:     false,
-				Method:    methodString(passive),
-				Error:     err.Error(),
-				CheckedAt: time.Now(),
-			}
-		}
-		results = append(results, *result)
-	}
-
-	return results, nil
-}
-
-func validateSingleProfile(ctx context.Context, store *profile.Store, registry *provider.Registry, providerID, profileName string, passive bool) ([]ValidationOutput, error) {
-	prov, ok := registry.Get(providerID)
-	if !ok {
-		return nil, fmt.Errorf("unknown provider: %s", providerID)
-	}
-
-	prof, err := store.Load(providerID, profileName)
-	if err != nil {
-		return nil, fmt.Errorf("load profile: %w", err)
-	}
-
-	result, err := validateProfile(ctx, prov, prof, passive)
-	if err != nil {
-		return nil, err
-	}
-
-	return []ValidationOutput{*result}, nil
-}
-
-func validateProfile(ctx context.Context, prov provider.Provider, prof *profile.Profile, passive bool) (*ValidationOutput, error) {
-	result, err := prov.ValidateToken(ctx, prof, passive)
-	if err != nil {
-		return nil, err
-	}
-
-	output := &ValidationOutput{
-		Provider:  result.Provider,
-		Profile:   result.Profile,
-		Valid:     result.Valid,
-		Method:    result.Method,
-		Error:     result.Error,
-		CheckedAt: result.CheckedAt,
-	}
-
-	if !result.ExpiresAt.IsZero() {
-		output.ExpiresAt = formatExpiryTime(result.ExpiresAt)
-	}
-
-	return output, nil
-}
-
-func methodString(passive bool) string {
-	if passive {
-		return "passive"
-	}
-	return "active"
+	return out
 }
 
 func formatExpiryTime(t time.Time) string {
