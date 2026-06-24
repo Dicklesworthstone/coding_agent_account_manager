@@ -85,8 +85,10 @@ This command scans local CLI logs to calculate actual token usage and estimates
 what the equivalent API cost would be. This helps you understand the value
 you're getting from your subscription.
 
+Token-cost analysis is available for providers with log scanners (claude, codex, gemini).
+
 Examples:
-  caam cost tokens                    # Show costs for all providers (last 30 days)
+  caam cost tokens                    # Show costs for providers with log scanners (claude, codex, gemini)
   caam cost tokens claude             # Show Claude costs only
   caam cost tokens --last 168h        # Show costs for last 7 days (168 hours)
   caam cost tokens --last 24h         # Show costs for last 24 hours
@@ -500,6 +502,18 @@ type TokenModelCost struct {
 	APICost      float64 `json:"api_cost"`
 }
 
+// tokenCostProviders are the providers with token-cost log scanners.
+var tokenCostProviders = []string{"claude", "codex", "gemini"}
+
+func isTokenCostProvider(p string) bool {
+	for _, tp := range tokenCostProviders {
+		if tp == p {
+			return true
+		}
+	}
+	return false
+}
+
 func runCostTokens(cmd *cobra.Command, args []string) error {
 	lastStr, _ := cmd.Flags().GetString("last")
 	format, _ := cmd.Flags().GetString("format")
@@ -510,12 +524,19 @@ func runCostTokens(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --last duration: %w", err)
 	}
 
-	// Parse provider argument
+	// Token-cost analysis relies on per-provider log scanners, which only exist
+	// for a subset of providers. Be explicit about scope: default to the
+	// providers that have scanners, and reject an explicit unsupported provider
+	// with a clear message instead of silently skipping it (issue #32).
 	var providers []string
 	if len(args) > 0 {
-		providers = []string{strings.ToLower(args[0])}
+		p := strings.ToLower(args[0])
+		if !isTokenCostProvider(p) {
+			return fmt.Errorf("token cost analysis not supported for provider: %s (supported: %s)", p, strings.Join(tokenCostProviders, ", "))
+		}
+		providers = []string{p}
 	} else {
-		providers = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+		providers = append([]string(nil), tokenCostProviders...)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

@@ -26,8 +26,10 @@ This command queries the provider's API to get current rate limit utilization,
 which is useful for deciding when to switch accounts. It also parses local logs
 to estimate token burn rate and predict when limits will be hit.
 
+Live limit fetching is available for providers with usage APIs (claude, codex).
+
 Examples:
-  caam limits                     # Show limits for all providers
+  caam limits                     # Show limits for all supported providers (claude, codex)
   caam limits claude              # Show Claude limits only
   caam limits codex               # Show Codex limits only
   caam limits --profile work      # Show limits for a specific profile
@@ -54,11 +56,19 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	showRecommend, _ := cmd.Flags().GetBool("recommend")
 	showForecast, _ := cmd.Flags().GetBool("forecast")
 
+	// Live limit fetching only has API support for a subset of providers (those
+	// with credential readers + API fetchers). Be explicit about scope: default
+	// to the supported set, and reject an explicit unsupported provider with a
+	// clear message rather than silently returning empty data (issue #32).
 	var providers []string
 	if len(args) > 0 {
-		providers = []string{strings.ToLower(args[0])}
+		p := strings.ToLower(args[0])
+		if !isLimitsProvider(p) {
+			return fmt.Errorf("limits not supported for provider: %s (supported: %s)", p, strings.Join(limitsProviders, ", "))
+		}
+		providers = []string{p}
 	} else {
-		providers = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+		providers = append([]string(nil), limitsProviders...)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -122,6 +132,18 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	}
 
 	return renderLimits(out, format, allResults)
+}
+
+// limitsProviders are the providers with live limit/usage API support.
+var limitsProviders = []string{"claude", "codex"}
+
+func isLimitsProvider(p string) bool {
+	for _, lp := range limitsProviders {
+		if lp == p {
+			return true
+		}
+	}
+	return false
 }
 
 func getProfileToken(vaultDir, provider, profileName string) (string, error) {
