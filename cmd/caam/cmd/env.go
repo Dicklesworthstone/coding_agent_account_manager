@@ -42,7 +42,7 @@ Use --export-prefix to change the export syntax (default: "export").`,
 
 		prov, ok := registry.Get(tool)
 		if !ok {
-			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown provider: %s (supported: %s)", tool, supportedToolsList())
 		}
 
 		prof, err := profileStore.Load(tool, name)

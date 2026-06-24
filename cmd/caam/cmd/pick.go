@@ -63,7 +63,7 @@ func runPick(cmd *cobra.Command, args []string) error {
 	}
 
 	if _, ok := tools[tool]; !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	if vault == nil {

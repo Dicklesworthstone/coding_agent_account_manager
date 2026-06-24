@@ -66,7 +66,7 @@ func runRefresh(cmd *cobra.Command, args []string) error {
 
 	tool := strings.ToLower(args[0])
 	if _, ok := tools[tool]; !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	if len(args) == 1 {
@@ -269,7 +269,7 @@ func refreshSingle(ctx context.Context, tool, profile string, threshold time.Dur
 
 func shouldRefreshProfile(tool, profile string, threshold time.Duration, force bool) (bool, string, error) {
 	if _, ok := tools[tool]; !ok {
-		return false, "", fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return false, "", fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	// Ensure profile exists.

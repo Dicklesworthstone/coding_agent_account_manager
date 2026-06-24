@@ -23,9 +23,12 @@ If no profile is specified, or the profile has no browser config, the URL
 will be opened in your system's default browser.
 
 Providers and their URLs:
-  codex   - OpenAI Platform (https://platform.openai.com/account)
-  claude  - Anthropic Console (https://console.anthropic.com/)
-  gemini  - Google AI Studio (https://aistudio.google.com/)
+  codex    - OpenAI Platform (https://platform.openai.com/account)
+  claude   - Anthropic Console (https://console.anthropic.com/)
+  gemini   - Google AI Studio (https://aistudio.google.com/)
+  agy      - Antigravity (https://antigravity.google/)
+  opencode - OpenCode (https://opencode.ai/)
+  cursor   - Cursor (https://cursor.com/settings)
 
 Examples:
   caam open codex           # Open OpenAI account in default browser
@@ -38,7 +41,7 @@ Examples:
 		// Validate provider using centralized metadata
 		meta, ok := provider.GetProviderMeta(tool)
 		if !ok {
-			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini)", tool)
+			return fmt.Errorf("unknown provider: %s (supported: %s)", tool, supportedToolsList())
 		}
 
 		// Allow custom URL override

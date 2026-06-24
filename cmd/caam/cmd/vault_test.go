@@ -67,14 +67,18 @@ func TestActivateCommand_UnknownTool(t *testing.T) {
 	}
 }
 
-// TestActivateCommand_Aliases tests activate command has switch and use aliases.
+// TestActivateCommand_Aliases tests activate command has the switch alias and
+// does NOT advertise "use" as an alias (there is a separate top-level `caam use`
+// command that sets the default profile, with different semantics).
 func TestActivateCommand_Aliases(t *testing.T) {
 	expectedAliases := map[string]bool{
 		"switch": false,
-		"use":    false,
 	}
 
 	for _, alias := range activateCmd.Aliases {
+		if alias == "use" {
+			t.Errorf("activate should not advertise %q as an alias; it conflicts with the top-level `caam use` command", alias)
+		}
 		expectedAliases[alias] = true
 	}
 

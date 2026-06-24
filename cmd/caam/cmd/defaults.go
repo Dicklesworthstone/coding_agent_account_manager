@@ -29,7 +29,7 @@ Use 'caam which' to see current defaults.`,
 
 		// Validate provider
 		if _, ok := tools[provider]; !ok {
-			return fmt.Errorf("unknown provider: %s (supported: codex, claude, gemini)", provider)
+			return fmt.Errorf("unknown provider: %s (supported: %s)", provider, supportedToolsList())
 		}
 
 		// Check if vault profile exists

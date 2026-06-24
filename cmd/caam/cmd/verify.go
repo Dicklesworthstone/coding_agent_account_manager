@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -9,21 +10,23 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/spf13/cobra"
 )
 
 // VerifyProfileResult represents the verification result for a single profile.
 type VerifyProfileResult struct {
-	Provider    string        `json:"provider"`
-	Profile     string        `json:"profile"`
-	Status      string        `json:"status"` // "healthy", "warning", "critical", "unknown"
-	TokenExpiry *time.Time    `json:"token_expiry,omitempty"`
-	ExpiresIn   string        `json:"expires_in,omitempty"`
-	ErrorCount  int           `json:"error_count,omitempty"`
-	Penalty     float64       `json:"penalty,omitempty"`
-	Issues      []string      `json:"issues,omitempty"`
-	Score       float64       `json:"score"`
+	Provider    string     `json:"provider"`
+	Profile     string     `json:"profile"`
+	Status      string     `json:"status"` // "healthy", "warning", "critical", "unknown"
+	TokenExpiry *time.Time `json:"token_expiry,omitempty"`
+	ExpiresIn   string     `json:"expires_in,omitempty"`
+	ErrorCount  int        `json:"error_count,omitempty"`
+	Penalty     float64    `json:"penalty,omitempty"`
+	Issues      []string   `json:"issues,omitempty"`
+	Score       float64    `json:"score"`
 }
 
 // VerifyOutput represents the complete verification output.
@@ -31,15 +34,24 @@ type VerifyOutput struct {
 	Profiles        []VerifyProfileResult `json:"profiles"`
 	Summary         VerifySummary         `json:"summary"`
 	Recommendations []string              `json:"recommendations,omitempty"`
+	Fixes           []VerifyFixResult     `json:"fixes,omitempty"`
+}
+
+// VerifyFixResult records the outcome of a --fix refresh attempt for one profile.
+type VerifyFixResult struct {
+	Provider string `json:"provider"`
+	Profile  string `json:"profile"`
+	Action   string `json:"action"` // "refreshed", "skipped", "failed"
+	Detail   string `json:"detail,omitempty"`
 }
 
 // VerifySummary provides a summary of verification results.
 type VerifySummary struct {
-	TotalProfiles  int `json:"total_profiles"`
-	HealthyCount   int `json:"healthy_count"`
-	WarningCount   int `json:"warning_count"`
-	CriticalCount  int `json:"critical_count"`
-	UnknownCount   int `json:"unknown_count"`
+	TotalProfiles int `json:"total_profiles"`
+	HealthyCount  int `json:"healthy_count"`
+	WarningCount  int `json:"warning_count"`
+	CriticalCount int `json:"critical_count"`
+	UnknownCount  int `json:"unknown_count"`
 }
 
 var verifyCmd = &cobra.Command{
@@ -64,22 +76,18 @@ Examples:
 func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().Bool("json", false, "output as JSON")
-	verifyCmd.Flags().Bool("fix", false, "auto-refresh expiring tokens (not yet implemented)")
+	verifyCmd.Flags().Bool("fix", false, "auto-refresh expiring/expired tokens for refreshable profiles")
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	fixMode, _ := cmd.Flags().GetBool("fix")
 
-	if fixMode {
-		return fmt.Errorf("--fix mode is not yet implemented")
-	}
-
 	var toolFilter string
 	if len(args) > 0 {
 		toolFilter = strings.ToLower(args[0])
 		if _, ok := tools[toolFilter]; !ok {
-			return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", toolFilter)
+			return fmt.Errorf("unknown tool: %s (supported: %s)", toolFilter, supportedToolsList())
 		}
 	}
 
@@ -88,8 +96,17 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		Recommendations: []string{},
 	}
 
+	// --fix: before reporting, attempt to refresh refreshable profiles whose
+	// tokens are expiring or expired. This delegates to the same provider-aware
+	// refresh path as `caam refresh` (Claude is intentionally unsupported and is
+	// reported as skipped; Codex/Gemini refresh where possible). Verification
+	// below then reflects the post-refresh state.
+	if fixMode {
+		output.Fixes = runVerifyFix(cmd, toolFilter)
+	}
+
 	// Get all profiles
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	providers := supportedTools()
 	for _, provider := range providers {
 		if toolFilter != "" && provider != toolFilter {
 			continue
@@ -134,6 +151,74 @@ func runVerify(cmd *cobra.Command, args []string) error {
 
 	printVerifyOutput(cmd.OutOrStdout(), output)
 	return nil
+}
+
+// runVerifyFix attempts to refresh refreshable profiles whose tokens are
+// expiring or expired, returning a per-profile record of what happened. It is
+// best-effort: individual refresh failures are recorded but do not abort the
+// overall verify run (verification still reports the resulting health).
+func runVerifyFix(cmd *cobra.Command, toolFilter string) []VerifyFixResult {
+	ctx := cmd.Context()
+
+	threshold := refresh.DefaultRefreshThreshold
+	if spmCfg, err := config.LoadSPMConfig(); err == nil {
+		if v := spmCfg.Health.RefreshThreshold.Duration(); v > 0 {
+			threshold = v
+		}
+	}
+
+	var results []VerifyFixResult
+
+	for _, provider := range supportedTools() {
+		if toolFilter != "" && provider != toolFilter {
+			continue
+		}
+
+		profiles, err := vault.List(provider)
+		if err != nil {
+			continue
+		}
+		sort.Strings(profiles)
+
+		for _, profileName := range profiles {
+			should, reason, err := shouldRefreshProfile(provider, profileName, threshold, false)
+			if err != nil {
+				results = append(results, VerifyFixResult{
+					Provider: provider, Profile: profileName,
+					Action: "failed", Detail: err.Error(),
+				})
+				continue
+			}
+			if !should {
+				// Not expiring/expired (or no refresh token) — nothing to fix.
+				continue
+			}
+
+			if err := refresh.RefreshProfile(ctx, provider, profileName, vault, healthStore); err != nil {
+				if errors.Is(err, refresh.ErrUnsupported) {
+					results = append(results, VerifyFixResult{
+						Provider: provider, Profile: profileName,
+						Action: "skipped", Detail: err.Error(),
+					})
+					continue
+				}
+				results = append(results, VerifyFixResult{
+					Provider: provider, Profile: profileName,
+					Action: "failed", Detail: err.Error(),
+				})
+				continue
+			}
+
+			// Keep the isolated profile in sync to avoid token drift.
+			syncVaultToIsolated(provider, profileName)
+			results = append(results, VerifyFixResult{
+				Provider: provider, Profile: profileName,
+				Action: "refreshed", Detail: reason,
+			})
+		}
+	}
+
+	return results
 }
 
 func verifyProfile(provider, profileName string) VerifyProfileResult {
@@ -264,6 +349,20 @@ func generateRecommendations(output *VerifyOutput) []string {
 }
 
 func printVerifyOutput(w io.Writer, output *VerifyOutput) {
+	if len(output.Fixes) > 0 {
+		fmt.Fprintln(w, "Fix attempts (--fix):")
+		for _, fix := range output.Fixes {
+			line := fmt.Sprintf("  %s %s/%s", verifyFixIcon(fix.Action), fix.Provider, fix.Profile)
+			if fix.Detail != "" {
+				line += fmt.Sprintf(" - %s (%s)", fix.Action, fix.Detail)
+			} else {
+				line += " - " + fix.Action
+			}
+			fmt.Fprintln(w, line)
+		}
+		fmt.Fprintln(w)
+	}
+
 	if len(output.Profiles) == 0 {
 		fmt.Fprintln(w, "No profiles found.")
 		return
@@ -331,6 +430,19 @@ func printVerifyOutput(w io.Writer, output *VerifyOutput) {
 		for _, rec := range output.Recommendations {
 			fmt.Fprintf(w, "  • %s\n", rec)
 		}
+	}
+}
+
+func verifyFixIcon(action string) string {
+	switch action {
+	case "refreshed":
+		return "✓"
+	case "skipped":
+		return "•"
+	case "failed":
+		return "✗"
+	default:
+		return "?"
 	}
 }
 

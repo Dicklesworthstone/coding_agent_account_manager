@@ -65,7 +65,7 @@ func runAlias(cmd *cobra.Command, args []string) error {
 
 	// Validate tool
 	if _, ok := tools[tool]; !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	// Validate profile exists
@@ -260,7 +260,7 @@ func runFavorite(cmd *cobra.Command, args []string) error {
 
 	tool := args[0]
 	if _, ok := tools[tool]; !ok {
-		return fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
 
 	// Clear favorites

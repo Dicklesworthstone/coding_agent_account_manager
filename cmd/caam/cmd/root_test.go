@@ -163,8 +163,9 @@ func TestActivateCommandFlags(t *testing.T) {
 		t.Errorf("Unexpected Use: %q", activateCmd.Use)
 	}
 
-	// Check aliases
-	expectedAliases := []string{"switch", "use"}
+	// Check aliases. "switch" is the activation alias; "use" must NOT be an alias
+	// because there is a separate top-level `caam use` command (issue #30).
+	expectedAliases := []string{"switch"}
 	for _, alias := range expectedAliases {
 		found := false
 		for _, a := range activateCmd.Aliases {
@@ -175,6 +176,11 @@ func TestActivateCommandFlags(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("Expected alias %q not found", alias)
+		}
+	}
+	for _, a := range activateCmd.Aliases {
+		if a == "use" {
+			t.Errorf("activate should not advertise %q as an alias (conflicts with top-level `caam use`)", a)
 		}
 	}
 

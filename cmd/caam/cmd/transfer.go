@@ -139,7 +139,7 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 			return nil, fmt.Errorf("tool cannot be empty")
 		}
 		if _, ok := tools[tool]; !ok {
-			return nil, fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return nil, fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 		}
 
 		profiles, err := v.List(tool)
@@ -165,7 +165,7 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 			return nil, fmt.Errorf("tool and profile are required")
 		}
 		if _, ok := tools[tool]; !ok {
-			return nil, fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", tool)
+			return nil, fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 		}
 
 		dirPath := v.ProfilePath(tool, profile)
@@ -431,7 +431,7 @@ func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*vaultExp
 			return nil, err
 		}
 		if _, ok := tools[opt.AsTool]; !ok {
-			return nil, fmt.Errorf("unknown tool: %s (supported: codex, claude, gemini)", opt.AsTool)
+			return nil, fmt.Errorf("unknown tool: %s (supported: %s)", opt.AsTool, supportedToolsList())
 		}
 		if err := validateVaultSegment("profile", opt.AsProfile); err != nil {
 			return nil, err
