@@ -40,12 +40,16 @@ var shallowProfileCmd = &cobra.Command{
 auth files are real and everything else is a symlink back to your real HOME.
 
 This enables N parallel sessions, each pinned to a different account, while
-preserving shared state (shell history, git config, ssh keys, Claude
-conversation history under ~/.claude/projects/). Unlike 'caam profile add'
-which gives each profile a blank, fully-isolated HOME, shallow profiles only
-isolate what MUST differ (the credentials).
+preserving shared state (shell history, git config, ssh keys, conversation
+history). Unlike 'caam profile add' which gives each profile a blank,
+fully-isolated HOME, shallow profiles only isolate what MUST differ (the
+provider's identity files).
 
-Layout under ~/orch-homes/<name>/:
+Supported providers (--tool, or inferred from --from-vault): claude, codex, agy.
+Each provider keeps only its own identity files real and private; everything
+else symlinks back to your real HOME.
+
+Layout under ~/orch-homes/<name>/ (claude shown):
 
   .claude/.credentials.json       (real file — per-identity OAuth tokens)
   .claude/.credentials.lock       (real file — per-identity flock target)
@@ -53,11 +57,16 @@ Layout under ~/orch-homes/<name>/:
   .claude/projects, .claude/todos (symlinks → ~/.claude/projects, etc.)
   .bashrc, .gitconfig, .ssh, ...  (symlinks → ~/.bashrc, etc.)
 
+  codex: .codex/auth.json + .codex/config.toml are real (CODEX_HOME is pinned).
+  agy:   .gemini/antigravity-cli/antigravity-oauth-token (+ optional Google
+         identity files) are real (GEMINI_HOME is pinned).
+
 Spawn under a shallow identity with:
 
-  caam shallow-spawn <name> -- claude
+  caam shallow-spawn <name> -- <tool>
 
-which sets HOME=~/orch-homes/<name> and execs the command.`,
+which sets HOME=~/orch-homes/<name> (plus CODEX_HOME/GEMINI_HOME for those
+providers) and execs the command.`,
 }
 
 func init() {
@@ -73,19 +82,26 @@ func init() {
 var shallowProfileCreateCmd = &cobra.Command{
 	Use:   "create <name>",
 	Short: "Create a new shallow profile",
-	Long: `Create a new shallow profile. Provisions the symlink farm and copies
-a credential file into <home>/.claude/.credentials.json.
+	Long: `Create a new shallow profile. Provisions the symlink farm and copies the
+provider's primary credential into the shallow HOME (claude .credentials.json,
+codex auth.json, or the agy antigravity-oauth-token).
+
+Provider:
+  --tool claude|codex|agy   Selects the layout. Inferred from --from-vault.
+                            Defaults to claude when neither is given.
 
 Credential source (one of):
-  --from-vault <tool>/<profile>   Use an existing caam vault profile's credentials
-  --from-file <path>              Copy credentials from an arbitrary path
-  (none)                          Leave credentials empty; populate later via login
+  --from-vault <tool>/<profile>   Use an existing caam vault profile (infers --tool)
+  --from-file <path>              Copy the primary auth file from a path (needs --tool
+                                  for non-claude providers)
+  (none)                          Leave the credential empty; populate later via login
 
 Examples:
   caam shallow-profile create alice --from-vault claude/alice@example.com
-  caam shallow-profile create bob   --from-file /tmp/bob.credentials.json
-  caam shallow-profile create scratch                 # empty credentials
-  caam shallow-profile create alice --json
+  caam shallow-profile create codex-bob --from-vault codex/bob --json
+  caam shallow-profile create agy-carol --from-vault agy/carol --json
+  caam shallow-profile create codex-x --tool codex --from-file /tmp/auth.json
+  caam shallow-profile create scratch                 # empty credentials (claude)
   caam shallow-profile create alice --force           # overwrite existing
   caam shallow-profile create alice --base /tmp/test-orch-homes`,
 	Args: cobra.ExactArgs(1),
@@ -93,9 +109,10 @@ Examples:
 }
 
 func init() {
-	shallowProfileCreateCmd.Flags().String("from-vault", "", "credential source: <tool>/<profile> from caam's vault (e.g. claude/alice@example.com)")
-	shallowProfileCreateCmd.Flags().String("from-file", "", "credential source: arbitrary path to a .credentials.json")
-	shallowProfileCreateCmd.Flags().String("from-claude-json", "", "optional path to copy as <home>/.claude.json (defaults to ~/.claude.json)")
+	shallowProfileCreateCmd.Flags().String("tool", "", "provider for this shallow profile: claude (default), codex, or agy. Inferred from --from-vault <tool>/<profile>.")
+	shallowProfileCreateCmd.Flags().String("from-vault", "", "credential source: <tool>/<profile> from caam's vault (e.g. claude/alice@example.com, codex/bob, agy/carol)")
+	shallowProfileCreateCmd.Flags().String("from-file", "", "credential source: arbitrary path to the provider's primary auth file (requires --tool for non-claude)")
+	shallowProfileCreateCmd.Flags().String("from-claude-json", "", "optional path to copy as <home>/.claude.json (claude only; defaults to ~/.claude.json)")
 	shallowProfileCreateCmd.Flags().Bool("force", false, "overwrite an existing shallow profile")
 	shallowProfileCreateCmd.Flags().Bool("json", false, "output as JSON")
 }
@@ -103,7 +120,9 @@ func init() {
 type shallowCreateOutput struct {
 	Success        bool   `json:"success"`
 	Name           string `json:"name"`
+	Provider       string `json:"provider,omitempty"`
 	Path           string `json:"path"`
+	CredentialPath string `json:"credential_path,omitempty"`
 	CredentialFrom string `json:"credential_from,omitempty"`
 	Error          string `json:"error,omitempty"`
 }
@@ -112,6 +131,8 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	jsonOut, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
+	tool, _ := cmd.Flags().GetString("tool")
+	tool = strings.ToLower(strings.TrimSpace(tool))
 	fromVault, _ := cmd.Flags().GetString("from-vault")
 	fromFile, _ := cmd.Flags().GetString("from-file")
 	fromClaudeJSON, _ := cmd.Flags().GetString("from-claude-json")
@@ -144,15 +165,25 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		SourceClaudeJSON: fromClaudeJSON,
 	}
 
+	// Determine the provider and resolve the credential source(s).
+	provider := tool
 	switch {
 	case fromVault != "":
-		credPath, label, err := resolveVaultCredential(fromVault)
+		vaultProvider, primary, extras, label, err := resolveVaultProvider(fromVault)
 		if err != nil {
 			return emit(err)
 		}
-		opts.CredentialSource = credPath
+		if tool != "" && tool != vaultProvider {
+			return emit(fmt.Errorf("--tool %q conflicts with --from-vault tool %q", tool, vaultProvider))
+		}
+		provider = vaultProvider
+		opts.CredentialSource = primary
+		opts.ExtraSources = extras
 		opts.CredentialFromLabel = label
 	case fromFile != "":
+		if provider == "" {
+			provider = "claude"
+		}
 		abs, err := filepath.Abs(fromFile)
 		if err != nil {
 			return emit(fmt.Errorf("resolve --from-file: %w", err))
@@ -163,12 +194,17 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		opts.CredentialSource = abs
 		opts.CredentialFromLabel = "file:" + abs
 	default:
+		if provider == "" {
+			provider = "claude"
+		}
 		// No credential source — terse stderr nudge unless json.
 		if !jsonOut {
-			fmt.Fprintln(cmd.ErrOrStderr(), "note: no --from-vault/--from-file given; .credentials.json will be empty.")
+			fmt.Fprintln(cmd.ErrOrStderr(), "note: no --from-vault/--from-file given; the primary credential will be empty.")
 			fmt.Fprintln(cmd.ErrOrStderr(), "      Populate it before running 'shallow-spawn' (e.g. by signing in inside the shallow HOME).")
 		}
 	}
+	opts.Provider = provider
+	output.Provider = provider
 
 	home, err := mgr.Create(name, opts)
 	if err != nil {
@@ -177,6 +213,9 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 
 	output.Path = home
 	output.CredentialFrom = opts.CredentialFromLabel
+	if credPath, perr := mgr.CredentialPath(name); perr == nil {
+		output.CredentialPath = credPath
+	}
 	if jsonOut {
 		output.Success = true
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -184,43 +223,84 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		return enc.Encode(output)
 	}
 
-	fmt.Fprintf(cmd.OutOrStdout(), "Created shallow profile %q\n", name)
+	fmt.Fprintf(cmd.OutOrStdout(), "Created shallow profile %q (provider: %s)\n", name, provider)
 	fmt.Fprintf(cmd.OutOrStdout(), "  Path: %s\n", home)
 	if opts.CredentialFromLabel != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "  Credentials: %s\n", opts.CredentialFromLabel)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "\nNext steps:\n")
-	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s -- claude\n", name)
+	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s -- %s\n", name, shallowSpawnHintBin(provider))
 	return nil
 }
 
-// resolveVaultCredential takes a "tool/profile" string and returns the absolute
-// path to that vault profile's .credentials.json, plus a human-readable label.
-func resolveVaultCredential(spec string) (string, string, error) {
+// shallowSpawnHintBin maps a provider to the binary a user most likely wants to
+// run under the shallow profile, for the "Next steps" hint.
+func shallowSpawnHintBin(provider string) string {
+	switch shallow.NormalizeProvider(provider) {
+	case "codex":
+		return "codex"
+	case "agy":
+		return "agy"
+	default:
+		return "claude"
+	}
+}
+
+// resolveVaultProvider parses a "<tool>/<profile>" --from-vault spec and returns
+// the provider id, the absolute path to the profile's PRIMARY credential file,
+// a map of optional extra source files (dest-relpath -> source-path) for
+// multi-file providers, and a human-readable label. The primary file must
+// exist; optional files are included only when present.
+func resolveVaultProvider(spec string) (provider, primary string, extras map[string]string, label string, err error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return "", "", fmt.Errorf("--from-vault requires <tool>/<profile>")
+		return "", "", nil, "", fmt.Errorf("--from-vault requires <tool>/<profile>")
 	}
 	parts := strings.SplitN(spec, "/", 2)
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		return "", "", fmt.Errorf("--from-vault must be in the form <tool>/<profile>, got %q", spec)
+		return "", "", nil, "", fmt.Errorf("--from-vault must be in the form <tool>/<profile>, got %q", spec)
 	}
 	tool := strings.ToLower(strings.TrimSpace(parts[0]))
-	profile := strings.TrimSpace(parts[1])
-	if tool != "claude" {
-		// Today, shallow profiles target Claude Code (the only tool whose
-		// auth file lives at ~/.claude/.credentials.json). Other tools have
-		// different layouts; their support is tracked separately.
-		return "", "", fmt.Errorf("--from-vault currently supports tool=claude only (got %q)", tool)
-	}
+	prof := strings.TrimSpace(parts[1])
 	if vault == nil {
-		return "", "", fmt.Errorf("vault not initialized")
+		return "", "", nil, "", fmt.Errorf("vault not initialized")
 	}
-	credPath := filepath.Join(vault.ProfilePath(tool, profile), ".credentials.json")
-	if _, err := os.Stat(credPath); err != nil {
-		return "", "", fmt.Errorf("vault profile %s/%s missing .credentials.json: %w", tool, profile, err)
+	dir := vault.ProfilePath(tool, prof)
+	label = "vault:" + tool + "/" + prof
+
+	switch tool {
+	case "claude":
+		primary = filepath.Join(dir, ".credentials.json")
+		if _, err := os.Stat(primary); err != nil {
+			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing .credentials.json: %w", tool, prof, err)
+		}
+	case "codex":
+		primary = filepath.Join(dir, "auth.json")
+		if _, err := os.Stat(primary); err != nil {
+			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing auth.json: %w", tool, prof, err)
+		}
+	case "agy":
+		primary = filepath.Join(dir, "antigravity-oauth-token")
+		if _, err := os.Stat(primary); err != nil {
+			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing antigravity-oauth-token: %w", tool, prof, err)
+		}
+		// Optional Google identity files, mapped to their shallow destinations.
+		optional := map[string]string{
+			"google_accounts.json": ".gemini/google_accounts.json",
+			"oauth_creds.json":     ".gemini/oauth_creds.json",
+			"settings.json":        ".gemini/antigravity-cli/settings.json",
+		}
+		extras = map[string]string{}
+		for vaultBase, destRel := range optional {
+			src := filepath.Join(dir, vaultBase)
+			if _, e := os.Stat(src); e == nil {
+				extras[destRel] = src
+			}
+		}
+	default:
+		return "", "", nil, "", fmt.Errorf("--from-vault does not support tool %q for shallow profiles (supported: %s)", tool, strings.Join(shallow.SupportedProviders(), ", "))
 	}
-	return credPath, "vault:" + tool + "/" + profile, nil
+	return tool, primary, extras, label, nil
 }
 
 // shallowProfileListCmd lists existing shallow profiles.
@@ -426,14 +506,43 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load shallow profile: %w", err)
 	}
 
+	// Provider drives the env-isolation policy (which provider-home var to pin or
+	// scrub). Legacy profiles without a recorded provider default to claude.
+	provider := "claude"
+	if prof.Meta != nil && prof.Meta.Provider != "" {
+		provider = prof.Meta.Provider
+	}
+	set, scrub := shallow.SpawnEnv(provider, prof.Path, name)
+
 	if printEnv {
-		fmt.Fprintf(cmd.OutOrStdout(), "HOME=%s\n", prof.Path)
-		fmt.Fprintf(cmd.OutOrStdout(), "SHALLOW_PROFILE=%s\n", name)
+		// Print the variables that WOULD be set, as clean KEY=VALUE lines, with
+		// HOME and SHALLOW_PROFILE first for stable output and the rest sorted.
+		fmt.Fprintf(cmd.OutOrStdout(), "HOME=%s\n", set["HOME"])
+		fmt.Fprintf(cmd.OutOrStdout(), "SHALLOW_PROFILE=%s\n", set["SHALLOW_PROFILE"])
+		extra := make([]string, 0, len(set))
+		for k := range set {
+			if k == "HOME" || k == "SHALLOW_PROFILE" {
+				continue
+			}
+			extra = append(extra, k)
+		}
+		sort.Strings(extra)
+		for _, k := range extra {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s=%s\n", k, set[k])
+		}
 		return nil
 	}
 
 	if len(rest) == 0 {
-		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- claude`)", name, name)
+		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, shallowSpawnHintBin(provider))
+	}
+
+	// Codex daemon caveat (#21): a long-lived `codex app-server`/`mcp-server`
+	// caches auth.json in memory, so a shallow codex session could be served by
+	// a daemon attached to a DIFFERENT identity. Warn (to stderr) so the user
+	// knows to restart it; we do not kill it here (it may be serving live work).
+	if shallow.NormalizeProvider(provider) == "codex" {
+		printCodexDaemonWarning(cmd.ErrOrStderr(), checkCodexDaemon("codex", false))
 	}
 
 	binPath, err := exec.LookPath(rest[0])
@@ -441,8 +550,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("lookup %q: %w", rest[0], err)
 	}
 
-	// Build environment: inherit, then override HOME and add SHALLOW_PROFILE.
-	envMap := make(map[string]string, len(os.Environ())+2)
+	// Build environment: inherit, then apply the provider's overrides and scrub
+	// any inherited variables that could leak the real identity back in.
+	envMap := make(map[string]string, len(os.Environ())+len(set))
 	for _, e := range os.Environ() {
 		idx := strings.IndexByte(e, '=')
 		if idx <= 0 {
@@ -450,12 +560,12 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		}
 		envMap[e[:idx]] = e[idx+1:]
 	}
-	envMap["HOME"] = prof.Path
-	envMap["SHALLOW_PROFILE"] = name
-	// Defensive: prevent stale CLAUDE_CONFIG_DIR from a parent shell pinning the
-	// active session to a path outside the shallow HOME (which would silently
-	// re-share the user's real ~/.config/claude-code/auth.json).
-	delete(envMap, "CLAUDE_CONFIG_DIR")
+	for k, v := range set {
+		envMap[k] = v
+	}
+	for _, k := range scrub {
+		delete(envMap, k)
+	}
 	envSlice := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envSlice = append(envSlice, k+"="+v)

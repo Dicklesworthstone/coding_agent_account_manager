@@ -82,6 +82,7 @@ func newShallowTestRoot() *cobra.Command {
 		Args: shallowProfileCreateCmd.Args,
 		RunE: shallowProfileCreateCmd.RunE,
 	}
+	create.Flags().String("tool", "", "")
 	create.Flags().String("from-vault", "", "")
 	create.Flags().String("from-file", "", "")
 	create.Flags().String("from-claude-json", "", "")
