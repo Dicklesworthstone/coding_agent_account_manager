@@ -115,3 +115,67 @@ func buildProfile(provider, name string, percent int) *ProfileState {
 		PoolStatus: authpool.PoolStatusReady,
 	}
 }
+
+// TestUsageUnavailable verifies issue #37: a profile with an errored/empty usage
+// fetch reports a human reason instead of looking like genuine 0% usage.
+func TestUsageUnavailable(t *testing.T) {
+	if r := usageUnavailable(nil); r != "no usage data" {
+		t.Errorf("nil info: got %q, want %q", r, "no usage data")
+	}
+
+	cases := []struct {
+		errMsg string
+		want   string
+	}{
+		{"token expired or invalid", "no usage: auth expired (re-login)"},
+		{"401 Unauthorized", "no usage: auth expired (re-login)"},
+		{"missing access token", "no usage: not logged in"},
+		{"usage not yet supported for opencode", "no usage: usage not supported"},
+	}
+	for _, tc := range cases {
+		got := usageUnavailable(&usage.UsageInfo{Error: tc.errMsg})
+		if got != tc.want {
+			t.Errorf("usageUnavailable(Error=%q) = %q, want %q", tc.errMsg, got, tc.want)
+		}
+	}
+
+	// Real data present -> no reason (show the number instead).
+	withWindow := &usage.UsageInfo{PrimaryWindow: &usage.UsageWindow{UsedPercent: 17}}
+	if r := usageUnavailable(withWindow); r != "" {
+		t.Errorf("with window: got %q, want empty", r)
+	}
+	withCredits := &usage.UsageInfo{Credits: &usage.CreditInfo{HasCredits: true}}
+	if r := usageUnavailable(withCredits); r != "" {
+		t.Errorf("with credits: got %q, want empty", r)
+	}
+}
+
+// TestTableRendererShowsReasonNotZeroPercent verifies that the live table shows
+// the unavailability reason rather than a misleading 0% bar for a logged-in
+// account whose usage fetch failed (issue #37).
+func TestTableRendererShowsReasonNotZeroPercent(t *testing.T) {
+	state := &MonitorState{
+		UpdatedAt: time.Now(),
+		Profiles: map[string]*ProfileState{
+			"claude/erroracct": {
+				Provider:    "claude",
+				ProfileName: "erroracct",
+				Usage:       &usage.UsageInfo{Provider: "claude", Error: "401 Unauthorized"},
+				Health:      health.StatusHealthy,
+				PoolStatus:  authpool.PoolStatusReady,
+			},
+		},
+	}
+
+	r := NewTableRenderer()
+	r.Width = 75
+	r.ShowEmoji = false
+	out := r.Render(state)
+
+	if !strings.Contains(out, "no usage: auth expired (re-login)") {
+		t.Fatalf("expected unavailability reason in output, got:\n%s", out)
+	}
+	if strings.Contains(out, "  0%") {
+		t.Fatalf("errored account must not render a 0%% bar; got:\n%s", out)
+	}
+}

@@ -52,20 +52,29 @@ func (r *TableRenderer) Render(state *MonitorState) string {
 				writeLine(&b, innerWidth, provHeader)
 			}
 
-			percent := usagePercent(p.Usage)
 			indicator := ""
 			if r.ShowEmoji {
 				indicator = fmt.Sprintf("[%s] ", healthEmoji(p.Health))
 			}
-			bar := progressBar(percent, 20)
-			percentStr := fmt.Sprintf("%3.0f%%", percent)
 
-			status := p.PoolStatus.String()
-			if p.InCooldown && p.CooldownUntil != nil {
-				status = fmt.Sprintf("cooldown %s", formatCooldown(p.CooldownUntil, now))
+			var line string
+			if reason := usageUnavailable(p.Usage); reason != "" {
+				// The fetch failed or returned no data (e.g. an expired token) —
+				// show why instead of a misleading 0% bar, so logged-in accounts
+				// don't look idle (issue #37).
+				line = fmt.Sprintf("  %s%-20s %s", indicator, truncate(p.ProfileName, 20), reason)
+			} else {
+				percent := usagePercent(p.Usage)
+				bar := progressBar(percent, 20)
+				percentStr := fmt.Sprintf("%3.0f%%", percent)
+
+				status := p.PoolStatus.String()
+				if p.InCooldown && p.CooldownUntil != nil {
+					status = fmt.Sprintf("cooldown %s", formatCooldown(p.CooldownUntil, now))
+				}
+
+				line = fmt.Sprintf("  %s%-20s %s %s | %s", indicator, truncate(p.ProfileName, 20), bar, percentStr, status)
 			}
-
-			line := fmt.Sprintf("  %s%-20s %s %s | %s", indicator, truncate(p.ProfileName, 20), bar, percentStr, status)
 			writeLine(&b, innerWidth, line)
 		}
 	}

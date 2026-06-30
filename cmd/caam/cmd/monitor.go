@@ -166,11 +166,24 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 	// makes subsequent shell output stair-step until `stty sane`.
 	var inputCh <-chan byte
 	restoreTerminal := func() {}
+	rawActive := false
 	if format == "table" && term.IsTerminal(int(os.Stdin.Fd())) {
-		inputCh, restoreTerminal = setupKeyboardInput()
+		inputCh, restoreTerminal, rawActive = setupKeyboardInput()
 	}
 	// Safety net in case of an unexpected return path.
 	defer restoreTerminal()
+
+	// While the keyboard input loop holds the terminal in raw mode, the kernel's
+	// OPOST/ONLCR output post-processing is disabled, so a bare '\n' no longer
+	// implies a carriage return. The renderers emit '\n'-terminated lines, so
+	// without translation every table line starts where the previous one ended
+	// and the whole table stair-steps diagonally across the screen (issue #37).
+	// Translate '\n' -> '\r\n' on the render path for as long as raw mode is
+	// active. The non-raw paths (--once / brief / json / alerts) are untouched.
+	renderOut := out
+	if rawActive {
+		renderOut = crlfWriter{w: out}
+	}
 
 	// stop restores the terminal first (so the final message and the shell
 	// prompt render with normal output processing) and prints "Monitor stopped."
@@ -186,9 +199,9 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 
 	// Clear screen and show initial output for table mode
 	if format == "table" {
-		clearScreen(out)
+		clearScreen(renderOut)
 	}
-	renderAndShow(mon, renderer, out, format)
+	renderAndShow(mon, renderer, renderOut, format)
 
 	for {
 		select {
@@ -203,7 +216,7 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 					fmt.Fprintf(os.Stderr, "Refresh error: %v\n", err)
 				}
 			}
-			renderAndShow(mon, renderer, out, format)
+			renderAndShow(mon, renderer, renderOut, format)
 
 		case key := <-inputCh:
 			switch key {
@@ -214,10 +227,32 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
 				if err := mon.Refresh(ctx); err != nil {
 					fmt.Fprintf(os.Stderr, "Refresh error: %v\n", err)
 				}
-				renderAndShow(mon, renderer, out, format)
+				renderAndShow(mon, renderer, renderOut, format)
 			}
 		}
 	}
+}
+
+// crlfWriter translates each bare '\n' (one not already preceded by '\r') into
+// '\r\n'. It wraps the monitor's output while the terminal is in raw mode, where
+// the kernel no longer performs OPOST/ONLCR translation; without it the table's
+// '\n'-terminated lines stair-step diagonally down the screen (issue #37).
+type crlfWriter struct{ w io.Writer }
+
+func (c crlfWriter) Write(p []byte) (int, error) {
+	buf := make([]byte, 0, len(p)+8)
+	var prev byte
+	for _, b := range p {
+		if b == '\n' && prev != '\r' {
+			buf = append(buf, '\r')
+		}
+		buf = append(buf, b)
+		prev = b
+	}
+	if _, err := c.w.Write(buf); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func renderAndShow(mon *monitor.Monitor, renderer monitor.Renderer, out io.Writer, format string) {
@@ -244,15 +279,18 @@ func clearScreen(out io.Writer) {
 // cleanup on every exit path: the reader goroutine blocks indefinitely in
 // os.Stdin.Read, so a deferred restore inside the goroutine would not run when
 // the monitor loop returns (issue #33). cleanup is safe to call more than once.
-func setupKeyboardInput() (<-chan byte, func()) {
+// The returned bool reports whether raw mode is actually active, so the caller
+// knows it must translate '\n' -> '\r\n' on the render path (issue #37).
+func setupKeyboardInput() (<-chan byte, func(), bool) {
 	ch := make(chan byte, 1)
 
 	// Try to put terminal in raw mode for key input
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		// Could not enter raw mode; nothing to restore.
-		return ch, func() {}
+		// Could not enter raw mode; nothing to restore, and OPOST is still on,
+		// so no '\n' -> '\r\n' translation is needed on the render path.
+		return ch, func() {}, false
 	}
 
 	var once sync.Once
@@ -278,5 +316,5 @@ func setupKeyboardInput() (<-chan byte, func()) {
 		}
 	}()
 
-	return ch, cleanup
+	return ch, cleanup, true
 }
