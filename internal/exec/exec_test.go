@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"golang.org/x/term"
 )
 
 // =============================================================================
@@ -828,5 +830,74 @@ func TestRun_RateLimitCallbackWithDelay(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Rate limit callback was not invoked")
+	}
+}
+
+// TestRun_NeedsTTYDetection verifies issue #36: when the wrapped tool aborts
+// because stdin is not a terminal, Run returns an *ExitCodeError carrying both
+// the real exit code and NeedsTTY=true (detected from the tool's stderr).
+func TestRun_NeedsTTYDetection(t *testing.T) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		t.Skip("stdin is a terminal; TTY-error detection only runs when stdin is not a TTY")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	prof := &profile.Profile{Name: "test", Provider: "test", BasePath: tmpDir}
+	mock := &mockProvider{id: "test", defaultBin: "sh", envVars: map[string]string{}}
+
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:  prof,
+		Provider: mock,
+		Args:     []string{"-c", "echo 'Error: stdin is not a terminal' >&2; exit 7"},
+		NoLock:   true,
+	})
+
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected *ExitCodeError, got %T: %v", err, err)
+	}
+	if exitErr.Code != 7 {
+		t.Errorf("Code = %d, want 7 (real exit code must be preserved)", exitErr.Code)
+	}
+	if !exitErr.NeedsTTY {
+		t.Errorf("NeedsTTY = false, want true (stderr contained 'stdin is not a terminal')")
+	}
+}
+
+// TestRun_NoFalseTTYDetection verifies the precision improvement: a non-zero
+// exit whose stderr is unrelated to terminals must NOT be flagged NeedsTTY, so
+// caam never prints a misleading "needs a terminal" hint for, e.g., an auth
+// error or a command-not-found.
+func TestRun_NoFalseTTYDetection(t *testing.T) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		t.Skip("stdin is a terminal")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	prof := &profile.Profile{Name: "test", Provider: "test", BasePath: tmpDir}
+	mock := &mockProvider{id: "test", defaultBin: "sh", envVars: map[string]string{}}
+
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:  prof,
+		Provider: mock,
+		Args:     []string{"-c", "echo 'auth error: status 401 unauthorized-ish' >&2; exit 13"},
+		NoLock:   true,
+	})
+
+	var exitErr *ExitCodeError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected *ExitCodeError, got %T: %v", err, err)
+	}
+	if exitErr.Code != 13 {
+		t.Errorf("Code = %d, want 13", exitErr.Code)
+	}
+	if exitErr.NeedsTTY {
+		t.Errorf("NeedsTTY = true for a non-TTY failure; want false")
 	}
 }

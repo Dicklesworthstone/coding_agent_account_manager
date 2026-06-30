@@ -11,6 +11,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -185,6 +186,21 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 // Execute runs the root command.
 func Execute() error {
 	return rootCmd.Execute()
+}
+
+// ExitCode maps an error returned by Execute to a process exit code. When the
+// wrapped tool (caam exec / caam run) exits non-zero, its real exit code is
+// propagated so callers branching on exit status see the tool's result rather
+// than a flattened 1 (issue #36). All other errors map to 1.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitCodeError
+	if errors.As(err, &exitErr) && exitErr.Code != 0 {
+		return exitErr.Code
+	}
+	return 1
 }
 
 // shouldShowWarnings returns true if the current command should display token warnings.
@@ -1928,13 +1944,73 @@ Examples:
 		ctx := context.Background()
 		noLock, _ := cmd.Flags().GetBool("no-lock")
 
-		return runner.Run(ctx, exec.RunOptions{
+		runErr := runner.Run(ctx, exec.RunOptions{
 			Profile:  prof,
 			Provider: prov,
 			Args:     toolArgs,
 			NoLock:   noLock,
 		})
+
+		// A non-zero exit from the wrapped tool is a runtime failure of that
+		// tool, not a misuse of caam. Suppress the Cobra usage block and the
+		// duplicate generic "Error: exit code N" line so the tool's own output
+		// is the only error shown (mirrors the backup command), and propagate
+		// the real exit code via ExitCode in main (issue #36).
+		var exitErr *exec.ExitCodeError
+		if errors.As(runErr, &exitErr) {
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+
+			// Only when the wrapped tool actually reported that it needs an
+			// interactive terminal: point the user at its non-interactive form.
+			// `caam exec <tool> <profile> -- ...` runs the tool in its default
+			// interactive mode, which can't start when stdin is not a TTY
+			// (piped, redirected, CI, or an agent harness).
+			if exitErr.NeedsTTY {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"\ncaam: %q exited %d because it needs an interactive terminal, but stdin\n"+
+						"is not a TTY here. To run non-interactively, use the tool's non-interactive\n"+
+						"form, for example:\n\n  %s\n",
+					tool, exitErr.Code, nonInteractiveExecExample(tool, name, toolArgs))
+			}
+		}
+		return runErr
 	},
+}
+
+// nonInteractiveExecExample returns an example `caam exec` invocation that runs
+// the given tool non-interactively, reusing the user's profile and arguments.
+// It is shown as a hint when an interactive session fails because stdin is not a
+// TTY. The mapping is best-effort; unknown tools get a generic placeholder.
+func nonInteractiveExecExample(tool, profileName string, toolArgs []string) string {
+	args := strings.Join(quoteArgsForHint(toolArgs), " ")
+	switch tool {
+	case "codex":
+		// codex runs non-interactively via the `exec` subcommand (alias `e`).
+		if len(toolArgs) > 0 && (toolArgs[0] == "exec" || toolArgs[0] == "e") {
+			return strings.TrimRight(fmt.Sprintf("caam exec codex %s -- %s", profileName, args), " ")
+		}
+		return strings.TrimRight(fmt.Sprintf("caam exec codex %s -- exec %s", profileName, args), " ")
+	case "claude", "gemini", "agy":
+		// claude/gemini/agy run a single prompt non-interactively via -p/--print.
+		return strings.TrimRight(fmt.Sprintf("caam exec %s %s -- -p %s", tool, profileName, args), " ")
+	default:
+		return strings.TrimRight(fmt.Sprintf("caam exec %s %s -- <non-interactive flag> %s", tool, profileName, args), " ")
+	}
+}
+
+// quoteArgsForHint double-quotes any argument containing whitespace so the
+// rendered hint is copy-pasteable.
+func quoteArgsForHint(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		if strings.ContainsAny(a, " \t") {
+			out[i] = fmt.Sprintf("%q", a)
+		} else {
+			out[i] = a
+		}
+	}
+	return out
 }
 
 func init() {

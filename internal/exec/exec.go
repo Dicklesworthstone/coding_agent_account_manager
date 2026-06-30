@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
+	"golang.org/x/term"
 )
 
 // Runner executes AI CLI tools with profile isolation.
@@ -64,10 +66,53 @@ type RunOptions struct {
 // ExitCodeError wraps a process exit code.
 type ExitCodeError struct {
 	Code int
+
+	// NeedsTTY is true when the wrapped tool's stderr indicated it could not
+	// start because stdin/stdout was not a terminal (TTY). Callers use this to
+	// print an accurate hint pointing at the tool's non-interactive form
+	// instead of a misleading usage dump (issue #36).
+	NeedsTTY bool
 }
 
 func (e *ExitCodeError) Error() string {
 	return fmt.Sprintf("exit code %d", e.Code)
+}
+
+// ttyRequiredRe matches stderr lines emitted by wrapped CLIs that abort because
+// they need an interactive terminal. It is intentionally conservative: it only
+// fires on phrasings that specifically describe a missing TTY (e.g. codex's
+// "stdin is not a terminal" or the Ink/Node "Raw mode is not supported"), so
+// unrelated runtime failures (auth errors, command-not-found, etc.) are never
+// mislabeled as TTY problems.
+var ttyRequiredRe = regexp.MustCompile(`(?i)` +
+	`not a (tty|terminal)` +
+	`|raw mode is not supported` +
+	`|requires (an? )?(interactive )?(tty|terminal)` +
+	`|must (be run|run) in (an? )?(interactive )?terminal` +
+	`|no tty` +
+	`|inappropriate ioctl for device`)
+
+// ttyErrorDetector observes output lines and records whether any matched the
+// "needs a terminal" signature. It is safe for use by the stderr-copy goroutine
+// while the line is observed; the result is read only after cmd.Run returns and
+// the observer has been flushed.
+type ttyErrorDetector struct {
+	mu  sync.Mutex
+	hit bool
+}
+
+func (d *ttyErrorDetector) observe(line string) {
+	if ttyRequiredRe.MatchString(line) {
+		d.mu.Lock()
+		d.hit = true
+		d.mu.Unlock()
+	}
+}
+
+func (d *ttyErrorDetector) tripped() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.hit
 }
 
 // Run executes the AI CLI tool with profile isolation.
@@ -172,21 +217,40 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 		}
 	}
 
-	var observers []func(string)
+	// Observers applied to both stdout and stderr.
+	var sharedObservers []func(string)
 	if capture != nil {
-		observers = append(observers, capture.ObserveLine)
+		sharedObservers = append(sharedObservers, capture.ObserveLine)
 	}
 	if rateObserver != nil {
-		observers = append(observers, rateObserver)
+		sharedObservers = append(sharedObservers, rateObserver)
 	}
-	if len(observers) > 0 {
-		onLine := func(line string) {
-			for _, obs := range observers {
-				obs(line)
+
+	// When stdin is not a terminal, also watch stderr for the "needs a terminal"
+	// signature so callers can surface a precise non-interactive hint instead of
+	// a misleading usage dump (issue #36). We only add this in the non-TTY case:
+	// when stdin IS a terminal we leave stderr wiring exactly as before so normal
+	// interactive sessions keep their inherited terminal stderr (some TUIs check
+	// isatty(stderr) and a pipe would change their behavior).
+	var ttyErr ttyErrorDetector
+	stderrObservers := sharedObservers
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		stderrObservers = append(append([]func(string){}, sharedObservers...), ttyErr.observe)
+	}
+
+	fanout := func(obs []func(string)) func(string) {
+		return func(line string) {
+			for _, o := range obs {
+				o(line)
 			}
 		}
-		stdoutObserver = newLineObserverWriter(os.Stdout, onLine)
-		stderrObserver = newLineObserverWriter(os.Stderr, onLine)
+	}
+
+	if len(sharedObservers) > 0 {
+		stdoutObserver = newLineObserverWriter(os.Stdout, fanout(sharedObservers))
+	}
+	if len(stderrObservers) > 0 {
+		stderrObserver = newLineObserverWriter(os.Stderr, fanout(stderrObservers))
 	}
 
 	// Connect stdio
@@ -249,8 +313,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 
 	if runErr != nil {
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			// Propagate the actual exit code.
-			return &ExitCodeError{Code: exitErr.ExitCode()}
+			// Propagate the actual exit code, plus whether the failure looked
+			// like a missing-terminal abort so callers can give a useful hint.
+			return &ExitCodeError{Code: exitErr.ExitCode(), NeedsTTY: ttyErr.tripped()}
 		}
 		return fmt.Errorf("run command: %w", runErr)
 	}
