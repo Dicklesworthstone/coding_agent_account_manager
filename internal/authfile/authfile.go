@@ -77,6 +77,7 @@ func CodexAuthFiles() AuthFileSet {
 //   - ~/.claude.json (settings file - not auth, but backed up for completeness)
 //   - ~/.config/claude-code/auth.json (auth credentials; or $CLAUDE_CONFIG_DIR/auth.json)
 //   - ~/.claude/settings.json (user settings)
+//   - ~/Library/Application Support/Claude/config.json (encrypted desktop OAuth cache on macOS)
 func ClaudeAuthFiles() AuthFileSet {
 	homeDir, _ := os.UserHomeDir()
 	claudeConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
@@ -115,9 +116,19 @@ func ClaudeAuthFiles() AuthFileSet {
 				Description: "Claude Code user settings (apiKeyHelper / API key mode)",
 				Required:    false,
 			},
+			{
+				Tool:        "claude",
+				Path:        claudeDesktopConfigPath(homeDir),
+				Description: "Claude Desktop encrypted OAuth token cache",
+				Required:    false,
+			},
 		},
 		AllowOptionalOnly: true,
 	}
+}
+
+func claudeDesktopConfigPath(homeDir string) string {
+	return filepath.Join(homeDir, "Library", "Application Support", "Claude", "config.json")
 }
 
 // GeminiAuthFiles returns the auth files for Gemini CLI.
@@ -381,6 +392,15 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	var missingRequired []string
 	var originalPaths []string
 	for _, spec := range fileSet.Files {
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			hasToken, err := claudeDesktopConfigHasToken(spec.Path)
+			if err != nil {
+				return err
+			}
+			if !hasToken {
+				continue
+			}
+		}
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			if spec.Required {
 				missingRequired = append(missingRequired, spec.Path)
@@ -916,6 +936,12 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	optionalHashes := make(map[string]string)
 	requiredFound := false
 	for _, spec := range fileSet.Files {
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			hasToken, err := claudeDesktopConfigHasToken(spec.Path)
+			if err != nil || !hasToken {
+				continue
+			}
+		}
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -983,6 +1009,12 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 func HasAuthFiles(fileSet AuthFileSet) bool {
 	optionalFound := false
 	for _, spec := range fileSet.Files {
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			hasToken, err := claudeDesktopConfigHasToken(spec.Path)
+			if err != nil || !hasToken {
+				continue
+			}
+		}
 		if _, err := os.Stat(spec.Path); err == nil {
 			if spec.Required {
 				return true
@@ -999,6 +1031,12 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 // ClearAuthFiles removes all auth files for a tool (logout).
 func ClearAuthFiles(fileSet AuthFileSet) error {
 	for _, spec := range fileSet.Files {
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if err := clearClaudeDesktopTokenCache(spec.Path); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := os.Remove(spec.Path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", spec.Path, err)
 		}
@@ -1006,7 +1044,94 @@ func ClearAuthFiles(fileSet AuthFileSet) error {
 	return nil
 }
 
+func isClaudeDesktopConfig(tool, path string) bool {
+	return tool == "claude" && filepath.Base(path) == "config.json" &&
+		strings.Contains(filepath.ToSlash(path), "/Library/Application Support/Claude/")
+}
+
+func claudeDesktopConfigHasToken(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read Claude desktop config: %w", err)
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false, fmt.Errorf("parse Claude desktop config: %w", err)
+	}
+
+	if _, ok := root["oauth:tokenCache"]; ok {
+		return true, nil
+	}
+	if _, ok := root["oauth:tokenCacheV2"]; ok {
+		return true, nil
+	}
+	return false, nil
+}
+
+func clearClaudeDesktopTokenCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read Claude desktop config: %w", err)
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse Claude desktop config: %w", err)
+	}
+
+	delete(root, "oauth:tokenCache")
+	delete(root, "oauth:tokenCacheV2")
+
+	updated, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal Claude desktop config: %w", err)
+	}
+	updated = append(updated, '\n')
+	if err := atomicWriteFile(path, updated, 0600); err != nil {
+		return fmt.Errorf("write Claude desktop config: %w", err)
+	}
+	return nil
+}
+
 // Helper functions
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+
+	dstFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := dstFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := dstFile.Write(data); err != nil {
+		dstFile.Close()
+		return err
+	}
+	if err := dstFile.Chmod(perm); err != nil {
+		dstFile.Close()
+		return err
+	}
+	if err := dstFile.Sync(); err != nil {
+		dstFile.Close()
+		return err
+	}
+	if err := dstFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
 
 func copyFile(src, dst string) error {
 	// Ensure parent directory exists
@@ -1105,9 +1230,11 @@ func stableFileHash(tool, path string) (string, error) {
 //     refreshToken (the actual auth identity)
 //   - .claude.json: settings file with oauthAccount (identity) mixed with
 //     volatile fields like changelogLastFetched, numStartups, tipsHistory
+//   - config.json: Claude Desktop config with encrypted OAuth token cache fields
 //
 // For .credentials.json, we hash the accessToken and refreshToken.
 // For .claude.json, we hash the oauthAccount field only.
+// For Claude Desktop config.json, we hash oauth:tokenCache* fields only.
 // For other files (settings.json, auth.json), we fall back to whole-file hash.
 func stableClaudeHash(path string) (string, error) {
 	base := filepath.Base(path)
@@ -1117,6 +1244,11 @@ func stableClaudeHash(path string) (string, error) {
 		return hashClaudeCredentials(path)
 	case ".claude.json":
 		return hashClaudeSettings(path)
+	case "config.json":
+		if isClaudeDesktopConfig("claude", path) {
+			return hashClaudeDesktopConfig(path)
+		}
+		return hashFile(path)
 	default:
 		return hashFile(path)
 	}
@@ -1210,6 +1342,41 @@ func hashClaudeSettings(path string) (string, error) {
 
 	h := sha256.New()
 	h.Write([]byte("claude:settings:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func hashClaudeDesktopConfig(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return hashBytes(data), nil
+	}
+
+	identityFields := map[string]interface{}{}
+	for _, key := range []string{"oauth:tokenCache", "oauth:tokenCacheV2"} {
+		if v, exists := root[key]; exists {
+			identityFields[key] = v
+		}
+	}
+
+	if len(identityFields) == 0 {
+		h := sha256.New()
+		h.Write([]byte("claude:desktop-config:no-token-cache"))
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+
+	canonical, err := json.Marshal(identityFields)
+	if err != nil {
+		return hashBytes(data), nil
+	}
+
+	h := sha256.New()
+	h.Write([]byte("claude:desktop-config:"))
 	h.Write(canonical)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

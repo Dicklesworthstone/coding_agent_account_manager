@@ -87,12 +87,12 @@ func TestSupportedAuthModes(t *testing.T) {
 
 func TestAuthFiles(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Run("returns four auth file specs", func(t *testing.T) {
+	t.Run("returns five auth file specs", func(t *testing.T) {
 		p := New()
 		files := p.AuthFiles()
 
-		if len(files) != 4 {
-			t.Fatalf("AuthFiles() returned %d files, want 4", len(files))
+		if len(files) != 5 {
+			t.Fatalf("AuthFiles() returned %d files, want 5", len(files))
 		}
 	})
 
@@ -145,6 +145,19 @@ func TestAuthFiles(t *testing.T) {
 		}
 		if file.Required {
 			t.Error(".claude/settings.json should be optional")
+		}
+	})
+
+	t.Run("fifth file is Claude Desktop config.json and optional", func(t *testing.T) {
+		p := New()
+		files := p.AuthFiles()
+
+		file := files[4]
+		if !strings.HasSuffix(file.Path, filepath.Join("Library", "Application Support", "Claude", "config.json")) {
+			t.Errorf("AuthFiles()[4].Path = %q, should end with Library/Application Support/Claude/config.json", file.Path)
+		}
+		if file.Required {
+			t.Error("Claude Desktop config.json should be optional")
 		}
 	})
 
@@ -576,6 +589,47 @@ func TestLogout(t *testing.T) {
 			t.Errorf("Logout() error = %v, should handle missing files", err)
 		}
 	})
+
+	t.Run("scrubs desktop OAuth cache without deleting config", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		prof := &profile.Profile{
+			Name:     "test",
+			Provider: "claude",
+			BasePath: tmpDir,
+		}
+
+		p := New()
+		p.PrepareProfile(context.Background(), prof)
+
+		configPath := claudeDesktopConfigPath(prof.HomePath())
+		writeJSON(t, configPath, map[string]interface{}{
+			"darkMode":           "light",
+			"oauth:tokenCache":   "encrypted-v1",
+			"oauth:tokenCacheV2": "encrypted-v2",
+		})
+
+		if err := p.Logout(context.Background(), prof); err != nil {
+			t.Fatalf("Logout() error = %v", err)
+		}
+
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("desktop config should be preserved: %v", err)
+		}
+		var got map[string]interface{}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("desktop config should remain valid JSON: %v", err)
+		}
+		if _, ok := got["oauth:tokenCache"]; ok {
+			t.Error("oauth:tokenCache should be removed")
+		}
+		if _, ok := got["oauth:tokenCacheV2"]; ok {
+			t.Error("oauth:tokenCacheV2 should be removed")
+		}
+		if got["darkMode"] != "light" {
+			t.Errorf("non-auth desktop config should be preserved, got %v", got["darkMode"])
+		}
+	})
 }
 
 // =============================================================================
@@ -634,6 +688,30 @@ func TestStatus(t *testing.T) {
 		}
 		if !status.LoggedIn {
 			t.Error("LoggedIn should be true when .claude.json exists")
+		}
+	})
+
+	t.Run("logged in when desktop OAuth cache exists", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		prof := &profile.Profile{
+			Name:     "test",
+			Provider: "claude",
+			BasePath: tmpDir,
+		}
+
+		p := New()
+		p.PrepareProfile(context.Background(), prof)
+
+		writeJSON(t, claudeDesktopConfigPath(prof.HomePath()), map[string]interface{}{
+			"oauth:tokenCacheV2": "encrypted-v2",
+		})
+
+		status, err := p.Status(context.Background(), prof)
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if !status.LoggedIn {
+			t.Error("LoggedIn should be true when desktop OAuth cache exists")
 		}
 	})
 
@@ -955,7 +1033,6 @@ func TestAPIKeyModeLifecycle(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // DetectExistingAuth Tests
 // =============================================================================
@@ -1113,6 +1190,29 @@ func TestDetectExistingAuth(t *testing.T) {
 		}
 	})
 
+	t.Run("detects Claude Desktop config token cache", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		p := New()
+
+		path := claudeDesktopConfigPath(home)
+		writeJSON(t, path, map[string]interface{}{
+			"darkMode":           "light",
+			"oauth:tokenCacheV2": "encrypted-v2",
+		})
+
+		detection, err := p.DetectExistingAuth()
+		if err != nil {
+			t.Fatalf("DetectExistingAuth() error = %v", err)
+		}
+
+		if !detection.Found {
+			t.Error("Should have found auth")
+		}
+		if detection.Primary.Path != path {
+			t.Errorf("Primary.Path = %q, want %q", detection.Primary.Path, path)
+		}
+	})
+
 	t.Run("prioritizes most recent file", func(t *testing.T) {
 		home, _ := setupEnv(t)
 		p := New()
@@ -1256,6 +1356,9 @@ func writeJSON(t *testing.T, path string, data interface{}) {
 	t.Helper()
 	b, err := json.Marshal(data)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, b, 0600); err != nil {

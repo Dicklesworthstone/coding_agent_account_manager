@@ -73,15 +73,15 @@
 
 **File:** `internal/provider/claude/claude.go:88-113`
 **Function:** `AuthFiles`
-**Classification:** Correct
+**Classification:** Updated
 
 **Assumptions:**
 - Primary: `~/.claude/.credentials.json`
 - Optional: `~/.claude.json`, `~/.config/claude-code/auth.json`, `~/.claude/settings.json`
 
-**Reality:** File paths are correct.
+**Reality:** Recent Claude Code builds on macOS can also refresh `~/.claude.json` from Claude Desktop's encrypted OAuth cache in `~/Library/Application Support/Claude/config.json`. If CAAM swaps only `~/.claude.json`, Claude Code may rewrite it back to the account represented by the desktop token cache on startup.
 
-**Action:** No changes needed.
+**Action:** Include the Claude Desktop config in Claude backups/restores, hash only `oauth:tokenCache*` for profile matching, and scrub only those keys during clear/logout so unrelated desktop settings remain intact.
 
 ---
 

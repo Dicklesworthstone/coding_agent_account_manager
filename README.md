@@ -68,7 +68,7 @@ No browser. No OAuth dance. No interruption to your flow state.
 ```mermaid
 flowchart LR
     subgraph System["Your System"]
-        A["~/.claude.json"]
+        A["~/.claude.json + Claude desktop token cache"]
         B["~/.codex/auth.json"]
         C["~/.gemini/settings.json"]
     end
@@ -213,7 +213,7 @@ wait
 
 | Tool | Auth Location | Login Command |
 |------|--------------|---------------|
-| **Claude Code** | OAuth: `~/.claude.json` + `~/.config/claude-code/auth.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
+| **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
@@ -223,9 +223,11 @@ wait
 **Subscription:** Claude Max ($200/month)
 
 **Auth Files:**
-- `~/.claude.json` — Main authentication token
+- `~/.claude/.credentials.json` — Claude Code OAuth credentials when present
+- `~/.claude.json` — Claude Code session/account state
 - `~/.config/claude-code/auth.json` — Secondary auth data
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
+- `~/Library/Application Support/Claude/config.json` — Claude Desktop encrypted OAuth token cache used by recent Claude Code builds on macOS
 
 **Login Command:** Inside Claude Code, type `/login`
 
@@ -663,6 +665,7 @@ claude "explain this authentication flow"
 │   │   ├── alice@gmail.com/
 │   │   │   ├── .claude.json        # Backed up auth
 │   │   │   ├── auth.json           # From ~/.config/claude-code/
+│   │   │   ├── config.json         # From ~/Library/Application Support/Claude/
 │   │   │   └── meta.json           # Timestamp, original paths
 │   │   └── bob@gmail.com/
 │   │       └── ...

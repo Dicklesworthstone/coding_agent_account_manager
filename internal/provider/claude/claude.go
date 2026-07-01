@@ -8,6 +8,7 @@
 //   - ~/.claude.json (legacy OAuth session state)
 //   - ~/.config/claude-code/auth.json (auth credentials; or $CLAUDE_CONFIG_DIR/auth.json)
 //   - ~/.claude/settings.json (user settings)
+//   - ~/Library/Application Support/Claude/config.json (encrypted desktop OAuth cache on macOS)
 //   - Project .claude/* files
 //
 // Context isolation for caam:
@@ -103,6 +104,10 @@ func claudeAuthPathForProfile(prof *profile.Profile) string {
 	return filepath.Join(claudeConfigDirForProfile(prof), "auth.json")
 }
 
+func claudeDesktopConfigPath(homeDir string) string {
+	return filepath.Join(homeDir, "Library", "Application Support", "Claude", "config.json")
+}
+
 // AuthFiles returns the auth file specifications for Claude Code.
 // This is the key method for auth file backup/restore.
 func (p *Provider) AuthFiles() []provider.AuthFileSpec {
@@ -127,6 +132,11 @@ func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 		{
 			Path:        filepath.Join(homeDir, ".claude", "settings.json"),
 			Description: "Claude Code settings (apiKeyHelper / API key mode)",
+			Required:    false,
+		},
+		{
+			Path:        claudeDesktopConfigPath(homeDir),
+			Description: "Claude Desktop encrypted OAuth token cache",
 			Required:    false,
 		},
 	}
@@ -333,6 +343,10 @@ func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
 		}
 	}
 
+	if err := clearClaudeDesktopTokenCache(claudeDesktopConfigPath(prof.HomePath())); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -357,6 +371,11 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 	// Primary credentials file for newer Claude Code versions.
 	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
 	if _, err := os.Stat(credentialsPath); err == nil {
+		status.LoggedIn = true
+	}
+
+	desktopConfigPath := claudeDesktopConfigPath(prof.HomePath())
+	if hasToken, err := claudeDesktopConfigHasToken(desktopConfigPath); err == nil && hasToken {
 		status.LoggedIn = true
 	}
 
@@ -411,6 +430,7 @@ func (p *Provider) ValidateProfile(ctx context.Context, prof *profile.Profile) e
 // - ~/.claude/.credentials.json (primary OAuth credentials)
 // - ~/.claude.json (legacy OAuth session state)
 // - ~/.config/claude-code/auth.json (current auth credentials; or $CLAUDE_CONFIG_DIR/auth.json)
+// - ~/Library/Application Support/Claude/config.json (desktop OAuth token cache)
 func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	detection := &provider.AuthDetection{
 		Provider:  p.ID(),
@@ -442,6 +462,10 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		{
 			path:        filepath.Join(homeDir, ".claude", "settings.json"),
 			description: "Claude Code settings (apiKeyHelper / API key mode)",
+		},
+		{
+			path:        claudeDesktopConfigPath(homeDir),
+			description: "Claude Desktop encrypted OAuth token cache",
 		},
 	}
 
@@ -508,6 +532,14 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 							authLoc.IsValid = true
 						} else {
 							authLoc.IsValid = true // Accept valid settings JSON
+						}
+					case "config.json":
+						if _, ok := parsed["oauth:tokenCache"]; ok {
+							authLoc.IsValid = true
+						} else if _, ok := parsed["oauth:tokenCacheV2"]; ok {
+							authLoc.IsValid = true
+						} else {
+							authLoc.ValidationError = "missing Claude Desktop OAuth token cache"
 						}
 					default:
 						// auth.json - check for typical auth fields
@@ -596,6 +628,13 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 		targetPath := filepath.Join(targetDir, "settings.json")
 		if err := copyFile(sourcePath, targetPath); err != nil {
 			return nil, fmt.Errorf("copy settings.json: %w", err)
+		}
+		copiedFiles = append(copiedFiles, targetPath)
+
+	case "config.json":
+		targetPath := claudeDesktopConfigPath(prof.HomePath())
+		if err := copyFile(sourcePath, targetPath); err != nil {
+			return nil, fmt.Errorf("copy Claude Desktop config.json: %w", err)
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
@@ -746,13 +785,20 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 	authJsonPath := claudeAuthPathForProfile(prof)
 	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
 	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
+	desktopConfigPath := claudeDesktopConfigPath(prof.HomePath())
 
 	claudeJsonExists := fileExists(claudeJsonPath)
 	authJsonExists := fileExists(authJsonPath)
 	credentialsExists := fileExists(credentialsPath)
 	settingsExists := fileExists(settingsPath)
+	desktopConfigHasToken, desktopConfigErr := claudeDesktopConfigHasToken(desktopConfigPath)
+	if desktopConfigErr != nil {
+		result.Valid = false
+		result.Error = desktopConfigErr.Error()
+		return result, nil
+	}
 
-	if !claudeJsonExists && !authJsonExists && !credentialsExists {
+	if !claudeJsonExists && !authJsonExists && !credentialsExists && !desktopConfigHasToken {
 		if provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
 			hasKey, err := claudeSettingsHasAPIKey(settingsPath)
 			if err != nil && settingsExists {
@@ -772,6 +818,12 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 		result.Valid = false
 		result.Error = "no auth files found"
 		return result, nil
+	}
+
+	if desktopConfigHasToken {
+		// The encrypted desktop token cache has no inspectable expiry. Its
+		// presence is enough for passive validation, matching Claude Code's
+		// current native startup behavior.
 	}
 
 	// Check .credentials.json if it exists
@@ -945,6 +997,57 @@ func claudeSettingsHasAPIKey(path string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func claudeDesktopConfigHasToken(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot read Claude Desktop config: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return false, fmt.Errorf("invalid Claude Desktop config: %v", err)
+	}
+
+	if _, ok := parsed["oauth:tokenCache"]; ok {
+		return true, nil
+	}
+	if _, ok := parsed["oauth:tokenCacheV2"]; ok {
+		return true, nil
+	}
+	return false, nil
+}
+
+func clearClaudeDesktopTokenCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read Claude Desktop config: %w", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return fmt.Errorf("parse Claude Desktop config: %w", err)
+	}
+
+	delete(parsed, "oauth:tokenCache")
+	delete(parsed, "oauth:tokenCacheV2")
+
+	updated, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal Claude Desktop config: %w", err)
+	}
+	updated = append(updated, '\n')
+	if err := atomicWriteFile(path, updated, 0600); err != nil {
+		return fmt.Errorf("write Claude Desktop config: %w", err)
+	}
+	return nil
 }
 
 type claudeCredentials struct {

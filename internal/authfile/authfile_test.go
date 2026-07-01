@@ -1085,6 +1085,102 @@ func TestHasAuthFiles(t *testing.T) {
 	})
 }
 
+func TestClaudeAuthFilesIncludesDesktopTokenCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	fileSet := ClaudeAuthFiles()
+	want := filepath.Join(home, "Library", "Application Support", "Claude", "config.json")
+
+	found := false
+	for _, spec := range fileSet.Files {
+		if spec.Path == want {
+			found = true
+			if spec.Required {
+				t.Error("Claude Desktop config should be optional")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ClaudeAuthFiles() missing Claude Desktop config path %q", want)
+	}
+}
+
+func TestClearAuthFilesScrubsClaudeDesktopTokenCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "Library", "Application Support", "Claude", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"darkMode":"light","oauth:tokenCache":"encrypted-v1","oauth:tokenCacheV2":"encrypted-v2"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "claude",
+		Files: []AuthFileSpec{
+			{Tool: "claude", Path: configPath, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+
+	if err := ClearAuthFiles(fileSet); err != nil {
+		t.Fatalf("ClearAuthFiles() error = %v", err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("desktop config should be preserved: %v", err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("desktop config should remain valid JSON: %v", err)
+	}
+	if _, ok := got["oauth:tokenCache"]; ok {
+		t.Error("oauth:tokenCache should be removed")
+	}
+	if _, ok := got["oauth:tokenCacheV2"]; ok {
+		t.Error("oauth:tokenCacheV2 should be removed")
+	}
+	if got["darkMode"] != "light" {
+		t.Errorf("non-auth desktop config should be preserved, got %v", got["darkMode"])
+	}
+	if HasAuthFiles(fileSet) {
+		t.Error("tokenless Claude Desktop config should not count as active auth")
+	}
+}
+
+func TestStableClaudeHashForDesktopConfigUsesOnlyTokenCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	configA := filepath.Join(tmpDir, "a", "Library", "Application Support", "Claude", "config.json")
+	configB := filepath.Join(tmpDir, "b", "Library", "Application Support", "Claude", "config.json")
+	for _, path := range []string{configA, configB} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(configA, []byte(`{"darkMode":"light","oauth:tokenCacheV2":"same-token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configB, []byte(`{"darkMode":"dark","windowState":{"x":10},"oauth:tokenCacheV2":"same-token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	hashA, err := stableClaudeHash(configA)
+	if err != nil {
+		t.Fatalf("stableClaudeHash(configA) error = %v", err)
+	}
+	hashB, err := stableClaudeHash(configB)
+	if err != nil {
+		t.Fatalf("stableClaudeHash(configB) error = %v", err)
+	}
+	if hashA != hashB {
+		t.Fatalf("desktop config hash should ignore non-auth fields: %s != %s", hashA, hashB)
+	}
+}
+
 func TestClearAuthFiles(t *testing.T) {
 	t.Run("removes existing files", func(t *testing.T) {
 		tmpDir := t.TempDir()

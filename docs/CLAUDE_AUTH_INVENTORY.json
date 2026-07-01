@@ -64,17 +64,18 @@
         "Primary: ~/.claude/.credentials.json (OAuth credentials)",
         "Optional: ~/.claude.json (legacy location)",
         "Optional: ~/.config/claude-code/auth.json",
-        "Optional: ~/.claude/settings.json (API key mode)"
+        "Optional: ~/.claude/settings.json (API key mode)",
+        "Optional: ~/Library/Application Support/Claude/config.json (encrypted desktop OAuth cache on macOS)"
       ],
       "observed_reality": [
         "~/.claude/.credentials.json IS the correct primary location",
         "~/.claude.json is legacy but may exist on older installs",
-        "File paths are CORRECT"
+        "Recent Claude Code builds on macOS can refresh ~/.claude.json from Claude Desktop oauth:tokenCache fields"
       ],
-      "classification": "correct",
-      "action": "No changes needed",
-      "risk_level": "low",
-      "user_visible": false
+      "classification": "updated",
+      "action": "Include Claude Desktop config in backup/restore, hash only oauth:tokenCache fields for matching, and scrub only those keys during clear/logout",
+      "risk_level": "medium",
+      "user_visible": true
     },
     {
       "id": "CLAUDE-004",
