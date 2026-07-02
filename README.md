@@ -138,24 +138,30 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel Claude Code sessions across N Claude Max accounts on the same machine.
+A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
+
+**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps only *its own* identity files real and private; everything else symlinks back to your real `~/`. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
 caam backup claude alice@example.com
-caam backup claude bob@example.com
+caam backup codex  bob
+caam backup agy    carol
 
-# Create a shallow profile for each identity, copying the credential out of the vault.
+# Create a shallow profile per identity, copying the credential out of the vault.
+# --tool is inferred from the <tool>/<profile> part of --from-vault.
 caam shallow-profile create alice --from-vault claude/alice@example.com
-caam shallow-profile create bob   --from-vault claude/bob@example.com
+caam shallow-profile create bob   --from-vault codex/bob
+caam shallow-profile create carol --from-vault agy/carol
 
-# Spawn concurrent Claude sessions, each pinned to its own identity.
-caam shallow-spawn alice -- claude  &   # session 1, alice's quota
-caam shallow-spawn bob   -- claude  &   # session 2, bob's quota
+# Spawn concurrent sessions, each pinned to its own identity and provider.
+caam shallow-spawn alice -- claude  &   # session 1, alice's Claude quota
+caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex identity
+caam shallow-spawn carol -- agy     &   # session 3, carol's Antigravity identity
 wait
 ```
 
-Layout under `~/orch-homes/<name>/`:
+Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-file sets are listed below):
 
 | Path | Real or symlink? | Why |
 |------|------------------|-----|
@@ -163,7 +169,15 @@ Layout under `~/orch-homes/<name>/`:
 | `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
 | `.claude.json` | **real file** | Claude Code rewrites this on every run; a symlink would mutate the user's real settings under the shallow identity. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
-| `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.codex/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
+| `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
+
+Per-provider real (private) files — everything else under the provider's home is symlinked through, so non-auth state (sessions, history, caches) stays shared:
+
+| Provider | Real / private files | Spawn pins |
+|----------|----------------------|------------|
+| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | scrubs `CLAUDE_CONFIG_DIR` |
+| `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced) | `CODEX_HOME=<profile>/.codex` |
+| `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
@@ -172,11 +186,11 @@ Layout under `~/orch-homes/<name>/`:
 **Subcommands:**
 
 ```bash
-caam shallow-profile create <name> [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
+caam shallow-profile create <name> [--tool claude|codex|agy] [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
 caam shallow-spawn <name> -- <cmd> [args...]
-caam shallow-spawn <name> --print-env       # print HOME=... without exec
+caam shallow-spawn <name> --print-env       # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
 ```
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
