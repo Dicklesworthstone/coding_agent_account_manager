@@ -77,6 +77,8 @@ func CodexAuthFiles() AuthFileSet {
 //   - ~/.claude.json (settings file - not auth, but backed up for completeness)
 //   - ~/.config/claude-code/auth.json (auth credentials; or $CLAUDE_CONFIG_DIR/auth.json)
 //   - ~/.claude/settings.json (user settings)
+//   - ~/Library/Application Support/Claude/config.json (macOS: Claude Desktop's
+//     encrypted OAuth token cache; only its oauth:tokenCache* fields are tracked)
 func ClaudeAuthFiles() AuthFileSet {
 	homeDir, _ := os.UserHomeDir()
 	claudeConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
@@ -115,9 +117,21 @@ func ClaudeAuthFiles() AuthFileSet {
 				Description: "Claude Code user settings (apiKeyHelper / API key mode)",
 				Required:    false,
 			},
+			{
+				Tool:        "claude",
+				Path:        claudeDesktopConfigPath(homeDir),
+				Description: "Claude Desktop encrypted OAuth token cache (macOS)",
+				Required:    false,
+			},
 		},
 		AllowOptionalOnly: true,
 	}
+}
+
+// claudeDesktopConfigPath is the macOS Claude Desktop config that holds the
+// encrypted OAuth token cache recent Claude Code builds can rehydrate from.
+func claudeDesktopConfigPath(homeDir string) string {
+	return filepath.Join(homeDir, "Library", "Application Support", "Claude", "config.json")
 }
 
 // GeminiAuthFiles returns the auth files for Gemini CLI.
@@ -381,6 +395,26 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	var missingRequired []string
 	var originalPaths []string
 	for _, spec := range fileSet.Files {
+		// Claude Desktop config: capture ONLY the oauth:tokenCache* fields, so we
+		// never persist (or later clobber) unrelated desktop settings (PR #44).
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			fields, ok, err := claudeDesktopTokenCache(spec.Path)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue // no token cache present — nothing to back up
+			}
+			destPath := filepath.Join(profileDir, filepath.Base(spec.Path))
+			if err := writeJSONFileAtomic(destPath, fields, 0600); err != nil {
+				return fmt.Errorf("backup %s: %w", spec.Path, err)
+			}
+			backedUp++
+			optionalFound = true
+			originalPaths = append(originalPaths, spec.Path)
+			continue
+		}
+
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			if spec.Required {
 				missingRequired = append(missingRequired, spec.Path)
@@ -707,6 +741,19 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 			continue // Skip optional files
 		}
 
+		// Claude Desktop config: MERGE the snapshot's oauth:tokenCache* fields
+		// into the live desktop config (replacing any stale cache) while leaving
+		// unrelated desktop settings intact, so switching the CAAM profile also
+		// swaps the account the desktop cache would otherwise reassert (PR #44).
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if err := restoreClaudeDesktopTokenCache(srcPath, spec.Path); err != nil {
+				return err
+			}
+			restored++
+			optionalFound = true
+			continue
+		}
+
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(spec.Path), 0700); err != nil {
 			return fmt.Errorf("create parent dir for %s: %w", spec.Path, err)
@@ -916,6 +963,13 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	optionalHashes := make(map[string]string)
 	requiredFound := false
 	for _, spec := range fileSet.Files {
+		// A Claude Desktop config with no token cache carries no identity; skip it
+		// so unrelated desktop settings never drive profile detection (PR #44).
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if _, ok, err := claudeDesktopTokenCache(spec.Path); err != nil || !ok {
+				continue
+			}
+		}
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -983,6 +1037,14 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 func HasAuthFiles(fileSet AuthFileSet) bool {
 	optionalFound := false
 	for _, spec := range fileSet.Files {
+		// The Claude Desktop config only counts as auth when it holds a token
+		// cache (the file also exists for token-less desktop installs).
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if _, ok, err := claudeDesktopTokenCache(spec.Path); err == nil && ok {
+				optionalFound = true
+			}
+			continue
+		}
 		if _, err := os.Stat(spec.Path); err == nil {
 			if spec.Required {
 				return true
@@ -999,11 +1061,192 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 // ClearAuthFiles removes all auth files for a tool (logout).
 func ClearAuthFiles(fileSet AuthFileSet) error {
 	for _, spec := range fileSet.Files {
+		// For the Claude Desktop config, scrub only the oauth:tokenCache* keys so
+		// logout does not destroy the user's unrelated desktop settings (PR #44).
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if err := scrubClaudeDesktopTokenCache(spec.Path); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := os.Remove(spec.Path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", spec.Path, err)
 		}
 	}
 	return nil
+}
+
+// --- Claude Desktop OAuth token cache (macOS) -------------------------------
+//
+// Recent Claude Code builds on macOS can refresh ~/.claude.json from Claude
+// Desktop's encrypted OAuth token cache at
+// ~/Library/Application Support/Claude/config.json. If caam swaps only the
+// dotfiles, that cache silently reasserts the previous account on the next
+// launch (reported in PR #44). caam therefore tracks ONLY the oauth cache
+// fields: it captures them on backup, merges them back on restore, and scrubs
+// only them on clear — never touching the unrelated Claude Desktop settings
+// stored in the same file. The values are opaque encrypted blobs; caam moves
+// them verbatim, which is valid for the same-machine backup/restore it performs.
+const (
+	claudeDesktopTokenKey   = "oauth:tokenCache"
+	claudeDesktopTokenKeyV2 = "oauth:tokenCacheV2"
+)
+
+var claudeDesktopTokenKeys = []string{claudeDesktopTokenKey, claudeDesktopTokenKeyV2}
+
+// isClaudeDesktopConfig reports whether spec.Path is the macOS Claude Desktop
+// config.json, which needs field-scoped handling rather than whole-file copy.
+func isClaudeDesktopConfig(tool, path string) bool {
+	return tool == "claude" &&
+		filepath.Base(path) == "config.json" &&
+		strings.Contains(filepath.ToSlash(path), "/Library/Application Support/Claude/")
+}
+
+// claudeDesktopTokenCache reads path and returns just its oauth:tokenCache*
+// fields. ok is false when the file is absent or carries no token cache.
+func claudeDesktopTokenCache(path string) (fields map[string]interface{}, ok bool, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read Claude desktop config: %w", err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, false, fmt.Errorf("parse Claude desktop config %s: %w", path, err)
+	}
+	fields = map[string]interface{}{}
+	for _, k := range claudeDesktopTokenKeys {
+		if v, exists := root[k]; exists {
+			fields[k] = v
+		}
+	}
+	return fields, len(fields) > 0, nil
+}
+
+// restoreClaudeDesktopTokenCache merges the token-cache fields captured in the
+// vault snapshot (vaultPath) into the live desktop config (livePath), replacing
+// any stale cache and preserving every other setting. The live file is created
+// if it does not yet exist.
+func restoreClaudeDesktopTokenCache(vaultPath, livePath string) error {
+	fields, ok, err := claudeDesktopTokenCache(vaultPath)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil // snapshot has nothing to restore
+	}
+	live := map[string]interface{}{}
+	if data, rerr := os.ReadFile(livePath); rerr == nil {
+		if uerr := json.Unmarshal(data, &live); uerr != nil {
+			return fmt.Errorf("parse live Claude desktop config %s: %w", livePath, uerr)
+		}
+	} else if !os.IsNotExist(rerr) {
+		return fmt.Errorf("read live Claude desktop config: %w", rerr)
+	}
+	// Drop any stale cache, then apply the snapshot's fields.
+	for _, k := range claudeDesktopTokenKeys {
+		delete(live, k)
+	}
+	for k, v := range fields {
+		live[k] = v
+	}
+	if err := os.MkdirAll(filepath.Dir(livePath), 0700); err != nil {
+		return fmt.Errorf("create Claude desktop config dir: %w", err)
+	}
+	if err := writeJSONFileAtomic(livePath, live, 0600); err != nil {
+		return fmt.Errorf("write Claude desktop config: %w", err)
+	}
+	return nil
+}
+
+// scrubClaudeDesktopTokenCache deletes only the oauth:tokenCache* keys from the
+// live desktop config, leaving all other settings intact. A missing file or a
+// file with no token cache is a no-op.
+func scrubClaudeDesktopTokenCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read Claude desktop config: %w", err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("parse Claude desktop config %s: %w", path, err)
+	}
+	changed := false
+	for _, k := range claudeDesktopTokenKeys {
+		if _, ok := root[k]; ok {
+			delete(root, k)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	if err := writeJSONFileAtomic(path, root, 0600); err != nil {
+		return fmt.Errorf("write Claude desktop config: %w", err)
+	}
+	return nil
+}
+
+// hashClaudeDesktopConfig hashes ONLY the oauth:tokenCache* fields, so unrelated
+// desktop settings never perturb active-profile detection.
+func hashClaudeDesktopConfig(path string) (string, error) {
+	fields, ok, err := claudeDesktopTokenCache(path)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		h := sha256.New()
+		h.Write([]byte("claude:desktop:no-token"))
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	canonical, err := json.Marshal(fields)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write([]byte("claude:desktop:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// writeJSONFileAtomic marshals v (indented) and writes it to path atomically.
+func writeJSONFileAtomic(path string, v interface{}, perm os.FileMode) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Helper functions
@@ -1117,6 +1360,9 @@ func stableClaudeHash(path string) (string, error) {
 		return hashClaudeCredentials(path)
 	case ".claude.json":
 		return hashClaudeSettings(path)
+	case "config.json":
+		// The Claude Desktop config.json: hash only its oauth:tokenCache* fields.
+		return hashClaudeDesktopConfig(path)
 	default:
 		return hashFile(path)
 	}

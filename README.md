@@ -227,7 +227,7 @@ wait
 
 | Tool | Auth Location | Login Command |
 |------|--------------|---------------|
-| **Claude Code** | OAuth: `~/.claude.json` + `~/.config/claude-code/auth.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
+| **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + (macOS) `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
@@ -237,9 +237,11 @@ wait
 **Subscription:** Claude Max ($200/month)
 
 **Auth Files:**
-- `~/.claude.json` — Main authentication token
+- `~/.claude/.credentials.json` — Claude Code OAuth credentials (primary)
+- `~/.claude.json` — Session/account state
 - `~/.config/claude-code/auth.json` — Secondary auth data
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
+- `~/Library/Application Support/Claude/config.json` — macOS: Claude Desktop's encrypted OAuth token cache (only its `oauth:tokenCache*` fields are tracked, so recent Claude Code builds can't reassert the previous account after a switch)
 
 **Login Command:** Inside Claude Code, type `/login`
 
