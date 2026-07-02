@@ -54,6 +54,17 @@ import (
 // shallow profile was created and which credential source was used.
 const ProfileMetaFilename = ".caam-shallow.json"
 
+// reservedDirPrefix marks caam's own transient working directories (build
+// staging and swap backups) inside the shallow base dir. Entries with this
+// prefix are internal scaffolding, never a user profile: List() hides them and
+// Create() refuses to mint a profile whose name would collide with them.
+const reservedDirPrefix = ".caam-tmp-"
+
+const (
+	stagingDirPrefix = reservedDirPrefix + "staging-"
+	backupDirPrefix  = reservedDirPrefix + "backup-"
+)
+
 // alwaysSkip lists top-level entries in the user's real HOME that should
 // NEVER be symlinked. We never want to recursively expose the real HOME
 // inside the shallow HOME, and we never want to capture leftover orch-homes
@@ -299,56 +310,116 @@ type CreateOptions struct {
 }
 
 // Create provisions a new shallow profile.
+//
+// Create is crash- and failure-safe with respect to an existing profile of the
+// same name (--force): it builds the entire replacement in a staging directory
+// FIRST and only swaps it into place once it is fully built. A failure at any
+// step (bad --from-claude-json, an unreadable real HOME, a source that vanished
+// mid-run, …) therefore leaves the pre-existing profile completely intact — the
+// live per-identity OAuth token is never destroyed before its replacement
+// exists (issue #42). It also refuses to touch anything that is, or contains,
+// the user's real HOME (issue #38).
 func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 	layout, err := layoutFor(opts.Provider)
 	if err != nil {
 		return "", err
 	}
 
-	home, err := m.HomeFor(name)
+	clean, err := validateProfileName(name)
 	if err != nil {
 		return "", err
 	}
+	if strings.HasPrefix(clean, reservedDirPrefix) {
+		return "", fmt.Errorf("invalid profile name %q: the %q prefix is reserved for caam's internal use", name, reservedDirPrefix)
+	}
+	home := filepath.Join(m.baseDir, clean)
 
+	// Hard safety invariant: a shallow profile's home must live strictly inside
+	// the shallow base dir and must never be (or contain) the user's real HOME.
+	// This is checked BEFORE anything is created or removed so a misconfigured
+	// --base / $CAAM_SHALLOW_HOMES_DIR (e.g. --base /home with profile "alice"
+	// resolving to the real /home/alice) can never lead to destroying real data.
+	if err := m.assertSafeProfileHome(home); err != nil {
+		return "", err
+	}
+
+	exists := false
 	if _, err := os.Lstat(home); err == nil {
 		if !opts.Force {
 			return "", fmt.Errorf("shallow profile %q already exists at %s (use --force to overwrite)", name, home)
 		}
-		if err := os.RemoveAll(home); err != nil {
-			return "", fmt.Errorf("remove existing profile: %w", err)
+		// --force only overwrites something that actually looks like a shallow
+		// profile (has the metadata sidecar). This stops a stray --base that
+		// happens to collide with an unrelated real directory from being wiped.
+		if err := assertLooksLikeShallowProfile(home); err != nil {
+			return "", err
 		}
+		exists = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("stat profile dir: %w", err)
 	}
 
+	// Ensure the base dir exists so the staging dir and the final rename happen
+	// on the same filesystem (rename is only atomic within one filesystem).
+	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
+		return "", fmt.Errorf("create base dir: %w", err)
+	}
+
+	// Build the whole profile in a staging dir first; nothing destructive has
+	// happened to an existing profile at this point.
+	staging, err := os.MkdirTemp(m.baseDir, stagingDirPrefix+clean+"-")
+	if err != nil {
+		return "", fmt.Errorf("create staging dir: %w", err)
+	}
+	if err := m.buildProfile(staging, name, layout, opts); err != nil {
+		_ = m.safeRemoveAll(staging)
+		return "", err
+	}
+
+	// Swap the fully-built staging profile into place. Only here, and only after
+	// the new profile is complete, is the previous profile removed.
+	if err := m.swapIntoPlace(staging, home, clean, exists); err != nil {
+		_ = m.safeRemoveAll(staging)
+		return "", err
+	}
+
+	return home, nil
+}
+
+// buildProfile provisions a complete shallow profile into dir (typically a
+// staging directory). It performs every fallible step — real dirs, the symlink
+// farm, inner symlinks, the real credential/config files, and the metadata
+// sidecar — so callers can build-then-swap without ever leaving a live profile
+// in a half-rebuilt state.
+func (m *Manager) buildProfile(dir, name string, layout *providerLayout, opts CreateOptions) error {
 	// Create base directories with restrictive perms (auth tokens live here).
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return "", fmt.Errorf("create profile dir: %w", err)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create profile dir: %w", err)
 	}
 	for _, dirName := range layout.realDirs {
-		if err := os.MkdirAll(filepath.Join(home, filepath.FromSlash(dirName)), 0o700); err != nil {
-			return "", fmt.Errorf("create real dir %s: %w", dirName, err)
+		if err := os.MkdirAll(filepath.Join(dir, filepath.FromSlash(dirName)), 0o700); err != nil {
+			return fmt.Errorf("create real dir %s: %w", dirName, err)
 		}
 	}
 
 	// Lay down the symlink farm before writing real files. (Symlink creation
 	// will skip names that conflict with the provider's realDirs/realEntries.)
-	if err := m.populateSymlinks(home, layout); err != nil {
-		return "", fmt.Errorf("populate symlinks: %w", err)
+	if err := m.populateSymlinks(dir, layout); err != nil {
+		return fmt.Errorf("populate symlinks: %w", err)
 	}
 
 	// For each real-dir root, also lay down inner symlinks so that non-managed
 	// subdirectories (e.g. .claude/projects, .codex/sessions, .gemini history)
 	// pass through to the user's real HOME.
 	for _, dirName := range layout.innerSymlinkRoots {
-		if err := m.populateInnerSymlinks(home, dirName, layout); err != nil {
-			return "", fmt.Errorf("populate %s symlinks: %w", dirName, err)
+		if err := m.populateInnerSymlinks(dir, dirName, layout); err != nil {
+			return fmt.Errorf("populate %s symlinks: %w", dirName, err)
 		}
 	}
 
 	// Write the provider's real (private) files.
-	if err := m.writeRealFiles(home, layout, opts); err != nil {
-		return "", err
+	if err := m.writeRealFiles(dir, layout, opts); err != nil {
+		return err
 	}
 
 	// Persist metadata sidecar.
@@ -360,11 +431,56 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 		RealHome:       m.realHome,
 		Version:        1,
 	}
-	if err := writeMeta(home, &meta); err != nil {
-		return "", fmt.Errorf("write metadata: %w", err)
+	if err := writeMeta(dir, &meta); err != nil {
+		return fmt.Errorf("write metadata: %w", err)
+	}
+	return nil
+}
+
+// swapIntoPlace atomically installs a freshly-built staging profile at home.
+//
+// When no previous profile exists, it is a single rename. When --force is
+// replacing an existing profile, the old profile is first moved aside to a
+// backup, the new one is renamed into place, and only THEN is the backup
+// removed; if the final rename fails, the backup is restored so the user is
+// never left without their original profile (issue #42). The symlink farm
+// survives the moves because its targets are absolute real-HOME paths.
+func (m *Manager) swapIntoPlace(staging, home, clean string, exists bool) error {
+	if !exists {
+		if err := os.Rename(staging, home); err != nil {
+			return fmt.Errorf("activate new profile: %w", err)
+		}
+		return nil
 	}
 
-	return home, nil
+	// Reserve a unique backup path, then free the name so we can rename the old
+	// profile onto it. (Renaming a directory onto an *existing* directory is not
+	// portable — some filesystems reject it even when the target is empty — so
+	// we rename onto a fresh, non-existent name instead.)
+	backup, err := os.MkdirTemp(m.baseDir, backupDirPrefix+clean+"-")
+	if err != nil {
+		return fmt.Errorf("create backup dir: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return fmt.Errorf("prepare backup slot: %w", err)
+	}
+	if err := os.Rename(home, backup); err != nil {
+		return fmt.Errorf("move existing profile aside: %w", err)
+	}
+
+	if err := os.Rename(staging, home); err != nil {
+		// Roll back: restore the original profile so nothing is lost.
+		if rbErr := os.Rename(backup, home); rbErr != nil {
+			return fmt.Errorf("activate rebuilt profile: %w (original profile preserved at %s; restore failed: %v)", err, backup, rbErr)
+		}
+		return fmt.Errorf("activate rebuilt profile: %w (original profile restored)", err)
+	}
+
+	// New profile is live; the old one can go. A failure here is non-fatal —
+	// the new profile is already in place — so leave the backup rather than
+	// error out on a successful create.
+	_ = m.safeRemoveAll(backup)
+	return nil
 }
 
 // writeRealFiles writes a provider's managed real (non-symlinked) files into the
@@ -597,6 +713,11 @@ func (m *Manager) List() ([]Profile, error) {
 			continue
 		}
 		name := e.Name()
+		// Skip caam's own transient staging/backup scaffolding — these are not
+		// user profiles (they only exist mid-Create or after a crashed swap).
+		if strings.HasPrefix(name, reservedDirPrefix) {
+			continue
+		}
 		if _, err := validateProfileName(name); err != nil {
 			continue
 		}
@@ -645,31 +766,261 @@ func (m *Manager) Delete(name string) error {
 	if !st.IsDir() {
 		return fmt.Errorf("%s is not a directory", home)
 	}
-	// Sanity guard: never delete the user's real HOME by accident.
-	if abs, err := filepath.Abs(home); err == nil && abs == m.realHome {
-		return fmt.Errorf("refusing to delete real HOME (%s)", abs)
-	}
-	return os.RemoveAll(home)
+	// Robust guard (shared with Create's --force path): never RemoveAll the real
+	// HOME, an ancestor of it, the filesystem root, or anything outside the
+	// shallow base dir — comparing both lexically and with symlinks resolved.
+	return m.safeRemoveAll(home)
 }
 
 // CredentialPath returns the absolute path to a profile's principal credential
-// file. The provider is read from the profile's metadata (defaulting to claude
-// for legacy profiles and when metadata is unavailable), so this resolves to
-// .claude/.credentials.json, .codex/auth.json, or the agy token as appropriate.
+// file (.claude/.credentials.json, .codex/auth.json, or the agy token). The
+// provider is resolved via ResolveProvider, so — like shallow-spawn — it fails
+// closed rather than silently assuming claude when the metadata is unreadable
+// (which would point callers at the wrong provider's credential file).
 func (m *Manager) CredentialPath(name string) (string, error) {
 	home, err := m.HomeFor(name)
 	if err != nil {
 		return "", err
 	}
-	provider := "claude"
-	if meta, err := readMeta(home); err == nil && meta.Provider != "" {
-		provider = meta.Provider
+	provider, err := m.ResolveProvider(name)
+	if err != nil {
+		return "", err
 	}
 	layout, err := layoutFor(provider)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, filepath.FromSlash(layout.primaryCredRel)), nil
+}
+
+// ResolveProvider determines a profile's shallow provider for the purpose of
+// env-isolation on spawn and credential resolution. It NEVER silently defaults
+// to claude when the answer is unknown: mis-labelling a codex/agy profile as
+// claude skips the CODEX_HOME/GEMINI_HOME pinning that keeps the real
+// ~/.codex / ~/.gemini identity out of the session (issue #43). Resolution
+// order:
+//
+//  1. If the metadata sidecar is readable, trust its recorded provider (an
+//     empty provider is normalized to claude by readMeta — that is the correct,
+//     intentional default for pre-provider legacy profiles).
+//  2. If the metadata is missing or corrupt, infer the provider from the
+//     on-disk layout (which is the ground truth for what is actually isolated).
+//     Only an unambiguous match is accepted.
+//  3. Otherwise fail closed with an actionable error.
+func (m *Manager) ResolveProvider(name string) (string, error) {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return "", err
+	}
+	provider, err := m.resolveProviderForHome(home, name)
+	if err != nil {
+		return "", err
+	}
+	// The resolved provider must map to a known layout; refuse otherwise rather
+	// than falling through to a permissive (no-pin) default at spawn time.
+	if _, err := layoutFor(provider); err != nil {
+		return "", fmt.Errorf("shallow profile %q records an unknown provider %q; refusing to proceed — recreate it with `caam shallow-profile create %s --force --tool <provider> ...`", name, provider, name)
+	}
+	return provider, nil
+}
+
+func (m *Manager) resolveProviderForHome(home, name string) (string, error) {
+	meta, err := readMeta(home)
+	if err == nil {
+		return NormalizeProvider(meta.Provider), nil
+	}
+	// Metadata unreadable (missing or corrupt). Try to recover the provider from
+	// the on-disk layout, but only accept an unambiguous answer.
+	if inferred, ierr := m.inferProviderFromDisk(home); ierr == nil {
+		return inferred, nil
+	}
+	reason := "has no metadata"
+	if !errors.Is(err, os.ErrNotExist) {
+		reason = fmt.Sprintf("has unreadable/corrupt metadata (%v)", err)
+	}
+	return "", fmt.Errorf("shallow profile %q %s and its provider cannot be determined from disk; refusing to spawn to avoid leaking the wrong identity — recreate it with `caam shallow-profile create %s --force --tool <provider> ...`", name, reason, name)
+}
+
+// inferProviderFromDisk determines a profile's provider by inspecting which
+// provider's PRIVATE credential dir/file is real (a non-symlink) inside the
+// shallow HOME. Every other provider's dir is either absent or a passthrough
+// symlink, so exactly the isolated provider matches. Returns an error unless
+// exactly one provider matches.
+func (m *Manager) inferProviderFromDisk(home string) (string, error) {
+	var matches []string
+	for _, p := range SupportedProviders() {
+		layout, err := layoutFor(p)
+		if err != nil {
+			continue
+		}
+		if layoutIsRealOnDisk(home, layout) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return "", fmt.Errorf("provider is ambiguous on disk (matched %v)", matches)
+}
+
+// layoutIsRealOnDisk reports whether a provider's private credential file and
+// each of its real dirs exist as REAL (non-symlink) entries in the shallow
+// HOME — the fingerprint of a profile that isolates exactly this provider. A
+// passthrough symlink to another provider's real dir fails the realDirs check,
+// so it cannot masquerade as an isolated identity.
+func layoutIsRealOnDisk(home string, layout *providerLayout) bool {
+	// Each of the provider's real dirs must be a real (non-symlink) directory.
+	for _, d := range layout.realDirs {
+		st, err := os.Lstat(filepath.Join(home, filepath.FromSlash(d)))
+		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+			return false
+		}
+	}
+	// The primary credential must be a real (non-symlink) regular file.
+	st, err := os.Lstat(filepath.Join(home, filepath.FromSlash(layout.primaryCredRel)))
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || st.IsDir() {
+		return false
+	}
+	return true
+}
+
+// assertSafeProfileHome verifies that home is a legitimate location for a
+// shallow profile: strictly inside the shallow base dir, and neither the real
+// HOME, an ancestor of it, nor the filesystem root. It is the single guard that
+// stands between a misconfigured --base and catastrophic data loss (issue #38).
+func (m *Manager) assertSafeProfileHome(home string) error {
+	abs, err := filepath.Abs(home)
+	if err != nil {
+		return fmt.Errorf("resolve profile path %q: %w", home, err)
+	}
+	abs = filepath.Clean(abs)
+	if isFilesystemRoot(abs) {
+		return fmt.Errorf("refusing to use the filesystem root %q as a shallow profile home", abs)
+	}
+	if m.wouldTouchRealHome(abs) {
+		return fmt.Errorf("refusing to use %q as a shallow profile home: it is, or contains, the real HOME (%s) — check your --base / $CAAM_SHALLOW_HOMES_DIR", abs, m.realHome)
+	}
+	if !m.isStrictlyInsideBase(abs) {
+		return fmt.Errorf("refusing to use %q as a shallow profile home: it is not inside the shallow base dir (%s)", abs, m.baseDir)
+	}
+	return nil
+}
+
+// safeRemoveAll is os.RemoveAll with the same guard as assertSafeProfileHome:
+// it refuses to remove the real HOME, an ancestor of it, the filesystem root,
+// or anything outside the shallow base dir. Shared by Delete and Create's
+// force-overwrite / staging paths so the protection cannot drift apart.
+func (m *Manager) safeRemoveAll(target string) error {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return fmt.Errorf("resolve %q: %w", target, err)
+	}
+	abs = filepath.Clean(abs)
+	if isFilesystemRoot(abs) {
+		return fmt.Errorf("refusing to remove filesystem root %q", abs)
+	}
+	if m.wouldTouchRealHome(abs) {
+		return fmt.Errorf("refusing to remove %q: it is, or contains, the real HOME (%s)", abs, m.realHome)
+	}
+	if !m.isStrictlyInsideBase(abs) {
+		return fmt.Errorf("refusing to remove %q: it is outside the shallow base dir (%s)", abs, m.baseDir)
+	}
+	return os.RemoveAll(target)
+}
+
+// wouldTouchRealHome reports whether removing/replacing target could affect the
+// user's real HOME — i.e. target IS the real HOME or an ANCESTOR of it. It
+// compares both lexically and with symlinks resolved, so an aliased path (e.g.
+// a symlinked /tmp or macOS /var -> /private/var) cannot slip past.
+func (m *Manager) wouldTouchRealHome(target string) bool {
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return true // fail safe: if we cannot reason about it, treat as dangerous
+	}
+	absReal, err := filepath.Abs(m.realHome)
+	if err != nil {
+		return true
+	}
+	if isEqualOrAncestor(filepath.Clean(absTarget), filepath.Clean(absReal)) {
+		return true
+	}
+	return isEqualOrAncestor(canonical(absTarget), canonical(absReal))
+}
+
+// isStrictlyInsideBase reports whether abs is a proper descendant of the shallow
+// base dir (never the base dir itself). Profile homes are always baseDir/<name>,
+// so this holds by construction for legitimate callers and rejects anything else.
+func (m *Manager) isStrictlyInsideBase(abs string) bool {
+	absBase, err := filepath.Abs(m.baseDir)
+	if err != nil {
+		return false
+	}
+	return isStrictlyInside(filepath.Clean(absBase), abs)
+}
+
+// assertLooksLikeShallowProfile refuses a --force overwrite of a directory that
+// does not carry the shallow metadata sidecar, so a --base that collides with an
+// unrelated real directory is not silently wiped. A present-but-corrupt sidecar
+// still counts (force is a legitimate way to repair a broken profile).
+func assertLooksLikeShallowProfile(home string) error {
+	metaPath := filepath.Join(home, ProfileMetaFilename)
+	if _, err := os.Lstat(metaPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("refusing to overwrite %q with --force: it does not look like a caam shallow profile (no %s). Remove it by hand if you really mean to replace it", home, ProfileMetaFilename)
+		}
+		return fmt.Errorf("inspect existing profile %q: %w", home, err)
+	}
+	return nil
+}
+
+// isFilesystemRoot reports whether p is a filesystem root ("/" on Unix, or a
+// volume root such as "C:\\" on Windows).
+func isFilesystemRoot(p string) bool {
+	return p == string(os.PathSeparator) || p == filepath.VolumeName(p)+string(os.PathSeparator)
+}
+
+// isEqualOrAncestor reports whether path is equal to, or a descendant of,
+// ancestor (i.e. ancestor "contains" path).
+func isEqualOrAncestor(ancestor, path string) bool {
+	rel, err := filepath.Rel(ancestor, path)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return false
+	}
+	return true
+}
+
+// isStrictlyInside reports whether child is a proper descendant of parent
+// (never equal to parent).
+func isStrictlyInside(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." {
+		return false
+	}
+	if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return false
+	}
+	return true
+}
+
+// canonical resolves symlinks in p when possible, falling back to a cleaned
+// absolute path when p does not exist (or cannot be resolved).
+func canonical(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(p)
 }
 
 // validateProfileName enforces a small, safe character set for profile names

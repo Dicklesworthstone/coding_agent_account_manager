@@ -361,6 +361,34 @@ func TestShallowSpawnUnknownProfile(t *testing.T) {
 	}
 }
 
+// TestShallowSpawnFailsClosedOnIndeterminateProvider verifies that shallow-spawn
+// refuses to run (rather than silently assuming the Claude env-isolation policy)
+// when a profile's provider can be neither read from metadata nor inferred from
+// disk — the fail-closed behavior added for issue #43.
+func TestShallowSpawnFailsClosedOnIndeterminateProvider(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	// Break the profile so its provider is indeterminate: remove the metadata
+	// sidecar and the real .claude layout so on-disk inference has nothing to
+	// latch onto.
+	profHome := filepath.Join(base, "alice")
+	if err := os.Remove(filepath.Join(profHome, ".caam-shallow.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(profHome, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true")
+	if err == nil {
+		t.Fatalf("expected shallow-spawn to fail closed on an indeterminate provider")
+	}
+	if !strings.Contains(err.Error(), "refusing to spawn") {
+		t.Fatalf("unexpected error (want fail-closed refusal): %v", err)
+	}
+}
+
 // TestShallowSpawnNoCommand requires a command after the profile name.
 func TestShallowSpawnNoCommand(t *testing.T) {
 	_, _ = shallowEnv(t)

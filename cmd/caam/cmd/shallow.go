@@ -507,10 +507,13 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	}
 
 	// Provider drives the env-isolation policy (which provider-home var to pin or
-	// scrub). Legacy profiles without a recorded provider default to claude.
-	provider := "claude"
-	if prof.Meta != nil && prof.Meta.Provider != "" {
-		provider = prof.Meta.Provider
+	// scrub). Resolve it fail-closed: if the metadata is unreadable and the
+	// provider cannot be unambiguously inferred from disk, refuse to spawn rather
+	// than silently assuming claude — which would skip CODEX_HOME/GEMINI_HOME
+	// pinning and could leak the real ~/.codex / ~/.gemini identity (issue #43).
+	provider, err := mgr.ResolveProvider(name)
+	if err != nil {
+		return err
 	}
 	set, scrub := shallow.SpawnEnv(provider, prof.Path, name)
 
