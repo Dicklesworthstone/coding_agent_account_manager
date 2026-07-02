@@ -181,11 +181,19 @@ func SpawnEnv(provider, home, name string) (set map[string]string, scrub []strin
 		"HOME":            home,
 		"SHALLOW_PROFILE": name,
 	}
+	// caam's own vault-locating variables are scrubbed for EVERY provider. A
+	// spawned caam process inherits the parent environment wholesale, so an
+	// inherited CAAM_HOME / XDG_DATA_HOME pointing at the real caam home would let
+	// it resolve the REAL vault — the master store of every account's tokens —
+	// even after the symlink farm is hardened (issue #41). With them scrubbed,
+	// caam resolves its vault under the shallow HOME, where the caam data subtree
+	// is deliberately withheld, so the spawned process sees no other identities.
+	scrub = []string{"CAAM_HOME", "XDG_DATA_HOME"}
 	switch NormalizeProvider(provider) {
 	case "claude":
 		// A stale CLAUDE_CONFIG_DIR from a parent shell would pin auth.json
 		// outside the shallow HOME, re-sharing the user's real identity.
-		scrub = []string{"CLAUDE_CONFIG_DIR"}
+		scrub = append(scrub, "CLAUDE_CONFIG_DIR")
 	case "codex":
 		// Pin CODEX_HOME inside the shallow HOME, overriding any inherited value
 		// so a parent CODEX_HOME cannot leak the real ~/.codex/auth.json.
@@ -590,9 +598,164 @@ func (m *Manager) writeExtraSources(home string, layout *providerLayout, opts Cr
 	return nil
 }
 
+// allProviderReservedTops returns the set of top-level HOME components reserved
+// by EVERY registered provider layout — its real dirs and its managed real
+// files. A provider's auth root must never be symlinked into ANY profile, not
+// just the one that owns it: otherwise a claude profile happily symlinks
+// .codex -> ~/.codex and .gemini -> ~/.gemini straight back to the user's real
+// Codex / Antigravity credentials, collapsing exactly the accounts the feature
+// keeps apart (issue #40). The owning provider still MkdirAlls its own tops as
+// real dirs and writes its managed files; for every OTHER provider the top is
+// simply withheld from the farm, so the wrong harness fails closed ("not signed
+// in") instead of silently using the real account.
+func allProviderReservedTops() map[string]bool {
+	tops := map[string]bool{}
+	for _, p := range SupportedProviders() {
+		layout, err := layoutFor(p)
+		if err != nil {
+			continue
+		}
+		for _, d := range layout.realDirs {
+			tops[topComponent(d)] = true
+		}
+		for _, e := range layout.realEntries {
+			tops[topComponent(e)] = true
+		}
+	}
+	return tops
+}
+
+// caamOwnedRoots returns absolute, cleaned paths of caam's own state roots that
+// must NEVER be reachable from inside a shallow profile — chiefly the credential
+// vault's data dir, the master store of EVERY stored account's tokens. If any of
+// these were symlinked into a profile, an agent pinned to identity A could read
+// and exfiltrate identities B and C through its own HOME (issue #41).
+//
+// The default vault lives at <realHome>/.local/share/caam/vault; we withhold the
+// whole <...>/caam data dir so the entire caam subtree — not just the vault — is
+// unreachable. The CAAM_HOME / XDG_DATA_HOME candidates mirror the precedence in
+// authfile.DefaultVaultPath so the relocated-vault variants are covered too.
+// Callers compare these both lexically and symlink-resolved (see mirrorEntry) so
+// a symlinked HOME component cannot hide the nesting.
+func (m *Manager) caamOwnedRoots() []string {
+	seen := map[string]bool{}
+	var roots []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if !seen[p] {
+			seen[p] = true
+			roots = append(roots, p)
+		}
+	}
+	// Default location, rooted at THIS manager's real HOME (which is what the
+	// farm mirrors) rather than os.UserHomeDir.
+	add(filepath.Join(m.realHome, ".local", "share", "caam"))
+	// Relocated-vault variants. We withhold ALL candidate caam roots regardless
+	// of precedence: whichever one actually holds the vault must be hidden, and
+	// over-withholding an empty caam dir is harmless.
+	if caamHome := strings.TrimSpace(os.Getenv("CAAM_HOME")); caamHome != "" {
+		add(caamHome)
+	}
+	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
+		add(filepath.Join(xdg, "caam"))
+	}
+	return roots
+}
+
+// rootRel classifies how a real-HOME path relates to caam's own state roots.
+type rootRel int
+
+const (
+	rootUnrelated rootRel = iota // symlink wholesale (the normal passthrough)
+	rootEquals                   // path IS a caam root — withhold entirely
+	rootContains                 // path CONTAINS a caam root — carve it out
+)
+
+// classifyAgainstRoots reports how srcAbs relates to the caam-owned roots,
+// comparing both lexically and with symlinks resolved (a symlinked HOME
+// component must not hide the nesting — e.g. ~/.local -> /data/local while the
+// vault sits at /data/local/share/caam).
+func classifyAgainstRoots(srcAbs string, caamRoots []string) rootRel {
+	srcVariants := []string{filepath.Clean(srcAbs), canonical(srcAbs)}
+	rel := rootUnrelated
+	for _, root := range caamRoots {
+		for _, r := range []string{root, canonical(root)} {
+			for _, s := range srcVariants {
+				if s == r {
+					return rootEquals // strongest verdict
+				}
+				if isEqualOrAncestor(s, r) {
+					// s is a strict ancestor of a caam root: it must be carved.
+					rel = rootContains
+				}
+			}
+		}
+	}
+	return rel
+}
+
+// mirrorEntry places the real-HOME entry srcAbs into the profile at dstAbs.
+// Normally this is a single wholesale symlink (the "everything else is
+// symlinked" design). But a wholesale symlink of a directory that is, or
+// contains, one of caam's own state roots would expose the credential vault
+// through the profile HOME (issue #41), so:
+//   - if srcAbs IS a caam-owned root, it is withheld entirely (no symlink);
+//   - if srcAbs merely CONTAINS a caam-owned root, srcAbs is recreated as a real
+//     directory and its children are mirrored one level deeper, carving out the
+//     caam subtree while every sibling (e.g. ~/.local/bin, ~/.local/share/<app>)
+//     still passes through as a symlink.
+func (m *Manager) mirrorEntry(srcAbs, dstAbs string, caamRoots []string) error {
+	switch classifyAgainstRoots(srcAbs, caamRoots) {
+	case rootEquals:
+		return nil // withhold caam-owned root entirely
+	case rootContains:
+		return m.mirrorInto(srcAbs, dstAbs, caamRoots)
+	default:
+		return atomicSymlink(srcAbs, dstAbs)
+	}
+}
+
+// mirrorInto recreates srcDir as a real directory at dstDir and mirrors each of
+// its children via mirrorEntry. Recursion is bounded: it only runs for a dir
+// that strictly contains a caam root, and each step descends one level toward
+// the finite set of roots, bottoming out at rootEquals (withheld) or
+// rootUnrelated (symlinked).
+func (m *Manager) mirrorInto(srcDir, dstDir string, caamRoots []string) error {
+	if err := os.MkdirAll(dstDir, 0o700); err != nil {
+		return fmt.Errorf("create carve-out dir %s: %w", dstDir, err)
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", srcDir, err)
+	}
+	for _, e := range entries {
+		childSrc := filepath.Join(srcDir, e.Name())
+		childDst := filepath.Join(dstDir, e.Name())
+		if _, err := os.Lstat(childSrc); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // vanished mid-iteration
+			}
+			return fmt.Errorf("stat %s: %w", childSrc, err)
+		}
+		if err := m.mirrorEntry(childSrc, childDst, caamRoots); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // populateSymlinks reads top-level entries in realHome and creates a symlink
 // in home for each, skipping names that collide with the provider's
-// realEntries/realDirs and names in alwaysSkip.
+// realEntries/realDirs and names in alwaysSkip. Two security narrowings apply:
+// every provider's auth root is withheld (not just the active one — issue #40),
+// and caam's own vault/data roots are carved out of the farm (issue #41).
 func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 	entries, err := os.ReadDir(m.realHome)
 	if err != nil {
@@ -608,6 +771,11 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 	for _, d := range layout.realDirs {
 		skip[topComponent(d)] = true
 	}
+	// Withhold EVERY provider's auth roots, not just the active one, so a claude
+	// profile never symlinks .codex/.gemini back to the real identity (issue #40).
+	for t := range allProviderReservedTops() {
+		skip[t] = true
+	}
 	for k := range alwaysSkip {
 		skip[k] = true
 	}
@@ -620,6 +788,8 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 			skip[top] = true
 		}
 	}
+
+	caamRoots := m.caamOwnedRoots()
 
 	for _, e := range entries {
 		name := e.Name()
@@ -635,8 +805,10 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 			}
 			return fmt.Errorf("stat source %s: %w", src, err)
 		}
-		if err := atomicSymlink(src, dst); err != nil {
-			return fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
+		// Normally a wholesale symlink; mirrorEntry carves out caam's own state
+		// roots so the profile cannot read the master vault through its HOME.
+		if err := m.mirrorEntry(src, dst, caamRoots); err != nil {
+			return fmt.Errorf("mirror %s -> %s: %w", dst, src, err)
 		}
 	}
 	return nil

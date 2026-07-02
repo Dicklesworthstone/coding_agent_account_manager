@@ -306,6 +306,15 @@ func TestCrossProfileIsolation(t *testing.T) {
 func TestSpawnEnvPerProvider(t *testing.T) {
 	home := "/orch/p"
 
+	hasScrub := func(scrub []string, want string) bool {
+		for _, s := range scrub {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+
 	claudeSet, claudeScrub := SpawnEnv("claude", home, "p")
 	if claudeSet["HOME"] != home || claudeSet["SHALLOW_PROFILE"] != "p" {
 		t.Fatalf("claude base env wrong: %v", claudeSet)
@@ -313,8 +322,17 @@ func TestSpawnEnvPerProvider(t *testing.T) {
 	if _, ok := claudeSet["CODEX_HOME"]; ok {
 		t.Fatalf("claude must not set CODEX_HOME")
 	}
-	if len(claudeScrub) != 1 || claudeScrub[0] != "CLAUDE_CONFIG_DIR" {
+	if !hasScrub(claudeScrub, "CLAUDE_CONFIG_DIR") {
 		t.Fatalf("claude must scrub CLAUDE_CONFIG_DIR, got %v", claudeScrub)
+	}
+
+	// Every provider must scrub caam's own vault-locating vars so a spawned caam
+	// process cannot resolve the real vault via the inherited environment (#41).
+	for _, provider := range []string{"claude", "codex", "agy"} {
+		_, scrub := SpawnEnv(provider, home, "p")
+		if !hasScrub(scrub, "CAAM_HOME") || !hasScrub(scrub, "XDG_DATA_HOME") {
+			t.Fatalf("%s must scrub CAAM_HOME and XDG_DATA_HOME, got %v", provider, scrub)
+		}
 	}
 
 	codexSet, _ := SpawnEnv("codex", home, "p")
