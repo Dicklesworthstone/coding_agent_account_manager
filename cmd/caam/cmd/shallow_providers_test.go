@@ -233,3 +233,160 @@ func TestShallowSpawnCodexSetsCodexHome(t *testing.T) {
 		t.Fatalf("inherited real CODEX_HOME leaked into shallow session: %v", gotEnv)
 	}
 }
+
+// TestShallowSpawnCodex covers the --reload-daemon flag added for issue #45:
+//   - the flag is parsed/consumed by shallow-spawn and NOT forwarded to <cmd>,
+//   - the codex daemon detect/reload hook runs (with reload=true) for a codex
+//     profile,
+//   - the hook is SKIPPED for a non-codex (claude) profile even when the flag
+//     is passed,
+//   - --print-env stays a non-exec, non-daemon path.
+func TestShallowSpawnCodex(t *testing.T) {
+	// daemonCall records one invocation of the daemon detect/reload hook.
+	type daemonCall struct {
+		tool   string
+		reload bool
+	}
+
+	// installSeams swaps in observable spawnExec + daemon-check hooks and returns
+	// pointers to the recorded child argv and the daemon-hook call log.
+	installSeams := func(t *testing.T) (childArgs *[]string, calls *[]daemonCall, spawned *bool) {
+		t.Helper()
+		var gotArgs []string
+		var gotCalls []daemonCall
+		var didSpawn bool
+
+		origExec := spawnExec
+		spawnExec = func(_ string, args []string, _ []string) error {
+			gotArgs = args
+			didSpawn = true
+			return nil
+		}
+		origCheck := shallowCodexDaemonCheck
+		shallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
+			gotCalls = append(gotCalls, daemonCall{tool: tool, reload: reload})
+			// Return an empty (undetected) warning so printCodexDaemonWarning is a
+			// no-op and the test does not depend on any real host daemon.
+			return codexDaemonWarning{}
+		}
+		t.Cleanup(func() {
+			spawnExec = origExec
+			shallowCodexDaemonCheck = origCheck
+		})
+		return &gotArgs, &gotCalls, &didSpawn
+	}
+
+	t.Run("codex profile consumes flag and reloads daemon", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+			"--from-vault", "codex/bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		childArgs, calls, spawned := installSeams(t)
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "codex-bob",
+			"--reload-daemon", "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+
+		if !*spawned {
+			t.Fatalf("expected the command to be exec'd")
+		}
+		// The flag must be consumed by shallow-spawn, not forwarded to the child.
+		wantChild := []string{"sh", "-c", "true"}
+		if strings.Join(*childArgs, "\x00") != strings.Join(wantChild, "\x00") {
+			t.Fatalf("child argv = %v, want %v (flag must not leak to child)", *childArgs, wantChild)
+		}
+		for _, a := range *childArgs {
+			if a == "--reload-daemon" {
+				t.Fatalf("--reload-daemon leaked into child argv: %v", *childArgs)
+			}
+		}
+		// The codex daemon hook must have run exactly once, with reload=true.
+		if len(*calls) != 1 {
+			t.Fatalf("expected 1 daemon-check call, got %d: %+v", len(*calls), *calls)
+		}
+		if (*calls)[0].tool != "codex" || !(*calls)[0].reload {
+			t.Fatalf("daemon-check call = %+v, want {codex true}", (*calls)[0])
+		}
+	})
+
+	t.Run("codex profile without flag warns but does not reload", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+			"--from-vault", "codex/bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		_, calls, _ := installSeams(t)
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "codex-bob",
+			"--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("expected 1 daemon-check call, got %d", len(*calls))
+		}
+		if (*calls)[0].reload {
+			t.Fatalf("daemon-check must default to reload=false, got %+v", (*calls)[0])
+		}
+	})
+
+	t.Run("non-codex profile accepts flag but skips daemon action", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		// A claude profile (default provider) with empty credentials.
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		childArgs, calls, spawned := installSeams(t)
+		// --reload-daemon must be ACCEPTED (no parse error) for a non-codex profile.
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice",
+			"--reload-daemon", "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn (non-codex must accept --reload-daemon): %v", err)
+		}
+		if !*spawned {
+			t.Fatalf("expected the command to be exec'd")
+		}
+		for _, a := range *childArgs {
+			if a == "--reload-daemon" {
+				t.Fatalf("--reload-daemon leaked into child argv: %v", *childArgs)
+			}
+		}
+		// ...but the codex daemon hook must NOT run for a non-codex provider.
+		if len(*calls) != 0 {
+			t.Fatalf("daemon-check must be skipped for non-codex provider, got %+v", *calls)
+		}
+	})
+
+	t.Run("print-env stays non-exec and skips daemon check", func(t *testing.T) {
+		base, _ := shallowEnv(t)
+		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+			"--from-vault", "codex/bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		_, calls, spawned := installSeams(t)
+		// --print-env together with --reload-daemon must still be a pure env dump.
+		stdout, _, err := runCmdCaptured(t, "shallow-spawn", "codex-bob",
+			"--reload-daemon", "--print-env")
+		if err != nil {
+			t.Fatalf("print-env: %v", err)
+		}
+		if *spawned {
+			t.Fatalf("--print-env must not exec anything")
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("--print-env must not trigger the daemon check, got %+v", *calls)
+		}
+		home := filepath.Join(base, "codex-bob")
+		if !strings.Contains(stdout, "HOME="+home) {
+			t.Fatalf("print-env missing HOME in %q", stdout)
+		}
+		if !strings.Contains(stdout, "CODEX_HOME="+filepath.Join(home, ".codex")) {
+			t.Fatalf("print-env missing CODEX_HOME in %q", stdout)
+		}
+	})
+}

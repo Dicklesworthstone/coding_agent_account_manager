@@ -476,9 +476,15 @@ Examples:
   caam shallow-spawn alice -- claude
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
+  caam shallow-spawn codex-bob --reload-daemon -- codex
 
 Use 'caam shallow-spawn <name> --print-env' to print the environment that
-WOULD be applied without executing anything (useful for shell wrappers).`,
+WOULD be applied without executing anything (useful for shell wrappers).
+
+--reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
+auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
+new identity takes effect. It is a shallow-spawn flag (place it BEFORE '--'),
+consumed here and never forwarded to the spawned command.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runShallowSpawn,
 }
@@ -486,7 +492,14 @@ WOULD be applied without executing anything (useful for shell wrappers).`,
 func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
+	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 }
+
+// shallowCodexDaemonCheck is the daemon detect/reload hook used by shallow-spawn.
+// It defaults to checkCodexDaemon and is a package var so tests can observe the
+// (tool, reload) arguments and stub out real host process scanning — mirroring
+// the spawnExec seam below.
+var shallowCodexDaemonCheck = checkCodexDaemon
 
 func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	name := args[0]
@@ -540,12 +553,17 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, shallowSpawnHintBin(provider))
 	}
 
-	// Codex daemon caveat (#21): a long-lived `codex app-server`/`mcp-server`
-	// caches auth.json in memory, so a shallow codex session could be served by
-	// a daemon attached to a DIFFERENT identity. Warn (to stderr) so the user
-	// knows to restart it; we do not kill it here (it may be serving live work).
+	// Codex daemon caveat (#21, #45): a long-lived `codex app-server`/`mcp-server`
+	// caches auth.json in memory, so a shallow codex session could be served by a
+	// daemon attached to a DIFFERENT identity. By default we only warn (to stderr)
+	// so the user knows to restart it; with --reload-daemon we SIGTERM it here so
+	// it respawns with the shallow auth. --reload-daemon is a shallow-spawn flag
+	// (parsed before `-- <cmd>`); it is consumed here and never forwarded to the
+	// child, and it triggers daemon action only when the resolved provider is
+	// codex (for non-codex profiles it is accepted but does nothing).
+	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
 	if shallow.NormalizeProvider(provider) == "codex" {
-		printCodexDaemonWarning(cmd.ErrOrStderr(), checkCodexDaemon("codex", false))
+		printCodexDaemonWarning(cmd.ErrOrStderr(), shallowCodexDaemonCheck("codex", reloadDaemon))
 	}
 
 	binPath, err := exec.LookPath(rest[0])

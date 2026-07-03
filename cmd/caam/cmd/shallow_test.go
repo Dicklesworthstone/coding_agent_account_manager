@@ -114,6 +114,7 @@ func newShallowTestRoot() *cobra.Command {
 	}
 	spawn.Flags().String("base", "", "")
 	spawn.Flags().Bool("print-env", false, "")
+	spawn.Flags().Bool("reload-daemon", false, "")
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
