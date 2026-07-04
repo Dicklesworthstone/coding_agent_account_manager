@@ -211,8 +211,10 @@ func SpawnEnv(provider, home, name string) (set map[string]string, scrub []strin
 type Meta struct {
 	Name string `json:"name"`
 	// Provider is the shallow layout this profile uses (claude, codex, agy).
-	// Profiles created before this field existed have it empty; readMeta then
-	// defaults them to "claude" (the only layout that existed at the time).
+	// Profiles created before this field existed have it empty; resolveProvider
+	// ForHome recovers the provider for such legacy metadata (from the credential
+	// label, else the claude default — issue #50) rather than readMeta rewriting
+	// this field.
 	Provider       string    `json:"provider,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	CredentialFrom string    `json:"credential_from,omitempty"`
@@ -523,11 +525,14 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 			return err
 		}
 	case "codex":
-		// Enforce file-based credential storage so codex reads our auth.json
-		// rather than an OS keychain. Reuses the provider's own helper so the
-		// exact config setting stays in one place.
-		if err := codex.EnsureFileCredentialStore(filepath.Join(home, ".codex")); err != nil {
-			return fmt.Errorf("configure codex credential store: %w", err)
+		// Seed the shallow config.toml from the user's real ~/.codex/config.toml
+		// (preserving [mcp_servers.*] and every other user section), THEN force
+		// file-based credential storage on top of it. Without the seed, the
+		// shallow .codex starts empty and EnsureFileCredentialStore would write a
+		// stub config containing only the credential-store line, silently dropping
+		// the user's MCP configuration so MCP tools stop loading (issue #46).
+		if err := m.writeCodexConfig(home); err != nil {
+			return err
 		}
 	case "agy":
 		if err := m.writeExtraSources(home, layout, opts); err != nil {
@@ -557,6 +562,45 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 	}
 	if err := writeFileAtomic(claudeJSONPath, []byte("{}\n"), 0o600); err != nil {
 		return fmt.Errorf("write skeleton .claude.json: %w", err)
+	}
+	return nil
+}
+
+// writeCodexConfig provisions <home>/.codex/config.toml for a shallow codex
+// profile. It carries the user's real ~/.codex/config.toml over verbatim (so
+// MCP server sections and every other user setting survive) and then enforces
+// file-based credential storage on top of it. The real config.toml is NOT
+// symlinked (it is a managed realEntry, so a spawned session writing to it can't
+// mutate the user's real one); seeding a copy is what preserves the content
+// (issue #46).
+//
+// If the real config.toml is absent, we fall back to EnsureFileCredentialStore's
+// minimal stub — there is simply nothing to preserve. If a config already exists
+// in the (staging) shallow HOME, it is kept and only the credential-store line
+// is reconciled.
+func (m *Manager) writeCodexConfig(home string) error {
+	shallowCodex := filepath.Join(home, ".codex")
+	shallowConfig := filepath.Join(shallowCodex, "config.toml")
+
+	// Only seed when we have not already written a shallow config (we never
+	// clobber an existing one) and the real config exists.
+	if _, err := os.Stat(shallowConfig); errors.Is(err, os.ErrNotExist) {
+		realConfig := filepath.Join(m.realHome, ".codex", "config.toml")
+		if _, rerr := os.Stat(realConfig); rerr == nil {
+			if cerr := copyFileMode(realConfig, shallowConfig, 0o600); cerr != nil {
+				return fmt.Errorf("seed .codex/config.toml from real HOME: %w", cerr)
+			}
+		} else if !errors.Is(rerr, os.ErrNotExist) {
+			return fmt.Errorf("stat real codex config: %w", rerr)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat shallow codex config: %w", err)
+	}
+
+	// Force file-based credential storage (replaces a keychain setting if the
+	// seeded config had one; appends the line otherwise; no-op if already file).
+	if err := codex.EnsureFileCredentialStore(shallowCodex); err != nil {
+		return fmt.Errorf("configure codex credential store: %w", err)
 	}
 	return nil
 }
@@ -972,13 +1016,20 @@ func (m *Manager) CredentialPath(name string) (string, error) {
 // ~/.codex / ~/.gemini identity out of the session (issue #43). Resolution
 // order:
 //
-//  1. If the metadata sidecar is readable, trust its recorded provider (an
-//     empty provider is normalized to claude by readMeta — that is the correct,
-//     intentional default for pre-provider legacy profiles).
-//  2. If the metadata is missing or corrupt, infer the provider from the
+//  1. If the metadata sidecar is readable and records an explicit provider,
+//     trust it.
+//  2. If the metadata is readable but the provider is blank (legacy pre-provider
+//     metadata), recover it from a well-formed vault:<provider>/<name> credential
+//     label; fall back to claude only for a genuinely blank label; fail closed on
+//     a present-but-unrecognized label (issue #50).
+//  3. If the metadata is missing or corrupt, infer the provider from the
 //     on-disk layout (which is the ground truth for what is actually isolated).
 //     Only an unambiguous match is accepted.
-//  3. Otherwise fail closed with an actionable error.
+//  4. Otherwise fail closed with an actionable error.
+//
+// This is the single shared resolution path used by shallow-spawn and
+// CredentialPath (and any future shallow-profile doctor), so all commands agree
+// on a profile's provider.
 func (m *Manager) ResolveProvider(name string) (string, error) {
 	home, err := m.HomeFor(name)
 	if err != nil {
@@ -996,10 +1047,59 @@ func (m *Manager) ResolveProvider(name string) (string, error) {
 	return provider, nil
 }
 
+// providerFromLegacyLabel recovers a shallow provider from a legacy credential
+// label of the STRICT form "vault:<supported-provider>/<profile-name>" (issue
+// #50). It returns ok=false for anything else — a blank/missing label, a
+// non-vault scheme (file:..., an email address, a filesystem path, a child
+// command name), an unsupported/unknown provider, a whitespace-only provider
+// token, or a missing profile-name component — so callers fail closed instead
+// of inferring an identity from an arbitrary string.
+func providerFromLegacyLabel(label string) (string, bool) {
+	label = strings.TrimSpace(label)
+	const scheme = "vault:"
+	if !strings.HasPrefix(label, scheme) {
+		return "", false
+	}
+	rest := label[len(scheme):]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 || slash >= len(rest)-1 {
+		// Need a non-empty provider token AND a non-empty profile-name component.
+		return "", false
+	}
+	rawProv := strings.TrimSpace(rest[:slash])
+	if rawProv == "" {
+		return "", false
+	}
+	if strings.TrimSpace(rest[slash+1:]) == "" {
+		return "", false
+	}
+	prov := NormalizeProvider(rawProv)
+	// Only KNOWN shallow providers are inferable; never accept an unsupported one.
+	if _, err := layoutFor(prov); err != nil {
+		return "", false
+	}
+	return prov, true
+}
+
 func (m *Manager) resolveProviderForHome(home, name string) (string, error) {
 	meta, err := readMeta(home)
 	if err == nil {
-		return NormalizeProvider(meta.Provider), nil
+		if raw := strings.TrimSpace(meta.Provider); raw != "" {
+			return NormalizeProvider(raw), nil
+		}
+		// Explicit provider is blank: legacy pre-provider metadata. Recover it
+		// from a well-formed vault:<provider>/<name> credential label when present
+		// (issue #50). A genuinely blank label is the original pre-provider case
+		// and defaults to claude (the only layout that existed then). A
+		// present-but-unrecognized label fails closed rather than guessing an
+		// identity from an arbitrary string.
+		if prov, ok := providerFromLegacyLabel(meta.CredentialFrom); ok {
+			return prov, nil
+		}
+		if strings.TrimSpace(meta.CredentialFrom) == "" {
+			return "claude", nil
+		}
+		return "", fmt.Errorf("shallow profile %q has a blank provider and an unrecognized credential label %q (not a vault:<provider>/<name> form for a supported provider: %s); refusing to guess the identity — recreate it with `caam shallow-profile create %s --force --tool <provider> ...`", name, meta.CredentialFrom, strings.Join(SupportedProviders(), ", "), name)
 	}
 	// Metadata unreadable (missing or corrupt). Try to recover the provider from
 	// the on-disk layout, but only accept an unambiguous answer.
@@ -1339,10 +1439,9 @@ func readMeta(home string) (*Meta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
-	// Back-compat: profiles created before the provider field existed are
-	// Claude profiles (the only layout at the time).
-	if strings.TrimSpace(m.Provider) == "" {
-		m.Provider = "claude"
-	}
+	// NOTE: the raw Provider is returned verbatim (a blank field is NOT forced to
+	// "claude" here). Defaulting/inference for legacy blank-provider metadata is
+	// centralized in resolveProviderForHome so it can consult the credential
+	// label before falling back (issue #50).
 	return &m, nil
 }

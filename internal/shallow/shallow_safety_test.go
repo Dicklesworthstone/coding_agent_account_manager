@@ -1,6 +1,7 @@
 package shallow
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,6 +267,140 @@ func TestResolveProviderInfersNonClaudeWhenMetaCorrupt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- #50: infer provider from legacy credential metadata --------------------
+
+// TestProviderFromLegacyLabel unit-tests the strict label parser: it accepts
+// ONLY vault:<supported-provider>/<name> and fails closed on everything else.
+func TestProviderFromLegacyLabel(t *testing.T) {
+	cases := []struct {
+		label  string
+		want   string
+		wantOK bool
+	}{
+		// valid, well-formed labels
+		{"vault:claude/legacy-profile", "claude", true},
+		{"vault:codex/bob", "codex", true},
+		{"vault:agy/carol", "agy", true},
+		{"vault:CODEX/bob", "codex", true},                 // provider is normalized
+		{"  vault:claude/alice  ", "claude", true},         // surrounding space tolerated
+		{"vault:claude/alice@example.com", "claude", true}, // name may contain @
+		// blank / missing
+		{"", "", false},
+		{"   ", "", false},
+		// non-vault schemes and arbitrary strings
+		{"file:/home/u/.codex/auth.json", "", false},
+		{"alice@example.com", "", false},
+		{"/home/u/.codex", "", false},
+		{"claude", "", false},
+		// unsupported / unknown providers
+		{"vault:openai/x", "", false},
+		{"vault:gpt/x", "", false},
+		{"vault:gemini/x", "", false}, // gemini is not a shallow provider id (agy is)
+		// malformed vault labels
+		{"vault:", "", false},
+		{"vault:codex", "", false},  // no profile name
+		{"vault:codex/", "", false}, // empty profile name
+		{"vault:/x", "", false},     // empty provider
+		{"vault: /x", "", false},    // whitespace-only provider
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			got, ok := providerFromLegacyLabel(tc.label)
+			if ok != tc.wantOK || got != tc.want {
+				t.Fatalf("providerFromLegacyLabel(%q) = (%q, %v), want (%q, %v)", tc.label, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestResolveProviderInfersFromLegacyMetadata drives the full ResolveProvider
+// path against hand-written legacy metadata (blank explicit provider), proving
+// shallow-spawn/CredentialPath recover the provider from a well-formed vault
+// label, keep the claude default for a genuinely blank label, and fail closed on
+// malformed/unsupported labels (issue #50).
+func TestResolveProviderInfersFromLegacyMetadata(t *testing.T) {
+	home := multiHome(t)
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real claude profile on disk; we overwrite ONLY its metadata per-case.
+	if _, err := mgr.Create("p", CreateOptions{Provider: "claude", CredentialSource: credSource(t, "x")}); err != nil {
+		t.Fatal(err)
+	}
+	profHome, _ := mgr.HomeFor("p")
+	metaPath := filepath.Join(profHome, ProfileMetaFilename)
+
+	// writeMeta lets a case omit the provider and/or credential_from keys entirely.
+	writeMetaFields := func(t *testing.T, fields map[string]any) {
+		t.Helper()
+		fields["name"] = "p"
+		fields["real_home"] = home
+		fields["version"] = 2
+		data, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(metaPath, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("valid legacy labels", func(t *testing.T) {
+		for label, want := range map[string]string{
+			"vault:claude/legacy-profile": "claude",
+			"vault:codex/legacy-profile":  "codex",
+			"vault:agy/legacy-profile":    "agy",
+		} {
+			writeMetaFields(t, map[string]any{"credential_from": label})
+			got, err := mgr.ResolveProvider("p")
+			if err != nil {
+				t.Fatalf("label %q: unexpected error: %v", label, err)
+			}
+			if got != want {
+				t.Fatalf("label %q resolved to %q, want %q", label, got, want)
+			}
+		}
+	})
+
+	t.Run("blank label defaults to claude", func(t *testing.T) {
+		// credential_from present but empty.
+		writeMetaFields(t, map[string]any{"credential_from": ""})
+		if got, err := mgr.ResolveProvider("p"); err != nil || got != "claude" {
+			t.Fatalf("blank label = (%q, %v), want (claude, nil)", got, err)
+		}
+		// credential_from key absent entirely.
+		writeMetaFields(t, map[string]any{})
+		if got, err := mgr.ResolveProvider("p"); err != nil || got != "claude" {
+			t.Fatalf("absent label = (%q, %v), want (claude, nil)", got, err)
+		}
+	})
+
+	t.Run("malformed and unsupported labels fail closed", func(t *testing.T) {
+		for _, label := range []string{
+			"file:/home/u/.codex/auth.json", // non-vault scheme
+			"alice@example.com",             // email-like
+			"/home/u/.codex",                // path
+			"codex",                         // bare child-command-like string
+			"vault:openai/x",                // unsupported provider
+			"vault:codex",                   // missing profile name
+			"vault:/x",                      // empty provider
+		} {
+			writeMetaFields(t, map[string]any{"credential_from": label})
+			if got, err := mgr.ResolveProvider("p"); err == nil {
+				t.Fatalf("label %q must fail closed, but resolved to %q", label, got)
+			}
+		}
+	})
+
+	t.Run("explicit provider still wins over label", func(t *testing.T) {
+		writeMetaFields(t, map[string]any{"provider": "codex", "credential_from": "vault:claude/x"})
+		if got, err := mgr.ResolveProvider("p"); err != nil || got != "codex" {
+			t.Fatalf("explicit provider = (%q, %v), want (codex, nil)", got, err)
+		}
+	})
 }
 
 // TestResolveProviderFailsClosedWhenAmbiguous ensures that when the provider

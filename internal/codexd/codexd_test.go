@@ -1,6 +1,7 @@
 package codexd
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -100,6 +101,131 @@ func TestDetect_DeduplicatesAndClassifies(t *testing.T) {
 	}
 	if procs[0].Subcommand != "mcp-server" || procs[1].Subcommand != "app-server" {
 		t.Fatalf("subcommands = %q,%q", procs[0].Subcommand, procs[1].Subcommand)
+	}
+}
+
+// TestEffectiveCodexHome covers the CODEX_HOME attribution used to scope a
+// shallow-spawn reload (issue #47), including the HOME/.codex fallback and the
+// fail-safe "unknown environment" case.
+func TestEffectiveCodexHome(t *testing.T) {
+	cases := []struct {
+		name    string
+		proc    Process
+		wantDir string
+		wantOK  bool
+	}{
+		{"explicit codex_home", Process{EnvKnown: true, CodexHome: "/orch/cod-a/.codex"}, "/orch/cod-a/.codex", true},
+		{"home fallback", Process{EnvKnown: true, Home: "/orch/cod-b"}, filepath.Clean("/orch/cod-b/.codex"), true},
+		{"codex_home wins over home", Process{EnvKnown: true, CodexHome: "/x/.codex", Home: "/y"}, "/x/.codex", true},
+		{"uncleaned path is cleaned", Process{EnvKnown: true, CodexHome: "/x/./sub/../.codex"}, filepath.Clean("/x/.codex"), true},
+		{"env unknown fails closed", Process{EnvKnown: false, CodexHome: "/x/.codex"}, "", false},
+		{"env known but empty", Process{EnvKnown: true}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.proc.EffectiveCodexHome()
+			if ok != tc.wantOK || got != tc.wantDir {
+				t.Fatalf("EffectiveCodexHome() = (%q, %v), want (%q, %v)", got, ok, tc.wantDir, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestFilterByCodexHome is the core #47 property: reloading one shallow codex
+// profile must NOT match the daemons of a concurrent profile, and daemons whose
+// environment cannot be inspected are left alone (fail-safe).
+func TestFilterByCodexHome(t *testing.T) {
+	codA := "/orch/cod-a/.codex"
+	codB := "/orch/cod-b/.codex"
+	procs := []Process{
+		{PID: 10, Subcommand: "app-server", EnvKnown: true, CodexHome: codA, ShallowProfile: "cod-a"},
+		{PID: 20, Subcommand: "mcp-server", EnvKnown: true, CodexHome: codB, ShallowProfile: "cod-b"},
+		{PID: 30, Subcommand: "app-server", EnvKnown: true, Home: "/orch/cod-a"},       // HOME/.codex fallback -> cod-a
+		{PID: 40, Subcommand: "proto", EnvKnown: false, CodexHome: codA},               // unknown env -> excluded even though it looks like cod-a
+		{PID: 50, Subcommand: "app-server", EnvKnown: true, CodexHome: "/real/.codex"}, // unrelated global daemon
+	}
+
+	gotA := FilterByCodexHome(procs, codA)
+	if pids := pidsOf(gotA); !reflect.DeepEqual(pids, []int{10, 30}) {
+		t.Fatalf("cod-a reload matched pids %v, want [10 30] (must not touch cod-b or unattributable daemons)", pids)
+	}
+
+	gotB := FilterByCodexHome(procs, codB)
+	if pids := pidsOf(gotB); !reflect.DeepEqual(pids, []int{20}) {
+		t.Fatalf("cod-b reload matched pids %v, want [20]", pids)
+	}
+
+	// Empty scope == host-wide (activate/next): everything passes through.
+	if got := FilterByCodexHome(procs, ""); len(got) != len(procs) {
+		t.Fatalf("empty scope must be host-wide: got %d, want %d", len(got), len(procs))
+	}
+}
+
+func pidsOf(procs []Process) []int {
+	out := make([]int, 0, len(procs))
+	for _, p := range procs {
+		out = append(out, p.PID)
+	}
+	return out
+}
+
+// TestDetect_PopulatesEnviron verifies Detect wires the per-platform environ
+// reader into the classified daemon's attribution fields (issue #47).
+func TestDetect_PopulatesEnviron(t *testing.T) {
+	origScan, origEnv := scanProcesses, readProcEnviron
+	t.Cleanup(func() { scanProcesses, readProcEnviron = origScan, origEnv })
+
+	scanProcesses = func() ([]rawProc, bool) {
+		return []rawProc{{pid: 77, cmdline: "codex app-server"}}, true
+	}
+	var inspected []int
+	readProcEnviron = func(pid int) (map[string]string, bool) {
+		inspected = append(inspected, pid)
+		return map[string]string{
+			"CODEX_HOME":      "/orch/cod-a/.codex",
+			"HOME":            "/orch/cod-a",
+			"SHALLOW_PROFILE": "cod-a",
+		}, true
+	}
+
+	procs, supported := Detect()
+	if !supported || len(procs) != 1 {
+		t.Fatalf("Detect() = (%+v, %v), want one daemon", procs, supported)
+	}
+	// The environ must be read ONLY for the classified daemon.
+	if !reflect.DeepEqual(inspected, []int{77}) {
+		t.Fatalf("environ inspected for %v, want only [77]", inspected)
+	}
+	p := procs[0]
+	if !p.EnvKnown || p.CodexHome != "/orch/cod-a/.codex" || p.Home != "/orch/cod-a" || p.ShallowProfile != "cod-a" {
+		t.Fatalf("attribution not populated: %+v", p)
+	}
+}
+
+// TestDetect_EnvironOnlyForDaemons proves the environ is NOT read for processes
+// that fail Codex-daemon classification (issue #47: inspect only after match).
+func TestDetect_EnvironOnlyForDaemons(t *testing.T) {
+	origScan, origEnv := scanProcesses, readProcEnviron
+	t.Cleanup(func() { scanProcesses, readProcEnviron = origScan, origEnv })
+
+	scanProcesses = func() ([]rawProc, bool) {
+		return []rawProc{
+			{pid: 1, cmdline: "codex app-server"}, // daemon -> inspected
+			{pid: 2, cmdline: "codex"},            // interactive -> ignored
+			{pid: 3, cmdline: "vim notes.txt"},    // unrelated -> ignored
+		}, true
+	}
+	var inspected []int
+	readProcEnviron = func(pid int) (map[string]string, bool) {
+		inspected = append(inspected, pid)
+		return nil, false
+	}
+
+	if _, supported := Detect(); !supported {
+		t.Fatal("expected supported=true")
+	}
+	if !reflect.DeepEqual(inspected, []int{1}) {
+		t.Fatalf("environ inspected for %v, want only the daemon [1]", inspected)
 	}
 }
 

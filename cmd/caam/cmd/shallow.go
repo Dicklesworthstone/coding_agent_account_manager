@@ -496,10 +496,12 @@ func init() {
 }
 
 // shallowCodexDaemonCheck is the daemon detect/reload hook used by shallow-spawn.
-// It defaults to checkCodexDaemon and is a package var so tests can observe the
-// (tool, reload) arguments and stub out real host process scanning — mirroring
-// the spawnExec seam below.
-var shallowCodexDaemonCheck = checkCodexDaemon
+// It defaults to checkCodexDaemonScoped and is a package var so tests can observe
+// the (tool, reload, codexHome) arguments and stub out real host process scanning
+// — mirroring the spawnExec seam below. shallow-spawn always passes the TARGET
+// profile's CODEX_HOME so a reload only touches that profile's daemons (#47),
+// unlike the host-wide activate/next path.
+var shallowCodexDaemonCheck = checkCodexDaemonScoped
 
 func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	name := args[0]
@@ -563,7 +565,10 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// codex (for non-codex profiles it is accepted but does nothing).
 	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
 	if shallow.NormalizeProvider(provider) == "codex" {
-		printCodexDaemonWarning(cmd.ErrOrStderr(), shallowCodexDaemonCheck("codex", reloadDaemon))
+		// Scope the daemon check to THIS profile's CODEX_HOME so a reload only
+		// affects daemons serving this profile, not a concurrent shallow codex
+		// profile (issue #47). set["CODEX_HOME"] is pinned by SpawnEnv above.
+		printCodexDaemonWarning(cmd.ErrOrStderr(), shallowCodexDaemonCheck("codex", reloadDaemon, set["CODEX_HOME"]))
 	}
 
 	binPath, err := exec.LookPath(rest[0])

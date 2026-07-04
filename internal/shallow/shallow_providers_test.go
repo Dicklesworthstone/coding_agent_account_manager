@@ -147,6 +147,67 @@ func TestCreateCodexProfile(t *testing.T) {
 	}
 }
 
+// TestCreateCodexProfilePreservesMCPConfig is the #46 property: a shallow codex
+// profile must carry the user's real ~/.codex/config.toml (including
+// [mcp_servers.*] sections) into the shallow HOME, while still forcing
+// file-based credential storage — instead of writing a stub that only contains
+// the credential-store line and silently drops MCP config.
+func TestCreateCodexProfilePreservesMCPConfig(t *testing.T) {
+	home := multiHome(t)
+
+	// Give the real HOME a codex config with an MCP section AND a non-file
+	// credential store, so we prove BOTH preservation and enforcement.
+	realConfig := "cli_auth_credentials_store = \"keychain\"\n\n" +
+		"[mcp_servers.tavily]\n" +
+		"command = \"npx\"\n" +
+		"args = [\"-y\", \"tavily-mcp\"]\n\n" +
+		"[mcp_servers.filesystem]\n" +
+		"command = \"mcp-fs\"\n"
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(realConfig), 0o600); err != nil {
+		t.Fatalf("write real codex config: %v", err)
+	}
+
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr.Create("codex-mcp", CreateOptions{Provider: "codex", CredentialSource: credSource(t, `{"codex":"x"}`), CredentialFromLabel: "vault:codex/x"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The shallow config.toml is a REAL file (never a symlink back to the real
+	// config — a spawned session rewrites it), and it carries the MCP sections.
+	shallowCfgPath := filepath.Join(got, ".codex", "config.toml")
+	mustNotSymlink(t, shallowCfgPath, ".codex/config.toml")
+	cfg, err := os.ReadFile(shallowCfgPath)
+	if err != nil {
+		t.Fatalf("read shallow config.toml: %v", err)
+	}
+	body := string(cfg)
+	for _, want := range []string{"[mcp_servers.tavily]", "[mcp_servers.filesystem]", `command = "npx"`, `command = "mcp-fs"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("shallow config.toml dropped user section %q:\n%s", want, body)
+		}
+	}
+	// Credential storage must be forced to file, replacing the keychain setting.
+	if !strings.Contains(body, `cli_auth_credentials_store = "file"`) {
+		t.Fatalf("shallow config.toml did not enforce file credential store:\n%s", body)
+	}
+	if strings.Contains(body, `"keychain"`) {
+		t.Fatalf("shallow config.toml kept the keychain credential store:\n%s", body)
+	}
+
+	// Editing the shallow config must NOT mutate the user's real config.
+	if err := os.WriteFile(shallowCfgPath, []byte("mutated = true\n"), 0o600); err != nil {
+		t.Fatalf("rewrite shallow config: %v", err)
+	}
+	realAfter, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if string(realAfter) != realConfig {
+		t.Fatalf("real ~/.codex/config.toml was mutated through the shallow profile:\n%s", realAfter)
+	}
+}
+
 func TestCreateAgyProfile(t *testing.T) {
 	home := multiHome(t)
 	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)

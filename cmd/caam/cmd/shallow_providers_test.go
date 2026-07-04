@@ -244,8 +244,9 @@ func TestShallowSpawnCodexSetsCodexHome(t *testing.T) {
 func TestShallowSpawnCodex(t *testing.T) {
 	// daemonCall records one invocation of the daemon detect/reload hook.
 	type daemonCall struct {
-		tool   string
-		reload bool
+		tool      string
+		reload    bool
+		codexHome string
 	}
 
 	// installSeams swaps in observable spawnExec + daemon-check hooks and returns
@@ -263,8 +264,8 @@ func TestShallowSpawnCodex(t *testing.T) {
 			return nil
 		}
 		origCheck := shallowCodexDaemonCheck
-		shallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
-			gotCalls = append(gotCalls, daemonCall{tool: tool, reload: reload})
+		shallowCodexDaemonCheck = func(tool string, reload bool, codexHome string) codexDaemonWarning {
+			gotCalls = append(gotCalls, daemonCall{tool: tool, reload: reload, codexHome: codexHome})
 			// Return an empty (undetected) warning so printCodexDaemonWarning is a
 			// no-op and the test does not depend on any real host daemon.
 			return codexDaemonWarning{}
@@ -277,7 +278,7 @@ func TestShallowSpawnCodex(t *testing.T) {
 	}
 
 	t.Run("codex profile consumes flag and reloads daemon", func(t *testing.T) {
-		_, _ = shallowEnv(t)
+		base, _ := shallowEnv(t)
 		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
 		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
 			"--from-vault", "codex/bob", "--json"); err != nil {
@@ -309,6 +310,13 @@ func TestShallowSpawnCodex(t *testing.T) {
 		}
 		if (*calls)[0].tool != "codex" || !(*calls)[0].reload {
 			t.Fatalf("daemon-check call = %+v, want {codex true}", (*calls)[0])
+		}
+		// The reload must be SCOPED to this profile's CODEX_HOME (issue #47), not
+		// a host-wide reload — otherwise it would disrupt concurrent codex
+		// profiles.
+		wantHome := filepath.Join(base, "codex-bob", ".codex")
+		if (*calls)[0].codexHome != wantHome {
+			t.Fatalf("daemon-check codexHome = %q, want %q (reload must be scoped to the target profile)", (*calls)[0].codexHome, wantHome)
 		}
 	})
 

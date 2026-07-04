@@ -6,10 +6,34 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func init() {
 	scanProcesses = scanProcLinux
+	readProcEnviron = readProcEnvironLinux
+}
+
+// readProcEnvironLinux reads /proc/<pid>/environ (NUL-separated KEY=VALUE) for a
+// process already classified as a Codex daemon. It returns (nil, false) when the
+// file cannot be read (process exited, or we lack permission — e.g. a daemon
+// owned by another user), so the caller treats the daemon as unattributable and
+// leaves it alone during a scoped reload (issue #47).
+func readProcEnvironLinux(pid int) (map[string]string, bool) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+	env := make(map[string]string, 16)
+	for _, kv := range strings.Split(string(data), "\x00") {
+		if kv == "" {
+			continue
+		}
+		if i := strings.IndexByte(kv, '='); i > 0 {
+			env[kv[:i]] = kv[i+1:]
+		}
+	}
+	return env, true
 }
 
 // scanProcLinux enumerates processes by reading /proc/<pid>/cmdline. This is

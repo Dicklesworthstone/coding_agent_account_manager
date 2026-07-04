@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -63,6 +64,13 @@ daemon:
 
 	cmd := exec.Command(exe, "-test.run=^TestDaemonHelper$")
 	cmd.Env = env
+	// Run the daemon as the leader of its OWN process group so teardown can
+	// signal the ENTIRE tree — the daemon AND any grandchild it (or a tool it
+	// drives, e.g. a Codex plugin-clone helper) may spawn — not just the direct
+	// child. Reaping only the direct child left grandchildren writing files
+	// under the temp home, racing t.TempDir() RemoveAll and failing cleanup with
+	// "directory not empty" (issue #48).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Redirect stdout/stderr to a file we can read
 	logFile, err := os.Create(logPath)
@@ -72,6 +80,29 @@ daemon:
 
 	err = cmd.Start()
 	require.NoError(t, err)
+
+	// stopDaemon deterministically tears the daemon's whole process group down.
+	// It is idempotent (sync.Once) and registered as a t.Cleanup so it runs even
+	// if the test fails early (e.g. the PID file never appears) — and, crucially,
+	// BEFORE the harness's t.TempDir() RemoveAll (registered first, so it runs
+	// last). After this returns, no process rooted under the temp home is alive
+	// to keep writing during cleanup.
+	var stopOnce sync.Once
+	pgid := cmd.Process.Pid // == process-group id, since the child is the group leader
+	stopDaemon := func() {
+		stopOnce.Do(func() {
+			// Graceful first: SIGTERM the whole group.
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+			// Brief grace for a clean shutdown, then hard-kill the group as a
+			// backstop. SIGKILL is sent while the leader is still unreaped so the
+			// group id cannot have been recycled onto an unrelated process.
+			time.Sleep(200 * time.Millisecond)
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			// Reap the direct child so it does not linger as a zombie.
+			_ = cmd.Wait()
+		})
+	}
+	t.Cleanup(stopDaemon)
 
 	// Wait for PID file
 	pidFound := false
@@ -141,8 +172,9 @@ daemon:
 
 	// 4. Stop
 	h.StartStep("Stop", "Send SIGTERM")
-	cmd.Process.Signal(syscall.SIGTERM)
-	cmd.Wait()
+	// Tear down the daemon and its ENTIRE process group, waiting for exit, before
+	// the harness/TempDir cleanup runs (issue #48). Idempotent with the t.Cleanup.
+	stopDaemon()
 	logFile.Close()
 	h.EndStep("Stop")
 }
