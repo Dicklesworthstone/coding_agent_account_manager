@@ -493,6 +493,7 @@ func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
+	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
 }
 
 // shallowCodexDaemonCheck is the daemon detect/reload hook used by shallow-spawn.
@@ -530,7 +531,13 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	set, scrub := shallow.SpawnEnv(provider, prof.Path, name)
+	// Agent View policy (#49): disable Claude Code's cross-session background
+	// supervisor for shallow claude sessions unless the user opted back in with
+	// --allow-agent-view or has already exported CLAUDE_CODE_DISABLE_AGENT_VIEW
+	// themselves (an explicit user choice we never override).
+	allowAgentView, _ := cmd.Flags().GetBool("allow-agent-view")
+	_, disableAgentViewSet := os.LookupEnv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
+	set, scrub := shallow.SpawnEnv(provider, prof.Path, name, allowAgentView, disableAgentViewSet)
 
 	if printEnv {
 		// Print the variables that WOULD be set, as clean KEY=VALUE lines, with

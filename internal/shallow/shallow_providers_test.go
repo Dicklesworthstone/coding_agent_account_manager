@@ -376,7 +376,7 @@ func TestSpawnEnvPerProvider(t *testing.T) {
 		return false
 	}
 
-	claudeSet, claudeScrub := SpawnEnv("claude", home, "p")
+	claudeSet, claudeScrub := SpawnEnv("claude", home, "p", false, false)
 	if claudeSet["HOME"] != home || claudeSet["SHALLOW_PROFILE"] != "p" {
 		t.Fatalf("claude base env wrong: %v", claudeSet)
 	}
@@ -390,20 +390,62 @@ func TestSpawnEnvPerProvider(t *testing.T) {
 	// Every provider must scrub caam's own vault-locating vars so a spawned caam
 	// process cannot resolve the real vault via the inherited environment (#41).
 	for _, provider := range []string{"claude", "codex", "agy"} {
-		_, scrub := SpawnEnv(provider, home, "p")
+		_, scrub := SpawnEnv(provider, home, "p", false, false)
 		if !hasScrub(scrub, "CAAM_HOME") || !hasScrub(scrub, "XDG_DATA_HOME") {
 			t.Fatalf("%s must scrub CAAM_HOME and XDG_DATA_HOME, got %v", provider, scrub)
 		}
 	}
 
-	codexSet, _ := SpawnEnv("codex", home, "p")
+	codexSet, _ := SpawnEnv("codex", home, "p", false, false)
 	if codexSet["CODEX_HOME"] != filepath.Join(home, ".codex") {
 		t.Fatalf("codex CODEX_HOME = %q", codexSet["CODEX_HOME"])
 	}
 
-	agySet, _ := SpawnEnv("agy", home, "p")
+	agySet, _ := SpawnEnv("agy", home, "p", false, false)
 	if agySet["GEMINI_HOME"] != filepath.Join(home, ".gemini") {
 		t.Fatalf("agy GEMINI_HOME = %q", agySet["GEMINI_HOME"])
+	}
+}
+
+// TestSpawnEnvAgentView proves the claude Agent View disable policy (#49):
+// CLAUDE_CODE_DISABLE_AGENT_VIEW=1 is injected by default for claude shallow
+// sessions, suppressed by --allow-agent-view (allowAgentView) and by a
+// pre-existing user CLAUDE_CODE_DISABLE_AGENT_VIEW (disableAgentViewSet), and
+// never applied to non-claude providers.
+func TestSpawnEnvAgentView(t *testing.T) {
+	const key = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+	home := "/orch/p"
+
+	// Default claude session: disable flag injected.
+	set, _ := SpawnEnv("claude", home, "p", false, false)
+	if set[key] != "1" {
+		t.Fatalf("default claude must inject %s=1, got %q", key, set[key])
+	}
+
+	// --allow-agent-view: user opts back in, so no injection.
+	set, _ = SpawnEnv("claude", home, "p", true, false)
+	if _, ok := set[key]; ok {
+		t.Fatalf("--allow-agent-view must NOT inject %s, got %q", key, set[key])
+	}
+
+	// User already exported the var: their explicit choice is preserved (not
+	// overridden), so SpawnEnv leaves it out of the override set entirely.
+	set, _ = SpawnEnv("claude", home, "p", false, true)
+	if _, ok := set[key]; ok {
+		t.Fatalf("pre-set %s must NOT be overridden, got %q", key, set[key])
+	}
+
+	// Non-claude providers have no Agent View feature — never inject, regardless
+	// of the flags.
+	for _, provider := range []string{"codex", "agy"} {
+		for _, allow := range []bool{false, true} {
+			for _, preset := range []bool{false, true} {
+				set, _ := SpawnEnv(provider, home, "p", allow, preset)
+				if _, ok := set[key]; ok {
+					t.Fatalf("%s must never inject %s (allow=%v preset=%v)", provider, key, allow, preset)
+				}
+			}
+		}
 	}
 }
 

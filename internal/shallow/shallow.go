@@ -175,8 +175,15 @@ func childUnder(dir, rel string) string {
 // might have exported (which would otherwise pull the real identity back in) is
 // either pinned to the shallow location or scrubbed.
 //
+// allowAgentView and disableAgentViewSet control the claude Agent View policy
+// (issue #49): unless the user opts back in via --allow-agent-view
+// (allowAgentView) or has already exported CLAUDE_CODE_DISABLE_AGENT_VIEW
+// themselves (disableAgentViewSet), shallow claude sessions inject
+// CLAUDE_CODE_DISABLE_AGENT_VIEW=1. Both flags are ignored for non-claude
+// providers, which have no Agent View feature.
+//
 // SpawnEnv is a pure function so the env-isolation policy is unit-testable.
-func SpawnEnv(provider, home, name string) (set map[string]string, scrub []string) {
+func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet bool) (set map[string]string, scrub []string) {
 	set = map[string]string{
 		"HOME":            home,
 		"SHALLOW_PROFILE": name,
@@ -194,6 +201,21 @@ func SpawnEnv(provider, home, name string) (set map[string]string, scrub []strin
 		// A stale CLAUDE_CONFIG_DIR from a parent shell would pin auth.json
 		// outside the shallow HOME, re-sharing the user's real identity.
 		scrub = append(scrub, "CLAUDE_CONFIG_DIR")
+		// Agent View / background supervisor (issue #49): Claude Code's Agent
+		// View feature runs a long-lived, cross-session background supervisor
+		// daemon that is NOT bound to the shallow profile's HOME. On resume a
+		// shallow claude session reconnects to an already-running supervisor
+		// bound to a DIFFERENT identity (typically the VM's primary Claude auth),
+		// bypassing shallow-spawn's per-identity isolation. caam cannot control
+		// that daemon's lifecycle, so we disable Agent View by default to keep
+		// shallow claude sessions foreground and honoring the per-identity
+		// .claude/.credentials.json. Users can opt back in with --allow-agent-view
+		// (allowAgentView) — accepting the auth-isolation caveat — and an existing
+		// explicit CLAUDE_CODE_DISABLE_AGENT_VIEW (disableAgentViewSet) is never
+		// overridden.
+		if !allowAgentView && !disableAgentViewSet {
+			set["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
+		}
 	case "codex":
 		// Pin CODEX_HOME inside the shallow HOME, overriding any inherited value
 		// so a parent CODEX_HOME cannot leak the real ~/.codex/auth.json.

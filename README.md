@@ -190,7 +190,8 @@ caam shallow-profile create <name> [--tool claude|codex|agy] [--from-vault <tool
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
 caam shallow-spawn <name> -- <cmd> [args...]
-caam shallow-spawn <name> --print-env       # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
+caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
+caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
 ```
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
@@ -218,6 +219,14 @@ caam shallow-spawn bob     -- claude --print "write tests for internal/shallow" 
 caam shallow-spawn charlie -- claude --print "draft release notes for v0.4.0"       &
 wait
 ```
+
+> **Claude Agent View is disabled by default in shallow sessions (issue #49).** Claude Code's Agent View feature (the `--bg` background-supervisor daemon) runs a **long-lived, cross-session** supervisor process that is **not** bound to the shallow profile's `HOME`. On resume, a shallow `claude` session would reconnect to an already-running supervisor bound to a *different* identity (typically the VM's primary Claude auth), silently bypassing shallow-spawn's per-identity auth isolation and using the wrong account. caam cannot control that daemon's lifecycle, so `caam shallow-spawn <name> -- claude` injects `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` into the child environment by default. This keeps the session foreground and honoring the per-identity `~/.claude/.credentials.json`.
+>
+> **Escape hatches** (both opt back into Agent View, accepting the auth-isolation caveat above):
+> - Pass `--allow-agent-view` on `shallow-spawn` — caam will not inject the disable flag for that invocation.
+> - Export `CLAUDE_CODE_DISABLE_AGENT_VIEW` yourself (to any value) before spawning — caam never overrides an explicit user setting.
+>
+> This only affects the `claude` provider; `codex` and `agy` shallow sessions have no Agent View feature and are unchanged.
 
 > **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered Anthropic endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
 
