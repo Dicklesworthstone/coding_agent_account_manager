@@ -1899,39 +1899,51 @@ func runRobotHistory(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	// Query activity log
+	// Query activity log. Column set mirrors the non-robot `caam history`
+	// path (internal/db ListRecentEvents): the activity_log table stores
+	// free-form context in the `details` column (JSON), NOT a `notes` column.
+	// Referencing a nonexistent column here previously made the query error
+	// out; that error was swallowed and the command silently returned an empty
+	// result. Surface any query/scan error instead so schema drift is loud.
 	if db.Conn() != nil {
-		query := `SELECT timestamp, provider, profile_name, event_type, COALESCE(duration_seconds, 0), COALESCE(notes, '')
+		query := `SELECT timestamp, provider, profile_name, event_type, COALESCE(duration_seconds, 0), COALESCE(details, '')
 			FROM activity_log
 			WHERE datetime(timestamp) >= datetime(?)
 			ORDER BY datetime(timestamp) DESC
 			LIMIT ?`
 		rows, err := db.Conn().Query(query, since.UTC().Format("2006-01-02 15:04:05"), limit)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var tsStr, provider, profile, eventType, notes string
-				var durationSecs int64
-				if err := rows.Scan(&tsStr, &provider, &profile, &eventType, &durationSecs, &notes); err != nil {
-					continue
-				}
-
-				if providerFilter != "" && provider != providerFilter {
-					continue
-				}
-
-				event := RobotHistoryEvent{
-					Timestamp: tsStr,
-					Provider:  provider,
-					Profile:   profile,
-					Event:     eventType,
-					Notes:     notes,
-				}
-				if durationSecs > 0 {
-					event.Duration = robotFormatDuration(time.Duration(durationSecs) * time.Second)
-				}
-				data.Events = append(data.Events, event)
+		if err != nil {
+			return robotError(cmd, "history", "DB_ERROR",
+				"failed to query activity log", err.Error(), nil)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var tsStr, provider, profile, eventType, details string
+			var durationSecs int64
+			if err := rows.Scan(&tsStr, &provider, &profile, &eventType, &durationSecs, &details); err != nil {
+				return robotError(cmd, "history", "DB_ERROR",
+					"failed to scan activity log row", err.Error(), nil)
 			}
+
+			if providerFilter != "" && provider != providerFilter {
+				continue
+			}
+
+			event := RobotHistoryEvent{
+				Timestamp: tsStr,
+				Provider:  provider,
+				Profile:   profile,
+				Event:     eventType,
+				Notes:     details,
+			}
+			if durationSecs > 0 {
+				event.Duration = robotFormatDuration(time.Duration(durationSecs) * time.Second)
+			}
+			data.Events = append(data.Events, event)
+		}
+		if err := rows.Err(); err != nil {
+			return robotError(cmd, "history", "DB_ERROR",
+				"failed to iterate activity log rows", err.Error(), nil)
 		}
 	}
 
