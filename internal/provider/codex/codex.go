@@ -115,12 +115,31 @@ func EnsureFileCredentialStore(home string) error {
 		return atomicWriteFile(configPath, updated, 0600)
 	}
 
-	text := string(data)
-	if !strings.HasSuffix(text, "\n") {
-		text += "\n"
+	// The key is absent, so we must add it as a TOP-LEVEL key. Appending to the
+	// end of the file is WRONG: in TOML every bare key after a `[table]` header
+	// belongs to that table, so appending after e.g. `[mcp_servers.foo]` would
+	// make it `mcp_servers.foo.cli_auth_credentials_store` — the file store would
+	// not be enforced at the root, and the MCP table would be polluted. Instead
+	// insert the key into the root table: after any leading comment/blank block
+	// but before the first content line (which is either a top-level key or the
+	// first table header). Everything before the first `[table]` header is root
+	// scope, so inserting at the first non-comment line is always top-level, and
+	// we never have to parse table headers or multi-line array bodies.
+	lines := strings.Split(string(data), "\n")
+	insertAt := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			insertAt = i + 1
+			continue
+		}
+		break
 	}
-	text += settingLine + "\n"
-	return atomicWriteFile(configPath, []byte(text), 0600)
+	newLines := make([]string, 0, len(lines)+1)
+	newLines = append(newLines, lines[:insertAt]...)
+	newLines = append(newLines, settingLine)
+	newLines = append(newLines, lines[insertAt:]...)
+	return atomicWriteFile(configPath, []byte(strings.Join(newLines, "\n")), 0600)
 }
 
 // AuthFiles returns the auth file specifications for Codex.

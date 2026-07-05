@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -753,4 +754,95 @@ func writeJSON(t *testing.T, path string, data interface{}) {
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestEnsureFileCredentialStore covers the #46 regression: when the config has
+// no top-level cli_auth_credentials_store but DOES contain table sections (e.g.
+// [mcp_servers.*]), the enforced key must land as a TOP-LEVEL key, not nested
+// under the last table. Appending at end-of-file (the old behavior) would make
+// it mcp_servers.<last>.cli_auth_credentials_store, silently failing to enforce
+// the file store.
+func TestEnsureFileCredentialStore(t *testing.T) {
+	const settingLine = `cli_auth_credentials_store = "file"`
+
+	// firstTableIdx returns the byte offset of the first TOML table header, or -1.
+	firstTableIdx := func(s string) int {
+		offset := 0
+		for _, line := range strings.Split(s, "\n") {
+			if t := strings.TrimSpace(line); strings.HasPrefix(t, "[") {
+				return offset
+			}
+			offset += len(line) + 1
+		}
+		return -1
+	}
+
+	write := func(t *testing.T, home, cfg string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(t *testing.T, home string) string {
+		t.Helper()
+		got, err := os.ReadFile(filepath.Join(home, "config.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(got)
+	}
+
+	t.Run("inserts top-level key before mcp_servers table", func(t *testing.T) {
+		home := t.TempDir()
+		write(t, home, "[mcp_servers.tavily]\ncommand = \"npx\"\nargs = [\"-y\", \"tavily-mcp\"]\n")
+		if err := EnsureFileCredentialStore(home); err != nil {
+			t.Fatalf("EnsureFileCredentialStore error: %v", err)
+		}
+		out := read(t, home)
+		settingIdx := strings.Index(out, settingLine)
+		if settingIdx < 0 {
+			t.Fatalf("setting line not written; got:\n%s", out)
+		}
+		tableIdx := firstTableIdx(out)
+		if tableIdx < 0 {
+			t.Fatalf("mcp_servers table lost; got:\n%s", out)
+		}
+		// The setting must appear BEFORE the first table header (top-level scope).
+		if settingIdx > tableIdx {
+			t.Errorf("setting nested under a table (idx %d > first table idx %d); got:\n%s", settingIdx, tableIdx, out)
+		}
+		if !strings.Contains(out, "[mcp_servers.tavily]") || !strings.Contains(out, `command = "npx"`) {
+			t.Errorf("MCP config not preserved; got:\n%s", out)
+		}
+	})
+
+	t.Run("replaces existing keychain value in place", func(t *testing.T) {
+		home := t.TempDir()
+		write(t, home, "cli_auth_credentials_store = \"keychain\"\n[mcp_servers.x]\ncommand = \"y\"\n")
+		if err := EnsureFileCredentialStore(home); err != nil {
+			t.Fatalf("EnsureFileCredentialStore error: %v", err)
+		}
+		out := read(t, home)
+		if strings.Contains(out, "keychain") {
+			t.Errorf("keychain not replaced; got:\n%s", out)
+		}
+		if !strings.Contains(out, settingLine) {
+			t.Errorf("file store not set; got:\n%s", out)
+		}
+	})
+
+	t.Run("preserves leading comment block", func(t *testing.T) {
+		home := t.TempDir()
+		write(t, home, "# my codex config\n\n[mcp_servers.x]\ncommand = \"y\"\n")
+		if err := EnsureFileCredentialStore(home); err != nil {
+			t.Fatalf("EnsureFileCredentialStore error: %v", err)
+		}
+		out := read(t, home)
+		if strings.Index(out, settingLine) > firstTableIdx(out) {
+			t.Errorf("setting not top-level; got:\n%s", out)
+		}
+		if !strings.Contains(out, "# my codex config") {
+			t.Errorf("leading comment lost; got:\n%s", out)
+		}
+	})
 }
