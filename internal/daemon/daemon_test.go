@@ -892,11 +892,11 @@ func TestDaemon_InitAuthPool(t *testing.T) {
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
 	cfg := &Config{
-		CheckInterval:         50 * time.Millisecond,
-		RefreshThreshold:      1 * time.Minute,
+		CheckInterval:          50 * time.Millisecond,
+		RefreshThreshold:       1 * time.Minute,
 		MaxConcurrentRefreshes: 2,
-		Verbose:               true,
-		UseAuthPool:           true,
+		Verbose:                true,
+		UseAuthPool:            true,
 	}
 
 	d := New(v, hs, cfg)
@@ -917,11 +917,11 @@ func TestDaemon_InitAuthPool_DefaultConcurrency(t *testing.T) {
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
 	cfg := &Config{
-		CheckInterval:         50 * time.Millisecond,
-		RefreshThreshold:      1 * time.Minute,
+		CheckInterval:          50 * time.Millisecond,
+		RefreshThreshold:       1 * time.Minute,
 		MaxConcurrentRefreshes: 0, // Should default to 3
-		Verbose:               true,
-		UseAuthPool:           true,
+		Verbose:                true,
+		UseAuthPool:            true,
 	}
 
 	d := New(v, hs, cfg)
@@ -1143,12 +1143,22 @@ func TestDaemon_RunLoop_MultipleIterations(t *testing.T) {
 		errCh <- d.Start()
 	}()
 
-	// Wait for multiple iterations
-	time.Sleep(150 * time.Millisecond)
-
-	stats := d.GetStats()
-	if stats.CheckCount < 3 {
-		t.Errorf("CheckCount = %d, expected at least 3 after 150ms with 20ms interval", stats.CheckCount)
+	// Wait for multiple iterations. Poll for the expected tick count instead of
+	// relying on a single fixed sleep: under heavy CPU load (e.g. many parallel
+	// test binaries) the daemon goroutine can be starved of scheduling time, so
+	// a fixed 150ms window is flaky. Polling to a generous deadline preserves
+	// the test's intent (the run loop ticks multiple times) without the flake.
+	deadline := time.Now().Add(5 * time.Second)
+	var checkCount int64
+	for time.Now().Before(deadline) {
+		checkCount = d.GetStats().CheckCount
+		if checkCount >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if checkCount < 3 {
+		t.Errorf("CheckCount = %d, expected at least 3 with 20ms interval", checkCount)
 	}
 
 	// Stop daemon
