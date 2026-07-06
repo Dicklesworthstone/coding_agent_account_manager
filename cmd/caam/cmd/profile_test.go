@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 )
 
 // TestProfileCommandStructure tests the profile parent command.
@@ -496,6 +498,50 @@ func TestLoginCommand(t *testing.T) {
 	err = loginCmd.Args(loginCmd, []string{"codex"})
 	if err == nil {
 		t.Error("Expected error for single arg")
+	}
+}
+
+// TestLoginCommand_ClaudeUnsupported is a regression test for issue #53:
+// `caam login claude <profile>` must return a clear, provider-specific message
+// pointing users at Claude Code's built-in /login flow, rather than the
+// misleading generic "profile not found"/token-expired error.
+func TestLoginCommand_ClaudeUnsupported(t *testing.T) {
+	err := loginCmd.RunE(loginCmd, []string{"claude", "home"})
+	if err == nil {
+		t.Fatal("expected an error for `login claude`, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "not supported for the claude provider") {
+		t.Errorf("expected claude-specific message, got: %q", msg)
+	}
+	if !strings.Contains(msg, "/login") {
+		t.Errorf("expected message to mention the /login flow, got: %q", msg)
+	}
+
+	// Case-insensitive: the provider arg is lowercased before the check.
+	if err := loginCmd.RunE(loginCmd, []string{"Claude", "home"}); err == nil ||
+		!strings.Contains(err.Error(), "not supported for the claude provider") {
+		t.Errorf("expected claude guard to fire for %q, got: %v", "Claude", err)
+	}
+
+	// Other providers must NOT hit the claude-specific short-circuit. They may
+	// still fail for unrelated reasons (missing profile, etc.), but never with
+	// the claude message. Set up an isolated registry + empty profile store so
+	// codex reaches its normal path (and fails on the missing profile, proving
+	// it flowed past the claude guard).
+	origRegistry := registry
+	origStore := profileStore
+	t.Cleanup(func() {
+		registry = origRegistry
+		profileStore = origStore
+	})
+	registry = provider.NewRegistry()
+	registry.Register(codex.New())
+	profileStore = profile.NewStore(t.TempDir())
+
+	if err := loginCmd.RunE(loginCmd, []string{"codex", "work"}); err != nil &&
+		strings.Contains(err.Error(), "not supported for the claude provider") {
+		t.Errorf("codex login must not trigger the claude guard, got: %q", err.Error())
 	}
 }
 

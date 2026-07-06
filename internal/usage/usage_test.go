@@ -353,6 +353,69 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 	}
 }
 
+// TestClaudeFetcher_Fetch_PercentScaling is a regression test for issue #52.
+// The Claude OAuth usage API reports utilization on a 0-100 percent scale
+// (1.0 == 1%, 4.0 == 4%, 100.0 == 100%). Earlier code treated any value
+// <= 1.0 as a 0-1 fraction and multiplied by 100, so a fresh subscription at
+// 1.0% weekly usage was mis-reported as 100%. Values must be taken as percents
+// directly: UsedPercent == floor(apiValue) and Utilization == apiValue/100.
+func TestClaudeFetcher_Fetch_PercentScaling(t *testing.T) {
+	tests := []struct {
+		name            string
+		apiValue        float64
+		wantUsedPercent int
+		wantUtilization float64
+	}{
+		{name: "half percent", apiValue: 0.5, wantUsedPercent: 0, wantUtilization: 0.005},
+		{name: "one percent boundary", apiValue: 1.0, wantUsedPercent: 1, wantUtilization: 0.01},
+		{name: "four percent", apiValue: 4.0, wantUsedPercent: 4, wantUtilization: 0.04},
+		{name: "full", apiValue: 100.0, wantUsedPercent: 100, wantUtilization: 1.0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := fmt.Sprintf(
+				`{"five_hour":{"utilization":%g,"resets_at":""},"seven_day":{"utilization":%g,"resets_at":""},"opus":{"utilization":%g,"resets_at":""}}`,
+				tc.apiValue, tc.apiValue, tc.apiValue,
+			)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, payload)
+			}))
+			defer server.Close()
+
+			fetcher := NewClaudeFetcher()
+			fetcher.baseURL = server.URL
+
+			info, err := fetcher.Fetch(context.Background(), "token")
+			if err != nil {
+				t.Fatalf("Fetch() error = %v", err)
+			}
+
+			for _, w := range []struct {
+				label  string
+				window *UsageWindow
+			}{
+				{"primary", info.PrimaryWindow},
+				{"secondary", info.SecondaryWindow},
+				{"tertiary", info.TertiaryWindow},
+			} {
+				if w.window == nil {
+					t.Fatalf("%s window is nil", w.label)
+				}
+				if w.window.UsedPercent != tc.wantUsedPercent {
+					t.Errorf("%s UsedPercent = %d, want %d (apiValue=%g)",
+						w.label, w.window.UsedPercent, tc.wantUsedPercent, tc.apiValue)
+				}
+				if diff := w.window.Utilization - tc.wantUtilization; diff > 1e-9 || diff < -1e-9 {
+					t.Errorf("%s Utilization = %g, want %g (apiValue=%g)",
+						w.label, w.window.Utilization, tc.wantUtilization, tc.apiValue)
+				}
+			}
+		})
+	}
+}
+
 func TestUsageInfo_MostConstrainedWindow(t *testing.T) {
 	tests := []struct {
 		name     string

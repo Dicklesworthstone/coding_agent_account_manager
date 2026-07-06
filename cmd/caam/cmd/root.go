@@ -1872,6 +1872,18 @@ Examples:
 		tool := strings.ToLower(args[0])
 		name := args[1]
 
+		// caam cannot drive Claude Code's auth: its OAuth endpoint is
+		// undocumented and its tokens are opaque, so `caam login claude ...`
+		// can only ever fail later with a misleading "profile not found" or
+		// token-expired error (issue #53). Human users must authenticate with
+		// Claude Code's own built-in /login flow. Return a clear, provider-
+		// specific message up front instead of the generic failure path.
+		if tool == "claude" {
+			return fmt.Errorf("caam login is not supported for the claude provider — " +
+				"use Claude Code's built-in /login flow instead (run `claude`, then type /login). " +
+				"See the docs for details")
+		}
+
 		prov, ok := registry.Get(tool)
 		if !ok {
 			return fmt.Errorf("unknown provider: %s", tool)

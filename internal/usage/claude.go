@@ -10,10 +10,10 @@ import (
 
 // Claude API constants.
 const (
-	ClaudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
-	ClaudeAPIBeta    = "oauth-2025-04-20"
-	ClaudeUserAgent  = "caam/1.0"
-	claudeTimeout    = 30 * time.Second
+	ClaudeUsageURL  = "https://api.anthropic.com/api/oauth/usage"
+	ClaudeAPIBeta   = "oauth-2025-04-20"
+	ClaudeUserAgent = "caam/1.0"
+	claudeTimeout   = 30 * time.Second
 )
 
 // ClaudeFetcher fetches usage data from Claude's OAuth API.
@@ -37,7 +37,7 @@ type claudeUsageResponse struct {
 }
 
 type claudeWindow struct {
-	Utilization float64 `json:"utilization"` // 0-100 percentage (normalized to 0-1 in parsing)
+	Utilization float64 `json:"utilization"` // percent on a 0-100 scale (1.0 == 1%, 100.0 == 100%)
 	ResetsAt    string  `json:"resets_at"`   // ISO8601 timestamp
 }
 
@@ -94,44 +94,38 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 		return info, fmt.Errorf("decode response: %w", err)
 	}
 
-	// Convert to UsageInfo
-	// Note: Claude API returns utilization as 0-100 percentage, not 0-1 fraction
+	// Convert to UsageInfo.
+	//
+	// The Claude OAuth usage API reports `utilization` as a percent on a 0-100
+	// scale: 1.0 means 1%, 4.0 means 4%, 100.0 means 100%. We must NOT treat
+	// small values (<= 1.0) as a 0-1 fraction — doing so mis-scaled a fresh
+	// subscription sitting at 1.0% into "100%" (issue #52). UsedPercent stores
+	// the percent directly (0-100) and Utilization stores the 0-1 fraction.
 	if usage.FiveHour != nil {
-		util := usage.FiveHour.Utilization
-		// Normalize: if > 1, it's a percentage; convert to 0-1 fraction
-		if util > 1 {
-			util = util / 100.0
-		}
+		pct := usage.FiveHour.Utilization
 		info.PrimaryWindow = &UsageWindow{
-			Utilization:    util,
-			UsedPercent:    int(util * 100),
+			Utilization:    pct / 100.0,
+			UsedPercent:    int(pct),
 			ResetsAt:       parseISO8601(usage.FiveHour.ResetsAt),
 			WindowDuration: 5 * time.Hour,
 		}
 	}
 
 	if usage.SevenDay != nil {
-		util := usage.SevenDay.Utilization
-		// Normalize: if > 1, it's a percentage; convert to 0-1 fraction
-		if util > 1 {
-			util = util / 100.0
-		}
+		pct := usage.SevenDay.Utilization
 		info.SecondaryWindow = &UsageWindow{
-			Utilization:    util,
-			UsedPercent:    int(util * 100),
+			Utilization:    pct / 100.0,
+			UsedPercent:    int(pct),
 			ResetsAt:       parseISO8601(usage.SevenDay.ResetsAt),
 			WindowDuration: 7 * 24 * time.Hour,
 		}
 	}
 
 	if usage.Opus != nil {
-		util := usage.Opus.Utilization
-		if util > 1 {
-			util = util / 100.0
-		}
+		pct := usage.Opus.Utilization
 		info.TertiaryWindow = &UsageWindow{
-			Utilization: util,
-			UsedPercent: int(util * 100),
+			Utilization: pct / 100.0,
+			UsedPercent: int(pct),
 			ResetsAt:    parseISO8601(usage.Opus.ResetsAt),
 			// Opus limits are typically daily/weekly but window duration is variable
 		}
