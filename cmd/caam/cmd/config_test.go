@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -551,5 +552,134 @@ func TestGetConfigValue_CompositeNodeYAML(t *testing.T) {
 	}
 	if !strings.Contains(got, "algorithm: smart") || !strings.Contains(got, "enabled: false") {
 		t.Errorf("getConfigValue(stealth.rotation) = %q, want YAML subtree with algorithm/enabled", got)
+	}
+}
+
+// =============================================================================
+// Issue #54: `config set` must accept every key `config show` emits.
+// =============================================================================
+
+// TestSetConfigValue_NestedSections asserts that representative keys which
+// `config show` displays — and which `config get` already resolved — are now
+// writable via `config set`. Before the reflection unification these were
+// rejected with "unknown section" / "unknown nested key" even though `show`
+// printed them, so users could see values they could never change (issue #54).
+// Each case sets a value, re-reads it, and confirms the config still validates.
+func TestSetConfigValue_NestedSections(t *testing.T) {
+	tests := []struct {
+		key   string
+		value string
+		want  string
+	}{
+		{"safety.auto_backup_before_switch", "always", "always"},
+		{"safety.max_auto_backups", "10", "10"},
+		{"stealth.rotation.enabled", "true", "true"},
+		{"stealth.rotation.algorithm", "round_robin", "round_robin"},
+		{"stealth.cooldown.enabled", "true", "true"},
+		{"stealth.cooldown.default_minutes", "30", "30"},
+		{"stealth.switch_delay.min_seconds", "3", "3"},
+		{"stealth.switch_delay.max_seconds", "40", "40"},
+		{"compaction_reminder.enabled", "true", "true"},
+		{"compaction_reminder.cooldown", "15m", "15m0s"},
+		{"compaction_reminder.prompt", "reread it", "reread it"},
+		{"subscriptions.gemini.plan", "pro", "pro"},
+		{"subscriptions.gemini.monthly_cost", "42", "42.00"},
+		{"rate_limits.claude.0", "429 detected", "429 detected"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			cfg := config.DefaultSPMConfig()
+			if err := setConfigValue(cfg, tt.key, tt.value); err != nil {
+				t.Fatalf("config show emits %q but config set rejects it: %v", tt.key, err)
+			}
+			got, err := getConfigValue(cfg, tt.key)
+			if err != nil {
+				t.Fatalf("getConfigValue(%q) after set: %v", tt.key, err)
+			}
+			if got != tt.want {
+				t.Errorf("after set %q=%q, get = %q, want %q", tt.key, tt.value, got, tt.want)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("config invalid after setting %q=%q: %v", tt.key, tt.value, err)
+			}
+		})
+	}
+}
+
+// TestSetConfigValue_SetsEverythingShowEmits is the write-side drift guard that
+// permanently locks show/get/set to one source of truth: every scalar leaf key
+// that `config show` (yaml.Marshal of *SPMConfig) emits must be writable via
+// `config set`, and the write must be observable via `config get`. This is the
+// end-to-end assertion for issue #54 and prevents the commands from diverging
+// again the next time a config field is added.
+func TestSetConfigValue_SetsEverythingShowEmits(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+
+	for _, key := range leafKeys("", root) {
+		t.Run(key, func(t *testing.T) {
+			before, err := getConfigValue(cfg, key)
+			if err != nil {
+				t.Fatalf("config show emits %q but config get cannot read it: %v", key, err)
+			}
+
+			// Resolve the leaf's concrete kind to choose a valid write value.
+			v, err := resolveYAMLPath(reflect.ValueOf(cfg), strings.Split(key, "."), key)
+			if err != nil {
+				t.Fatalf("resolve %q: %v", key, err)
+			}
+			for v.Kind() == reflect.Ptr {
+				v = v.Elem()
+			}
+
+			if v.Kind() == reflect.Slice {
+				// List leaves (rate_limits.*, login_patterns.*.*) accept a
+				// comma-separated value; verify it is written, not rejected.
+				if err := setConfigValue(cfg, key, "alpha,beta"); err != nil {
+					t.Fatalf("config show emits list %q but config set rejects it: %v", key, err)
+				}
+				got, err := getConfigValue(cfg, key)
+				if err != nil {
+					t.Fatalf("getConfigValue(%q) after set: %v", key, err)
+				}
+				if !strings.Contains(got, "alpha") || !strings.Contains(got, "beta") {
+					t.Errorf("set list %q did not take effect: %q", key, got)
+				}
+				return
+			}
+
+			// Scalar leaves must round-trip: writing back the value `get`
+			// reported must reproduce it exactly.
+			if err := setConfigValue(cfg, key, before); err != nil {
+				t.Fatalf("config show emits %q but config set rejects it: %v", key, err)
+			}
+			after, err := getConfigValue(cfg, key)
+			if err != nil {
+				t.Fatalf("getConfigValue(%q) after set: %v", key, err)
+			}
+			if after != before {
+				t.Errorf("round-trip mismatch for %q: before=%q after=%q", key, before, after)
+			}
+		})
+	}
+}
+
+// TestSetConfigValue_UnknownStillErrors ensures the reflection writer keeps
+// rejecting genuinely unknown keys so error behavior did not regress.
+func TestSetConfigValue_UnknownStillErrors(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+	for _, key := range []string{"unknown_key", "unknown.section.key", "invalid_section.key", "stealth.rotation.bogus", "stealth.bogus", ""} {
+		if err := setConfigValue(cfg, key, "x"); err == nil {
+			t.Errorf("setConfigValue(%q) = nil error, want error", key)
+		}
 	}
 }

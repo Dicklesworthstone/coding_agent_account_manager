@@ -113,20 +113,32 @@ Examples:
 var configSetCmd = &cobra.Command{
 	Use:   "set <key> <value>",
 	Short: "Set a configuration value",
-	Long: `Set a specific configuration value.
+	Long: `Set a specific configuration value by its key path.
 
-Key paths use dot notation: section.key
-Values are parsed based on the key's type.
+Key paths use dot notation and address any key that 'caam config show'
+emits, to arbitrary depth. This is the exact same key space that
+'caam config get' reads, so every value shown can be written back
+(issue #54).
 
-Duration values: 10m, 1h, 30s, 2h30m
-Boolean values: true, false, yes, no, 1, 0
-Integer values: 30, 90, 365
+Values are parsed based on the addressed field's type:
+  Duration values: 10m, 1h, 30s, 2h30m
+  Boolean values:  true, false, yes, no, 1, 0, on, off
+  Integer values:  30, 90, 365
+  Float values:    0.8, 275
+  String values:   used verbatim
+  List values:     comma-separated (e.g. "429,rate limit"); address a
+                   single element by index to preserve commas, e.g.
+                   'set rate_limits.claude.0 "a{2,3}"'
 
 Examples:
   caam config set health.refresh_threshold 5m
   caam config set health.penalty_decay_rate 0.9
   caam config set analytics.retention_days 30
-  caam config set runtime.file_watching false`,
+  caam config set runtime.file_watching false
+  caam config set safety.auto_backup_before_switch always
+  caam config set stealth.rotation.enabled true
+  caam config set stealth.rotation.algorithm round_robin
+  caam config set subscriptions.gemini.plan pro`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		key := args[0]
@@ -251,9 +263,19 @@ func resolveYAMLPath(v reflect.Value, parts []string, fullKey string) (reflect.V
 				return reflect.Value{}, fmt.Errorf("unknown key: %s (no such entry %q)", fullKey, part)
 			}
 			v = mv
+		case reflect.Slice, reflect.Array:
+			// e.g. rate_limits.claude.0 — index into a list leaf.
+			idx, err := strconv.Atoi(part)
+			if err != nil {
+				return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
+			}
+			if idx < 0 || idx >= v.Len() {
+				return reflect.Value{}, fmt.Errorf("index out of range for %s: %d (len %d)", fullKey, idx, v.Len())
+			}
+			v = v.Index(idx)
 		default:
-			// We still have path segments but hit a scalar/slice — the path
-			// goes deeper than the schema allows.
+			// We still have path segments but hit a scalar — the path goes
+			// deeper than the schema allows.
 			return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
 		}
 	}
@@ -323,315 +345,192 @@ func formatConfigScalar(v reflect.Value, key string) (string, error) {
 	}
 }
 
-// setConfigValue sets a value in the config by key path.
+// setConfigValue sets a value in the config by its dotted key path.
+//
+// Like getConfigValue, it is driven entirely by reflection over the YAML-tagged
+// SPMConfig struct so that show/get/set share a single source of truth: every
+// scalar leaf that `config show` emits (and `config get` can read) can also be
+// written here. Previously `set` used a hand-maintained switch that only knew
+// about version/health/analytics/runtime/project/alerts/handoff/daemon/tui (and
+// two nested cases), so every other section `show` displayed —
+// stealth.* / safety.* / rate_limits.* / login_patterns.* / subscriptions.* /
+// compaction_reminder.* — was rejected as "unknown section" / "unknown nested
+// key" even though `show` printed it and `get` could read it (issue #54).
+// Reflection keeps the three commands in lockstep permanently.
+//
+// The resulting value is not semantically validated here; SPMConfig.Validate()
+// (invoked by Save) enforces enum membership, ranges and regex compilation and
+// returns a descriptive error to the user.
 func setConfigValue(cfg *config.SPMConfig, key, value string) error {
+	if key == "" {
+		return fmt.Errorf("empty key")
+	}
 	parts := strings.Split(key, ".")
-	if len(parts) < 1 || len(parts) > 3 {
-		return fmt.Errorf("invalid key format: %s (use section.key or section.subsection.key)", key)
+	return assignYAMLPath(reflect.ValueOf(cfg), parts, key, value, 0)
+}
+
+// assignYAMLPath walks a value along a dotted path (matching yaml tags for
+// struct fields, string keys for maps and integer indices for slices) and writes
+// raw into the addressed leaf. Map entries are not addressable in Go, so the
+// entry is copied into an addressable temporary, mutated, and stored back with
+// SetMapIndex. depth distinguishes a bad top-level segment ("unknown section")
+// from a bad nested one ("unknown key"), mirroring resolveYAMLPath's messages.
+func assignYAMLPath(v reflect.Value, parts []string, fullKey, raw string, depth int) error {
+	// Deref pointers as we descend.
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return fmt.Errorf("unknown key: %s", fullKey)
+		}
+		v = v.Elem()
 	}
 
-	// Handle top-level keys
-	if len(parts) == 1 {
-		switch parts[0] {
-		case "version":
-			v, err := strconv.Atoi(value)
-			if err != nil {
-				return fmt.Errorf("invalid version: %w", err)
+	part := parts[0]
+	rest := parts[1:]
+
+	switch v.Kind() {
+	case reflect.Struct:
+		field, ok := fieldByYAMLTag(v, part)
+		if !ok {
+			if depth == 0 {
+				return fmt.Errorf("unknown section: %s", part)
 			}
-			cfg.Version = v
-			return nil
-		default:
-			return fmt.Errorf("unknown key: %s", key)
+			return fmt.Errorf("unknown key: %s", fullKey)
 		}
-	}
+		if len(rest) == 0 {
+			return setScalarValue(field, fullKey, raw)
+		}
+		return assignYAMLPath(field, rest, fullKey, raw, depth+1)
 
-	section := parts[0]
-	field := parts[1]
-
-	// Handle nested sections (3 parts)
-	if len(parts) == 3 {
-		subfield := parts[2]
-		switch section {
-		case "alerts":
-			if field == "notifications" {
-				return setNotificationsValue(&cfg.Alerts.Notifications, subfield, value)
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String {
+			return fmt.Errorf("unknown key: %s", fullKey)
+		}
+		keyVal := reflect.ValueOf(part)
+		elem := v.MapIndex(keyVal)
+		if !elem.IsValid() {
+			return fmt.Errorf("unknown key: %s (no such entry %q)", fullKey, part)
+		}
+		// Map values are not addressable; mutate an addressable copy and store
+		// it back.
+		tmp := reflect.New(v.Type().Elem()).Elem()
+		tmp.Set(elem)
+		if len(rest) == 0 {
+			if err := setScalarValue(tmp, fullKey, raw); err != nil {
+				return err
 			}
-		case "daemon":
-			if field == "auth_pool" {
-				return setAuthPoolValue(&cfg.Daemon.AuthPool, subfield, value)
-			}
+		} else if err := assignYAMLPath(tmp, rest, fullKey, raw, depth+1); err != nil {
+			return err
 		}
-		return fmt.Errorf("unknown nested key: %s", key)
-	}
+		v.SetMapIndex(keyVal, tmp)
+		return nil
 
-	switch section {
-	case "health":
-		return setHealthValue(&cfg.Health, field, value)
-	case "analytics":
-		return setAnalyticsValue(&cfg.Analytics, field, value)
-	case "runtime":
-		return setRuntimeValue(&cfg.Runtime, field, value)
-	case "project":
-		return setProjectValue(&cfg.Project, field, value)
-	case "alerts":
-		return setAlertsValue(&cfg.Alerts, field, value)
-	case "handoff":
-		return setHandoffValue(&cfg.Handoff, field, value)
-	case "daemon":
-		return setDaemonValue(&cfg.Daemon, field, value)
-	case "tui":
-		return setTUIValue(&cfg.TUI, field, value)
+	case reflect.Slice, reflect.Array:
+		idx, err := strconv.Atoi(part)
+		if err != nil {
+			return fmt.Errorf("unknown key: %s", fullKey)
+		}
+		if idx < 0 || idx >= v.Len() {
+			return fmt.Errorf("index out of range for %s: %d (len %d)", fullKey, idx, v.Len())
+		}
+		if len(rest) == 0 {
+			return setScalarValue(v.Index(idx), fullKey, raw)
+		}
+		return assignYAMLPath(v.Index(idx), rest, fullKey, raw, depth+1)
+
 	default:
-		return fmt.Errorf("unknown section: %s", section)
+		return fmt.Errorf("unknown key: %s", fullKey)
 	}
 }
 
-func setHealthValue(h *config.HealthConfig, field, value string) error {
-	switch field {
-	case "refresh_threshold":
-		d, err := time.ParseDuration(value)
+// setScalarValue parses raw according to the concrete type of the addressed leaf
+// and assigns it. It is the write-side counterpart of formatConfigScalar and
+// supports every leaf type the schema uses: config.Duration, bool, the int/uint
+// families, floats, strings and string lists (comma-separated).
+func setScalarValue(v reflect.Value, fullKey, raw string) error {
+	if !v.CanSet() {
+		return fmt.Errorf("cannot set %s", fullKey)
+	}
+
+	// config.Duration is a named int64; parse human-readable durations before
+	// the generic int handling would treat it as a raw nanosecond count.
+	if v.Type() == reflect.TypeOf(config.Duration(0)) {
+		d, err := time.ParseDuration(raw)
 		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
+			return fmt.Errorf("invalid duration for %s: %w", fullKey, err)
 		}
-		h.RefreshThreshold = config.Duration(d)
-	case "warning_threshold":
-		d, err := time.ParseDuration(value)
+		v.SetInt(int64(d))
+		return nil
+	}
+
+	switch v.Kind() {
+	case reflect.Bool:
+		b, err := parseBool(raw)
 		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
+			return err
 		}
-		h.WarningThreshold = config.Duration(d)
-	case "penalty_decay_rate":
-		f, err := strconv.ParseFloat(value, 64)
+		v.SetBool(b)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid float: %w", err)
+			return fmt.Errorf("invalid integer for %s: %w", fullKey, err)
 		}
-		h.PenaltyDecayRate = f
-	case "penalty_decay_interval":
-		d, err := time.ParseDuration(value)
+		if v.OverflowInt(n) {
+			return fmt.Errorf("value out of range for %s: %s", fullKey, raw)
+		}
+		v.SetInt(n)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := strconv.ParseUint(raw, 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
+			return fmt.Errorf("invalid unsigned integer for %s: %w", fullKey, err)
 		}
-		h.PenaltyDecayInterval = config.Duration(d)
+		if v.OverflowUint(n) {
+			return fmt.Errorf("value out of range for %s: %s", fullKey, raw)
+		}
+		v.SetUint(n)
+	case reflect.Float32, reflect.Float64:
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("invalid number for %s: %w", fullKey, err)
+		}
+		if v.OverflowFloat(f) {
+			return fmt.Errorf("value out of range for %s: %s", fullKey, raw)
+		}
+		v.SetFloat(f)
+	case reflect.String:
+		v.SetString(raw)
+	case reflect.Slice:
+		if v.Type().Elem().Kind() != reflect.String {
+			return fmt.Errorf("cannot set %s: unsupported list element type %s", fullKey, v.Type().Elem().Kind())
+		}
+		items := parseStringList(raw)
+		s := reflect.MakeSlice(v.Type(), len(items), len(items))
+		for i, it := range items {
+			s.Index(i).SetString(it)
+		}
+		v.Set(s)
 	default:
-		return fmt.Errorf("unknown health field: %s", field)
+		return fmt.Errorf("cannot set %s: unsupported type %s", fullKey, v.Kind())
 	}
 	return nil
 }
 
-func setAnalyticsValue(a *config.AnalyticsConfig, field, value string) error {
-	switch field {
-	case "enabled":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		a.Enabled = b
-	case "retention_days":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.RetentionDays = i
-	case "aggregate_retention_days":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.AggregateRetentionDays = i
-	case "cleanup_on_startup":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		a.CleanupOnStartup = b
-	default:
-		return fmt.Errorf("unknown analytics field: %s", field)
+// parseStringList splits a comma-separated value into a trimmed string slice,
+// dropping empty entries. An empty (or whitespace-only) input clears the list.
+// To set a single element that itself contains a comma (e.g. a regex like
+// "a{2,3}"), address that element by index instead: set rate_limits.claude.0.
+func parseStringList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
 	}
-	return nil
-}
-
-func setRuntimeValue(r *config.RuntimeConfig, field, value string) error {
-	switch field {
-	case "file_watching":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
-		r.FileWatching = b
-	case "reload_on_sighup":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		r.ReloadOnSIGHUP = b
-	case "pid_file":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		r.PIDFile = b
-	default:
-		return fmt.Errorf("unknown runtime field: %s", field)
 	}
-	return nil
-}
-
-func setProjectValue(p *config.ProjectConfig, field, value string) error {
-	switch field {
-	case "enabled":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		p.Enabled = b
-	case "auto_activate":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		p.AutoActivate = b
-	default:
-		return fmt.Errorf("unknown project field: %s", field)
-	}
-	return nil
-}
-
-func setAlertsValue(a *config.AlertConfig, field, value string) error {
-	switch field {
-	case "enabled":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		a.Enabled = b
-	case "warning_threshold":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.WarningThreshold = i
-	case "critical_threshold":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.CriticalThreshold = i
-	default:
-		return fmt.Errorf("unknown alerts field: %s", field)
-	}
-	return nil
-}
-
-func setNotificationsValue(n *config.NotificationConfig, field, value string) error {
-	switch field {
-	case "terminal":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		n.Terminal = b
-	case "desktop":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		n.Desktop = b
-	case "webhook":
-		n.Webhook = value
-	default:
-		return fmt.Errorf("unknown notifications field: %s", field)
-	}
-	return nil
-}
-
-func setHandoffValue(h *config.HandoffConfig, field, value string) error {
-	switch field {
-	case "auto_trigger":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		h.AutoTrigger = b
-	case "debounce_delay":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
-		}
-		h.DebounceDelay = config.Duration(d)
-	case "max_retries":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		h.MaxRetries = i
-	case "fallback_to_manual":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		h.FallbackToManual = b
-	default:
-		return fmt.Errorf("unknown handoff field: %s", field)
-	}
-	return nil
-}
-
-func setDaemonValue(d *config.DaemonConfig, field, value string) error {
-	switch field {
-	case "check_interval":
-		dur, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
-		}
-		d.CheckInterval = config.Duration(dur)
-	case "refresh_threshold":
-		dur, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
-		}
-		d.RefreshThreshold = config.Duration(dur)
-	case "verbose":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		d.Verbose = b
-	default:
-		return fmt.Errorf("unknown daemon field: %s", field)
-	}
-	return nil
-}
-
-func setAuthPoolValue(a *config.AuthPoolConfig, field, value string) error {
-	switch field {
-	case "enabled":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		a.Enabled = b
-	case "max_concurrent_refresh":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.MaxConcurrentRefresh = i
-	case "refresh_retry_delay":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid duration: %w", err)
-		}
-		a.RefreshRetryDelay = config.Duration(d)
-	case "max_refresh_retries":
-		i, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %w", err)
-		}
-		a.MaxRefreshRetries = i
-	default:
-		return fmt.Errorf("unknown auth_pool field: %s", field)
-	}
-	return nil
+	return out
 }
 
 // parseBool parses various boolean representations.
@@ -644,89 +543,6 @@ func parseBool(s string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid boolean: %s (use true/false, yes/no, 1/0)", s)
 	}
-}
-
-func getTUIValue(t *config.TUIConfig, field string) (string, error) {
-	switch field {
-	case "theme":
-		return t.Theme, nil
-	case "high_contrast":
-		return strconv.FormatBool(t.HighContrast), nil
-	case "reduced_motion":
-		return strconv.FormatBool(t.ReducedMotion), nil
-	case "toasts":
-		return strconv.FormatBool(t.Toasts), nil
-	case "mouse":
-		return strconv.FormatBool(t.Mouse), nil
-	case "show_key_hints":
-		return strconv.FormatBool(t.ShowKeyHints), nil
-	case "density":
-		return t.Density, nil
-	case "no_tui":
-		return strconv.FormatBool(t.NoTUI), nil
-	default:
-		return "", fmt.Errorf("unknown tui field: %s", field)
-	}
-}
-
-func setTUIValue(t *config.TUIConfig, field, value string) error {
-	switch field {
-	case "theme":
-		theme := strings.ToLower(strings.TrimSpace(value))
-		switch theme {
-		case "auto", "dark", "light":
-			t.Theme = theme
-		default:
-			return fmt.Errorf("invalid theme: %s (use auto, dark, or light)", value)
-		}
-	case "high_contrast":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.HighContrast = b
-	case "reduced_motion":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.ReducedMotion = b
-	case "toasts":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.Toasts = b
-	case "mouse":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.Mouse = b
-	case "show_key_hints":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.ShowKeyHints = b
-	case "density":
-		density := strings.ToLower(strings.TrimSpace(value))
-		switch density {
-		case "cozy", "compact":
-			t.Density = density
-		default:
-			return fmt.Errorf("invalid density: %s (use cozy or compact)", value)
-		}
-	case "no_tui":
-		b, err := parseBool(value)
-		if err != nil {
-			return err
-		}
-		t.NoTUI = b
-	default:
-		return fmt.Errorf("unknown tui field: %s", field)
-	}
-	return nil
 }
 
 // configTUICmd shows and manages TUI preferences.
@@ -811,4 +627,3 @@ Examples:
 		return nil
 	},
 }
-
