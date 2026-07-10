@@ -97,7 +97,9 @@ func TestWatcher_Discovery(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The watch context must comfortably outlive the discovery poll below —
+	// if it expires first, the watcher goes deaf mid-test.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	require.NoError(t, watcher.Start(ctx))
@@ -119,14 +121,62 @@ func TestWatcher_Discovery(t *testing.T) {
 	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
 	require.NoError(t, os.WriteFile(credsPath, credsData, 0600))
 
-	// Wait for debounce and processing
-	time.Sleep(500 * time.Millisecond)
+	// Wait for debounce and processing. Poll instead of a single fixed sleep:
+	// under heavy CPU load the fsnotify delivery plus the 100ms debounce can
+	// exceed a fixed 500ms window, failing the test even though discovery
+	// works (same flake class as the daemon run-loop tests, deflaked the same
+	// way). Polling to a generous deadline preserves the test's intent.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(discoveries)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	assert.Len(t, discoveries, 1)
+	// require (not assert): indexing discoveries[0] after a non-fatal length
+	// failure panicked, and the panic used to wedge the whole package via the
+	// deferred watcher.Stop() deadlock (now fixed in eventLoop/Stop).
+	require.Len(t, discoveries, 1)
 	assert.Equal(t, "claude/newuser@example.com", discoveries[0])
+}
+
+// TestWatcher_StopAfterContextExpiry is a regression test for a Stop()
+// deadlock: eventLoop closed doneCh only when it exited via stopCh, so if the
+// watch context was cancelled (or expired) first, eventLoop returned without
+// signalling and a subsequent Stop() blocked forever on <-doneCh.
+func TestWatcher_StopAfterContextExpiry(t *testing.T) {
+	tmpDir := t.TempDir()
+	homeDir := filepath.Join(tmpDir, "home")
+	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
+	t.Setenv("HOME", homeDir)
+
+	vault := authfile.NewVault(filepath.Join(tmpDir, "vault"))
+	watcher, err := NewWatcher(vault, WatcherConfig{Providers: []string{"claude"}})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, watcher.Start(ctx))
+
+	// Kill the context first, give the loops a moment to exit via ctx.Done(),
+	// THEN Stop. Before the fix this deadlocked.
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- watcher.Stop() }()
+	select {
+	case stopErr := <-done:
+		require.NoError(t, stopErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("watcher.Stop() deadlocked after context cancellation")
+	}
 }
 
 func TestWatcher_UpdateExisting(t *testing.T) {

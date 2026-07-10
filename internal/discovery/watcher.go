@@ -92,9 +92,13 @@ func (w *Watcher) Start(ctx context.Context) error {
 		return fmt.Errorf("watcher already running")
 	}
 	w.watching = true
-	// Recreate channels for this run (in case of restart after Stop)
+	// Recreate channels for this run (in case of restart after Stop). Capture
+	// them locally while holding the lock: the goroutines below must signal on
+	// THIS run's channels even if a later Stop/Start cycle swaps the fields.
 	w.stopCh = make(chan struct{})
 	w.doneCh = make(chan struct{})
+	stopCh := w.stopCh
+	doneCh := w.doneCh
 	w.mu.Unlock()
 
 	// Add watches for all auth file directories
@@ -118,8 +122,8 @@ func (w *Watcher) Start(ctx context.Context) error {
 	}
 
 	// Start event loop
-	go w.eventLoop(ctx)
-	go w.debounceLoop(ctx)
+	go w.eventLoop(ctx, stopCh, doneCh)
+	go w.debounceLoop(ctx, stopCh)
 
 	return nil
 }
@@ -162,8 +166,13 @@ func (w *Watcher) getWatchPaths() []string {
 	return paths
 }
 
-// eventLoop handles fsnotify events.
-func (w *Watcher) eventLoop(ctx context.Context) {
+// eventLoop handles fsnotify events. doneCh is closed on EVERY exit path (not
+// just the stopCh one): eventLoop can also exit via ctx cancellation/expiry or
+// a closed fsnotify channel, and Stop() blocks on <-doneCh — signalling only
+// on the stopCh path deadlocked any Stop() that followed a ctx-driven exit.
+func (w *Watcher) eventLoop(ctx context.Context, stopCh <-chan struct{}, doneCh chan<- struct{}) {
+	defer close(doneCh)
+
 	watchedPaths := make(map[string]string) // path -> provider
 	for _, provider := range w.config.Providers {
 		fileSet, ok := authfile.GetAuthFileSet(provider)
@@ -179,8 +188,7 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-w.stopCh:
-			close(w.doneCh)
+		case <-stopCh:
 			return
 		case event, ok := <-w.watcher.Events:
 			if !ok {
@@ -231,7 +239,7 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 }
 
 // debounceLoop processes pending changes after debounce interval.
-func (w *Watcher) debounceLoop(ctx context.Context) {
+func (w *Watcher) debounceLoop(ctx context.Context, stopCh <-chan struct{}) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -239,7 +247,7 @@ func (w *Watcher) debounceLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-w.stopCh:
+		case <-stopCh:
 			return
 		case <-ticker.C:
 			w.processPending()

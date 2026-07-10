@@ -1188,9 +1188,22 @@ func TestDaemon_GetStats_AfterRunning(t *testing.T) {
 
 	// Start daemon
 	go d.Start()
-	time.Sleep(100 * time.Millisecond)
 
-	stats := d.GetStats()
+	// Poll for the first completed check instead of relying on a single fixed
+	// sleep: under heavy CPU load the daemon goroutine can be starved of
+	// scheduling time within a fixed 100ms window, leaving CheckCount at 0 and
+	// failing the test intermittently even though the check loop works (same
+	// flake class as TestDaemon_RunLoop_MultipleIterations, deflaked the same
+	// way). Polling to a generous deadline preserves the test's intent.
+	deadline := time.Now().Add(5 * time.Second)
+	var stats Stats
+	for time.Now().Before(deadline) {
+		stats = d.GetStats()
+		if !stats.StartTime.IsZero() && stats.CheckCount > 0 && !stats.LastCheck.IsZero() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// StartTime should be set
 	if stats.StartTime.IsZero() {
