@@ -472,6 +472,11 @@ var shallowSpawnCmd = &cobra.Command{
 the given command. Concurrent invocations under different names hit
 independent .credentials.json files and can run truly in parallel.
 
+Each spawn also backfills missing symlinks for user-installed skills
+(~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
+profile, so spawned sessions see the same skill library as direct ones.
+Auth/config files stay real and private; nothing is copied or overwritten.
+
 Examples:
   caam shallow-spawn alice -- claude
   caam shallow-spawn alice -- claude --print "explain this codebase"
@@ -560,6 +565,21 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 
 	if len(rest) == 0 {
 		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, shallowSpawnHintBin(provider))
+	}
+
+	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
+	// populated by jsm) are workflow content, not identity state, but they can
+	// drift out of a shallow profile — the real skills dir may postdate profile
+	// creation, and codex materializes a REAL <shallow>/.codex/skills holding
+	// only its bundled ".system" entries, hiding every user skill from spawned
+	// sessions. Backfill missing skill symlinks before exec so shallow sessions
+	// see the same skill library as direct ones. Best-effort: a repair failure
+	// is reported but never blocks the spawn.
+	if created, rerr := mgr.RepairSkillShare(name); rerr != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not share user skills into shallow profile %q: %v\n", name, rerr)
+	} else if len(created) > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "note: linked %d user skill entr%s from your real HOME into shallow profile %q\n",
+			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
 	}
 
 	// Codex daemon caveat (#21, #45): a long-lived `codex app-server`/`mcp-server`

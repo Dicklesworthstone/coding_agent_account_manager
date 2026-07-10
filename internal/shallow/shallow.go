@@ -91,6 +91,27 @@ type providerLayout struct {
 	realEntries       []string // relpaths of managed real files (never symlinked)
 	innerSymlinkRoots []string // real dirs whose non-managed children are symlinked through
 	primaryCredRel    string   // principal credential file (target of --from-file / vault primary)
+	skillShareDirs    []skillShareDir
+}
+
+// skillShareDir describes a directory of user-installed skills that must stay
+// visible inside shallow profiles (issue #56). Skills are static workflow
+// content (SKILL.md + references/scripts), not identity state, so hiding them
+// behind the shallow boundary silently strips capabilities from spawned
+// sessions.
+//
+// At create time the inner symlink farm already passes the whole directory
+// through when it exists in the real HOME. The gap is drift AFTER creation:
+// the real skills dir may not have existed yet (so no symlink was laid down),
+// and the tool itself may then materialize a REAL skills dir inside the
+// shallow HOME containing only its bundled/system entries (codex does exactly
+// this). RepairSkillShare heals both shapes on every spawn.
+type skillShareDir struct {
+	// rel is the skills directory relative to HOME (e.g. ".codex/skills").
+	rel string
+	// localOnly lists child names that are per-profile (never backfilled from
+	// the real HOME), e.g. codex's bundled ".system" skills.
+	localOnly []string
 }
 
 // SupportedProviders lists the shallow-capable providers in display order.
@@ -120,6 +141,7 @@ func layoutFor(provider string) (*providerLayout, error) {
 			realEntries:       []string{".claude/.credentials.json", ".claude/.credentials.lock", ".claude.json", ProfileMetaFilename},
 			innerSymlinkRoots: []string{".claude"},
 			primaryCredRel:    ".claude/.credentials.json",
+			skillShareDirs:    []skillShareDir{{rel: ".claude/skills"}},
 		}, nil
 	case "codex":
 		return &providerLayout{
@@ -128,6 +150,9 @@ func layoutFor(provider string) (*providerLayout, error) {
 			realEntries:       []string{".codex/auth.json", ".codex/config.toml", ProfileMetaFilename},
 			innerSymlinkRoots: []string{".codex"},
 			primaryCredRel:    ".codex/auth.json",
+			// Codex materializes its bundled skills into $CODEX_HOME/skills/.system;
+			// that subtree is per-profile and never backfilled from the real HOME.
+			skillShareDirs: []skillShareDir{{rel: ".codex/skills", localOnly: []string{".system"}}},
 		}, nil
 	case "agy":
 		return &providerLayout{
@@ -142,6 +167,7 @@ func layoutFor(provider string) (*providerLayout, error) {
 			},
 			innerSymlinkRoots: []string{".gemini", ".gemini/antigravity-cli"},
 			primaryCredRel:    ".gemini/antigravity-cli/antigravity-oauth-token",
+			skillShareDirs:    []skillShareDir{{rel: ".gemini/skills"}},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported shallow provider %q (supported: %s)", provider, strings.Join(SupportedProviders(), ", "))
@@ -927,6 +953,116 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 		}
 	}
 	return nil
+}
+
+// RepairSkillShare backfills user-installed skills from the real HOME into an
+// existing shallow profile (issue #56). It resolves the profile's provider
+// fail-closed (same path as shallow-spawn) and heals each of the layout's
+// skillShareDirs:
+//
+//   - shallow entry missing entirely  -> one wholesale symlink to the real
+//     skills dir (identical to what profile creation lays down when the real
+//     dir already exists);
+//   - shallow entry already a symlink -> left alone (already shared);
+//   - shallow entry a REAL directory  -> per-skill backfill: every child of the
+//     real skills dir that is not per-profile (localOnly, e.g. codex's
+//     ".system") and does not already exist in the shallow dir gets a symlink.
+//     Existing entries — real or symlink — are never touched or replaced.
+//
+// It never copies, deletes, or overwrites anything, so a profile's private
+// auth/config files and any genuinely profile-local skills are unaffected.
+// Returns the HOME-relative paths of the symlinks it created (empty when the
+// profile was already healthy). Safe to call on every spawn: the healthy case
+// is a couple of Lstats.
+func (m *Manager) RepairSkillShare(name string) ([]string, error) {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return nil, err
+	}
+	provider, err := m.ResolveProvider(name)
+	if err != nil {
+		return nil, err
+	}
+	layout, err := layoutFor(provider)
+	if err != nil {
+		return nil, err
+	}
+	var created []string
+	for _, d := range layout.skillShareDirs {
+		links, err := m.ensureSkillShare(home, d)
+		if err != nil {
+			return created, fmt.Errorf("share %s: %w", d.rel, err)
+		}
+		created = append(created, links...)
+	}
+	return created, nil
+}
+
+// ensureSkillShare implements RepairSkillShare for a single skills directory.
+func (m *Manager) ensureSkillShare(home string, d skillShareDir) ([]string, error) {
+	src := filepath.Join(m.realHome, filepath.FromSlash(d.rel))
+	st, err := os.Stat(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil // no real skills dir: nothing to share
+		}
+		return nil, fmt.Errorf("stat %s: %w", src, err)
+	}
+	if !st.IsDir() {
+		return nil, nil // not a directory: nothing shareable
+	}
+
+	dst := filepath.Join(home, filepath.FromSlash(d.rel))
+	dstInfo, err := os.Lstat(dst)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// The profile predates the real skills dir: lay down the same wholesale
+		// passthrough symlink that Create would have.
+		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+			return nil, fmt.Errorf("create parent of %s: %w", dst, err)
+		}
+		if err := os.Symlink(src, dst); err != nil {
+			return nil, fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
+		}
+		return []string{d.rel}, nil
+	case err != nil:
+		return nil, fmt.Errorf("stat %s: %w", dst, err)
+	case dstInfo.Mode()&os.ModeSymlink != 0:
+		return nil, nil // already a passthrough; leave it alone
+	case !dstInfo.IsDir():
+		return nil, nil // unexpected real file; never clobber
+	}
+
+	// Real shallow-side skills dir (e.g. codex materialized its bundled
+	// ".system" skills before any share existed): backfill per-skill symlinks
+	// for real-HOME skills that are missing here.
+	localOnly := map[string]bool{}
+	for _, n := range d.localOnly {
+		localOnly[n] = true
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", src, err)
+	}
+	var created []string
+	for _, e := range entries {
+		name := e.Name()
+		if localOnly[name] {
+			continue
+		}
+		childDst := filepath.Join(dst, name)
+		if _, err := os.Lstat(childDst); err == nil {
+			continue // profile already has an entry under this name; never touch it
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return created, fmt.Errorf("stat %s: %w", childDst, err)
+		}
+		childSrc := filepath.Join(src, name)
+		if err := os.Symlink(childSrc, childDst); err != nil {
+			return created, fmt.Errorf("symlink %s -> %s: %w", childDst, childSrc, err)
+		}
+		created = append(created, filepath.ToSlash(filepath.Join(d.rel, name)))
+	}
+	return created, nil
 }
 
 // Profile is a lightweight summary returned by List.

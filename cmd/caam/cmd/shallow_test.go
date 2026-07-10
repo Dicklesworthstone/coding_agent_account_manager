@@ -351,6 +351,80 @@ func TestShallowSpawnExecsCorrectHome(t *testing.T) {
 	}
 }
 
+// TestShallowSpawnBackfillsCodexSkills proves the end-to-end wiring of the
+// skill-share repair (#56): a codex shallow profile whose shallow .codex/skills
+// drifted into a real, system-only directory gets the real HOME's user skills
+// symlinked back in during shallow-spawn, before the child is exec'd — while
+// --print-env never mutates the profile.
+func TestShallowSpawnBackfillsCodexSkills(t *testing.T) {
+	base, realHome := shallowEnv(t)
+
+	// Real codex identity + a user-installed (jsm-style) skill.
+	codexDir := filepath.Join(realHome, ".codex")
+	if err := os.MkdirAll(filepath.Join(codexDir, "skills", "user-skill"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"OPENAI_API_KEY":null}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "skills", "user-skill", "SKILL.md"), []byte("# user skill\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "cx", "--tool", "codex",
+		"--from-file", filepath.Join(codexDir, "auth.json"), "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the drift from issue #56: replace the create-time skills
+	// passthrough with a REAL dir holding only codex's bundled .system skills.
+	shallowSkills := filepath.Join(base, "cx", ".codex", "skills")
+	if err := os.Remove(shallowSkills); err != nil {
+		t.Fatalf("remove skills passthrough: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(shallowSkills, ".system", "builtin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// --print-env must not repair (read-only contract).
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx", "--print-env"); err != nil {
+		t.Fatalf("print-env: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(shallowSkills, "user-skill")); !os.IsNotExist(err) {
+		t.Fatalf("--print-env must not mutate the profile (err=%v)", err)
+	}
+
+	// Stub the exec and the host daemon scan.
+	origExec := spawnExec
+	spawnExec = func(_ string, _ []string, _ []string) error { return nil }
+	t.Cleanup(func() { spawnExec = origExec })
+	origCheck := shallowCodexDaemonCheck
+	shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
+	t.Cleanup(func() { shallowCodexDaemonCheck = origCheck })
+
+	_, stderr, err := runCmdCaptured(t, "shallow-spawn", "cx", "--", "sh", "-c", "true")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if !strings.Contains(stderr, "linked 1 user skill") {
+		t.Fatalf("expected skill-link note on stderr, got %q", stderr)
+	}
+
+	// The user skill is now visible inside the shallow profile...
+	got, err := os.ReadFile(filepath.Join(shallowSkills, "user-skill", "SKILL.md"))
+	if err != nil || string(got) != "# user skill\n" {
+		t.Fatalf("user skill not shared into shallow profile: %q, err=%v", got, err)
+	}
+	// ...while the bundled .system dir stays real and profile-local, and the
+	// auth file stays a real private file.
+	if st, err := os.Lstat(filepath.Join(shallowSkills, ".system")); err != nil || st.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf(".system must stay a real profile-local dir (err=%v)", err)
+	}
+	if st, err := os.Lstat(filepath.Join(base, "cx", ".codex", "auth.json")); err != nil || st.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("auth.json must stay a real private file (err=%v)", err)
+	}
+}
+
 // TestShallowSpawnAgentViewFlag proves the end-to-end wiring of the claude
 // Agent View disable policy (#49) through the real command tree: the injected
 // CLAUDE_CODE_DISABLE_AGENT_VIEW=1 appears in the exec env of a default claude
