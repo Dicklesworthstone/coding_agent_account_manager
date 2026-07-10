@@ -759,6 +759,27 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 			return fmt.Errorf("create parent dir for %s: %w", spec.Path, err)
 		}
 
+		// Claude user settings (~/.claude/settings.json): restore the snapshot
+		// but carry the LIVE machine's plugin state forward (issue #55). Plugin
+		// installs/enablement are machine-level workflow state — the plugin
+		// content and marketplaces under ~/.claude/plugins/ are shared across
+		// accounts already — while settings.json is swapped per account because
+		// it can hold apiKeyHelper/env auth. Without the merge, activating an
+		// account whose snapshot predates a plugin install "uninstalls" every
+		// plugin until the user switches back.
+		if isClaudeUserSettings(fileSet.Tool, spec.Path) {
+			if err := restoreClaudeUserSettings(srcPath, spec.Path); err != nil {
+				return fmt.Errorf("restore %s: %w", spec.Path, err)
+			}
+			restored++
+			if spec.Required {
+				requiredFound = true
+			} else {
+				optionalFound = true
+			}
+			continue
+		}
+
 		// Freshness guard (Codex/ChatGPT refresh-token rotation safety):
 		// If the LIVE auth file is the SAME OpenAI identity as this snapshot but
 		// was refreshed more recently, the snapshot's refresh_token has already
@@ -1094,6 +1115,70 @@ const (
 
 var claudeDesktopTokenKeys = []string{claudeDesktopTokenKey, claudeDesktopTokenKeyV2}
 
+// --- Claude Code user settings (~/.claude/settings.json) ---------------------
+//
+// settings.json is swapped per account because it can carry identity/auth
+// (apiKeyHelper, env with ANTHROPIC_API_KEY). But it ALSO carries plugin
+// enablement (enabledPlugins), which is machine-level workflow state: the
+// plugin content, marketplaces, and install records under ~/.claude/plugins/
+// are shared across accounts (caam never touches them), so an account swap
+// that reverts enabledPlugins makes installed plugins vanish from /plugin
+// while their marketplaces still show — exactly the asymmetry in issue #55.
+// On restore, the LIVE machine's value of each shared key wins (including its
+// absence), so plugin state persists across `caam activate` like the shared
+// plugin content dir does.
+
+// claudeUserSettingsSharedKeys are top-level settings.json keys that describe
+// machine-level workflow state (shared across accounts) rather than
+// per-account identity. The live values of these keys survive a restore.
+var claudeUserSettingsSharedKeys = []string{"enabledPlugins"}
+
+// isClaudeUserSettings reports whether spec.Path is Claude Code's user
+// settings file (~/.claude/settings.json), which needs key-scoped merge
+// handling on restore rather than a whole-file copy.
+func isClaudeUserSettings(tool, path string) bool {
+	return tool == "claude" &&
+		filepath.Base(path) == "settings.json" &&
+		filepath.Base(filepath.Dir(path)) == ".claude"
+}
+
+// restoreClaudeUserSettings writes the vault snapshot to livePath while
+// preserving the live file's claudeUserSettingsSharedKeys (present value or
+// absence). Falls back to a verbatim copy whenever either side is missing or
+// not a JSON object — there is then either nothing to preserve or nothing safe
+// to merge into.
+func restoreClaudeUserSettings(vaultPath, livePath string) error {
+	vaultRaw, err := os.ReadFile(vaultPath)
+	if err != nil {
+		return fmt.Errorf("read snapshot %s: %w", vaultPath, err)
+	}
+	var vaultObj map[string]interface{}
+	if err := json.Unmarshal(vaultRaw, &vaultObj); err != nil || vaultObj == nil {
+		return copyFile(vaultPath, livePath) // snapshot not a JSON object: restore verbatim
+	}
+
+	liveRaw, err := os.ReadFile(livePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return copyFile(vaultPath, livePath) // no live state to preserve
+		}
+		return fmt.Errorf("read live %s: %w", livePath, err)
+	}
+	var liveObj map[string]interface{}
+	if err := json.Unmarshal(liveRaw, &liveObj); err != nil || liveObj == nil {
+		return copyFile(vaultPath, livePath) // live file unparseable: restore verbatim
+	}
+
+	for _, key := range claudeUserSettingsSharedKeys {
+		if v, ok := liveObj[key]; ok {
+			vaultObj[key] = v
+		} else {
+			delete(vaultObj, key)
+		}
+	}
+	return writeJSONFileAtomic(livePath, vaultObj, 0600)
+}
+
 // isClaudeDesktopConfig reports whether spec.Path is the macOS Claude Desktop
 // config.json, which needs field-scoped handling rather than whole-file copy.
 func isClaudeDesktopConfig(tool, path string) bool {
@@ -1351,7 +1436,11 @@ func stableFileHash(tool, path string) (string, error) {
 //
 // For .credentials.json, we hash the accessToken and refreshToken.
 // For .claude.json, we hash the oauthAccount field only.
-// For other files (settings.json, auth.json), we fall back to whole-file hash.
+// For settings.json, we hash only the auth-bearing fields (apiKeyHelper/env),
+// since the rest (enabledPlugins, hooks, UI prefs) is workflow state that
+// drifts freely — and the enabledPlugins merge on restore (issue #55) makes
+// the live file intentionally diverge from its snapshot.
+// For other files (auth.json), we fall back to whole-file hash.
 func stableClaudeHash(path string) (string, error) {
 	base := filepath.Base(path)
 
@@ -1360,6 +1449,8 @@ func stableClaudeHash(path string) (string, error) {
 		return hashClaudeCredentials(path)
 	case ".claude.json":
 		return hashClaudeSettings(path)
+	case "settings.json":
+		return hashClaudeUserSettings(path)
 	case "config.json":
 		// The Claude Desktop config.json: hash only its oauth:tokenCache* fields.
 		return hashClaudeDesktopConfig(path)
@@ -1456,6 +1547,50 @@ func hashClaudeSettings(path string) (string, error) {
 
 	h := sha256.New()
 	h.Write([]byte("claude:settings:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashClaudeUserSettings hashes only the auth-bearing fields of Claude's
+// ~/.claude/settings.json (apiKeyHelper and env — the API-key-mode identity).
+// Everything else in the file (enabledPlugins, hooks, permissions, UI prefs)
+// is volatile workflow state; hashing it whole-file made profile detection
+// break on any settings tweak, and would ALWAYS break after the restore-time
+// enabledPlugins merge (issue #55).
+func hashClaudeUserSettings(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return hashBytes(data), nil
+	}
+
+	identityFields := map[string]interface{}{}
+	for _, key := range []string{"apiKeyHelper", "env"} {
+		if v, exists := root[key]; exists {
+			identityFields[key] = v
+		}
+	}
+
+	if len(identityFields) == 0 {
+		// No auth-bearing fields: purely workflow settings. Fixed sentinel so
+		// settings drift never breaks profile detection (matches the
+		// .claude.json no-identity convention above).
+		h := sha256.New()
+		h.Write([]byte("claude:user-settings:no-identity"))
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+
+	canonical, err := json.Marshal(identityFields)
+	if err != nil {
+		return hashBytes(data), nil
+	}
+
+	h := sha256.New()
+	h.Write([]byte("claude:user-settings:"))
 	h.Write(canonical)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
