@@ -98,11 +98,11 @@ type Stats struct {
 	ProfilesChecked int64
 
 	// Backup stats
-	LastBackup      time.Time
-	NextBackup      time.Time
-	BackupCount     int64
-	BackupErrors    int64
-	BackupEnabled   bool
+	LastBackup    time.Time
+	NextBackup    time.Time
+	BackupCount   int64
+	BackupErrors  int64
+	BackupEnabled bool
 
 	// Pool stats (when UseAuthPool is enabled)
 	PoolEnabled       bool
@@ -244,7 +244,7 @@ func (d *Daemon) Start() error {
 		d.mu.Unlock()
 		return fmt.Errorf("daemon already running")
 	}
-	
+
 	// Acquire PID lock first
 	if err := d.acquirePIDLock(); err != nil {
 		d.mu.Unlock()
@@ -331,7 +331,7 @@ func (d *Daemon) ReloadConfig() {
 	d.configMu.Unlock()
 
 	d.logger.Println("Config reloaded (runtime settings applied)")
-	
+
 	// Signal runLoop to update ticker
 	select {
 	case d.configChanged <- struct{}{}:
@@ -494,7 +494,7 @@ func (d *Daemon) runLoop() {
 // acquirePIDLock securely acquires the PID file lock
 func (d *Daemon) acquirePIDLock() error {
 	path := PIDFilePath()
-	
+
 	// Create parent directory if needed
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("create pid dir: %w", err)
@@ -516,7 +516,7 @@ func (d *Daemon) acquirePIDLock() error {
 	// Note: We have the lock, so no one else is writing now.
 	// But previous process might have crashed leaving PID.
 	// Or we are the first.
-	
+
 	// Read existing PID
 	data, err := os.ReadFile(path)
 	if err == nil && len(data) > 0 {
@@ -541,7 +541,7 @@ func (d *Daemon) acquirePIDLock() error {
 		f.Close()
 		return fmt.Errorf("seek pid file: %w", err)
 	}
-	
+
 	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
 		health.UnlockFile(f)
 		f.Close()
@@ -710,7 +710,7 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor":
+	case "opencode", "cursor", "grok":
 		// No token expiry parsing for these providers yet
 		return nil
 	}

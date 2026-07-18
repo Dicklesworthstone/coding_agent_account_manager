@@ -41,35 +41,35 @@ type DetectedPath struct {
 type DetectedAgentStatus string
 
 const (
-	StatusReady       DetectedAgentStatus = "ready"        // Binary installed, auth present
-	StatusNeedsAuth   DetectedAgentStatus = "needs_auth"   // Binary installed, no auth
-	StatusNotFound    DetectedAgentStatus = "not_found"    // Binary not found in PATH
-	StatusUnavailable DetectedAgentStatus = "unavailable"  // Error checking status
+	StatusReady       DetectedAgentStatus = "ready"       // Binary installed, auth present
+	StatusNeedsAuth   DetectedAgentStatus = "needs_auth"  // Binary installed, no auth
+	StatusNotFound    DetectedAgentStatus = "not_found"   // Binary not found in PATH
+	StatusUnavailable DetectedAgentStatus = "unavailable" // Error checking status
 )
 
 // DetectReport contains the full detection results.
 type DetectReport struct {
-	Timestamp string           `json:"timestamp"`
-	Agents    []DetectedAgent  `json:"agents"`
-	Summary   DetectSummary    `json:"summary"`
+	Timestamp string          `json:"timestamp"`
+	Agents    []DetectedAgent `json:"agents"`
+	Summary   DetectSummary   `json:"summary"`
 }
 
 // DetectSummary summarizes the detection results.
 type DetectSummary struct {
-	TotalAgents   int `json:"total_agents"`
-	Installed     int `json:"installed"`
-	Ready         int `json:"ready"`
-	NeedAuth      int `json:"need_auth"`
-	NotFound      int `json:"not_found"`
+	TotalAgents int `json:"total_agents"`
+	Installed   int `json:"installed"`
+	Ready       int `json:"ready"`
+	NeedAuth    int `json:"need_auth"`
+	NotFound    int `json:"not_found"`
 }
 
 // AgentSpec defines how to detect a specific AI coding agent.
 type AgentSpec struct {
-	Name         string   // e.g., "claude", "codex", "gemini"
-	DisplayName  string   // e.g., "Claude Code (Anthropic)"
-	BinaryNames  []string // Binary names to search in PATH
-	VersionArgs  []string // Arguments to get version (e.g., ["--version"])
-	VersionRegex string   // Regex to extract version from output
+	Name         string            // e.g., "claude", "codex", "gemini"
+	DisplayName  string            // e.g., "Claude Code (Anthropic)"
+	BinaryNames  []string          // Binary names to search in PATH
+	VersionArgs  []string          // Arguments to get version (e.g., ["--version"])
+	VersionRegex string            // Regex to extract version from output
 	ConfigPaths  func() []PathSpec // Function to get config paths (uses home dir)
 	AuthPaths    func() []PathSpec // Function to get auth paths (uses home dir)
 }
@@ -209,6 +209,32 @@ func getAgentSpecs() []AgentSpec {
 				return []PathSpec{
 					{filepath.Join(homeDir, ".aider.conf.yml"), "Aider config (API keys)"},
 					{filepath.Join(xdgConfigHome, "aider", "aider.conf.yml"), "Aider XDG config"},
+				}
+			},
+		},
+		{
+			Name:         "grok",
+			DisplayName:  "Grok Build (xAI)",
+			BinaryNames:  []string{"grok"},
+			VersionArgs:  []string{"--version"},
+			VersionRegex: `(?:grok[- ]?|v?)(\d+\.\d+(?:\.\d+)?)`,
+			ConfigPaths: func() []PathSpec {
+				grokHome := os.Getenv("GROK_HOME")
+				if grokHome == "" {
+					grokHome = filepath.Join(homeDir, ".grok")
+				}
+				return []PathSpec{
+					{grokHome, "Grok home directory"},
+				}
+			},
+			AuthPaths: func() []PathSpec {
+				grokHome := os.Getenv("GROK_HOME")
+				if grokHome == "" {
+					grokHome = filepath.Join(homeDir, ".grok")
+				}
+				return []PathSpec{
+					{filepath.Join(grokHome, "auth.json"), "Login credential (grok login)"},
+					{filepath.Join(grokHome, "config.toml"), "Grok configuration"},
 				}
 			},
 		},
@@ -597,6 +623,8 @@ func printDetectReport(report *DetectReport, verbose bool) {
 					fmt.Printf("  %s: Run 'codex login'\n", agent.Name)
 				case "gemini":
 					fmt.Printf("  %s: Run 'gemini' and select Login with Google\n", agent.Name)
+				case "grok":
+					fmt.Printf("  %s: Run 'grok login'\n", agent.Name)
 				case "opencode":
 					fmt.Printf("  %s: Run 'opencode' and follow login prompts\n", agent.Name)
 				case "cursor":

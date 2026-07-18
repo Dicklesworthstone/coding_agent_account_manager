@@ -202,7 +202,7 @@ type Model struct {
 
 // DefaultProviders returns the default list of provider names.
 func DefaultProviders() []string {
-	return []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	return []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 }
 
 // New creates a new TUI model with default settings.
@@ -2050,6 +2050,8 @@ func vaultIdentityEmail(provider, profileDir string) string {
 		if id == nil {
 			id, _ = identity.ExtractFromGeminiConfig(filepath.Join(profileDir, "oauth_creds.json"))
 		}
+	case "grok":
+		id, _ = identity.ExtractFromGrokAuth(filepath.Join(profileDir, "auth.json"))
 	case "opencode":
 		id, _ = identity.ExtractFromGenericAuth(filepath.Join(profileDir, "auth.json"))
 	case "cursor":

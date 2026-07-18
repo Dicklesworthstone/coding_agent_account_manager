@@ -14,6 +14,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ### New Providers
 
+- **Grok Build (xAI)** provider support — resolves #57. Swaps `~/.grok/auth.json` (+ optional `config.toml`), honors the documented `GROK_HOME` override, extracts account identity from the login credential, and deliberately leaves the unaffiliated community grok-cli's `grok.db` / `user-settings.json` untouched.
 - **OpenCode** and **Cursor CLI** provider support ([`8da7fa0`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/8da7fa00fed1240aa664e05955fd8de83bce0966)) — resolves #8 and #9
 
 ### Coordinator & Orchestration

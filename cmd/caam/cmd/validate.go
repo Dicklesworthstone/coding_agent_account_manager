@@ -159,7 +159,7 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		return out
 	}
 
-	// Tools without expiry parsing (opencode/cursor/agy) return nil info; the
+	// Tools without expiry parsing (opencode/cursor/agy/grok) return nil info; the
 	// presence of the vault profile dir is the validation signal for them.
 	if info == nil {
 		out.Valid = true

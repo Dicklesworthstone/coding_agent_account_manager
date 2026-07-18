@@ -214,6 +214,12 @@ var providerMetaRegistry = map[string]ProviderMeta{
 		AccountURL:  "https://antigravity.google/",
 		Description: "Google Antigravity account",
 	},
+	"grok": {
+		ID:          "grok",
+		DisplayName: "Grok Build (xAI)",
+		AccountURL:  "https://console.x.ai/",
+		Description: "xAI Console",
+	},
 	"opencode": {
 		ID:          "opencode",
 		DisplayName: "OpenCode",

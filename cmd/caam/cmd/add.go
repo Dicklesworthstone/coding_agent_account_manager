@@ -243,6 +243,9 @@ func runToolLogin(ctx context.Context, tool string, deviceCode bool) error {
 	case "gemini":
 		// Gemini uses interactive login
 		cmd = execCommand(ctx, "gemini")
+	case "grok":
+		// Grok Build uses `grok login` (browser OIDC)
+		cmd = execCommand(ctx, "grok", "login")
 	case "opencode":
 		cmd = execCommand(ctx, "opencode")
 	case "cursor":

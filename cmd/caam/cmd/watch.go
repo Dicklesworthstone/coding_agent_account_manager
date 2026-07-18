@@ -67,11 +67,11 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	// Default to all providers
 	providers := watchProviders
 	if len(providers) == 0 {
-		providers = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+		providers = []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	}
 
 	// Validate providers
-	validProviders := map[string]bool{"claude": true, "codex": true, "gemini": true, "opencode": true, "cursor": true}
+	validProviders := map[string]bool{"claude": true, "codex": true, "gemini": true, "grok": true, "opencode": true, "cursor": true}
 	for _, p := range providers {
 		if !validProviders[strings.ToLower(p)] {
 			return fmt.Errorf("unknown provider: %s", p)

@@ -59,7 +59,7 @@ func (r *PoolRefresher) getTokenExpiry(provider, profile string) (time.Time, err
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor":
+	case "opencode", "cursor", "grok":
 		// No token expiry parsing for these providers yet
 		return time.Time{}, nil
 	default:

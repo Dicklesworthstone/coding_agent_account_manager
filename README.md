@@ -240,6 +240,7 @@ wait
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
+| **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 
 ### Claude Code (Claude Max)
 
@@ -286,6 +287,20 @@ wait
 **Login Command:** Start `gemini`, select "Login with Google" or use `/auth` to switch modes
 
 **Notes:** For CAAM, Gemini Ultra behaves like Claude Max and GPT Pro: OAuth tokens are stored locally and can be swapped instantly.
+
+### Grok Build (xAI)
+
+**Auth Files:**
+- `~/.grok/auth.json` — login credential written by `grok login` (required)
+- `~/.grok/config.toml` — CLI configuration (optional, travels with the account)
+
+**Login Command:** `grok login` (browser OIDC via xAI accounts)
+
+**Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). Grok Build tokens expire after 7 days; run `grok login` to refresh — CAAM cannot refresh them.
+
+**Caveats:**
+- **`GROK_DEPLOYMENT_KEY` precedence:** in enterprise/deployment setups this environment variable takes precedence over `auth.json`, so a swapped profile is silently ignored while it is set.
+- **`~/.grok` collision:** the unaffiliated community CLI [`superagent-ai/grok-cli`](https://github.com/superagent-ai/grok-cli) (npm `grok-dev`) also uses `~/.grok/` but stores its state in `grok.db` / `user-settings.json`. CAAM touches only the official Grok Build files (`auth.json`, `config.toml`), so the two CLIs can coexist.
 
 ---
 

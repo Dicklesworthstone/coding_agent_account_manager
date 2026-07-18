@@ -27,6 +27,7 @@ Providers and their URLs:
   claude   - Anthropic Console (https://console.anthropic.com/)
   gemini   - Google AI Studio (https://aistudio.google.com/)
   agy      - Antigravity (https://antigravity.google/)
+  grok     - xAI Console (https://console.x.ai/)
   opencode - OpenCode (https://opencode.ai/)
   cursor   - Cursor (https://cursor.com/settings)
 

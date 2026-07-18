@@ -108,7 +108,13 @@ func TestE2E_NavigationWithTabKey(t *testing.T) {
 		t.Errorf("Expected provider 'gemini', got %q", m.currentProvider())
 	}
 
-	// Continue tabbing through opencode and cursor
+	// Continue tabbing through grok, opencode, and cursor
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+	if m.currentProvider() != "grok" {
+		t.Errorf("Expected provider 'grok', got %q", m.currentProvider())
+	}
+
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 	m = updated.(Model)
 	if m.currentProvider() != "opencode" {

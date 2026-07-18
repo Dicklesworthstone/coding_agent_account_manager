@@ -34,6 +34,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
+	grokprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/grok"
 	opencodeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/opencode"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tui"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
@@ -59,6 +60,7 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"claude":   authfile.ClaudeAuthFiles,
 	"gemini":   authfile.GeminiAuthFiles,
 	"agy":      authfile.AntigravityAuthFiles,
+	"grok":     authfile.GrokAuthFiles,
 	"opencode": authfile.OpenCodeAuthFiles,
 	"cursor":   authfile.CursorAuthFiles,
 }
@@ -120,6 +122,7 @@ Supported tools:
   - claude   (Anthropic Claude Code / Claude Max)
   - gemini   (Google Gemini CLI / Gemini Ultra)
   - agy      (Antigravity CLI)
+  - grok     (xAI Grok Build CLI)
   - opencode (OpenCode)
   - cursor   (Cursor CLI)
 
@@ -156,6 +159,7 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		registry.Register(claude.New())
 		registry.Register(gemini.New())
 		registry.Register(agy.New())
+		registry.Register(grokprovider.New())
 		registry.Register(opencodeprovider.New())
 		registry.Register(cursorprovider.New())
 
@@ -348,6 +352,13 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 			normalizeIdentityPlan(id)
 			return id
 		}
+	case "grok":
+		id, err := identity.ExtractFromGrokAuth(filepath.Join(vaultPath, "auth.json"))
+		if err != nil {
+			return nil
+		}
+		normalizeIdentityPlan(id)
+		return id
 	case "opencode":
 		id, err := identity.ExtractFromGenericAuth(filepath.Join(vaultPath, "auth.json"))
 		if err != nil {

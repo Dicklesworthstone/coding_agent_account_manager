@@ -370,8 +370,8 @@ func TestGetProviderMeta(t *testing.T) {
 func TestAllProviderMeta(t *testing.T) {
 	all := AllProviderMeta()
 
-	if len(all) != 6 {
-		t.Errorf("AllProviderMeta() len = %d, want 6", len(all))
+	if len(all) != 7 {
+		t.Errorf("AllProviderMeta() len = %d, want 7", len(all))
 	}
 
 	// Verify all known providers are present
@@ -390,7 +390,7 @@ func TestAllProviderMeta(t *testing.T) {
 		}
 	}
 
-	for _, expected := range []string{"codex", "claude", "gemini", "agy", "opencode", "cursor"} {
+	for _, expected := range []string{"codex", "claude", "gemini", "agy", "grok", "opencode", "cursor"} {
 		if !ids[expected] {
 			t.Errorf("AllProviderMeta() missing %q", expected)
 		}
@@ -400,8 +400,8 @@ func TestAllProviderMeta(t *testing.T) {
 func TestKnownProviderIDs(t *testing.T) {
 	ids := KnownProviderIDs()
 
-	if len(ids) != 6 {
-		t.Errorf("KnownProviderIDs() len = %d, want 6", len(ids))
+	if len(ids) != 7 {
+		t.Errorf("KnownProviderIDs() len = %d, want 7", len(ids))
 	}
 
 	// Verify all expected IDs are present
@@ -410,7 +410,7 @@ func TestKnownProviderIDs(t *testing.T) {
 		idMap[id] = true
 	}
 
-	for _, expected := range []string{"codex", "claude", "gemini", "agy", "opencode", "cursor"} {
+	for _, expected := range []string{"codex", "claude", "gemini", "agy", "grok", "opencode", "cursor"} {
 		if !idMap[expected] {
 			t.Errorf("KnownProviderIDs() missing %q", expected)
 		}

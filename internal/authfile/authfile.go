@@ -230,6 +230,45 @@ func AntigravityAuthFiles() AuthFileSet {
 	}
 }
 
+// GrokAuthFiles returns the auth files for xAI's official Grok CLI ("Grok Build").
+//
+// The CLI stores its login credential in $GROK_HOME/auth.json (default
+// ~/.grok/auth.json), written by `grok login`, alongside config.toml in the
+// same directory. Both paths and the GROK_HOME override ("Override config
+// directory (default: ~/.grok)") are confirmed from the official installer
+// (https://x.ai/cli/install.sh) and the CLI's bundled documentation.
+//
+// Disambiguation: an unaffiliated community CLI (superagent-ai/grok-cli, npm
+// grok-dev) also uses ~/.grok/ but stores its state in grok.db and
+// user-settings.json. caam deliberately touches ONLY auth.json and
+// config.toml — the official Grok Build files — so the two CLIs can coexist
+// without caam clobbering community-CLI state.
+func GrokAuthFiles() AuthFileSet {
+	home := os.Getenv("GROK_HOME")
+	if home == "" {
+		homeDir, _ := os.UserHomeDir()
+		home = filepath.Join(homeDir, ".grok")
+	}
+
+	return AuthFileSet{
+		Tool: "grok",
+		Files: []AuthFileSpec{
+			{
+				Tool:        "grok",
+				Path:        filepath.Join(home, "auth.json"),
+				Description: "Grok Build CLI login credential (written by 'grok login')",
+				Required:    true,
+			},
+			{
+				Tool:        "grok",
+				Path:        filepath.Join(home, "config.toml"),
+				Description: "Grok Build CLI configuration",
+				Required:    false,
+			},
+		},
+	}
+}
+
 // OpenCodeAuthFiles returns the auth files for OpenCode.
 // OpenCode stores auth in $XDG_DATA_HOME/opencode/auth.json (default ~/.local/share/opencode/auth.json).
 func OpenCodeAuthFiles() AuthFileSet {
@@ -295,6 +334,8 @@ func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 		return GeminiAuthFiles(), true
 	case "agy", "antigravity":
 		return AntigravityAuthFiles(), true
+	case "grok", "grok-build":
+		return GrokAuthFiles(), true
 	case "opencode", "oc":
 		return OpenCodeAuthFiles(), true
 	case "cursor", "cur":

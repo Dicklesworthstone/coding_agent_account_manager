@@ -491,6 +491,8 @@ func (h *Handlers) getProfileIdentity(tool, name string) *identity.Identity {
 		if err != nil {
 			id, err = identity.ExtractFromGeminiConfig(vaultPath + "/oauth_creds.json")
 		}
+	case "grok":
+		id, err = identity.ExtractFromGrokAuth(vaultPath + "/auth.json")
 	case "opencode":
 		id, err = identity.ExtractFromGenericAuth(vaultPath + "/auth.json")
 	case "cursor":

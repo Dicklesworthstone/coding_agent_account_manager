@@ -19,13 +19,14 @@ const (
 	ToolClaude   Tool = "claude"
 	ToolCodex    Tool = "codex"
 	ToolGemini   Tool = "gemini"
+	ToolGrok     Tool = "grok"
 	ToolOpenCode Tool = "opencode"
 	ToolCursor   Tool = "cursor"
 )
 
 // AllTools returns all supported tools.
 func AllTools() []Tool {
-	return []Tool{ToolClaude, ToolCodex, ToolGemini, ToolOpenCode, ToolCursor}
+	return []Tool{ToolClaude, ToolCodex, ToolGemini, ToolGrok, ToolOpenCode, ToolCursor}
 }
 
 // DiscoveredAuth represents an existing auth session found on the system.
@@ -38,9 +39,9 @@ type DiscoveredAuth struct {
 
 // ScanResult holds all discovered auth sessions.
 type ScanResult struct {
-	Found     []DiscoveredAuth      // Auth files that were found
-	NotFound  []Tool                // Tools with no auth files
-	ToolPaths map[Tool][]string     // All auth file paths checked per tool
+	Found     []DiscoveredAuth  // Auth files that were found
+	NotFound  []Tool            // Tools with no auth files
+	ToolPaths map[Tool][]string // All auth file paths checked per tool
 }
 
 // Scan checks all supported tools for existing auth files.
@@ -124,6 +125,9 @@ func getAuthFileSet(tool Tool) *authfile.AuthFileSet {
 		return &set
 	case ToolGemini:
 		set := authfile.GeminiAuthFiles()
+		return &set
+	case ToolGrok:
+		set := authfile.GrokAuthFiles()
 		return &set
 	case ToolOpenCode:
 		set := authfile.OpenCodeAuthFiles()

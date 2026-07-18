@@ -64,7 +64,7 @@ func NewWatcher(vault *authfile.Vault, config WatcherConfig) (*Watcher, error) {
 		config.Logger = slog.Default()
 	}
 	if len(config.Providers) == 0 {
-		config.Providers = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+		config.Providers = []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	}
 
 	fsWatcher, err := fsnotify.NewWatcher()
@@ -500,6 +500,12 @@ func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, er
 		}
 		return nil, fmt.Errorf("gemini config not found")
 
+	case "grok":
+		if strings.HasSuffix(path, "auth.json") {
+			return identity.ExtractFromGrokAuth(path)
+		}
+		return nil, fmt.Errorf("grok auth not found")
+
 	case "opencode":
 		if strings.HasSuffix(path, "auth.json") {
 			return identity.ExtractFromGenericAuth(path)
@@ -521,7 +527,7 @@ func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, er
 // This is useful for discovering accounts that were logged in before the watcher started.
 func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) ([]string, error) {
 	if len(providers) == 0 {
-		providers = []string{"claude", "codex", "gemini", "opencode", "cursor"}
+		providers = []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -584,6 +590,13 @@ func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) (
 			}
 			settingsPath := filepath.Join(geminiHome, "settings.json")
 			ident, err = identity.ExtractFromGeminiConfig(settingsPath)
+		case "grok":
+			for _, spec := range fileSet.Files {
+				if spec.Required {
+					ident, err = identity.ExtractFromGrokAuth(spec.Path)
+					break
+				}
+			}
 		case "opencode":
 			for _, spec := range fileSet.Files {
 				if spec.Required {

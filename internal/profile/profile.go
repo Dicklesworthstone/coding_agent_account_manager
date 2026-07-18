@@ -139,6 +139,10 @@ func (p *Profile) LoadIdentity() {
 			candidates = append(candidates, filepath.Join(p.BasePath, "gcloud", "application_default_credentials.json"))
 		}
 		id = loadIdentityFromPaths(candidates, identity.ExtractFromGeminiConfig)
+	case "grok":
+		id = loadIdentityFromPaths([]string{
+			filepath.Join(p.HomePath(), ".grok", "auth.json"),
+		}, identity.ExtractFromGrokAuth)
 	case "opencode":
 		id = loadIdentityFromPaths([]string{
 			filepath.Join(p.HomePath(), ".local", "share", "opencode", "auth.json"),

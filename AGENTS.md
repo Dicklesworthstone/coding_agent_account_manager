@@ -316,6 +316,7 @@ coding_agent_account_manager/
 | Claude (Anthropic) | `~/.claude.json` | Backup, activate, rotate, refresh |
 | Codex (OpenAI) | `~/.codex/auth.json` | Backup, activate, rotate |
 | Gemini (Google) | `~/.gemini/settings.json` | Backup, activate, rotate |
+| Grok Build (xAI) | `~/.grok/auth.json` (+ `config.toml`; respects `GROK_HOME`) | Backup, activate, rotate |
 | ChatGPT (OpenAI) | Various | Backup, activate |
 
 ### Key Design Decisions

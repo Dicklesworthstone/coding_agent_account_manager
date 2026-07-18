@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -22,6 +23,8 @@ func ExtractIdentity(tool Tool, authPath string) (string, bool) {
 		return extractCodexIdentity(data)
 	case ToolGemini:
 		return extractGeminiIdentity(data)
+	case ToolGrok:
+		return extractGrokIdentity(data)
 	case ToolOpenCode:
 		return extractGenericJSONIdentity(data)
 	case ToolCursor:
@@ -181,6 +184,56 @@ func extractGenericJSONIdentity(data []byte) (string, bool) {
 				return email, true
 			}
 		}
+	}
+
+	// Valid auth file but couldn't extract identity
+	return "", true
+}
+
+// extractGrokIdentity parses Grok Build's auth.json for identity info.
+//
+// The file (as written by `grok login`, observed on Grok CLI 0.1.210) is a
+// JSON object keyed by a dynamic credential key ("<oidc-issuer>::<client-id>"
+// or, in the CLI's own docs example, "https://accounts.x.ai/sign-in") whose
+// entry object carries "email" and "user_id" fields. Top-level keys are
+// treated as opaque: every top-level object value is scanned for identity
+// fields, with flat top-level fields checked first for forward compatibility.
+func extractGrokIdentity(data []byte) (string, bool) {
+	var auth map[string]interface{}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return "", false
+	}
+
+	// Flat layout first.
+	for _, field := range []string{"email", "user_id"} {
+		if val, ok := auth[field].(string); ok && val != "" {
+			return val, true
+		}
+	}
+
+	// Dynamic credential-key layout: scan entries in sorted key order for
+	// deterministic results, preferring email over user_id.
+	keys := make([]string, 0, len(auth))
+	for k := range auth {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	fallback := ""
+	for _, k := range keys {
+		entry, ok := auth[k].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if email, ok := entry["email"].(string); ok && email != "" {
+			return email, true
+		}
+		if userID, ok := entry["user_id"].(string); ok && userID != "" && fallback == "" {
+			fallback = userID
+		}
+	}
+	if fallback != "" {
+		return fallback, true
 	}
 
 	// Valid auth file but couldn't extract identity

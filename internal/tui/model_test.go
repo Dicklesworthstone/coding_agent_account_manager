@@ -14,8 +14,8 @@ import (
 
 func TestNew(t *testing.T) {
 	m := New()
-	if len(m.providers) != 5 {
-		t.Errorf("expected 5 providers, got %d", len(m.providers))
+	if len(m.providers) != 6 {
+		t.Errorf("expected 6 providers, got %d", len(m.providers))
 	}
 	if m.activeProvider != 0 {
 		t.Errorf("expected activeProvider 0, got %d", m.activeProvider)
@@ -35,7 +35,7 @@ func TestNewWithProviders(t *testing.T) {
 
 func TestDefaultProviders(t *testing.T) {
 	providers := DefaultProviders()
-	expected := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	expected := []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	if len(providers) != len(expected) {
 		t.Errorf("expected %d providers, got %d", len(expected), len(providers))
 	}

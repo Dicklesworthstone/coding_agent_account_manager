@@ -88,7 +88,7 @@ func TestJSONMode_BackupFailureReturnsError(t *testing.T) {
 // "codex, claude, gemini" subset.
 func TestSupportedToolsList(t *testing.T) {
 	got := supportedToolsList()
-	for _, want := range []string{"agy", "claude", "codex", "cursor", "gemini", "opencode"} {
+	for _, want := range []string{"agy", "claude", "codex", "cursor", "gemini", "grok", "opencode"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("supportedToolsList() = %q, missing %q", got, want)
 		}
