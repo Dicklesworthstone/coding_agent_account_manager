@@ -239,15 +239,24 @@ func (d *Daemon) initAuthPool() {
 
 // Start begins the daemon's main loop.
 func (d *Daemon) Start() error {
+	// Install the signal handler before the PID file becomes visible: a
+	// supervisor (or test) that detects the PID file and immediately sends
+	// SIGTERM must hit the graceful-shutdown path, not the default handler
+	// (which kills the process and leaves the PID file behind).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+
 	d.mu.Lock()
 	if d.running {
 		d.mu.Unlock()
+		signal.Stop(sigCh)
 		return fmt.Errorf("daemon already running")
 	}
 
 	// Acquire PID lock first
 	if err := d.acquirePIDLock(); err != nil {
 		d.mu.Unlock()
+		signal.Stop(sigCh)
 		return fmt.Errorf("acquire pid lock: %w", err)
 	}
 
@@ -272,10 +281,6 @@ func (d *Daemon) Start() error {
 			d.logger.Println("Pool monitor started")
 		}
 	}
-
-	// Set up signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	d.wg.Add(1)
 	go func() {

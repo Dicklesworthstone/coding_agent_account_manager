@@ -580,16 +580,21 @@ func TestDaemonStartAndStop(t *testing.T) {
 		errCh <- d.Start()
 	}()
 
-	// Wait a bit for it to start
-	time.Sleep(100 * time.Millisecond)
-
+	// Wait for the daemon to start and complete at least one check. Poll
+	// instead of a fixed sleep: under heavy machine load the run loop's first
+	// 50ms tick can take well over 100ms to fire.
+	deadline := time.Now().Add(5 * time.Second)
+	for !d.IsRunning() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !d.IsRunning() {
 		t.Error("daemon should be running after Start")
 	}
 
-	// Check that it did at least one check
-	stats := d.GetStats()
-	if stats.CheckCount < 1 {
+	for d.GetStats().CheckCount < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stats := d.GetStats(); stats.CheckCount < 1 {
 		t.Errorf("expected at least 1 check, got %d", stats.CheckCount)
 	}
 

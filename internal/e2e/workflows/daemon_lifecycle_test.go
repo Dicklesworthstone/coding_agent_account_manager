@@ -74,9 +74,10 @@ daemon:
 	daemonPID := cmd.Process.Pid
 	h.LogInfo("Daemon process started", "pid", daemonPID)
 
-	// Wait for PID file to appear
+	// Wait for PID file to appear. 20s bound: subprocess spawn + Go
+	// test-binary init can take well over 5s on a heavily loaded machine.
 	pidFound := false
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 200; i++ {
 		if _, err := os.Stat(pidFile); err == nil {
 			pidFound = true
 			break
@@ -183,7 +184,8 @@ daemon:
 	}
 
 	waitForPID := func() bool {
-		for i := 0; i < 50; i++ {
+		// 20s bound: subprocess startup can exceed 5s under heavy load.
+		for i := 0; i < 200; i++ {
 			if _, err := os.Stat(pidFile); err == nil {
 				return true
 			}

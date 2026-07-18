@@ -44,15 +44,19 @@ type WatcherConfig struct {
 
 // Watcher monitors auth file changes and auto-discovers new accounts.
 type Watcher struct {
-	vault    *authfile.Vault
-	config   WatcherConfig
-	watcher  *fsnotify.Watcher
-	logger   *slog.Logger
-	mu       sync.Mutex
-	pending  map[string]time.Time // path -> last change time
-	stopCh   chan struct{}
-	doneCh   chan struct{}
-	watching bool
+	vault   *authfile.Vault
+	config  WatcherConfig
+	watcher *fsnotify.Watcher
+	logger  *slog.Logger
+	mu      sync.Mutex
+	pending map[string]time.Time // path -> last change time
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	// debounceDoneCh is closed when debounceLoop exits. Stop() waits on it so
+	// an in-flight processPending backup can never race a caller that removes
+	// the vault directory right after Stop() returns.
+	debounceDoneCh chan struct{}
+	watching       bool
 }
 
 // NewWatcher creates a new auth file watcher.
@@ -73,13 +77,14 @@ func NewWatcher(vault *authfile.Vault, config WatcherConfig) (*Watcher, error) {
 	}
 
 	return &Watcher{
-		vault:   vault,
-		config:  config,
-		watcher: fsWatcher,
-		logger:  config.Logger,
-		pending: make(map[string]time.Time),
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		vault:          vault,
+		config:         config,
+		watcher:        fsWatcher,
+		logger:         config.Logger,
+		pending:        make(map[string]time.Time),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		debounceDoneCh: make(chan struct{}),
 	}, nil
 }
 
@@ -97,8 +102,10 @@ func (w *Watcher) Start(ctx context.Context) error {
 	// THIS run's channels even if a later Stop/Start cycle swaps the fields.
 	w.stopCh = make(chan struct{})
 	w.doneCh = make(chan struct{})
+	w.debounceDoneCh = make(chan struct{})
 	stopCh := w.stopCh
 	doneCh := w.doneCh
+	debounceDoneCh := w.debounceDoneCh
 	w.mu.Unlock()
 
 	// Add watches for all auth file directories
@@ -123,7 +130,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 
 	// Start event loop
 	go w.eventLoop(ctx, stopCh, doneCh)
-	go w.debounceLoop(ctx, stopCh)
+	go w.debounceLoop(ctx, stopCh, debounceDoneCh)
 
 	return nil
 }
@@ -138,6 +145,7 @@ func (w *Watcher) Stop() error {
 	w.watching = false
 	stopCh := w.stopCh
 	doneCh := w.doneCh
+	debounceDoneCh := w.debounceDoneCh
 	w.mu.Unlock()
 
 	select {
@@ -146,6 +154,7 @@ func (w *Watcher) Stop() error {
 		close(stopCh)
 	}
 	<-doneCh
+	<-debounceDoneCh
 	return w.watcher.Close()
 }
 
@@ -238,8 +247,11 @@ func (w *Watcher) eventLoop(ctx context.Context, stopCh <-chan struct{}, doneCh 
 	}
 }
 
-// debounceLoop processes pending changes after debounce interval.
-func (w *Watcher) debounceLoop(ctx context.Context, stopCh <-chan struct{}) {
+// debounceLoop processes pending changes after debounce interval. doneCh is
+// closed on every exit path; Stop() waits on it so no processPending backup
+// is still writing to the vault after Stop() returns.
+func (w *Watcher) debounceLoop(ctx context.Context, stopCh <-chan struct{}, doneCh chan<- struct{}) {
+	defer close(doneCh)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 

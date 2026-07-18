@@ -104,9 +104,10 @@ daemon:
 	}
 	t.Cleanup(stopDaemon)
 
-	// Wait for PID file
+	// Wait for PID file. 20s bound: subprocess spawn + Go test-binary init can
+	// take well over 5s on a heavily loaded machine.
 	pidFound := false
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 200; i++ {
 		if _, err := os.Stat(pidFile); err == nil {
 			pidFound = true
 			break

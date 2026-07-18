@@ -310,7 +310,18 @@ func TestWatcher_AutoProfileOnIdentityError(t *testing.T) {
 	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
 	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
 
-	time.Sleep(500 * time.Millisecond)
+	// Poll instead of a fixed sleep: under heavy machine load the fsnotify
+	// event + debounce interval can take well over 500ms to fire.
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		mu.Lock()
+		n := len(discoveries)
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -377,11 +388,24 @@ func TestE2E_RapidFileChanges(t *testing.T) {
 		}
 		data, _ := json.Marshal(creds)
 		require.NoError(t, os.WriteFile(credsPath, data, 0600))
-		time.Sleep(20 * time.Millisecond) // Quick succession
+		time.Sleep(5 * time.Millisecond) // Quick succession, well inside the debounce window
 	}
 
-	// Wait for debounce to complete
-	time.Sleep(600 * time.Millisecond)
+	// Wait for the debounced discovery. Poll instead of a fixed sleep: under
+	// heavy machine load the fsnotify event + debounce interval can take well
+	// over 600ms to fire. After the first discovery, wait one more full
+	// debounce interval of quiet so a spurious second discovery would be seen.
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		mu.Lock()
+		n := discoveryCount
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	time.Sleep(400 * time.Millisecond)
 
 	mu.Lock()
 	count := discoveryCount
@@ -629,13 +653,23 @@ func TestE2E_PartialWriteRecovery(t *testing.T) {
 	validData, _ := json.Marshal(validCreds)
 	require.NoError(t, os.WriteFile(credsPath, validData, 0600))
 
-	time.Sleep(400 * time.Millisecond)
+	// Should have at least one successful discovery (the valid one).
+	// The partial write might create an auto-profile or be skipped.
+	// Poll instead of a fixed sleep: under heavy machine load the fsnotify
+	// event + debounce interval can take well over 400ms to fire.
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		mu.Lock()
+		n := len(discoveries)
+		mu.Unlock()
+		if n >= 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-
-	// Should have at least one successful discovery (the valid one)
-	// The partial write might create an auto-profile or be skipped
 	assert.GreaterOrEqual(t, len(discoveries), 1, "should have at least one discovery")
 }
 
