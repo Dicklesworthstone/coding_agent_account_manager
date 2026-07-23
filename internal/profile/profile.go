@@ -115,8 +115,15 @@ func (p *Profile) MetaPath() string {
 
 // LoadIdentity loads identity information from this profile's auth files.
 // Errors are ignored to keep identity extraction best-effort.
+//
+// The identity is always re-derived from the live auth files when they can be
+// read. A previously cached value persisted in profile.json is used only as a
+// fallback when live extraction yields nothing. Short-circuiting on a non-nil
+// cached identity (the old behavior) pinned stale plan_type/expires_at forever
+// with no way to refresh them (issue #60): the health/status display kept
+// showing a warning for a credential that was in fact healthy.
 func (p *Profile) LoadIdentity() {
-	if p == nil || p.Identity != nil {
+	if p == nil {
 		return
 	}
 
@@ -154,9 +161,42 @@ func (p *Profile) LoadIdentity() {
 		}, identity.ExtractFromGenericAuth)
 	}
 
+	// Prefer freshly extracted live identity; keep any cached value only as a
+	// fallback so profiles whose live auth is momentarily unreadable still show
+	// their last-known identity.
 	if id != nil {
 		p.Identity = id
 	}
+}
+
+// CountAuthFiles returns the number of regular files present under this
+// profile's auth-bearing directories (pseudo-HOME, xdg_config, codex_home).
+// Symlinked directories are followed. It is used to report truthfully whether a
+// clone actually captured any credentials.
+func (p *Profile) CountAuthFiles() int {
+	if p == nil {
+		return 0
+	}
+	count := 0
+	for _, root := range []string{p.HomePath(), p.XDGConfigPath(), p.CodexHomePath()} {
+		if info, err := os.Stat(root); err != nil || !info.IsDir() {
+			continue
+		}
+		real := root
+		if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil {
+			real = resolved
+		}
+		_ = filepath.Walk(real, func(_ string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.Mode().IsRegular() {
+				count++
+			}
+			return nil
+		})
+	}
+	return count
 }
 
 func loadIdentityFromPaths(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
@@ -811,9 +851,30 @@ func copyAuthFiles(source, target *Profile) error {
 }
 
 // copyDir copies contents from src to dst directory recursively.
+//
+// If src is a symlink to a directory (the layout caam creates when it adopts a
+// pre-existing account, e.g. profiles/codex/<name>/codex_home -> ~/.codex), the
+// symlink is resolved first. filepath.Walk does NOT follow a symlinked root: it
+// lstat's the root, sees a symlink (not a directory), and returns immediately
+// without descending — which silently produced an empty clone (issue #60).
+// Resolving to the real path makes Walk traverse the actual tree.
 func copyDir(src, dst string) error {
-	if _, err := os.Stat(src); os.IsNotExist(err) {
-		return nil // Source doesn't exist, nothing to copy
+	info, err := os.Stat(src) // Stat (not Lstat) follows symlinks.
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Source doesn't exist, nothing to copy.
+		}
+		return err
+	}
+	if !info.IsDir() {
+		// src resolves to a non-directory (e.g. a dangling or file symlink);
+		// there is no directory tree to copy.
+		return nil
+	}
+
+	// Resolve any symlinks in src so Walk traverses the real directory.
+	if resolved, rerr := filepath.EvalSymlinks(src); rerr == nil {
+		src = resolved
 	}
 
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {

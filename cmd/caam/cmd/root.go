@@ -306,7 +306,48 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		ph.TokenExpiresAt = expInfo.ExpiresAt
 	}
 
+	// Fallback: when the vault snapshot yields no usable expiry, derive health
+	// from the profile's own live credential instead of leaving TokenExpiresAt
+	// zero (which caps the verdict at 🟡 Warning forever, even for a perfectly
+	// healthy live token — issue #60). Adopted profiles symlink their auth dir
+	// to the live location, so this reads the real, current token.
+	if ph.TokenExpiresAt.IsZero() {
+		if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+			ph.TokenExpiresAt = liveExp.ExpiresAt
+		}
+	}
+
 	return ph
+}
+
+// parseLiveProfileExpiry reads the token expiry from a profile's own auth
+// directory (following adoption symlinks). Best-effort; returns nil on any
+// failure.
+func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
+	if profileStore == nil {
+		return nil
+	}
+	prof, err := profileStore.Load(tool, profileName)
+	if err != nil {
+		return nil
+	}
+	var info *health.ExpiryInfo
+	switch tool {
+	case "codex":
+		info, err = health.ParseCodexExpiry(filepath.Join(prof.CodexHomePath(), "auth.json"))
+	case "claude":
+		info, err = health.ParseClaudeExpiry(filepath.Join(prof.HomePath(), ".claude"))
+	case "gemini":
+		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
+	case "grok":
+		info, err = health.ParseCodexExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+	default:
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 func getProfileHealthWithIdentity(tool, profileName string) (*health.ProfileHealth, *identity.Identity) {
@@ -1842,14 +1883,25 @@ Examples:
 		if cloned.Description != "" {
 			fmt.Printf("  Description: %s\n", cloned.Description)
 		}
+		authCopied := 0
 		if withAuth {
-			fmt.Println("  Auth files: copied")
-		} else {
+			authCopied = cloned.CountAuthFiles()
+		}
+		switch {
+		case withAuth && authCopied > 0:
+			fmt.Printf("  Auth files: copied (%d file(s))\n", authCopied)
+		case withAuth && authCopied == 0:
+			// Don't claim success we didn't achieve: the source may have no
+			// credentials, or an unreadable source home. Tell the truth so the
+			// user knows to log in rather than discovering it at first use.
+			fmt.Println("  Auth files: none found to copy — source profile has no readable credentials")
+			fmt.Fprintf(os.Stderr, "Warning: --with-auth copied 0 files; log in with 'caam login %s %s' before using this profile\n", tool, targetName)
+		default:
 			fmt.Println("  Auth files: not copied (use --with-auth to include)")
 		}
 
 		fmt.Printf("\nNext steps:\n")
-		if !withAuth {
+		if !withAuth || authCopied == 0 {
 			fmt.Printf("  caam login %s %s    # Authenticate\n", tool, targetName)
 		}
 		fmt.Printf("  caam exec %s %s      # Run with this profile\n", tool, targetName)

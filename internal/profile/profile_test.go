@@ -953,6 +953,55 @@ func TestStoreCloneWithoutAuth(t *testing.T) {
 	}
 }
 
+// TestStoreCloneWithAuthSymlinkedCodexHome reproduces issue #60: when a
+// profile's codex_home is a symlink (the layout caam creates when it adopts a
+// pre-existing account), `clone --with-auth` used to silently produce an empty
+// profile because filepath.Walk does not follow a symlinked root. The clone must
+// follow the symlink and copy the real auth files.
+func TestStoreCloneWithAuthSymlinkedCodexHome(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewStore(tmpDir)
+
+	source, err := store.Create("codex", "adopted", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Simulate an adopted account: codex_home is a symlink to the real dir
+	// (e.g. ~/.codex) rather than a regular directory.
+	realCodex := filepath.Join(t.TempDir(), "dot-codex")
+	if err := os.MkdirAll(realCodex, 0700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	authContent := []byte(`{"tokens":{"access_token":"live-token"}}`)
+	if err := os.WriteFile(filepath.Join(realCodex, "auth.json"), authContent, 0600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	codexHome := source.CodexHomePath()
+	_ = os.RemoveAll(codexHome)
+	if err := os.Symlink(realCodex, codexHome); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+
+	cloned, err := store.Clone("codex", "adopted", "clone-target", CloneOptions{WithAuth: true})
+	if err != nil {
+		t.Fatalf("Clone() error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(cloned.CodexHomePath(), "auth.json"))
+	if err != nil {
+		t.Fatalf("cloned auth.json was not copied through the symlink (issue #60): %v", err)
+	}
+	if string(got) != string(authContent) {
+		t.Errorf("cloned auth content = %q, want %q", string(got), string(authContent))
+	}
+
+	if n := cloned.CountAuthFiles(); n == 0 {
+		t.Errorf("CountAuthFiles() = 0, want > 0 after copying auth through symlink")
+	}
+}
+
 func TestStoreCloneErrors(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewStore(tmpDir)
