@@ -343,8 +343,13 @@ get_installed_version() {
         # Try 'version' subcommand first (caam style), then --version flag
         local version_output
         version_output=$("$bin_path" version 2>/dev/null || "$bin_path" --version 2>/dev/null || echo "")
+        # Strip the "... built on ... with go1.24.4" toolchain suffix first, so a
+        # dev/source build ("caam dev (unknown) built on unknown with go1.24.4")
+        # does not get misread as caam version 1.24.4 — which broke idempotency
+        # and caused an endless download→verify→rebuild loop (issue #59).
+        version_output=$(printf '%s' "$version_output" | head -1 | sed -E 's/[[:space:]]*(built on|with go).*$//')
         # Extract version from output like "caam v1.2.3 (...)" or "caam 1.2.3"
-        echo "$version_output" | head -1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 || echo ""
+        echo "$version_output" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -1 || echo ""
     else
         echo ""
     fi
@@ -812,12 +817,43 @@ verify_release_assets() {
         fi
     else
         local identity="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/tags/${version}"
-        if ! cosign verify-blob \
+        local cosign_out=""
+        local verified=0
+
+        # Attempt 1: the plain invocation. Works with cosign v3.x, which reads
+        # the sigstore bundle (v0.3) format by default.
+        cosign_out=$(cosign verify-blob \
             --bundle "$signature_path" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --certificate-identity "$identity" \
-            "$checksums_path" >/dev/null 2>&1; then
+            "$checksums_path" 2>&1) && verified=1
+
+        # Attempt 2: cosign v2.x only parses the new sigstore bundle format when
+        # explicitly told to via --new-bundle-format. Our releases are signed by
+        # cosign v3 (GoReleaser signs: block), so v2.x consumers fail the plain
+        # invocation with "bundle does not contain cert for verification". Retry
+        # with the flag when it is supported. See issue #59.
+        if [ "$verified" -ne 1 ] && cosign verify-blob --help 2>/dev/null | grep -q -- '--new-bundle-format'; then
+            cosign_out=$(cosign verify-blob \
+                --new-bundle-format \
+                --bundle "$signature_path" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                --certificate-identity "$identity" \
+                "$checksums_path" 2>&1) && verified=1
+        fi
+
+        if [ "$verified" -ne 1 ]; then
             print_error "Signature verification failed."
+            # Surface cosign's real error instead of hiding it — the actual
+            # message makes diagnosis immediate (compat vs. genuine tampering).
+            if [ -n "$cosign_out" ]; then
+                printf '%s\n' "$cosign_out" | while IFS= read -r line; do
+                    print_error "  cosign: $line"
+                done
+            fi
+            local cosign_ver
+            cosign_ver=$(cosign version 2>/dev/null | grep -iE 'GitVersion|version' | head -1 || true)
+            [ -n "$cosign_ver" ] && print_error "  (installed $cosign_ver — cosign v3.x recommended)"
             return 1
         fi
     fi
@@ -1012,8 +1048,17 @@ try_binary_install() {
     if ! verify_release_assets "$release_json" "$version" "$asset_name" "$archive_path" "$tmp_dir"; then
         error "Release verification failed"
         error "This could indicate a tampered download or network issue"
-        error "Set CAAM_SKIP_VERIFY=1 to bypass (not recommended)"
-        return 1
+        error ""
+        error "Refusing to fall back to an unsigned source build of an unverified release."
+        error "A verification failure must never silently downgrade into installing"
+        error "unsigned code (supply-chain safety). See issue #59."
+        error ""
+        error "If you understand and accept the risk, re-run with:"
+        error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
+        # Fail CLOSED: exit the whole installer rather than returning non-zero,
+        # which the caller would treat as "no prebuilt binary" and fall through
+        # to try_go_install (an unsigned build of main HEAD).
+        die "Release signature/checksum verification failed" $EXIT_VERIFY_FAILED
     fi
 
     info "Extracting archive..."
@@ -1118,7 +1163,32 @@ try_go_install() {
     info "Building $BIN_NAME from source (this may take a minute)..."
     build_output="$tmp_dir/$BIN_NAME"
 
-    local build_cmd="cd \"$src_dir\" && GO111MODULE=on CGO_ENABLED=0 go build -o \"$build_output\" \"./cmd/$BIN_NAME\""
+    # If a specific version was requested, build that release tag rather than
+    # whatever main HEAD happens to be (issue #59).
+    if [ -n "$INSTALL_VERSION" ] && [ "$fetched" -eq 1 ] && command -v git >/dev/null 2>&1; then
+        if git -C "$src_dir" fetch --depth 1 origin "refs/tags/${INSTALL_VERSION}:refs/tags/${INSTALL_VERSION}" >/dev/null 2>&1 &&
+           git -C "$src_dir" checkout -q "tags/${INSTALL_VERSION}" >/dev/null 2>&1; then
+            info "Building source at tag ${INSTALL_VERSION}"
+        else
+            warn "Could not check out tag ${INSTALL_VERSION}; building default branch."
+        fi
+    fi
+
+    # Stamp version metadata via -ldflags so `caam version` reports a parseable
+    # string instead of "caam dev (unknown) ... with go1.24.4" (issue #59).
+    local version_pkg="github.com/${REPO_OWNER}/${REPO_NAME}/internal/version"
+    local stamp_ver="" stamp_commit="" stamp_date
+    stamp_date=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
+    if [ "$fetched" -eq 1 ] && command -v git >/dev/null 2>&1; then
+        stamp_ver=$(git -C "$src_dir" describe --tags --always 2>/dev/null || true)
+        stamp_commit=$(git -C "$src_dir" rev-parse --short HEAD 2>/dev/null || true)
+    fi
+    [ -n "$INSTALL_VERSION" ] && stamp_ver="$INSTALL_VERSION"
+    [ -z "$stamp_ver" ] && stamp_ver="source"
+    [ -z "$stamp_commit" ] && stamp_commit="source"
+    local ldflags="-s -w -X ${version_pkg}.Version=${stamp_ver} -X ${version_pkg}.Commit=${stamp_commit} -X ${version_pkg}.Date=${stamp_date}"
+
+    local build_cmd="cd \"$src_dir\" && GO111MODULE=on CGO_ENABLED=0 go build -ldflags \"$ldflags\" -o \"$build_output\" \"./cmd/$BIN_NAME\""
 
     if [ "$HAS_GUM" = true ]; then
         if ! spin "Compiling $BIN_NAME" bash -c "$build_cmd"; then
@@ -1131,7 +1201,7 @@ try_go_install() {
             return 1
         fi
     else
-        if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
+        if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -ldflags "$ldflags" -o "$build_output" "./cmd/$BIN_NAME"); then
             error "Go build failed."
             error ""
             error "Troubleshooting:"
