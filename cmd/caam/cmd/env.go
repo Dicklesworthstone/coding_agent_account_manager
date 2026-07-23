@@ -33,6 +33,12 @@ Examples:
   # Unset the variables when done
   eval "$(caam env codex work --unset)"
 
+On error (unknown provider, missing profile, etc.) this command writes a
+diagnostic to stderr AND emits a failing shell command ('false') to stdout, so
+'eval "$(caam env ...)"' aborts loudly instead of silently keeping the parent
+shell's environment. With 'set -e' the script stops; otherwise check $? after
+the eval.
+
 Use --unset to print unset commands instead of export commands.
 Use --export-prefix to change the export syntax (default: "export").`,
 	Args: cobra.ExactArgs(2),
@@ -42,17 +48,20 @@ Use --export-prefix to change the export syntax (default: "export").`,
 
 		prov, ok := registry.Get(tool)
 		if !ok {
+			emitEvalFailure()
 			return fmt.Errorf("unknown provider: %s (supported: %s)", tool, supportedToolsList())
 		}
 
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
+			emitEvalFailure()
 			return err
 		}
 
 		ctx := context.Background()
 		envVars, err := prov.Env(ctx, prof)
 		if err != nil {
+			emitEvalFailure()
 			return fmt.Errorf("get environment: %w", err)
 		}
 
@@ -94,6 +103,18 @@ Use --export-prefix to change the export syntax (default: "export").`,
 
 		return nil
 	},
+}
+
+// emitEvalFailure prints a shell command that makes `eval "$(caam env ...)"`
+// fail loudly instead of silently succeeding. Command substitution discards the
+// child process's exit status, so an empty stdout on error is indistinguishable
+// from `eval ""` (a no-op that returns 0) — which silently leaves the parent
+// shell's HOME/CLAUDE_CONFIG_DIR/etc. in place and defeats profile isolation
+// (issue #58). Emitting `false` (portable across bash/zsh/fish) propagates a
+// non-zero status through the eval. The human-readable cause is still written
+// to stderr by cobra. This mirrors how direnv/asdf/nvm behave at this boundary.
+func emitEvalFailure() {
+	fmt.Println("false  # caam env: failed to resolve profile environment — see error on stderr above")
 }
 
 func init() {
