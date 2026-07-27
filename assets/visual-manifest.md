@@ -3,18 +3,25 @@
 Size: M — CLI with a vault, a provider layer, and a runner; real architecture,
 one process at runtime.
 
-Style bible: One set: a light-grey LEGO terminal-workshop floor on a white
-seamless backdrop. One camera: gentle three-quarter angle, slightly elevated.
-Accent: glowing translucent teal marks the credential vault and everything it
-injects — every other build stays grey/white. Studio softbox lighting
-throughout.
+Style bible: Full-color LEGO-city sets — colorful bricks, busy skyline
+backdrops, photorealistic LEGO product photography with shallow depth of
+field. Brick-built banner typography (red frame, yellow panel, blue studded
+letters) plus white station signposts and sticker nameplates carry all
+naming in-scene; signage is 1–3 words, never sentences. Providers are
+personified as robot characters with playful logo-riffs — evoke each
+brand's shape and color, never an exact trademark (warm-orange starburst
+CLAUDE, monochrome-hex CODEX, sparkle-gem GEMINI, llama OLLAMA…). The
+credential vault stays the glowing translucent-teal centerpiece across
+every scene: one focal story beat dominates via light and scale — attention
+hierarchy, not color removal.
 
 Layer definitions (house direction, July 2026): architecture and process
-views are FULL LEGO renders (§System diorama pattern) — text-free; every
-label lives in a legend table beside the image in the atlas page and README.
-A hand-authored modern SVG (direct SVG/D3, never Mermaid) is added only when
+views are FULL LEGO renders carrying their own short brick-built signage
+(banner, signposts, nameplates). Legends beside the image cover only what
+signs don't name — env var names, file modes, profile kinds. A
+hand-authored modern SVG (direct SVG/D3, never Mermaid) is added only when
 precise semantics (branching, exact env var names) genuinely exceed what a
-lego render + legend can carry.
+signposted render + slim legend can carry.
 
 | # | Question | Layer | Source | Status |
 |---|----------|-------|--------|--------|

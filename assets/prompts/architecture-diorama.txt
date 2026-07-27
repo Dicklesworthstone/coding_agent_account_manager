@@ -1,28 +1,41 @@
 Generate 1 LEGO-themed illustration for the caam README architecture view —
-caam is one account manager over ten AI-coding-CLI providers, routing
-credentials from a central vault to whichever tool is being launched.
+caam is one account manager over many AI-coding-CLI providers, routing one
+credential from a central vault to whichever tool is being launched.
 Save to /Users/christianmc/projects/caam/assets/ as caam-architecture.png.
 
 Image: caam-architecture.png, landscape 1536x1024:
-A LEGO factory-floor diorama seen at a gentle three-quarter angle, slightly
-elevated: on the left, a neat arc of ten small distinct grey LEGO terminal
-stations (each a slightly different little machine — different heights,
-screens, antennae — but all plain grey). Grey cables and conveyor tracks run
-from every station toward the center-right, converging on one large central
-switchboard-vault build: a cabinet of small drawers glowing translucent
-teal, topped with a patch-panel of sockets, with exactly one teal-lit cable
-plugged through to a single running workstation on the far right whose
-screen area is a plain glowing teal tile. The story: many machines, one
-vault, one live routed credential. One minifig operator plugs the teal
-cable into the patch panel; a second minifig restocks a teal drawer with a
-small translucent cartridge. Style bible: light-grey LEGO terminal-workshop
-floor on a white seamless backdrop, gentle three-quarter camera angle
-slightly elevated, glowing translucent teal is the ONLY accent color,
-everything else grey/white, studio softbox lighting. Mood: clean, bright,
-studio-lit product-photography style on a plain light backdrop, shallow
-depth of field, photorealistic LEGO render. NO text in the image.
+A vibrant full-color LEGO factory-floor diorama, photorealistic LEGO
+product photography, gentle three-quarter elevated angle. Arranged in an
+arc on the LEFT, six distinct colorful provider stations — each a small
+brick-built booth staffed by a robot character that riffs playfully on an
+AI-brand shape WITHOUT exact trademarks, each booth topped by a white
+signpost with its name: a warm-orange robot with a soft starburst-shaped
+head at a booth signed "CLAUDE"; a sleek black-and-white robot with a
+hexagonal knot emblem signed "CODEX"; a blue-violet robot with a
+four-pointed sparkle-gem head signed "GEMINI"; a dark robot with a
+minimalist slash emblem signed "GROK"; a white LEGO llama figure at a
+booth signed "OLLAMA"; and a small orange-and-teal robot signed "QUICK".
+Colorful cables and conveyor tracks run from every booth toward the
+CENTER-RIGHT, converging on the hero of the scene: one large central
+switchboard-vault build — a cabinet of small drawers glowing translucent
+teal from within, the brightest light in the frame, topped with a
+patch-panel of sockets and a brick-built sign reading "VAULT". Exactly ONE
+teal-lit glowing cable is plugged through the patch panel and runs to a
+single running workstation on the far right with a small signpost reading
+"RUN", its screen glowing teal, a happy yellow minifig operator at the
+keys. A second minifig on a ladder restocks a teal drawer with a small
+translucent cartridge. The story: many provider characters, one glowing
+vault, one live routed credential. Colorful LEGO-city backdrop, soft blue
+sky. Attention hierarchy via light and scale: the teal vault dominates;
+booths are colorful but smaller and dimmer. Shallow depth of field. The
+ONLY text anywhere: "CLAUDE", "CODEX", "GEMINI", "GROK", "OLLAMA",
+"QUICK", "VAULT", "RUN". No other words, no sentences.
 
-Self-critique: LEGO aesthetic convincing, composition readable at
-README-banner size, no text/typos, the contrast "ten grey stations, one
-teal vault routing one live credential" reads instantly. Regenerate until
-good. Return final file paths.
+Self-critique: LEGO aesthetic convincing; readable at README-banner size;
+the story "many provider booths, one teal vault, one live cable" reads
+instantly; exactly one glowing cable leaves the patch panel; robots evoke
+brands via shape/color only (no real logos). Verify EVERY rendered word
+letter-by-letter: C-L-A-U-D-E; C-O-D-E-X; G-E-M-I-N-I; G-R-O-K;
+O-L-L-A-M-A; Q-U-I-C-K; V-A-U-L-T; R-U-N. Any misspelling, extra letter,
+duplicated or gibberish signage = regenerate. Return final file path and a
+per-word spelling verification report.

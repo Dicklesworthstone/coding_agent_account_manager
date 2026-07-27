@@ -1,27 +1,43 @@
 Generate 1 LEGO-themed illustration for the caam README hero — caam is a
 CLI that switches AI-coding-CLI accounts instantly from a local credential
 vault instead of the slow browser OAuth login dance.
-Save to /Users/christianmc/projects/caam/assets/ (create the directory).
+Save to /Users/christianmc/projects/caam/assets/ as caam-hero.png.
 
 Image: caam-hero.png, landscape 1536x1024:
-A LEGO diorama scene: on the left, a tangled, deliberately slow mess of
-plain grey LEGO plumbing — looping pipes, valves, and a small grey
-brick-built browser-window panel — that winds overhead and dead-ends at a
-striped barrier (the browser OAuth login dance). On the right, a compact,
-tidy LEGO vault cabinet with rows of small drawers, each drawer glowing
-translucent teal (stored credentials); one short teal-lit chute runs
-straight from an open drawer into a single grey terminal workstation whose
-screen area is a plain glowing teal tile (the instant account swap). Style
-bible: light-grey LEGO terminal-workshop floor on a white seamless
-backdrop, gentle three-quarter camera angle slightly elevated, glowing
-translucent teal is the ONLY accent color, everything else grey/white,
-studio softbox lighting. One minifig engineer pulls the glowing teal drawer
-open mid-swap; a second minifig walks away from the grey pipe maze,
-gesturing toward the vault. Mood: clean, bright, studio-lit
-product-photography style on a plain light backdrop, shallow depth of
-field, photorealistic LEGO render. NO text in the image.
+A vibrant full-color LEGO-city diorama, photorealistic LEGO product
+photography. Across the top, a big brick-built billboard banner: red LEGO
+frame around a yellow panel with the word "CAAM" spelled in large blue
+studded LEGO letters, and below it a smaller green ribbon banner reading
+"ONE VAULT, EVERY AGENT" in white letters. The scene beneath tells one
+story left to right: on the LEFT, a comically tangled maze of colorful
+LEGO plumbing — looping pipes, valves, a brick-built browser-window panel —
+dead-ends at a red-and-white striped barrier with a round red sign reading
+"LOGIN"; queued in front of the barrier, waiting and slumped, a small line
+of robot characters that riff playfully on AI-brand shapes WITHOUT exact
+trademarks: a warm-orange robot whose head is a soft starburst shape
+(white sticker nameplate "CLAUDE"), a sleek black-and-white robot with a
+hexagonal knot emblem (nameplate "CODEX"), a blue-violet robot with a
+four-pointed sparkle-gem head (nameplate "GEMINI"), and a little white
+LEGO llama figure (nameplate "OLLAMA"). On the RIGHT, the star of the
+scene: a tidy LEGO vault cabinet with rows of small drawers all glowing
+translucent teal from within — the brightest, most saturated light source
+in the frame — with one open drawer feeding a short teal-lit chute
+straight into a colorful terminal workstation where a happy yellow
+minifig engineer is already typing, screen glowing teal. A cheerful
+minifig waves the robots over from the pipe maze toward the vault. Busy
+colorful LEGO-city skyline with blue sky and brick clouds in the soft
+background. Attention hierarchy via light and scale, not color removal:
+the teal-glowing vault and the CAAM banner dominate; everything else is
+colorful but dimmer and smaller. Shallow depth of field, studio-quality
+lighting, crisp foreground. The ONLY text anywhere: "CAAM",
+"ONE VAULT, EVERY AGENT", "LOGIN", "CLAUDE", "CODEX", "GEMINI", "OLLAMA".
+No other words, no sentences.
 
-Self-critique: LEGO aesthetic convincing, composition readable at
-README-banner size, no text/typos, the contrast "slow tangled OAuth
-plumbing vs instant teal vault swap" reads instantly. Regenerate until
-good. Return final file paths.
+Self-critique: LEGO aesthetic convincing; composition readable at
+README-banner size; the story "slow OAuth queue at the barrier vs instant
+teal vault swap" reads instantly; robots evoke brands via shape/color only
+(no real logos). Verify EVERY rendered word letter-by-letter: C-A-A-M;
+O-N-E V-A-U-L-T, E-V-E-R-Y A-G-E-N-T; L-O-G-I-N; C-L-A-U-D-E; C-O-D-E-X;
+G-E-M-I-N-I; O-L-L-A-M-A. Any misspelling, extra letter, duplicated or
+gibberish signage = regenerate. Return final file path and a per-word
+spelling verification report.

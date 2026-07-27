@@ -12,27 +12,23 @@
 
 <h2>What is it?</h2>
 <figure><img src="assets/caam-hero.png" alt="">
-<figcaption>Instead of the browser OAuth login dance (left), caam swaps accounts straight from a local credential vault (right) — sub-100ms, no Keychain.</figcaption></figure>
+<figcaption>Instead of queueing at the browser OAuth LOGIN barrier (left), agents get swapped straight from the local credential vault (right) — sub-100ms, no Keychain.</figcaption></figure>
 
 <h2>How is it shaped?</h2>
 <figure><img src="assets/caam-architecture.png" alt="">
-<figcaption>Many tools, one vault: every provider CLI wires into the central switchboard-vault, which routes exactly one credential to the tool being launched.</figcaption></figure>
+<figcaption>Many tools, one vault: every provider booth wires into the central VAULT, which routes exactly one credential to the tool being launched — the six signposted booths stand in for the full ten-provider matrix.</figcaption></figure>
 <table class="legend">
-<tr><td>the grey stations</td><td>the provider CLIs — claude, codex, gemini, agy, grok, deepseek, ollama, quick, opencode, cursor</td></tr>
-<tr><td>teal drawer cabinet</td><td>the credential vault: file-swap, token, and endpoint profiles</td></tr>
-<tr><td>patch panel + one teal cable</td><td>active-profile selection — one credential routed per launch</td></tr>
-<tr><td>workstation, teal screen</td><td>the child CLI process caam spawns</td></tr>
+<tr><td>the VAULT's drawers</td><td>file-swap, token, and endpoint profiles, side by side</td></tr>
+<tr><td>patch panel + one lit cable</td><td>active-profile selection — one credential routed per launch</td></tr>
 </table>
 
 <h2>How does data move?</h2>
 <figure><img src="assets/caam-run-process.png" alt="">
 <figcaption>The launch sequence of <code>caam run claude</code>: a profile leaves the shelf, is scrubbed clean of ambient auth, and is injected into the freshly started tool.</figcaption></figure>
 <table class="legend">
-<tr><td>shelf of teal cartridges</td><td>token/endpoint profiles stored in the vault (mode 0600)</td></tr>
-<tr><td>lifted cartridge</td><td>default-profile resolution — <code>.active-token</code> marker, cooldown rotation</td></tr>
-<tr><td>airlock shedding grey bricks</td><td>ambient auth env scrub (ANTHROPIC_*, CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR…)</td></tr>
-<tr><td>conveyor</td><td>env injection: the profile's own CLAUDE_CODE_OAUTH_TOKEN + per-profile CLAUDE_CONFIG_DIR</td></tr>
-<tr><td>powered-up terminal</td><td>the spawned claude child (PTY, rate-limit watch)</td></tr>
+<tr><td>1. SHELF</td><td>profiles live in the vault (mode 0600); the lifted cartridge is default-profile resolution — <code>.active-token</code> marker, cooldown rotation</td></tr>
+<tr><td>2. SCRUB</td><td>ambient auth env scrub (ANTHROPIC_*, CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR…)</td></tr>
+<tr><td>3. INJECT</td><td>env injection: the profile's own CLAUDE_CODE_OAUTH_TOKEN + per-profile CLAUDE_CONFIG_DIR</td></tr>
 </table>
 
 <figure><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 430" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">

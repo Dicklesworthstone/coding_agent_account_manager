@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/caam-hero.png" alt="LEGO diorama: a tangled grey OAuth pipe maze dead-ending at a barrier, beside a tidy vault of glowing teal credential drawers feeding a terminal" width="900">
+  <img src="assets/caam-hero.png" alt="LEGO city diorama under a brick-built CAAM banner: provider robots queue at a LOGIN barrier beside a tangled OAuth pipe maze, while a teal-glowing credential vault swaps an account straight into a terminal" width="900">
 </p>
 
 *Instead of the browser OAuth login dance (left), caam swaps accounts straight from a local credential vault (right) — sub-100ms, no Keychain.*
@@ -270,16 +270,14 @@ wait
 
 *Fork addition. This section and the next describe features that exist only in this fork.*
 
-<p align="center"><img src="assets/caam-architecture.png" alt="LEGO diorama: ten grey provider stations wired into a central teal switchboard-vault routing one credential to a running workstation" width="820"></p>
+<p align="center"><img src="assets/caam-architecture.png" alt="LEGO diorama: signposted provider robot booths — CLAUDE, CODEX, GEMINI, GROK, OLLAMA, QUICK — wired into a central teal-glowing VAULT that routes one lit cable to a workstation signed RUN" width="820"></p>
 
-*How the system is shaped — many tools, one vault: every provider CLI wires into the central switchboard-vault, which routes exactly one credential to the tool being launched.*
+*How the system is shaped — many tools, one vault: every provider booth wires into the central VAULT, which routes exactly one credential to the tool being launched (the six signposted booths stand in for the full provider matrix below).*
 
 | In the scene | Meaning |
 |---|---|
-| the grey stations | the provider CLIs — claude, codex, gemini, agy, grok, deepseek, ollama, quick, opencode, cursor |
-| teal drawer cabinet | the credential vault: file-swap, token, and endpoint profiles |
-| patch panel + one teal cable | active-profile selection — one credential routed per launch |
-| workstation, teal screen | the child CLI process caam spawns |
+| the VAULT's drawers | file-swap, token, and endpoint profiles, side by side |
+| patch panel + one lit cable | active-profile selection — one credential routed per launch |
 
 On macOS, recent Claude Code builds keep the OAuth credential in the system Keychain, which has exactly one slot and no way to point the CLI at another. File-swap profiles capture `~/.claude.json` without the credential, so every switch lands on a forced `/login`.
 
@@ -311,17 +309,15 @@ For the default token profile, `caam run claude` and `caam exec claude <name>` i
 
 **Cooldowns and rotation apply.** Token profiles are first-class in health, cooldowns, and rotation. `caam cooldown set claude/work --minutes 30` works as usual, and when the default token profile is cooling down, `caam run claude` rotates to another token profile before launching. Health checks are passive (format/expiry); `caam validate claude work --active` makes one cheap authenticated call against Claude's OAuth usage endpoint to confirm the token is live.
 
-<p align="center"><img src="assets/caam-run-process.png" alt="LEGO diorama: a teal profile cartridge leaves a shelf, passes a scrubbing airlock shedding grey bricks, rides a conveyor into a powering-up terminal" width="820"></p>
+<p align="center"><img src="assets/caam-run-process.png" alt="LEGO assembly line under a CAAM RUN banner: 1. SHELF of teal profile cartridges, 2. SCRUB airlock shedding junk bricks, 3. INJECT conveyor, 4. LAUNCH terminal where a CLAUDE robot waits" width="820"></p>
 
 *The launch sequence of `caam run claude`: a profile leaves the shelf, is scrubbed clean of ambient auth, and is injected into the freshly started tool.*
 
-| In the scene | Meaning |
+| Signpost | What the sign can't say |
 |---|---|
-| shelf of teal cartridges | token/endpoint profiles stored in the vault (mode 0600) |
-| lifted cartridge | default-profile resolution — `.active-token` marker, cooldown rotation |
-| airlock shedding grey bricks | ambient auth env scrub (`ANTHROPIC_*`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`…) |
-| conveyor | env injection: the profile's own `CLAUDE_CODE_OAUTH_TOKEN` + per-profile `CLAUDE_CONFIG_DIR` |
-| powered-up terminal | the spawned claude child (PTY, rate-limit watch) |
+| 1. SHELF | profiles live in the vault (mode 0600); the lifted cartridge is default-profile resolution — `.active-token` marker, cooldown rotation |
+| 2. SCRUB | ambient auth env scrub (`ANTHROPIC_*`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`…) |
+| 3. INJECT | the profile's own `CLAUDE_CODE_OAUTH_TOKEN` + per-profile `CLAUDE_CONFIG_DIR` |
 
 <p align="center"><img src="assets/diagrams/token-run-flow.svg" alt="Flow diagram: caam run claude resolves the default token profile, rotates past cooldowns, reads the vaulted token, scrubs ambient auth vars, injects the token env, spawns claude" width="820"></p>
 
