@@ -1,0 +1,27 @@
+Generate 1 LEGO-themed illustration for the caam README hero — caam is a
+CLI that switches AI-coding-CLI accounts instantly from a local credential
+vault instead of the slow browser OAuth login dance.
+Save to /Users/christianmc/projects/caam/assets/ (create the directory).
+
+Image: caam-hero.png, landscape 1536x1024:
+A LEGO diorama scene: on the left, a tangled, deliberately slow mess of
+plain grey LEGO plumbing — looping pipes, valves, and a small grey
+brick-built browser-window panel — that winds overhead and dead-ends at a
+striped barrier (the browser OAuth login dance). On the right, a compact,
+tidy LEGO vault cabinet with rows of small drawers, each drawer glowing
+translucent teal (stored credentials); one short teal-lit chute runs
+straight from an open drawer into a single grey terminal workstation whose
+screen area is a plain glowing teal tile (the instant account swap). Style
+bible: light-grey LEGO terminal-workshop floor on a white seamless
+backdrop, gentle three-quarter camera angle slightly elevated, glowing
+translucent teal is the ONLY accent color, everything else grey/white,
+studio softbox lighting. One minifig engineer pulls the glowing teal drawer
+open mid-swap; a second minifig walks away from the grey pipe maze,
+gesturing toward the vault. Mood: clean, bright, studio-lit
+product-photography style on a plain light backdrop, shallow depth of
+field, photorealistic LEGO render. NO text in the image.
+
+Self-critique: LEGO aesthetic convincing, composition readable at
+README-banner size, no text/typos, the contrast "slow tangled OAuth
+plumbing vs instant teal vault swap" reads instantly. Regenerate until
+good. Return final file paths.

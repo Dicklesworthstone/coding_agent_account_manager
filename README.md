@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="assets/caam-hero.png" alt="LEGO diorama: a tangled grey OAuth pipe maze dead-ending at a barrier, beside a tidy vault of glowing teal credential drawers feeding a terminal" width="900">
+</p>
+
+*Instead of the browser OAuth login dance (left), caam swaps accounts straight from a local credential vault (right) — sub-100ms, no Keychain.*
+
 > **This is a fork** of [Dicklesworthstone/coding_agent_account_manager](https://github.com/Dicklesworthstone/coding_agent_account_manager) (Emanuel's caam). It adds macOS-native multi-account switching for Claude Code through token/env-injection profiles (no Keychain involvement), endpoint profiles, and four providers on top of upstream's file-swap set: deepseek, ollama, quick (Amazon Quick's local desktop agent), and anthropic-compatible endpoints such as GLM and Moonshot/Kimi. Use upstream if file-swap switching for claude/codex/gemini/grok/opencode/cursor covers you; use this fork on macOS, where the Keychain breaks file-swap Claude switching, or when you want the extra providers. The fork ships no releases and no install script; the install instructions below (Homebrew, install.sh, release archives) all fetch upstream builds without the fork's features, so build from source:
 >
 > ```bash
@@ -5,7 +11,7 @@
 > cd coding_agent_account_manager && go build -o caam ./cmd/caam
 > ```
 >
-> The fork's additions are the two sections [macOS multi-account (token profiles)](#macos-multi-account-token-profiles) and [Endpoint profiles & extended providers](#endpoint-profiles--extended-providers); the rest of this README is upstream's.
+> The fork's additions are the two sections [macOS multi-account (token profiles)](#macos-multi-account-token-profiles) and [Endpoint profiles & extended providers](#endpoint-profiles--extended-providers); the rest of this README is upstream's. A guided [visual tour](VISUAL-TOUR.html) (architecture + flow diagrams, sources in [`assets/`](assets/)) covers the whole system.
 
 <p align="center">
   <img src="coding_agent_account_manager_illustration.webp" alt="caam - Coding Agent Account Manager" width="600">
@@ -264,6 +270,10 @@ wait
 
 *Fork addition. This section and the next describe features that exist only in this fork.*
 
+<p align="center"><img src="assets/diagrams/architecture.svg" alt="Architecture: caam CLI over a profile vault and SQLite history, feeding a runner that scrubs and injects env before spawning the child process" width="820"></p>
+
+*How the system is shaped: one CLI over local state; the runner scrubs ambient auth env and injects the profile's own before spawning the child CLI.*
+
 On macOS, recent Claude Code builds keep the OAuth credential in the system Keychain, which has exactly one slot and no way to point the CLI at another. File-swap profiles capture `~/.claude.json` without the credential, so every switch lands on a forced `/login`.
 
 Token profiles sidestep the Keychain entirely. A token profile stores one long-lived token, minted with `claude setup-token`, in the vault (mode 0600) and injects it into the tool's environment at run time; no auth files move and the Keychain is never touched.
@@ -293,6 +303,10 @@ For the default token profile, `caam run claude` and `caam exec claude <name>` i
 **Parallel-safe.** Because nothing is swapped on disk, concurrent sessions cannot race each other's auth state: a `caam run claude` already running as `work` keeps its injected token and config dir even after you activate `personal` for the next session. Zero Keychain prompts throughout.
 
 **Cooldowns and rotation apply.** Token profiles are first-class in health, cooldowns, and rotation. `caam cooldown set claude/work --minutes 30` works as usual, and when the default token profile is cooling down, `caam run claude` rotates to another token profile before launching. Health checks are passive (format/expiry); `caam validate claude work --active` makes one cheap authenticated call against Claude's OAuth usage endpoint to confirm the token is live.
+
+<p align="center"><img src="assets/diagrams/token-run-flow.svg" alt="Flow: caam run claude resolves the default token profile, rotates past cooldowns, reads the vaulted token, scrubs ambient auth vars, injects the token env, spawns claude" width="560"></p>
+
+*How a run moves: resolve the default token profile (rotating past cooldowns), read the vaulted token, scrub ambient auth vars, inject, spawn.*
 
 ---
 
@@ -326,6 +340,10 @@ Notes:
 - **Anthropic-compatible endpoints** (GLM, Moonshot/Kimi, anything else speaking the Anthropic API) reuse the `claude` provider: `--base-url` points the `claude` binary at the service with its issued token, isolated in its own `CLAUDE_CONFIG_DIR`. A claude endpoint profile must always name its base URL; there is no default, and the URL must be `https://` (the bearer token would travel cleartext over plain http). `http`/`ws` remain accepted for ollama and quick, which are localhost-typical.
 - **ollama** endpoint profiles take no token at all; `caam token add ollama <name>` reads nothing from stdin.
 - Endpoint profiles show as `name [endpoint]` in `caam ls` and `name (endpoint)` in `caam status`.
+
+<p align="center"><img src="assets/diagrams/provider-credential-map.svg" alt="Map of credential kinds: upstream file-swap vault vs the fork's token profiles and endpoint profiles, all feeding caam run/exec" width="820"></p>
+
+*Three credential kinds: upstream's file-swap vault, and the fork's token and endpoint profiles — both env-injected at launch.*
 
 ---
 
