@@ -193,9 +193,29 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("provider %s not found in registry", tool)
 	}
 
-	// Get active profile
+	// Get active profile. A token-profile default takes precedence: token
+	// profiles never touch the live auth files, so they are resolved by the
+	// explicit .active-token marker, not by live-file comparison.
+	var tokenEnv map[string]string
 	fileSet := tools[tool]()
-	activeProfileName, _ := vault.ActiveProfile(fileSet)
+	var activeProfileName string
+	if tokenProfile, _ := vault.ActiveTokenProfile(tool); tokenProfile != "" {
+		// Cooldowns are first-class for token profiles: if the default is
+		// cooling down, rotate to another token profile.
+		tokenProfile = rotateTokenProfileIfCoolingDown(tool, tokenProfile, db, selector, quiet)
+
+		token, _, err := vault.ReadTokenProfile(tool, tokenProfile)
+		if err != nil {
+			return fmt.Errorf("read token profile %s/%s: %w", tool, tokenProfile, err)
+		}
+		tokenEnv, err = authfile.TokenEnv(tool, tokenProfile, token)
+		if err != nil {
+			return err
+		}
+		activeProfileName = tokenProfile
+	} else {
+		activeProfileName, _ = vault.ActiveProfile(fileSet)
+	}
 	if activeProfileName == "" {
 		// If no active profile, try to select one
 		profiles, err := vault.List(tool)
@@ -210,8 +230,18 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("no profile selected for %s", tool)
 		}
 		activeProfileName = res.Selected
-		// Restore it
-		if err := vault.Restore(fileSet, activeProfileName); err != nil {
+		if vault.IsTokenProfile(tool, activeProfileName) {
+			// Rotation picked a token profile: inject env instead of swapping.
+			token, _, err := vault.ReadTokenProfile(tool, activeProfileName)
+			if err != nil {
+				return fmt.Errorf("read token profile %s/%s: %w", tool, activeProfileName, err)
+			}
+			tokenEnv, err = authfile.TokenEnv(tool, activeProfileName, token)
+			if err != nil {
+				return err
+			}
+			_ = vault.SetActiveTokenProfile(tool, activeProfileName)
+		} else if err := vault.Restore(fileSet, activeProfileName); err != nil {
 			return fmt.Errorf("activate profile: %w", err)
 		}
 	}
@@ -241,13 +271,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Set CLI overrides
 	// Cooldown duration is now passed directly to SmartRunner via opts.CooldownDuration
 
-	// Run
+	// Run. For token profiles, Env carries the injected token variables (they
+	// override the scrubbed ambient API keys); for file-swap profiles it is
+	// nil and auth comes from the restored files.
 	runOptions := exec.RunOptions{
 		Profile:      prof,
 		Provider:     prov,
 		Args:         cliArgs,
 		WorkDir:      cwd,
-		Env:          nil,  // Inherit
+		Env:          tokenEnv,
 		UseGlobalEnv: true, // Force global environment for vault-based switching
 	}
 
@@ -283,6 +315,38 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	}
 
 	return err
+}
+
+// rotateTokenProfileIfCoolingDown returns the token profile to use for this
+// run. If the current default is in an active cooldown and another token
+// profile is available, the rotation selector picks a replacement (which
+// becomes the new default). Falls back to the current profile on any error so
+// a rotation hiccup never blocks execution.
+func rotateTokenProfileIfCoolingDown(tool, current string, db *caamdb.DB, selector *rotation.Selector, quiet bool) string {
+	if db == nil || selector == nil {
+		return current
+	}
+	ev, err := db.ActiveCooldown(tool, current, time.Now().UTC())
+	if err != nil || ev == nil {
+		return current
+	}
+
+	candidates, err := vault.ListTokenProfiles(tool)
+	if err != nil || len(candidates) <= 1 {
+		return current
+	}
+	res, err := selector.Select(tool, candidates, current)
+	if err != nil || res == nil || res.Selected == "" || res.Selected == current {
+		return current
+	}
+	if err := vault.SetActiveTokenProfile(tool, res.Selected); err != nil {
+		return current
+	}
+	if !quiet {
+		fmt.Fprintf(os.Stderr, "caam: token profile %s/%s is in cooldown, switched to %s/%s\n",
+			tool, current, tool, res.Selected)
+	}
+	return res.Selected
 }
 
 // runPrecheck checks current usage levels and switches profile if near limit.

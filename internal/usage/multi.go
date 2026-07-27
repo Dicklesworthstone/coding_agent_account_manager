@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 )
 
@@ -346,6 +348,11 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 
 		switch provider {
 		case "claude":
+			// Token profiles store the raw token directly.
+			if tok, err := readTokenProfileFile(profileDir); err == nil {
+				token, readErr = tok, nil
+				break
+			}
 			// Try new location first
 			credPath := filepath.Join(profileDir, ".credentials.json")
 			token, _, readErr = ReadClaudeCredentials(credPath)
@@ -374,4 +381,33 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 	}
 
 	return credentials, nil
+}
+
+// readTokenProfileFile reads the raw token from a token profile directory in
+// the vault (marked by a meta.json with type "token"). Returns an error for
+// non-token profile directories so callers fall back to auth-file parsing.
+func readTokenProfileFile(profileDir string) (string, error) {
+	metaData, err := os.ReadFile(filepath.Join(profileDir, authfile.TokenMetaFileName))
+	if err != nil {
+		return "", err
+	}
+	var meta struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(metaData, &meta); err != nil {
+		return "", fmt.Errorf("parse token meta: %w", err)
+	}
+	if meta.Type != authfile.ProfileTypeToken {
+		return "", fmt.Errorf("not a token profile")
+	}
+
+	data, err := os.ReadFile(filepath.Join(profileDir, authfile.TokenFileName))
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("token file is empty")
+	}
+	return token, nil
 }

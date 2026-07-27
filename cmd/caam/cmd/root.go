@@ -787,6 +787,9 @@ type statusTool struct {
 	Tool          string `json:"tool"`
 	LoggedIn      bool   `json:"logged_in"`
 	ActiveProfile string `json:"active_profile,omitempty"`
+	// ProfileType is "token" when the active profile is a token (env-injection)
+	// profile; empty for file-swap profiles.
+	ProfileType string `json:"profile_type,omitempty"`
 	// SavedProfiles is the number of vault profiles saved for this tool. It is
 	// populated when the tool is logged in but the live auth matches no saved
 	// profile, so JSON consumers can reconcile `status` with `ls` (issue #20).
@@ -852,6 +855,41 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	for _, tool := range toolsToCheck {
 		fileSet := tools[tool]()
 		hasAuth := authfile.HasAuthFiles(fileSet)
+
+		// A token-profile default takes precedence: it is what run/exec will
+		// use, regardless of the live auth files on disk.
+		if tokenProfile, _ := vault.ActiveTokenProfile(tool); tokenProfile != "" {
+			ph, status := tokenProfileHealth(tool, tokenProfile)
+
+			if jsonOutput {
+				st := statusTool{
+					Tool:          tool,
+					LoggedIn:      true,
+					ActiveProfile: tokenProfile,
+					ProfileType:   authfile.ProfileTypeToken,
+					Health: &statusHealth{
+						Status:     status.String(),
+						ErrorCount: ph.ErrorCount1h,
+					},
+				}
+				if cooldownStr := getCooldownString(tool, tokenProfile, health.FormatOptions{NoColor: true}); cooldownStr != "" {
+					st.Health.CooldownRemaining = cooldownStr
+				}
+				output.Tools = append(output.Tools, st)
+			} else {
+				healthStr := health.FormatStatusWithReason(status, ph, formatOpts)
+				if cooldownStr := getCooldownString(tool, tokenProfile, formatOpts); cooldownStr != "" {
+					healthStr = healthStr + " " + cooldownStr
+				}
+				fmt.Printf("%-10s  %-20s  %-24s  %-10s  %s\n", tool, tokenProfile+" (token)", "-", "-", healthStr)
+			}
+
+			if status == health.StatusWarning || status == health.StatusCritical {
+				detailedStatus := health.FormatStatusWithReason(status, ph, health.FormatOptions{NoColor: true})
+				warnings = append(warnings, fmt.Sprintf("%s/%s: %s", tool, tokenProfile, detailedStatus))
+			}
+			continue
+		}
 
 		if !hasAuth {
 			if jsonOutput {
@@ -1003,10 +1041,13 @@ type lsOutput struct {
 }
 
 type lsProfile struct {
-	Tool     string             `json:"tool"`
-	Name     string             `json:"name"`
-	Active   bool               `json:"active"`
-	System   bool               `json:"system"`
+	Tool   string `json:"tool"`
+	Name   string `json:"name"`
+	Active bool   `json:"active"`
+	System bool   `json:"system"`
+	// Type is "token" for token (env-injection) profiles; empty for
+	// file-swap profiles.
+	Type     string             `json:"type,omitempty"`
 	Health   lsHealth           `json:"health"`
 	Identity *identity.Identity `json:"identity,omitempty"`
 }
@@ -1103,10 +1144,21 @@ func runLs(cmd *cobra.Command, args []string) error {
 		// Check which is active
 		fileSet := tools[tool]()
 		activeProfile, _ := vault.ActiveProfile(fileSet)
+		if tokenActive, _ := vault.ActiveTokenProfile(tool); tokenActive != "" {
+			// A token-profile default overrides live-file matching: it is what
+			// run/exec will actually use.
+			activeProfile = tokenActive
+		}
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
-			status := health.CalculateStatus(ph)
+			isToken := vault.IsTokenProfile(tool, p)
+			var status health.HealthStatus
+			if isToken {
+				ph, status = tokenProfileHealth(tool, p)
+			} else {
+				status = health.CalculateStatus(ph)
+			}
 
 			if jsonOutput {
 				lp := lsProfile{
@@ -1114,6 +1166,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Name:   p,
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
+					Type:   lsProfileType(isToken),
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
@@ -1133,6 +1186,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 				displayName := p
 				if authfile.IsSystemProfile(p) {
 					displayName = fmt.Sprintf("%s [system]", p)
+				}
+				if isToken {
+					displayName = fmt.Sprintf("%s [token]", displayName)
 				}
 
 				email, plan := formatIdentityDisplay(id)
@@ -1191,6 +1247,11 @@ func runLs(cmd *cobra.Command, args []string) error {
 	for tool, profiles := range allProfiles {
 		fileSet := tools[tool]()
 		activeProfile, _ := vault.ActiveProfile(fileSet)
+		if tokenActive, _ := vault.ActiveTokenProfile(tool); tokenActive != "" {
+			// A token-profile default overrides live-file matching: it is what
+			// run/exec will actually use.
+			activeProfile = tokenActive
+		}
 
 		if !jsonOutput {
 			fmt.Printf("%s:\n", tool)
@@ -1199,7 +1260,13 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
-			status := health.CalculateStatus(ph)
+			isToken := vault.IsTokenProfile(tool, p)
+			var status health.HealthStatus
+			if isToken {
+				ph, status = tokenProfileHealth(tool, p)
+			} else {
+				status = health.CalculateStatus(ph)
+			}
 
 			if jsonOutput {
 				lp := lsProfile{
@@ -1207,6 +1274,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Name:   p,
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
+					Type:   lsProfileType(isToken),
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
@@ -1227,6 +1295,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 				if authfile.IsSystemProfile(p) {
 					displayName = fmt.Sprintf("%s [system]", p)
 				}
+				if isToken {
+					displayName = fmt.Sprintf("%s [token]", displayName)
+				}
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
@@ -1241,6 +1312,14 @@ func runLs(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// lsProfileType maps the token-profile flag to the lsProfile.Type value.
+func lsProfileType(isToken bool) string {
+	if isToken {
+		return authfile.ProfileTypeToken
+	}
+	return ""
 }
 
 func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
@@ -2019,20 +2098,55 @@ Examples:
 			return fmt.Errorf("unknown provider: %s", tool)
 		}
 
-		prof, err := profileStore.Load(tool, name)
-		if err != nil {
-			return err
-		}
-
 		ctx := context.Background()
 		noLock, _ := cmd.Flags().GetBool("no-lock")
 
-		runErr := runner.Run(ctx, exec.RunOptions{
-			Profile:  prof,
-			Provider: prov,
-			Args:     toolArgs,
-			NoLock:   noLock,
-		})
+		// Token profiles run via env injection: no isolated profile home is
+		// needed, the token and per-profile config dir are passed in the
+		// environment.
+		var runOpts exec.RunOptions
+		if vault != nil && vault.IsTokenProfile(tool, name) {
+			token, _, err := vault.ReadTokenProfile(tool, name)
+			if err != nil {
+				return err
+			}
+			env, err := authfile.TokenEnv(tool, name, token)
+			if err != nil {
+				return err
+			}
+			prof, err := profileStore.Load(tool, name)
+			if err != nil {
+				// Token profiles usually exist only in the vault; use a
+				// transient profile object so locking has a stable home.
+				prof = &profile.Profile{
+					Name:     name,
+					Provider: tool,
+					AuthMode: "token",
+					BasePath: profileStore.ProfilePath(tool, name),
+				}
+			}
+			runOpts = exec.RunOptions{
+				Profile:      prof,
+				Provider:     prov,
+				Args:         toolArgs,
+				NoLock:       noLock,
+				Env:          env,
+				UseGlobalEnv: true, // env injection needs the real HOME
+			}
+		} else {
+			prof, err := profileStore.Load(tool, name)
+			if err != nil {
+				return err
+			}
+			runOpts = exec.RunOptions{
+				Profile:  prof,
+				Provider: prov,
+				Args:     toolArgs,
+				NoLock:   noLock,
+			}
+		}
+
+		runErr := runner.Run(ctx, runOpts)
 
 		// A non-zero exit from the wrapped tool is a runtime failure of that
 		// tool, not a misuse of caam. Suppress the Cobra usage block and the

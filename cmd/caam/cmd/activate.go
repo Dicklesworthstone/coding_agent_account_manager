@@ -283,6 +283,46 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Token profiles: activation records the profile as the default for
+	// run/exec env injection. No auth files are swapped, so the file-swap
+	// machinery below (refresh, backup, re-snapshot, restore) is skipped.
+	// Cooldown enforcement above applies to token profiles too.
+	if vault.IsTokenProfile(tool, profileName) {
+		if err := vault.SetActiveTokenProfile(tool, profileName); err != nil {
+			return emitJSONError(fmt.Errorf("activate token profile: %w", err))
+		}
+
+		if healthStore != nil {
+			h, _ := healthStore.GetProfile(tool, profileName)
+			if h == nil {
+				h = &health.ProfileHealth{}
+			}
+			h.LastActivatedAt = time.Now()
+			_ = healthStore.UpdateProfile(tool, profileName, h)
+		}
+
+		if spmCfg.Analytics.Enabled && db != nil {
+			logProfileSwitch(db, tool, previousProfile, profileName, map[string]any{
+				"previous_profile": previousProfile,
+				"selection_source": source,
+				"profile_type":     "token",
+			})
+		}
+
+		output.Profile = profileName
+		output.Success = true
+
+		if jsonOutput {
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			return enc.Encode(output)
+		}
+
+		fmt.Printf("Activated %s token profile '%s'\n", tool, profileName)
+		fmt.Printf("  It is now the default for 'caam run %s' / 'caam exec %s %s' (env injection)\n", tool, tool, profileName)
+		return nil
+	}
+
 	// Step 1: Refresh if needed
 	refreshed := refreshIfNeeded(cmd.Context(), tool, profileName, jsonOutput)
 	output.Refreshed = refreshed
@@ -397,6 +437,10 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	if err := vault.Restore(fileSet, profileName); err != nil {
 		return emitJSONError(fmt.Errorf("activate failed: %w", err))
 	}
+
+	// A file-swap profile is now active: clear any token-profile default so
+	// run/exec pick up the restored auth files instead of injecting a token.
+	_ = vault.ClearActiveTokenProfile(tool)
 
 	// Record activation timestamp in health store
 	if healthStore != nil {

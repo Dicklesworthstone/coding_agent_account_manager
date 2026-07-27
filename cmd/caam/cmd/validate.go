@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -89,12 +90,13 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Active validation against saved vault profiles is not implemented; vault
-	// profiles are raw auth files, not isolated profile homes. Surface this on
-	// stderr (diagnostics) and proceed with passive validation rather than
-	// silently pretending to make API calls.
+	// Active validation against saved file-swap vault profiles is not
+	// implemented; those are raw auth files, not isolated profile homes.
+	// Token profiles DO support --active (a single cheap API probe). Surface
+	// the limitation on stderr (diagnostics) and proceed rather than silently
+	// pretending to make API calls for file-swap profiles.
 	if validateActive {
-		fmt.Fprintln(os.Stderr, "note: --active is not supported for saved vault profiles; performing passive validation")
+		fmt.Fprintln(os.Stderr, "note: --active applies to token profiles only; file-swap vault profiles are validated passively")
 	}
 
 	results := []ValidationOutput{}
@@ -115,6 +117,10 @@ func runValidate(cmd *cobra.Command, args []string) error {
 				continue // Skip _original / _backup_* system profiles
 			}
 			if profileFilter != "" && profileName != profileFilter {
+				continue
+			}
+			if vault.IsTokenProfile(tool, profileName) {
+				results = append(results, validateTokenProfile(cmd.Context(), tool, profileName, validateActive))
 				continue
 			}
 			results = append(results, validateVaultProfile(tool, profileName))
@@ -182,6 +188,53 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		out.Valid = true
 		if !info.ExpiresAt.IsZero() {
 			out.ExpiresAt = formatExpiryTime(info.ExpiresAt)
+		}
+	}
+
+	return out
+}
+
+// validateTokenProfile validates a token profile. Passive validation checks
+// that the token is present and plausibly shaped (no network). With active=
+// true, a single cheap API probe confirms the token is live; an inconclusive
+// probe (network trouble) falls back to the passive verdict rather than
+// reporting the token as invalid.
+func validateTokenProfile(ctx context.Context, tool, profileName string, active bool) ValidationOutput {
+	out := ValidationOutput{
+		Provider:  tool,
+		Profile:   profileName,
+		Method:    "passive",
+		CheckedAt: time.Now(),
+	}
+
+	token, _, err := vault.ReadTokenProfile(tool, profileName)
+	if err != nil {
+		out.Valid = false
+		out.Error = err.Error()
+		return out
+	}
+	if err := authfile.ValidateTokenFormat(tool, token); err != nil {
+		out.Valid = false
+		out.Error = err.Error()
+		return out
+	}
+	out.Valid = true
+
+	if active {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		valid, err := probeToken(ctx, tool, token)
+		switch {
+		case err != nil:
+			// Inconclusive: keep the passive verdict, note the probe failure.
+			out.Error = fmt.Sprintf("active probe inconclusive: %v", err)
+		case valid:
+			out.Method = "active"
+		default:
+			out.Method = "active"
+			out.Valid = false
+			out.Error = "provider rejected token (unauthorized)"
 		}
 	}
 

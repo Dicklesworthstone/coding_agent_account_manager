@@ -338,11 +338,19 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	// 2. Select best backup profile
 	r.setState(SelectingBackup)
 
-	// Get all profiles
-	profiles, err := r.vault.List(r.loginHandler.Provider())
+	// Get all profiles. Token profiles are excluded here: this handoff path
+	// swaps auth files on disk mid-session, which cannot inject a token
+	// profile's environment into the already-running process.
+	allProfiles, err := r.vault.List(r.loginHandler.Provider())
 	if err != nil {
 		r.failWithManual("failed to list profiles: %v", err)
 		return
+	}
+	profiles := allProfiles[:0:0]
+	for _, p := range allProfiles {
+		if !r.vault.IsTokenProfile(r.loginHandler.Provider(), p) {
+			profiles = append(profiles, p)
+		}
 	}
 
 	// Select best
