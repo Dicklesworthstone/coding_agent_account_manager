@@ -263,3 +263,46 @@ func TestValidateTokenFormat(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateTokenFormat_NeverEchoesTokenBytes(t *testing.T) {
+	// A "token" that fails the format check may be a mispasted secret of some
+	// other kind; error messages must describe it (length + prefix class)
+	// without echoing any of its bytes.
+	cases := []struct {
+		tool  string
+		token string
+	}{
+		{"claude", "hunter2-super-secret-password"},
+		{"deepseek", "AKIAIOSFODNN7EXAMPLE"},
+	}
+	for _, tc := range cases {
+		err := ValidateTokenFormat(tc.tool, tc.token)
+		if err == nil {
+			t.Errorf("ValidateTokenFormat(%s, mispasted secret) = nil, want error", tc.tool)
+			continue
+		}
+		msg := err.Error()
+		for n := 4; n <= len(tc.token); n++ {
+			if strings.Contains(msg, tc.token[:n]) {
+				t.Errorf("%s error message echoes token bytes %q: %s", tc.tool, tc.token[:n], msg)
+				break
+			}
+		}
+		if !strings.Contains(msg, "chars") {
+			t.Errorf("%s error message should describe token length: %s", tc.tool, msg)
+		}
+	}
+
+	// The prefix-class description itself stays non-sensitive: a deepseek-shaped
+	// key pasted for claude is reported by class, not by content.
+	err := ValidateTokenFormat("claude", "sk-proj-something-that-is-not-anthropic")
+	if err == nil {
+		t.Fatal("expected error for non-anthropic sk- token")
+	}
+	if strings.Contains(err.Error(), "sk-proj") {
+		t.Errorf("error message echoes token bytes beyond the class: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "sk-* prefix") {
+		t.Errorf("error message should carry the detected prefix class: %s", err.Error())
+	}
+}

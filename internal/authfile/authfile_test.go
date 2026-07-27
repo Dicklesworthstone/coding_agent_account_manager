@@ -1732,3 +1732,42 @@ func TestVaultCopyProfile(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateVaultSegment_RejectsLeadingDot(t *testing.T) {
+	invalid := []string{
+		".active-token", // would collide with the vault's active-token marker
+		".hidden",
+		".",
+		"..",
+	}
+	for _, name := range invalid {
+		if _, err := validateVaultSegment("profile", name); err == nil {
+			t.Errorf("validateVaultSegment(%q) = nil error, want rejection", name)
+		}
+	}
+
+	valid := []string{"work", "user@example.com", "a.b", "burst-2"}
+	for _, name := range valid {
+		got, err := validateVaultSegment("profile", name)
+		if err != nil {
+			t.Errorf("validateVaultSegment(%q) unexpected error: %v", name, err)
+		}
+		if got != name {
+			t.Errorf("validateVaultSegment(%q) = %q, want unchanged", name, got)
+		}
+	}
+}
+
+func TestSaveTokenProfile_RejectsActiveTokenMarkerName(t *testing.T) {
+	v := NewVault(t.TempDir())
+	if err := v.SaveTokenProfile("claude", ".active-token", "sk-ant-oat01-test-token-value", "test"); err == nil {
+		t.Fatal("SaveTokenProfile accepted profile name .active-token; it would shadow the marker file")
+	}
+	// The marker path must remain usable as a plain file.
+	if err := v.SaveTokenProfile("claude", "work", "sk-ant-oat01-test-token-value", "test"); err != nil {
+		t.Fatalf("SaveTokenProfile(work) error: %v", err)
+	}
+	if err := v.SetActiveTokenProfile("claude", "work"); err != nil {
+		t.Fatalf("SetActiveTokenProfile error after leading-dot rejection: %v", err)
+	}
+}

@@ -63,17 +63,23 @@ type RunOptions struct {
 	UseGlobalEnv bool
 }
 
-// authEnvVarsToUnset lists globally exported API-key env vars that must not
-// leak into a vault-switched session: auth should come from the swapped files,
-// not from an ambient key that can collapse multiple profiles onto the same
-// account.
+// authEnvVarsToUnset lists globally exported auth env vars that must not leak
+// into a profile-switched session: auth should come from the profile (swapped
+// files, isolated profile home, or injected env), not from an ambient value
+// that can collapse multiple profiles onto the same account.
 func authEnvVarsToUnset(providerID string) []string {
 	switch strings.ToLower(strings.TrimSpace(providerID)) {
 	case "claude":
 		// ANTHROPIC_AUTH_TOKEN/ANTHROPIC_BASE_URL are scrubbed too: an ambient
 		// anthropic-compatible redirect (GLM/Moonshot) would otherwise hijack
 		// token profiles, and endpoint profiles re-inject their own values.
-		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+		// CLAUDE_CODE_OAUTH_TOKEN/CLAUDE_CONFIG_DIR likewise: token profiles
+		// re-inject both per profile, and a stale ambient value from a parent
+		// shell would pin every profile to one account/config dir.
+		return []string{
+			"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+			"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+		}
 	case "codex":
 		return []string{"OPENAI_API_KEY"}
 	case "gemini":
@@ -92,6 +98,48 @@ func authEnvVarsToUnset(providerID string) []string {
 	default:
 		return nil
 	}
+}
+
+// buildProcessEnv assembles the child-process environment shared by
+// Runner.Run (pipe path) and SmartRunner.Run (PTY path):
+//
+//  1. inherit the parent environment
+//  2. scrub the provider's ambient auth vars (authEnvVarsToUnset): auth must
+//     come from the profile, never from an ambient key that can collapse
+//     multiple profiles onto the same account
+//  3. apply providerEnv (isolated-profile HOME/XDG/CLAUDE_CONFIG_DIR, ...)
+//  4. apply extraEnv (opts.Env: token/endpoint profile injection)
+//
+// Later stages override earlier ones, so values injected by the provider or
+// the profile always win over the scrub. The scrub is unconditional: it
+// protects vault-based runs (UseGlobalEnv) and isolated-home exec runs alike.
+func buildProcessEnv(providerID string, providerEnv, extraEnv map[string]string) []string {
+	envMap := make(map[string]string)
+
+	for _, e := range os.Environ() {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+
+	for _, name := range authEnvVarsToUnset(providerID) {
+		delete(envMap, name)
+	}
+
+	for k, v := range providerEnv {
+		envMap[k] = v
+	}
+
+	for k, v := range extraEnv {
+		envMap[k] = v
+	}
+
+	env := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 // ExitCodeError wraps a process exit code.
@@ -171,41 +219,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 	bin := opts.Provider.DefaultBin()
 	cmd := exec.CommandContext(ctx, bin, opts.Args...)
 
-	// Set up environment with deduplication (last one wins in our map logic)
-	envMap := make(map[string]string)
-
-	// 1. Start with inherited environment
-	for _, e := range os.Environ() {
-		parts := strings.SplitN(e, "=", 2)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-
-	// In vault-based switching mode, auth should come from the swapped files,
-	// not from a globally exported API key that can collapse multiple profiles
-	// onto the same account.
-	if opts.UseGlobalEnv {
-		for _, name := range authEnvVarsToUnset(opts.Provider.ID()) {
-			delete(envMap, name)
-		}
-	}
-
-	// 2. Apply provider environment (overrides inherited)
-	for k, v := range providerEnv {
-		envMap[k] = v
-	}
-
-	// 3. Apply custom environment options (overrides provider)
-	for k, v := range opts.Env {
-		envMap[k] = v
-	}
-
-	// Reassemble into slice
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Assemble the child environment: inherit, scrub ambient auth vars, then
+	// apply provider env and explicit opts.Env (which always win).
+	cmd.Env = buildProcessEnv(opts.Provider.ID(), providerEnv, opts.Env)
 
 	// Set working directory
 	if opts.WorkDir != "" {

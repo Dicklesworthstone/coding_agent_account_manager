@@ -220,24 +220,9 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	bin := opts.Provider.DefaultBin()
 	cmd := ExecCommand(ctx, bin, opts.Args...)
 
-	// Apply env (same as Runner.Run)
-	envMap := make(map[string]string)
-	for _, e := range os.Environ() {
-		parts := splitEnv(e)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	for k, v := range providerEnv {
-		envMap[k] = v
-	}
-	for k, v := range opts.Env {
-		envMap[k] = v
-	}
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Apply env via the shared helper (same as Runner.Run): inherit, scrub
+	// ambient auth vars, then providerEnv and opts.Env (which always win).
+	cmd.Env = buildProcessEnv(opts.Provider.ID(), providerEnv, opts.Env)
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
 	}
@@ -590,13 +575,4 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 		}
 		// In drain mode, continue looping without delay until ReadOutput returns EOF
 	}
-}
-
-func splitEnv(s string) []string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '=' {
-			return []string{s[:i], s[i+1:]}
-		}
-	}
-	return []string{s}
 }

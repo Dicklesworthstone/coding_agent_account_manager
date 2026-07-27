@@ -972,3 +972,126 @@ func TestRun_NoFalseTTYDetection(t *testing.T) {
 		t.Errorf("NeedsTTY = true for a non-TTY failure; want false")
 	}
 }
+
+// =============================================================================
+// buildProcessEnv Tests (shared env assembly for Runner.Run and SmartRunner.Run)
+// =============================================================================
+
+func envSliceToMap(t *testing.T, env []string) map[string]string {
+	t.Helper()
+	m := make(map[string]string, len(env))
+	for _, e := range env {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) != 2 {
+			t.Fatalf("malformed env entry %q", e)
+		}
+		m[parts[0]] = parts[1]
+	}
+	return m
+}
+
+func TestBuildProcessEnv_ScrubProviderExtraOrdering(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "ambient-key")
+	t.Setenv("CAAM_TEST_CANARY", "survives")
+
+	t.Run("ambient auth var is scrubbed", func(t *testing.T) {
+		env := envSliceToMap(t, buildProcessEnv("gemini", nil, nil))
+		if _, ok := env["GEMINI_API_KEY"]; ok {
+			t.Error("ambient GEMINI_API_KEY leaked through the scrub")
+		}
+		if env["CAAM_TEST_CANARY"] != "survives" {
+			t.Error("unrelated inherited env var was dropped")
+		}
+	})
+
+	t.Run("provider env overrides inherited and survives scrub", func(t *testing.T) {
+		env := envSliceToMap(t, buildProcessEnv("gemini",
+			map[string]string{"HOME": "/isolated", "GEMINI_API_KEY": "provider-key"}, nil))
+		if env["HOME"] != "/isolated" {
+			t.Errorf("HOME = %q, want provider-injected /isolated", env["HOME"])
+		}
+		if env["GEMINI_API_KEY"] != "provider-key" {
+			t.Errorf("GEMINI_API_KEY = %q, want provider-injected value to win over scrub", env["GEMINI_API_KEY"])
+		}
+	})
+
+	t.Run("opts.Env wins over provider env and scrub", func(t *testing.T) {
+		env := envSliceToMap(t, buildProcessEnv("gemini",
+			map[string]string{"GEMINI_API_KEY": "provider-key"},
+			map[string]string{"GEMINI_API_KEY": "profile-key"}))
+		if env["GEMINI_API_KEY"] != "profile-key" {
+			t.Errorf("GEMINI_API_KEY = %q, want opts.Env value to win", env["GEMINI_API_KEY"])
+		}
+	})
+}
+
+func TestRun_FileSwapExecScrubsAmbientAuthEnv(t *testing.T) {
+	// `caam exec <tool> <profile>` file-swap runs build RunOptions WITHOUT
+	// UseGlobalEnv; the ambient-auth scrub must still apply while the
+	// provider's isolation env (HOME/XDG/CLAUDE_CONFIG_DIR) is preserved.
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "test",
+		Provider: "claude",
+		BasePath: tmpDir,
+	}
+	if err := os.MkdirAll(prof.BasePath, 0700); err != nil {
+		t.Fatalf("Failed to create profile dir: %v", err)
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "shared-key")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-ambient")
+
+	profileCfg := filepath.Join(tmpDir, "claude-config")
+	mock := &mockProvider{
+		id:         "claude",
+		defaultBin: "sh",
+		envVars:    map[string]string{"CLAUDE_CONFIG_DIR": profileCfg},
+	}
+
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:  prof,
+		Provider: mock,
+		Args: []string{"-c",
+			`test -z "${ANTHROPIC_API_KEY:-}" && test -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && test "$CLAUDE_CONFIG_DIR" = "` + profileCfg + `"`},
+		NoLock: true,
+		// UseGlobalEnv deliberately unset: file-swap exec path.
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v (ambient auth env leaked into file-swap exec, or provider env lost?)", err)
+	}
+}
+
+func TestRun_UseGlobalEnvScrubsClaudeOAuthTokenAndConfigDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "test",
+		Provider: "claude",
+		BasePath: tmpDir,
+	}
+	if err := os.MkdirAll(prof.BasePath, 0700); err != nil {
+		t.Fatalf("Failed to create profile dir: %v", err)
+	}
+
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-ambient")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/stale/parent/config")
+
+	mock := &mockProvider{
+		id:         "claude",
+		defaultBin: "sh",
+		envVars:    map[string]string{},
+	}
+
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:      prof,
+		Provider:     mock,
+		Args:         []string{"-c", `test -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && test -z "${CLAUDE_CONFIG_DIR:-}"`},
+		NoLock:       true,
+		UseGlobalEnv: true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v (ambient CLAUDE_CODE_OAUTH_TOKEN/CLAUDE_CONFIG_DIR leaked?)", err)
+	}
+}

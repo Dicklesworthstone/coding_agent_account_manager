@@ -94,14 +94,14 @@ var tokenImportCmd = &cobra.Command{
 profile. Recognized pattern: claude-<name>-token (e.g. claude-burst-token
 imports as claude/burst).
 
-The default directory is ~/.config/veup, the conventional home of tokens
-minted with 'claude setup-token'. Source files are only read, never modified
-or removed. Existing profiles are skipped unless --force is given.
+--dir is required: point it at wherever you keep tokens minted with
+'claude setup-token' (for example ~/.config/veup or ~/.config/tokens).
+Source files are only read, never modified or removed. Existing profiles
+are skipped unless --force is given.
 
 Examples:
-  caam token import
-  caam token import --dir /path/to/tokens
-  caam token import --force   # overwrite existing profiles`,
+  caam token import --dir ~/.config/veup
+  caam token import --dir /path/to/tokens --force   # overwrite existing profiles`,
 	Args: cobra.NoArgs,
 	RunE: runTokenImport,
 }
@@ -135,7 +135,7 @@ func init() {
 	tokenAddCmd.Flags().String("endpoint", "", "endpoint URL: store an endpoint profile instead of a plain token profile")
 	tokenAddCmd.Flags().String("base-url", "", "alias for --endpoint (anthropic-compatible base URL for claude)")
 
-	tokenImportCmd.Flags().String("dir", "", "directory to scan (default ~/.config/veup)")
+	tokenImportCmd.Flags().String("dir", "", "directory to scan for claude-<name>-token files (required; e.g. ~/.config/veup)")
 	tokenImportCmd.Flags().Bool("force", false, "overwrite existing profiles")
 	tokenImportCmd.Flags().Bool("json", false, "output as JSON")
 
@@ -291,16 +291,6 @@ func runTokenAdd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// defaultTokenImportDir is the conventional location of pre-existing token
-// files minted with `claude setup-token`.
-func defaultTokenImportDir() string {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(homeDir, ".config", "veup")
-}
-
 // tokenImportCandidate is one importable token file found by the scanner.
 type tokenImportCandidate struct {
 	Provider string
@@ -359,10 +349,10 @@ func runTokenImport(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 
 	if dir == "" {
-		dir = defaultTokenImportDir()
-	}
-	if dir == "" {
-		return fmt.Errorf("cannot determine import directory (no home dir); use --dir")
+		return fmt.Errorf("--dir is required: the directory to scan for claude-<name>-token files\n" +
+			"(common locations: ~/.config/veup, ~/.config/tokens, or wherever you saved\n" +
+			"the output of 'claude setup-token'), e.g.:\n\n" +
+			"  caam token import --dir ~/.config/veup")
 	}
 
 	candidates, err := scanTokenImportDir(dir)

@@ -1,6 +1,10 @@
 package exec
 
 import (
+	"context"
+	"os"
+	osexec "os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -8,6 +12,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
@@ -247,5 +252,95 @@ func TestSmartRunner_WithRotation(t *testing.T) {
 
 	if sr.rotation != selector {
 		t.Error("rotation selector not set correctly")
+	}
+}
+
+// =============================================================================
+// SmartRunner PTY-path env scrub tests
+// =============================================================================
+
+// captureSmartRunnerCmdEnv runs SmartRunner.Run for the codex provider (which
+// has a login handler and therefore takes the PTY path) with ExecCommand
+// mocked to capture the *exec.Cmd handed to the PTY controller. The env
+// assertions are made on the captured command, so the test proves what the
+// PTY child would receive even on machines where the PTY itself cannot start
+// (Run errors from pty setup are tolerated).
+func captureSmartRunnerCmdEnv(t *testing.T, extraEnv map[string]string) map[string]string {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(tmpDir, 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	prof := &profile.Profile{
+		Name:     "test",
+		Provider: "codex",
+		BasePath: tmpDir,
+	}
+
+	mock := &mockProvider{
+		id:         "codex",
+		defaultBin: "true",
+		envVars:    map[string]string{"CODEX_HOME": filepath.Join(tmpDir, "codex-home")},
+	}
+
+	var captured *osexec.Cmd
+	origExec := ExecCommand
+	ExecCommand = func(ctx context.Context, name string, args ...string) *osexec.Cmd {
+		captured = osexec.CommandContext(ctx, name, args...)
+		return captured
+	}
+	defer func() { ExecCommand = origExec }()
+
+	runner := NewRunner(provider.NewRegistry())
+	sr := NewSmartRunner(runner, SmartRunnerOptions{})
+
+	// PTY startup can fail in constrained environments; the env is assembled
+	// before the controller is created, so only the capture matters here.
+	_ = sr.Run(context.Background(), RunOptions{
+		Profile:      prof,
+		Provider:     mock,
+		NoLock:       true,
+		Env:          extraEnv,
+		UseGlobalEnv: true, // matches `caam run` vault-based switching
+	})
+
+	if captured == nil {
+		t.Fatal("ExecCommand was never invoked; SmartRunner did not take the PTY path")
+	}
+
+	env := make(map[string]string, len(captured.Env))
+	for _, e := range captured.Env {
+		for i := 0; i < len(e); i++ {
+			if e[i] == '=' {
+				env[e[:i]] = e[i+1:]
+				break
+			}
+		}
+	}
+	return env
+}
+
+func TestSmartRunner_PTYPathScrubsAmbientAuthEnv(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "ambient-key")
+
+	env := captureSmartRunnerCmdEnv(t, nil)
+
+	if v, ok := env["OPENAI_API_KEY"]; ok {
+		t.Errorf("ambient OPENAI_API_KEY leaked into the PTY child env (value %q)", v)
+	}
+	if _, ok := env["CODEX_HOME"]; !ok {
+		t.Error("provider env (CODEX_HOME) missing from PTY child env")
+	}
+}
+
+func TestSmartRunner_PTYPathInjectedEnvWinsOverScrub(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "ambient-key")
+
+	env := captureSmartRunnerCmdEnv(t, map[string]string{"OPENAI_API_KEY": "profile-key"})
+
+	if env["OPENAI_API_KEY"] != "profile-key" {
+		t.Errorf("OPENAI_API_KEY = %q, want injected opts.Env value %q to win over the scrub",
+			env["OPENAI_API_KEY"], "profile-key")
 	}
 }

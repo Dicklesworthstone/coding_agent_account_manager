@@ -67,9 +67,13 @@ var endpointSpecs = map[string]EndpointSpec{
 	},
 	// Anthropic-compatible endpoints (GLM, Moonshot/Kimi, ...): the claude
 	// binary is pointed at a different base URL with a provider-issued token.
+	// https only: ANTHROPIC_AUTH_TOKEN is a bearer credential and these are
+	// remote services, so a plain-http base URL would send it cleartext.
+	// (ollama/quick keep http/ws because they are localhost-typical and
+	// ollama carries no credential at all.)
 	"claude": {
 		TokenRequired: true,
-		Schemes:       []string{"http", "https"},
+		Schemes:       []string{"https"},
 	},
 }
 

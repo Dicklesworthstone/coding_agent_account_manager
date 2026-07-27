@@ -273,8 +273,8 @@ Token profiles sidestep the Keychain entirely. A token profile stores one long-l
 claude setup-token | caam token add claude work
 caam token add claude personal      # prompts for a hidden paste
 
-# Or bulk-import existing claude-<name>-token files (default dir: ~/.config/veup)
-caam token import
+# Or bulk-import existing claude-<name>-token files from wherever you keep them
+caam token import --dir ~/.config/veup
 caam token import --dir /path/to/tokens --force
 
 caam token ls                       # list token/endpoint profiles
@@ -323,7 +323,7 @@ caam token add claude kimi --base-url https://api.moonshot.ai/anthropic
 Notes:
 
 - **quick** is Amazon Quick's *local* desktop instance. The desktop app bundles an agent server driven over an authenticated WebSocket (default `ws://localhost:8771`); the bearer is the per-launch `VITE_INSTANCE_TOKEN` from the agent process environment. There is no cloud API behind it.
-- **Anthropic-compatible endpoints** (GLM, Moonshot/Kimi, anything else speaking the Anthropic API) reuse the `claude` provider: `--base-url` points the `claude` binary at the service with its issued token, isolated in its own `CLAUDE_CONFIG_DIR`. A claude endpoint profile must always name its base URL; there is no default.
+- **Anthropic-compatible endpoints** (GLM, Moonshot/Kimi, anything else speaking the Anthropic API) reuse the `claude` provider: `--base-url` points the `claude` binary at the service with its issued token, isolated in its own `CLAUDE_CONFIG_DIR`. A claude endpoint profile must always name its base URL; there is no default, and the URL must be `https://` (the bearer token would travel cleartext over plain http). `http`/`ws` remain accepted for ollama and quick, which are localhost-typical.
 - **ollama** endpoint profiles take no token at all; `caam token add ollama <name>` reads nothing from stdin.
 - Endpoint profiles show as `name [endpoint]` in `caam ls` and `name (endpoint)` in `caam status`.
 

@@ -367,7 +367,7 @@ func ValidateTokenFormat(tool, token string) error {
 		// sk-ant-oat01-... ; API keys look like sk-ant-api03-... . Accept the
 		// sk-ant- family and reject obviously foreign strings.
 		if !strings.HasPrefix(token, "sk-ant-") {
-			return fmt.Errorf("claude tokens start with sk-ant- (got %q...)", truncateToken(token))
+			return fmt.Errorf("claude tokens start with sk-ant- (got %s)", describeToken(token))
 		}
 		if len(token) < 20 {
 			return fmt.Errorf("token too short to be a claude token")
@@ -375,7 +375,7 @@ func ValidateTokenFormat(tool, token string) error {
 	case "deepseek":
 		// DeepSeek API keys (platform.deepseek.com) look like sk-<hex/alnum>.
 		if !strings.HasPrefix(token, "sk-") {
-			return fmt.Errorf("deepseek API keys start with sk- (got %q...)", truncateToken(token))
+			return fmt.Errorf("deepseek API keys start with sk- (got %s)", describeToken(token))
 		}
 		if len(token) < 16 {
 			return fmt.Errorf("token too short to be a deepseek API key")
@@ -406,12 +406,17 @@ func ValidateProfileToken(tool, token string, meta *TokenMeta) error {
 	return ValidateTokenFormat(tool, token)
 }
 
-// truncateToken returns a short non-sensitive prefix of a token for error
-// messages.
-func truncateToken(token string) string {
-	const n = 6
-	if len(token) <= n {
-		return token
+// describeToken returns a non-sensitive description of a token for error
+// messages: its length and a coarse prefix class only. It never echoes any
+// token bytes — a "token" that fails the format check may be a mispasted
+// secret of some other kind, and even a short prefix can leak it.
+func describeToken(token string) string {
+	class := "unrecognized prefix"
+	switch {
+	case strings.HasPrefix(token, "sk-ant-"):
+		class = "sk-ant-* prefix"
+	case strings.HasPrefix(token, "sk-"):
+		class = "sk-* prefix"
 	}
-	return token[:n]
+	return fmt.Sprintf("%d chars, %s", len(token), class)
 }

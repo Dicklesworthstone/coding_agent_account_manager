@@ -491,3 +491,22 @@ func TestRotateTokenProfileIfCoolingDown(t *testing.T) {
 		t.Errorf("all-cooldown fallback = %q, want mcc22", got)
 	}
 }
+
+func TestTokenImport_RequiresDir(t *testing.T) {
+	setupTokenTest(t)
+	resetTokenFlags(t)
+
+	// No --dir: there is deliberately no baked-in default directory (a
+	// machine-specific convention does not belong in the tool); the error
+	// must point the user at --dir with example locations.
+	err := runTokenImport(tokenImportCmd, nil)
+	if err == nil {
+		t.Fatal("runTokenImport without --dir succeeded; want an error requiring --dir")
+	}
+	if !strings.Contains(err.Error(), "--dir") {
+		t.Errorf("error %q should mention --dir", err.Error())
+	}
+	if !strings.Contains(err.Error(), "caam token import --dir") {
+		t.Errorf("error %q should show an example invocation", err.Error())
+	}
+}

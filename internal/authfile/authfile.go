@@ -1902,6 +1902,13 @@ func validateVaultSegment(kind, val string) (string, error) {
 	if val == "." || val == ".." {
 		return "", fmt.Errorf("invalid %s: %q", kind, val)
 	}
+	// Reject leading dots entirely: a profile named ".active-token" would
+	// collide with the vault's active-token marker file (and other dotfile
+	// markers), turning the marker path into a directory and breaking
+	// activation with confusing EISDIR errors.
+	if strings.HasPrefix(val, ".") {
+		return "", fmt.Errorf("invalid %s: %q (must not start with '.')", kind, val)
+	}
 	// Only allow safe characters: alphanumeric, underscore, hyphen, period, and @.
 	// This prevents shell injection when profile names are used in shell scripts
 	// (e.g., claude.go's setupAPIKeyHelper embeds profile name in bash script).

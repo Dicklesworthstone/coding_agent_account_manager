@@ -139,6 +139,7 @@ func TestValidateEndpointURL(t *testing.T) {
 		{"quick wss", "quick", "wss://localhost:8771", false},
 		{"quick http", "quick", "http://localhost:8771", false},
 		{"claude https", "claude", "https://api.moonshot.ai/anthropic", false},
+		{"claude http rejected (bearer would travel cleartext)", "claude", "http://api.moonshot.ai/anthropic", true},
 		{"claude ws rejected", "claude", "ws://api.moonshot.ai", true},
 		{"unsupported provider", "deepseek", "https://api.deepseek.com", true},
 	}
