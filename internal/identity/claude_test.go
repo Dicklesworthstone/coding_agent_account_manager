@@ -287,3 +287,111 @@ func TestFixture_ClaudeInvalid(t *testing.T) {
 		t.Error("expected error for invalid JSON fixture")
 	}
 }
+
+func writeClaudeJSONFile(t *testing.T, dir string, content map[string]interface{}) string {
+	t.Helper()
+
+	path := filepath.Join(dir, ".claude.json")
+	data, err := json.Marshal(content)
+	if err != nil {
+		t.Fatalf("marshal .claude.json: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write .claude.json: %v", err)
+	}
+	return path
+}
+
+func TestExtractFromClaudeJSON_OAuthAccount(t *testing.T) {
+	dir := t.TempDir()
+	path := writeClaudeJSONFile(t, dir, map[string]interface{}{
+		"oauthAccount": map[string]interface{}{
+			"emailAddress":     "max@example.com",
+			"accountUuid":      "uuid-123",
+			"organizationName": "Example Org",
+			"planDisplayName":  "Max 20x",
+		},
+	})
+
+	id, err := ExtractFromClaudeJSON(path)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeJSON error: %v", err)
+	}
+	if id.Email != "max@example.com" {
+		t.Errorf("Email = %q, want %q", id.Email, "max@example.com")
+	}
+	if id.AccountID != "uuid-123" {
+		t.Errorf("AccountID = %q, want %q", id.AccountID, "uuid-123")
+	}
+	if id.Organization != "Example Org" {
+		t.Errorf("Organization = %q, want %q", id.Organization, "Example Org")
+	}
+	if id.PlanType != "Max 20x" {
+		t.Errorf("PlanType = %q, want %q", id.PlanType, "Max 20x")
+	}
+	if id.Provider != "claude" {
+		t.Errorf("Provider = %q, want %q", id.Provider, "claude")
+	}
+}
+
+func TestExtractFromClaudeJSON_BillingTypeInference(t *testing.T) {
+	dir := t.TempDir()
+	path := writeClaudeJSONFile(t, dir, map[string]interface{}{
+		"oauthAccount": map[string]interface{}{
+			"emailAddress": "sub@example.com",
+			"billingType":  "stripe_subscription",
+		},
+	})
+
+	id, err := ExtractFromClaudeJSON(path)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeJSON error: %v", err)
+	}
+	if id.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q (inferred from billingType)", id.PlanType, "max")
+	}
+}
+
+func TestExtractFromClaudeJSON_MissingFile(t *testing.T) {
+	if _, err := ExtractFromClaudeJSON(filepath.Join(t.TempDir(), ".claude.json")); err == nil {
+		t.Error("expected error for missing .claude.json")
+	}
+}
+
+func TestExtractFromClaudeCredentials_EnrichedFromSiblingClaudeJSON(t *testing.T) {
+	dir := t.TempDir()
+
+	credPath := filepath.Join(dir, ".credentials.json")
+	credData, err := json.Marshal(map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"subscriptionType": "max",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal credentials: %v", err)
+	}
+	if err := os.WriteFile(credPath, credData, 0600); err != nil {
+		t.Fatalf("write .credentials.json: %v", err)
+	}
+
+	writeClaudeJSONFile(t, dir, map[string]interface{}{
+		"oauthAccount": map[string]interface{}{
+			"emailAddress": "sibling@example.com",
+			"accountUuid":  "uuid-sib",
+		},
+	})
+
+	id, err := ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "sibling@example.com" {
+		t.Errorf("Email = %q, want enrichment from sibling .claude.json", id.Email)
+	}
+	if id.AccountID != "uuid-sib" {
+		t.Errorf("AccountID = %q, want %q", id.AccountID, "uuid-sib")
+	}
+	if id.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q (credentials value must win)", id.PlanType, "max")
+	}
+}

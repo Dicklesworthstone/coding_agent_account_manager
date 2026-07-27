@@ -398,6 +398,16 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		return emitJSONError(fmt.Errorf("activate failed: %w", err))
 	}
 
+	// Record activation timestamp in health store
+	if healthStore != nil {
+		h, _ := healthStore.GetProfile(tool, profileName)
+		if h == nil {
+			h = &health.ProfileHealth{}
+		}
+		h.LastActivatedAt = time.Now()
+		_ = healthStore.UpdateProfile(tool, profileName, h)
+	}
+
 	// Codex daemon check: swapping auth.json on disk does not affect a running
 	// `codex app-server`/`mcp-server`, which caches auth in-process. Detect it
 	// and warn (or, with --reload-daemon, restart it) so the switch isn't a

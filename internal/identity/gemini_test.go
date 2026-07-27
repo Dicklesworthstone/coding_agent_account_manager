@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -166,5 +167,72 @@ func TestFixture_GeminiNoEmail(t *testing.T) {
 	// Organization should be set from project_id
 	if identity.Organization != "project-without-email" {
 		t.Errorf("Organization = %q, want %q", identity.Organization, "project-without-email")
+	}
+}
+
+func makeTestJWT(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+func TestExtractFromGeminiConfig_IDTokenJWT(t *testing.T) {
+	token := makeTestJWT(t, map[string]interface{}{
+		"email": "oauth@example.com",
+		"name":  "OAuth User",
+	})
+	config := map[string]interface{}{
+		"access_token": "ya29.opaque",
+		"id_token":     token,
+	}
+	path := writeGeminiFile(t, config)
+
+	identity, err := ExtractFromGeminiConfig(path)
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+	if identity.Email != "oauth@example.com" {
+		t.Errorf("Email = %q, want %q (decoded from id_token)", identity.Email, "oauth@example.com")
+	}
+	if identity.Organization != "OAuth User" {
+		t.Errorf("Organization = %q, want %q", identity.Organization, "OAuth User")
+	}
+}
+
+func TestExtractFromGeminiConfig_RefreshTokenImpliesPlan(t *testing.T) {
+	config := map[string]interface{}{
+		"email":         "cli@example.com",
+		"refresh_token": "1//refresh",
+	}
+	path := writeGeminiFile(t, config)
+
+	identity, err := ExtractFromGeminiConfig(path)
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+	if identity.PlanType != "ultra" {
+		t.Errorf("PlanType = %q, want %q (refresh_token implies CLI OAuth)", identity.PlanType, "ultra")
+	}
+}
+
+func TestExtractFromGeminiConfig_DirectEmailWinsOverJWT(t *testing.T) {
+	token := makeTestJWT(t, map[string]interface{}{"email": "jwt@example.com"})
+	config := map[string]interface{}{
+		"email":    "direct@example.com",
+		"id_token": token,
+	}
+	path := writeGeminiFile(t, config)
+
+	identity, err := ExtractFromGeminiConfig(path)
+	if err != nil {
+		t.Fatalf("ExtractFromGeminiConfig error: %v", err)
+	}
+	if identity.Email != "direct@example.com" {
+		t.Errorf("Email = %q, want direct field to win", identity.Email)
 	}
 }

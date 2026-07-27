@@ -81,7 +81,12 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 
 	// Factor 1: Token expiry (primary)
 	if h.TokenExpiresAt.IsZero() {
-		// Unknown expiry - neutral
+		// Unknown expiry — if no errors and plan detected, assume healthy.
+		// Many providers (Claude Max via .claude.json) don't expose expiry
+		// but tokens are valid for weeks. Don't penalize the score for this.
+		if h.ErrorCount1h == 0 && h.PlanType != "" {
+			score += 0.6 // Enough to clear the warning threshold
+		}
 	} else if h.TokenExpiresAt.Before(now) {
 		score -= 1.0 // Expired
 	} else {

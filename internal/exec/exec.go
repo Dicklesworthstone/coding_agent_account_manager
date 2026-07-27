@@ -63,6 +63,23 @@ type RunOptions struct {
 	UseGlobalEnv bool
 }
 
+// authEnvVarsToUnset lists globally exported API-key env vars that must not
+// leak into a vault-switched session: auth should come from the swapped files,
+// not from an ambient key that can collapse multiple profiles onto the same
+// account.
+func authEnvVarsToUnset(providerID string) []string {
+	switch strings.ToLower(strings.TrimSpace(providerID)) {
+	case "claude":
+		return []string{"ANTHROPIC_API_KEY"}
+	case "codex":
+		return []string{"OPENAI_API_KEY"}
+	case "gemini":
+		return []string{"GEMINI_API_KEY"}
+	default:
+		return nil
+	}
+}
+
 // ExitCodeError wraps a process exit code.
 type ExitCodeError struct {
 	Code int
@@ -148,6 +165,15 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 		parts := strings.SplitN(e, "=", 2)
 		if len(parts) == 2 {
 			envMap[parts[0]] = parts[1]
+		}
+	}
+
+	// In vault-based switching mode, auth should come from the swapped files,
+	// not from a globally exported API key that can collapse multiple profiles
+	// onto the same account.
+	if opts.UseGlobalEnv {
+		for _, name := range authEnvVarsToUnset(opts.Provider.ID()) {
+			delete(envMap, name)
 		}
 	}
 

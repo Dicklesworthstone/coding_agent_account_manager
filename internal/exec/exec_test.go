@@ -680,6 +680,77 @@ func TestRun_ProfileMetadataUpdated(t *testing.T) {
 	}
 }
 
+func TestRun_UseGlobalEnvScrubsProviderAuthEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "test",
+		Provider: "claude",
+		BasePath: tmpDir,
+	}
+
+	if err := os.MkdirAll(prof.BasePath, 0700); err != nil {
+		t.Fatalf("Failed to create profile dir: %v", err)
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "shared-key")
+
+	mock := &mockProvider{
+		id:         "claude",
+		defaultBin: "sh",
+		envVars:    map[string]string{},
+	}
+
+	registry := provider.NewRegistry()
+	runner := NewRunner(registry)
+
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:      prof,
+		Provider:     mock,
+		Args:         []string{"-c", `test -z "${ANTHROPIC_API_KEY:-}"`},
+		NoLock:       true,
+		UseGlobalEnv: true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v (ANTHROPIC_API_KEY leaked into vault-switched session?)", err)
+	}
+}
+
+func TestRun_ExplicitEnvOverridesScrubbedAuthEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "test",
+		Provider: "claude",
+		BasePath: tmpDir,
+	}
+
+	if err := os.MkdirAll(prof.BasePath, 0700); err != nil {
+		t.Fatalf("Failed to create profile dir: %v", err)
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "shared-key")
+
+	mock := &mockProvider{
+		id:         "claude",
+		defaultBin: "sh",
+		envVars:    map[string]string{},
+	}
+
+	registry := provider.NewRegistry()
+	runner := NewRunner(registry)
+
+	err := runner.Run(context.Background(), RunOptions{
+		Profile:      prof,
+		Provider:     mock,
+		Args:         []string{"-c", `test "$ANTHROPIC_API_KEY" = "profile-key"`},
+		Env:          map[string]string{"ANTHROPIC_API_KEY": "profile-key"},
+		NoLock:       true,
+		UseGlobalEnv: true,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
 func TestRun_CodexSessionCapture(t *testing.T) {
 	tmpDir := t.TempDir()
 	prof := &profile.Profile{

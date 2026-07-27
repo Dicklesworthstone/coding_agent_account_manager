@@ -374,24 +374,32 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 	case "claude":
 		id, err := identity.ExtractFromClaudeCredentials(filepath.Join(vaultPath, ".credentials.json"))
 		if err != nil {
-			return nil
+			// Fallback: try .claude.json directly (vault may not have .credentials.json)
+			id, err = identity.ExtractFromClaudeJSON(filepath.Join(vaultPath, ".claude.json"))
+			if err != nil {
+				return nil
+			}
 		}
 		normalizeIdentityPlan(id)
 		return id
 	case "gemini":
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
+		// Prefer oauth_creds.json: it carries the id_token JWT with the
+		// account email, while settings.json often has no identity fields.
 		candidates := []string{
-			filepath.Join(vaultPath, "settings.json"),
 			filepath.Join(vaultPath, "oauth_creds.json"),
+			filepath.Join(vaultPath, "settings.json"),
 		}
 		for _, path := range candidates {
 			id, err := identity.ExtractFromGeminiConfig(path)
 			if err != nil {
 				continue
 			}
-			normalizeIdentityPlan(id)
-			return id
+			if id.Email != "" {
+				normalizeIdentityPlan(id)
+				return id
+			}
 		}
 	case "grok":
 		id, err := identity.ExtractFromGrokAuth(filepath.Join(vaultPath, "auth.json"))

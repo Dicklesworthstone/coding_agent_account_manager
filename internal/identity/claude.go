@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -14,8 +15,9 @@ import (
 //   - accountId: No longer present in claudeAiOauth
 //   - email: No longer present in claudeAiOauth
 //
-// These fields will return empty strings. Only expiresAt and subscriptionType
-// are reliably present. Callers should handle empty identity fields gracefully.
+// Those fields are instead enriched from a sibling .claude.json file (same
+// directory), which carries richer identity data under oauthAccount
+// (emailAddress, accountUuid, organizationName, planDisplayName, etc.).
 //
 // See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001)
 func ExtractFromClaudeCredentials(path string) (*Identity, error) {
@@ -35,18 +37,80 @@ func ExtractFromClaudeCredentials(path string) (*Identity, error) {
 	identity := &Identity{Provider: "claude"}
 
 	raw, ok := root["claudeAiOauth"].(map[string]interface{})
-	if !ok {
-		return identity, nil
+	if ok {
+		identity.AccountID = valueAsString(raw["accountId"])
+		identity.PlanType = valueAsString(raw["subscriptionType"])
+		identity.Email = valueAsString(raw["email"])
+		if exp, ok := parseEpoch(raw["expiresAt"]); ok {
+			identity.ExpiresAt = exp
+		}
 	}
 
-	identity.AccountID = valueAsString(raw["accountId"])
-	identity.PlanType = valueAsString(raw["subscriptionType"])
-	identity.Email = valueAsString(raw["email"])
-	if exp, ok := parseEpoch(raw["expiresAt"]); ok {
-		identity.ExpiresAt = exp
+	// If email/accountID still empty, try sibling .claude.json which has
+	// oauthAccount with emailAddress, accountUuid, planDisplayName, etc.
+	if identity.Email == "" || identity.AccountID == "" {
+		enrichFromClaudeJSON(path, identity)
 	}
 
 	return identity, nil
+}
+
+// ExtractFromClaudeJSON reads a .claude.json file directly and extracts
+// identity from the oauthAccount object.
+func ExtractFromClaudeJSON(path string) (*Identity, error) {
+	identity := &Identity{Provider: "claude"}
+	if err := enrichFromClaudeJSONPath(path, identity); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+// enrichFromClaudeJSON looks for .claude.json as a sibling of the given
+// .credentials.json path (same directory) and enriches the identity.
+func enrichFromClaudeJSON(credentialsPath string, id *Identity) {
+	dir := filepath.Dir(credentialsPath)
+	_ = enrichFromClaudeJSONPath(filepath.Join(dir, ".claude.json"), id)
+}
+
+func enrichFromClaudeJSONPath(path string, id *Identity) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+
+	var root map[string]interface{}
+	if err := dec.Decode(&root); err != nil {
+		return fmt.Errorf("parse .claude.json: %w", err)
+	}
+
+	acct, ok := root["oauthAccount"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	if id.Email == "" {
+		id.Email = valueAsString(acct["emailAddress"])
+	}
+	if id.AccountID == "" {
+		id.AccountID = valueAsString(acct["accountUuid"])
+	}
+	if id.Organization == "" {
+		id.Organization = valueAsString(acct["organizationName"])
+	}
+	if id.PlanType == "" {
+		id.PlanType = valueAsString(acct["planDisplayName"])
+		if id.PlanType == "" {
+			// Infer from billing type
+			if valueAsString(acct["billingType"]) == "stripe_subscription" {
+				id.PlanType = "max"
+			}
+		}
+	}
+
+	return nil
 }
 
 func parseEpoch(value interface{}) (time.Time, bool) {

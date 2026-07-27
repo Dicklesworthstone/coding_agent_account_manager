@@ -40,10 +40,15 @@ func FormatHealthStatus(status HealthStatus, health *ProfileHealth, opts FormatO
 			text = FormatTimeRemaining(health.TokenExpiresAt)
 		}
 	} else {
-		// No expiry info
+		// No expiry info — show last activation context instead
 		switch status {
 		case StatusHealthy:
-			text = "Valid"
+			if !health.LastActivatedAt.IsZero() {
+				ago := time.Since(health.LastActivatedAt)
+				text = fmt.Sprintf("Active (%s ago)", formatDurationNatural(ago))
+			} else {
+				text = "Valid"
+			}
 		case StatusWarning:
 			if health.ErrorCount1h > 0 {
 				text = fmt.Sprintf("%d errors", health.ErrorCount1h)

@@ -37,6 +37,9 @@ type ProfileHealth struct {
 	// PlanType is the subscription tier (free, pro, enterprise).
 	PlanType string `json:"plan_type,omitempty"`
 
+	// LastActivatedAt is when this profile was last activated (switched to).
+	LastActivatedAt time.Time `json:"last_activated_at,omitempty"`
+
 	// LastChecked is when health was last verified.
 	LastChecked time.Time `json:"last_checked,omitempty"`
 }
