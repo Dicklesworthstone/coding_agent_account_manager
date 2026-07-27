@@ -382,13 +382,16 @@ func TestToolsMap(t *testing.T) {
 		}
 	}
 
-	// Verify each tool returns auth files
+	// Verify each tool returns a well-formed file set. Env-injection-only
+	// providers (deepseek, ollama, quick) legitimately have no auth files;
+	// every other provider must list at least one.
+	envOnly := map[string]bool{"deepseek": true, "ollama": true, "quick": true}
 	for tool, getFileSet := range tools {
 		fileSet := getFileSet()
 		if fileSet.Tool == "" {
 			t.Errorf("Expected Tool for tool %q", tool)
 		}
-		if len(fileSet.Files) == 0 {
+		if len(fileSet.Files) == 0 && !envOnly[tool] {
 			t.Errorf("Expected Files for tool %q", tool)
 		}
 	}

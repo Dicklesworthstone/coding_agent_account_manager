@@ -42,6 +42,12 @@ const (
 
 	// ProfileTypeToken is the meta.json type marker for token profiles.
 	ProfileTypeToken = "token"
+
+	// ProfileTypeEndpoint is the meta.json type marker for endpoint profiles
+	// (endpoint URL + optional bearer token; see endpoint.go). Both types form
+	// the env-injection profile family and are handled uniformly by
+	// IsTokenProfile / ReadTokenProfile / rotation / cooldowns.
+	ProfileTypeEndpoint = "endpoint"
 )
 
 // TokenMeta describes a token profile. Stored as meta.json in the profile's
@@ -55,6 +61,11 @@ type TokenMeta struct {
 
 	// Name is the profile name.
 	Name string `json:"name"`
+
+	// Endpoint is the service endpoint URL for endpoint profiles (Type
+	// "endpoint"): the Ollama server, the Amazon Quick local agent WebSocket,
+	// or an anthropic-compatible base URL. Empty for plain token profiles.
+	Endpoint string `json:"endpoint,omitempty"`
 
 	// Source records where the token came from (e.g. an imported file path,
 	// or "stdin"). Informational only.
@@ -88,13 +99,26 @@ func (v *Vault) SaveTokenProfile(tool, name, token, source string) error {
 		Source:    source,
 		CreatedAt: time.Now().UTC(),
 	}
+	return writeTokenProfileFiles(dir, token, meta)
+}
+
+// writeTokenProfileFiles writes the token file (when token is non-empty) and
+// meta.json for an env-injection profile, both mode 0600. A pre-existing
+// token file is removed when token is empty so re-saving an endpoint profile
+// without auth cannot leave a stale credential behind.
+func writeTokenProfileFiles(dir, token string, meta TokenMeta) error {
 	metaData, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal token meta: %w", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, TokenFileName), []byte(token+"\n"), 0600); err != nil {
-		return fmt.Errorf("write token file: %w", err)
+	tokenPath := filepath.Join(dir, TokenFileName)
+	if token != "" {
+		if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0600); err != nil {
+			return fmt.Errorf("write token file: %w", err)
+		}
+	} else if err := os.Remove(tokenPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale token file: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, TokenMetaFileName), metaData, 0600); err != nil {
 		return fmt.Errorf("write token meta: %w", err)
@@ -102,8 +126,12 @@ func (v *Vault) SaveTokenProfile(tool, name, token, source string) error {
 	return nil
 }
 
-// IsTokenProfile reports whether the named vault profile is a token profile
-// (has a meta.json with type "token").
+// IsTokenProfile reports whether the named vault profile is an env-injection
+// profile (has a meta.json with type "token" or "endpoint"). Both family
+// members behave identically at every integration point — activation records
+// a default instead of swapping files, run/exec inject environment variables,
+// rotation/cooldowns/ls/status treat them first-class — so callers need no
+// finer distinction; ProfileEnv dispatches on the stored type.
 func (v *Vault) IsTokenProfile(tool, name string) bool {
 	dir, err := v.safeProfileDir(tool, name)
 	if err != nil {
@@ -117,10 +145,13 @@ func (v *Vault) IsTokenProfile(tool, name string) bool {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return false
 	}
-	return meta.Type == ProfileTypeToken
+	return meta.Type == ProfileTypeToken || meta.Type == ProfileTypeEndpoint
 }
 
-// ReadTokenProfile returns the stored token and metadata for a token profile.
+// ReadTokenProfile returns the stored token and metadata for an env-injection
+// profile (token or endpoint type). For endpoint profiles whose provider needs
+// no auth (e.g. ollama) the returned token is "" and no error is raised; for
+// every other case a missing or empty token file is an error.
 func (v *Vault) ReadTokenProfile(tool, name string) (string, *TokenMeta, error) {
 	dir, err := v.safeProfileDir(tool, name)
 	if err != nil {
@@ -135,16 +166,26 @@ func (v *Vault) ReadTokenProfile(tool, name string) (string, *TokenMeta, error) 
 	if err := json.Unmarshal(metaData, &meta); err != nil {
 		return "", nil, fmt.Errorf("parse token meta: %w", err)
 	}
-	if meta.Type != ProfileTypeToken {
+	if meta.Type != ProfileTypeToken && meta.Type != ProfileTypeEndpoint {
 		return "", nil, fmt.Errorf("%s/%s is not a token profile (type %q)", tool, name, meta.Type)
+	}
+
+	tokenOptional := false
+	if meta.Type == ProfileTypeEndpoint {
+		if spec, ok := EndpointSpecFor(tool); ok && !spec.TokenRequired {
+			tokenOptional = true
+		}
 	}
 
 	tokenData, err := os.ReadFile(filepath.Join(dir, TokenFileName))
 	if err != nil {
+		if tokenOptional && os.IsNotExist(err) {
+			return "", &meta, nil
+		}
 		return "", nil, fmt.Errorf("read token file: %w", err)
 	}
 	token := strings.TrimSpace(string(tokenData))
-	if token == "" {
+	if token == "" && !tokenOptional {
 		return "", nil, fmt.Errorf("token file for %s/%s is empty", tool, name)
 	}
 	return token, &meta, nil
@@ -216,29 +257,99 @@ func (v *Vault) ClearActiveTokenProfile(tool string) error {
 	return nil
 }
 
-// TokenEnv returns the environment variables that inject a token profile into
-// the wrapped tool. For Claude Code:
-//
-//	CLAUDE_CODE_OAUTH_TOKEN  the token itself
-//	CLAUDE_CONFIG_DIR        $HOME/.claude-<name> (per-profile settings and
-//	                         history isolation; parallel-safe)
-//
-// Other providers gain token/env support in later workstreams; unknown tools
-// return an error so callers fail loudly instead of running unauthenticated.
+// TokenEnv returns the environment variables that inject a plain token
+// profile into the wrapped tool. It is the meta-less form of ProfileEnv; use
+// ProfileEnv when the profile's TokenMeta is at hand so endpoint profiles
+// resolve correctly.
 func TokenEnv(tool, name, token string) (map[string]string, error) {
-	switch strings.ToLower(strings.TrimSpace(tool)) {
+	return ProfileEnv(tool, name, token, nil)
+}
+
+// ProfileEnv returns the environment variables that inject an env-injection
+// profile into the wrapped tool. meta may be nil (plain token profile).
+//
+// Token profiles:
+//
+//	claude    CLAUDE_CODE_OAUTH_TOKEN + CLAUDE_CONFIG_DIR=$HOME/.claude-<name>
+//	          (per-profile settings/history isolation; parallel-safe)
+//	deepseek  DEEPSEEK_API_KEY
+//	grok      GROK_DEPLOYMENT_KEY (the CLI's documented env credential; it
+//	          takes precedence over auth.json, which is exactly the injection
+//	          semantics token profiles want)
+//
+// Endpoint profiles (meta.Type == "endpoint"):
+//
+//	claude    ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN + CLAUDE_CONFIG_DIR
+//	          (anthropic-compatible endpoints: GLM, Moonshot/Kimi, ...)
+//	ollama    OLLAMA_HOST (no auth)
+//	quick     VITE_AGENT_WS_URL + VITE_INSTANCE_TOKEN (Amazon Quick local
+//	          desktop agent; variable names match the agent's own protocol)
+//
+// Unknown tools return an error so callers fail loudly instead of running
+// unauthenticated.
+func ProfileEnv(tool, name, token string, meta *TokenMeta) (map[string]string, error) {
+	tool = strings.ToLower(strings.TrimSpace(tool))
+
+	if meta != nil && meta.Type == ProfileTypeEndpoint {
+		if meta.Endpoint == "" {
+			return nil, fmt.Errorf("endpoint profile %s/%s has no endpoint URL", tool, name)
+		}
+		switch tool {
+		case "claude":
+			configDir, err := claudeProfileConfigDir(name)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]string{
+				"ANTHROPIC_BASE_URL":   meta.Endpoint,
+				"ANTHROPIC_AUTH_TOKEN": token,
+				"CLAUDE_CONFIG_DIR":    configDir,
+			}, nil
+		case "ollama":
+			return map[string]string{
+				"OLLAMA_HOST": meta.Endpoint,
+			}, nil
+		case "quick":
+			return map[string]string{
+				"VITE_AGENT_WS_URL":   meta.Endpoint,
+				"VITE_INSTANCE_TOKEN": token,
+			}, nil
+		default:
+			return nil, fmt.Errorf("endpoint profiles are not supported for %s", tool)
+		}
+	}
+
+	switch tool {
 	case "claude":
-		homeDir, err := os.UserHomeDir()
+		configDir, err := claudeProfileConfigDir(name)
 		if err != nil {
-			return nil, fmt.Errorf("resolve home dir: %w", err)
+			return nil, err
 		}
 		return map[string]string{
 			"CLAUDE_CODE_OAUTH_TOKEN": token,
-			"CLAUDE_CONFIG_DIR":       filepath.Join(homeDir, ".claude-"+name),
+			"CLAUDE_CONFIG_DIR":       configDir,
+		}, nil
+	case "deepseek":
+		return map[string]string{
+			"DEEPSEEK_API_KEY": token,
+		}, nil
+	case "grok":
+		return map[string]string{
+			"GROK_DEPLOYMENT_KEY": token,
 		}, nil
 	default:
 		return nil, fmt.Errorf("token profiles are not supported for %s yet", tool)
 	}
+}
+
+// claudeProfileConfigDir returns the per-profile CLAUDE_CONFIG_DIR for a
+// claude env-injection profile.
+func claudeProfileConfigDir(name string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir: %w", err)
+	}
+	return filepath.Join(homeDir, ".claude-"+name), nil
 }
 
 // ValidateTokenFormat performs a passive, offline sanity check of a token's
@@ -261,8 +372,38 @@ func ValidateTokenFormat(tool, token string) error {
 		if len(token) < 20 {
 			return fmt.Errorf("token too short to be a claude token")
 		}
+	case "deepseek":
+		// DeepSeek API keys (platform.deepseek.com) look like sk-<hex/alnum>.
+		if !strings.HasPrefix(token, "sk-") {
+			return fmt.Errorf("deepseek API keys start with sk- (got %q...)", truncateToken(token))
+		}
+		if len(token) < 16 {
+			return fmt.Errorf("token too short to be a deepseek API key")
+		}
 	}
 	return nil
+}
+
+// ValidateProfileToken is the meta-aware form of ValidateTokenFormat: endpoint
+// profiles skip the plain-token shape checks (an anthropic-compatible token
+// for a claude endpoint profile is issued by GLM/Moonshot/etc., not
+// Anthropic), enforcing only the provider's token-required rule. Passive,
+// never makes network calls.
+func ValidateProfileToken(tool, token string, meta *TokenMeta) error {
+	if meta != nil && meta.Type == ProfileTypeEndpoint {
+		spec, ok := EndpointSpecFor(tool)
+		if !ok {
+			return fmt.Errorf("endpoint profiles are not supported for %s", tool)
+		}
+		if meta.Endpoint == "" {
+			return fmt.Errorf("endpoint profile has no endpoint URL")
+		}
+		if spec.TokenRequired && strings.TrimSpace(token) == "" {
+			return fmt.Errorf("token is empty")
+		}
+		return nil
+	}
+	return ValidateTokenFormat(tool, token)
 }
 
 // truncateToken returns a short non-sensitive prefix of a token for error

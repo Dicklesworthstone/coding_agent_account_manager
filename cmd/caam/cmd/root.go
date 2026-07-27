@@ -33,6 +33,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/envonly"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	grokprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/grok"
 	opencodeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/opencode"
@@ -63,6 +64,11 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"grok":     authfile.GrokAuthFiles,
 	"opencode": authfile.OpenCodeAuthFiles,
 	"cursor":   authfile.CursorAuthFiles,
+	// Env-injection-only providers: no auth files to swap; profiles are token
+	// or endpoint profiles in the vault (see `caam token add`).
+	"deepseek": authfile.DeepSeekAuthFiles,
+	"ollama":   authfile.OllamaAuthFiles,
+	"quick":    authfile.QuickAuthFiles,
 }
 
 // supportedTools returns the auth-swap providers (the keys of the tools map),
@@ -162,6 +168,9 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		registry.Register(grokprovider.New())
 		registry.Register(opencodeprovider.New())
 		registry.Register(cursorprovider.New())
+		registry.Register(envonly.DeepSeek())
+		registry.Register(envonly.Ollama())
+		registry.Register(envonly.Quick())
 
 		// Initialize runner
 		runner = exec.NewRunner(registry)
@@ -833,7 +842,20 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
+	// The big three are always shown; any other supported tool joins the
+	// default listing once it has saved profiles, so token/endpoint profiles
+	// for the newer providers (grok, deepseek, ollama, quick, ...) are
+	// first-class in status without forcing empty rows on everyone.
 	toolsToCheck := []string{"codex", "claude", "gemini"}
+	for _, tool := range supportedTools() {
+		switch tool {
+		case "codex", "claude", "gemini":
+			continue
+		}
+		if profiles, err := vault.List(tool); err == nil && len(profiles) > 0 {
+			toolsToCheck = append(toolsToCheck, tool)
+		}
+	}
 	if len(args) > 0 {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
@@ -861,12 +883,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		if tokenProfile, _ := vault.ActiveTokenProfile(tool); tokenProfile != "" {
 			ph, status := tokenProfileHealth(tool, tokenProfile)
 
+			profileType := authfile.ProfileTypeToken
+			if _, meta, err := vault.ReadTokenProfile(tool, tokenProfile); err == nil && meta.Type != "" {
+				profileType = meta.Type
+			}
+
 			if jsonOutput {
 				st := statusTool{
 					Tool:          tool,
 					LoggedIn:      true,
 					ActiveProfile: tokenProfile,
-					ProfileType:   authfile.ProfileTypeToken,
+					ProfileType:   profileType,
 					Health: &statusHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
@@ -881,7 +908,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				if cooldownStr := getCooldownString(tool, tokenProfile, formatOpts); cooldownStr != "" {
 					healthStr = healthStr + " " + cooldownStr
 				}
-				fmt.Printf("%-10s  %-20s  %-24s  %-10s  %s\n", tool, tokenProfile+" (token)", "-", "-", healthStr)
+				fmt.Printf("%-10s  %-20s  %-24s  %-10s  %s\n", tool, tokenProfile+" ("+profileType+")", "-", "-", healthStr)
 			}
 
 			if status == health.StatusWarning || status == health.StatusCritical {
@@ -2106,11 +2133,11 @@ Examples:
 		// environment.
 		var runOpts exec.RunOptions
 		if vault != nil && vault.IsTokenProfile(tool, name) {
-			token, _, err := vault.ReadTokenProfile(tool, name)
+			token, meta, err := vault.ReadTokenProfile(tool, name)
 			if err != nil {
 				return err
 			}
-			env, err := authfile.TokenEnv(tool, name, token)
+			env, err := authfile.ProfileEnv(tool, name, token, meta)
 			if err != nil {
 				return err
 			}

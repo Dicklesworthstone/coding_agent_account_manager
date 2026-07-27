@@ -219,7 +219,9 @@ func TestToolsMapConsistency(t *testing.T) {
 				t.Errorf("Tool mismatch: expected %q, got %q", toolName, fileSet.Tool)
 			}
 
-			if len(fileSet.Files) == 0 {
+			// Env-injection-only providers have no auth files by design.
+			envOnly := map[string]bool{"deepseek": true, "ollama": true, "quick": true}
+			if len(fileSet.Files) == 0 && !envOnly[toolName] {
 				t.Error("Files should not be empty")
 			}
 

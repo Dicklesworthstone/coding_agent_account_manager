@@ -207,13 +207,13 @@ func validateTokenProfile(ctx context.Context, tool, profileName string, active 
 		CheckedAt: time.Now(),
 	}
 
-	token, _, err := vault.ReadTokenProfile(tool, profileName)
+	token, meta, err := vault.ReadTokenProfile(tool, profileName)
 	if err != nil {
 		out.Valid = false
 		out.Error = err.Error()
 		return out
 	}
-	if err := authfile.ValidateTokenFormat(tool, token); err != nil {
+	if err := authfile.ValidateProfileToken(tool, token, meta); err != nil {
 		out.Valid = false
 		out.Error = err.Error()
 		return out
@@ -224,7 +224,7 @@ func validateTokenProfile(ctx context.Context, tool, profileName string, active 
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		valid, err := probeToken(ctx, tool, token)
+		valid, err := probeProfile(ctx, tool, token, meta)
 		switch {
 		case err != nil:
 			// Inconclusive: keep the passive verdict, note the probe failure.
@@ -234,7 +234,11 @@ func validateTokenProfile(ctx context.Context, tool, profileName string, active 
 		default:
 			out.Method = "active"
 			out.Valid = false
-			out.Error = "provider rejected token (unauthorized)"
+			if meta != nil && meta.Type == authfile.ProfileTypeEndpoint {
+				out.Error = fmt.Sprintf("endpoint not reachable: %s", meta.Endpoint)
+			} else {
+				out.Error = "provider rejected token (unauthorized)"
+			}
 		}
 	}
 

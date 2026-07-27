@@ -70,11 +70,25 @@ type RunOptions struct {
 func authEnvVarsToUnset(providerID string) []string {
 	switch strings.ToLower(strings.TrimSpace(providerID)) {
 	case "claude":
-		return []string{"ANTHROPIC_API_KEY"}
+		// ANTHROPIC_AUTH_TOKEN/ANTHROPIC_BASE_URL are scrubbed too: an ambient
+		// anthropic-compatible redirect (GLM/Moonshot) would otherwise hijack
+		// token profiles, and endpoint profiles re-inject their own values.
+		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
 	case "codex":
 		return []string{"OPENAI_API_KEY"}
 	case "gemini":
 		return []string{"GEMINI_API_KEY"}
+	case "grok":
+		// The Grok Build CLI gives GROK_DEPLOYMENT_KEY precedence over
+		// auth.json, so an ambient key silently overrides swapped profiles;
+		// grok token profiles re-inject it per profile.
+		return []string{"GROK_DEPLOYMENT_KEY"}
+	case "deepseek":
+		return []string{"DEEPSEEK_API_KEY"}
+	case "ollama":
+		return []string{"OLLAMA_HOST"}
+	case "quick":
+		return []string{"VITE_INSTANCE_TOKEN", "VITE_AGENT_WS_URL"}
 	default:
 		return nil
 	}

@@ -39,9 +39,25 @@ Token profiles are first-class: they appear in ls/status, participate in
 rotation and cooldowns, and 'caam activate' on a token profile sets it as the
 default for 'caam run'/'caam exec'.
 
+Endpoint profiles are the second member of the family: they carry a service
+endpoint URL plus an optional bearer token, created with --endpoint (alias
+--base-url):
+
+  ollama  injects OLLAMA_HOST (no auth)
+  quick   injects VITE_AGENT_WS_URL + VITE_INSTANCE_TOKEN (Amazon Quick's
+          local desktop agent)
+  claude  with --base-url injects ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN
+          (+ CLAUDE_CONFIG_DIR isolation) for anthropic-compatible endpoints
+          such as GLM or Moonshot/Kimi
+
 Examples:
   claude setup-token | caam token add claude work    # pipe a fresh token
   caam token add claude personal                     # paste interactively
+  caam token add deepseek main                       # DeepSeek API key
+  caam token add ollama local                        # default endpoint
+  caam token add ollama gpu --endpoint http://gpu-box:11434
+  caam token add quick desktop                       # paste VITE_INSTANCE_TOKEN
+  caam token add claude glm --base-url https://api.z.ai/api/anthropic
   caam token import                                  # import existing token files
   caam token ls                                      # list token profiles
   caam token rm claude old                           # delete a token profile`,
@@ -49,16 +65,24 @@ Examples:
 
 var tokenAddCmd = &cobra.Command{
 	Use:   "add <provider> <name>",
-	Short: "Add a token profile (token read from stdin or interactive paste)",
+	Short: "Add a token or endpoint profile (token read from stdin or interactive paste)",
 	Long: `Stores a token as a new token profile in the vault (mode 0600).
 
 The token is read from stdin when piped, or prompted for (hidden input) when
 run interactively. The token itself is never accepted as a command-line
 argument so it cannot leak into shell history or process listings.
 
+With --endpoint (alias --base-url) an ENDPOINT profile is stored instead:
+the endpoint URL plus, when the provider requires auth, a bearer token from
+stdin as above. Providers with a well-known default endpoint (ollama, quick)
+may omit the flag; claude endpoint profiles (anthropic-compatible services
+like GLM or Moonshot/Kimi) must always name their base URL.
+
 Examples:
   claude setup-token | caam token add claude work
-  caam token add claude personal   # prompts for a hidden paste`,
+  caam token add claude personal   # prompts for a hidden paste
+  caam token add ollama local      # endpoint profile, default endpoint
+  caam token add claude kimi --base-url https://api.moonshot.ai/anthropic`,
 	Args: cobra.ExactArgs(2),
 	RunE: runTokenAdd,
 }
@@ -108,6 +132,8 @@ func init() {
 	tokenAddCmd.Flags().Bool("json", false, "output as JSON")
 	tokenAddCmd.Flags().Bool("force", false, "allow replacing an existing profile")
 	tokenAddCmd.Flags().Bool("no-verify", false, "skip the passive token format check")
+	tokenAddCmd.Flags().String("endpoint", "", "endpoint URL: store an endpoint profile instead of a plain token profile")
+	tokenAddCmd.Flags().String("base-url", "", "alias for --endpoint (anthropic-compatible base URL for claude)")
 
 	tokenImportCmd.Flags().String("dir", "", "directory to scan (default ~/.config/veup)")
 	tokenImportCmd.Flags().Bool("force", false, "overwrite existing profiles")
@@ -118,10 +144,12 @@ func init() {
 	tokenRmCmd.Flags().Bool("json", false, "output as JSON")
 }
 
-// tokenProfileJSON is the JSON representation of a token profile.
+// tokenProfileJSON is the JSON representation of a token/endpoint profile.
 type tokenProfileJSON struct {
 	Provider  string `json:"provider"`
 	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Endpoint  string `json:"endpoint,omitempty"`
 	Active    bool   `json:"active"`
 	Source    string `json:"source,omitempty"`
 	CreatedAt string `json:"created_at,omitempty"`
@@ -173,6 +201,28 @@ func runTokenAdd(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
 	noVerify, _ := cmd.Flags().GetBool("no-verify")
+	endpoint, _ := cmd.Flags().GetString("endpoint")
+	if endpoint == "" {
+		endpoint, _ = cmd.Flags().GetString("base-url")
+	}
+
+	// Decide the profile kind. An explicit --endpoint/--base-url always means
+	// an endpoint profile; endpoint-native providers (those with a well-known
+	// default endpoint, e.g. ollama and quick) store endpoint profiles even
+	// without the flag. claude has no default endpoint, so plain token
+	// profiles remain its default and --base-url opts into the
+	// anthropic-compatible endpoint variant.
+	spec, endpointCapable := authfile.EndpointSpecFor(provider)
+	isEndpoint := endpoint != ""
+	if endpointCapable && spec.DefaultEndpoint != "" {
+		isEndpoint = true
+		if endpoint == "" {
+			endpoint = spec.DefaultEndpoint
+		}
+	}
+	if isEndpoint && !endpointCapable {
+		return fmt.Errorf("endpoint profiles are not supported for %s (supported: claude, ollama, quick)", provider)
+	}
 
 	if !force {
 		if existing, err := vault.List(provider); err == nil {
@@ -184,34 +234,59 @@ func runTokenAdd(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	token, err := readTokenFromInput(cmd.InOrStdin())
-	if err != nil {
-		return err
-	}
-	if token == "" {
-		return fmt.Errorf("no token provided on stdin")
-	}
-
-	if !noVerify {
-		if err := authfile.ValidateTokenFormat(provider, token); err != nil {
-			return fmt.Errorf("token failed format check: %w (use --no-verify to store anyway)", err)
+	// Endpoint profiles for auth-less providers (ollama) take no token, so
+	// nothing is read from stdin for them.
+	needToken := !isEndpoint || spec.TokenRequired
+	var token string
+	if needToken {
+		token, err = readTokenFromInput(cmd.InOrStdin())
+		if err != nil {
+			return err
+		}
+		if token == "" {
+			return fmt.Errorf("no token provided on stdin")
 		}
 	}
 
-	if err := vault.SaveTokenProfile(provider, name, token, "stdin"); err != nil {
-		return err
+	if isEndpoint {
+		if err := authfile.ValidateEndpointURL(provider, endpoint); err != nil {
+			return err
+		}
+		if err := vault.SaveEndpointProfile(provider, name, endpoint, token, "stdin"); err != nil {
+			return err
+		}
+	} else {
+		if !noVerify {
+			if err := authfile.ValidateTokenFormat(provider, token); err != nil {
+				return fmt.Errorf("token failed format check: %w (use --no-verify to store anyway)", err)
+			}
+		}
+		if err := vault.SaveTokenProfile(provider, name, token, "stdin"); err != nil {
+			return err
+		}
 	}
 
 	if jsonOutput {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(map[string]interface{}{
+		out := map[string]interface{}{
 			"success":  true,
 			"provider": provider,
 			"name":     name,
-		})
+		}
+		if isEndpoint {
+			out["type"] = authfile.ProfileTypeEndpoint
+			out["endpoint"] = endpoint
+		} else {
+			out["type"] = authfile.ProfileTypeToken
+		}
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Saved token profile %s/%s\n", provider, name)
+	if isEndpoint {
+		fmt.Fprintf(cmd.OutOrStdout(), "Saved endpoint profile %s/%s (%s)\n", provider, name, endpoint)
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "Saved token profile %s/%s\n", provider, name)
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "  Activate it with: caam activate %s %s\n", provider, name)
 	return nil
 }
@@ -390,6 +465,7 @@ func runTokenLs(cmd *cobra.Command, args []string) error {
 			row := tokenProfileJSON{
 				Provider: provider,
 				Name:     name,
+				Type:     authfile.ProfileTypeToken,
 				Active:   name == active,
 			}
 			_, meta, err := vault.ReadTokenProfile(provider, name)
@@ -397,6 +473,8 @@ func runTokenLs(cmd *cobra.Command, args []string) error {
 				row.Status = "unreadable"
 			} else {
 				row.Status = "ok"
+				row.Type = meta.Type
+				row.Endpoint = meta.Endpoint
 				row.Source = meta.Source
 				if !meta.CreatedAt.IsZero() {
 					row.CreatedAt = meta.CreatedAt.Format("2006-01-02")
@@ -425,13 +503,17 @@ func runTokenLs(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(out, "  Or import existing token files: caam token import")
 		return nil
 	}
-	fmt.Fprintf(out, "%-10s  %-20s  %-10s  %-12s  %s\n", "PROVIDER", "PROFILE", "STATUS", "ADDED", "SOURCE")
+	fmt.Fprintf(out, "%-10s  %-20s  %-10s  %-10s  %-12s  %s\n", "PROVIDER", "PROFILE", "TYPE", "STATUS", "ADDED", "ENDPOINT/SOURCE")
 	for _, r := range rows {
 		marker := "  "
 		if r.Active {
 			marker = "● "
 		}
-		fmt.Fprintf(out, "%s%-8s  %-20s  %-10s  %-12s  %s\n", marker, r.Provider, r.Name, r.Status, r.CreatedAt, r.Source)
+		detail := r.Source
+		if r.Endpoint != "" {
+			detail = r.Endpoint
+		}
+		fmt.Fprintf(out, "%s%-8s  %-20s  %-10s  %-10s  %-12s  %s\n", marker, r.Provider, r.Name, r.Type, r.Status, r.CreatedAt, detail)
 	}
 	return nil
 }
@@ -476,6 +558,71 @@ func runTokenRm(cmd *cobra.Command, args []string) error {
 // It is a var so tests can point it at a local server; the default is Claude's
 // OAuth usage endpoint, which validates the token without consuming quota.
 var claudeTokenProbeURL = usage.ClaudeUsageURL
+
+// endpointProbeTimeout bounds the reachability probes for endpoint profiles.
+// Local services (ollama, the Amazon Quick desktop agent) answer in
+// milliseconds when up; anything slower is as good as down.
+const endpointProbeTimeout = 3 * time.Second
+
+// probeProfile actively validates an env-injection profile. Token profiles
+// get a single cheap authenticated API call; endpoint profiles get a cheap
+// reachability probe of their stored endpoint. Returns (valid, nil) on a
+// conclusive answer; a non-nil error means the probe was inconclusive and
+// says nothing about the profile.
+func probeProfile(ctx context.Context, tool, token string, meta *authfile.TokenMeta) (bool, error) {
+	if meta != nil && meta.Type == authfile.ProfileTypeEndpoint {
+		switch strings.ToLower(strings.TrimSpace(tool)) {
+		case "ollama":
+			// GET <endpoint>/api/tags is Ollama's canonical liveness check.
+			return probeHTTPReachable(ctx, strings.TrimSuffix(meta.Endpoint, "/")+"/api/tags")
+		case "quick":
+			// The Quick agent speaks WebSocket; any HTTP answer from its port
+			// (including an upgrade/auth rejection) proves the instance is up.
+			return probeHTTPReachable(ctx, wsToHTTP(meta.Endpoint))
+		default:
+			// Anthropic-compatible endpoints (claude --base-url) have no
+			// uniformly cheap, quota-free probe; passive verdict stands.
+			return false, fmt.Errorf("active validation not supported for %s endpoint profiles", tool)
+		}
+	}
+	return probeToken(ctx, tool, token)
+}
+
+// probeHTTPReachable reports whether an HTTP GET of url receives ANY response
+// within the probe timeout. Every HTTP status — including 4xx/5xx — counts as
+// reachable: the probe asserts the service is up, not that the request is
+// authorized. Connection errors mean down (false, nil); only a malformed URL
+// is inconclusive.
+func probeHTTPReachable(ctx context.Context, url string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, endpointProbeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("create probe request: %w", err)
+	}
+	client := &http.Client{Timeout: endpointProbeTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Connection refused/timeout: conclusive "not reachable".
+		return false, nil
+	}
+	defer resp.Body.Close()
+	return true, nil
+}
+
+// wsToHTTP maps a WebSocket endpoint to its HTTP origin for reachability
+// probing (ws → http, wss → https); http(s) URLs pass through unchanged.
+func wsToHTTP(endpoint string) string {
+	switch {
+	case strings.HasPrefix(endpoint, "ws://"):
+		return "http://" + strings.TrimPrefix(endpoint, "ws://")
+	case strings.HasPrefix(endpoint, "wss://"):
+		return "https://" + strings.TrimPrefix(endpoint, "wss://")
+	default:
+		return endpoint
+	}
+}
 
 // probeToken actively validates a token with a single cheap API call.
 // Returns (valid, nil) on a conclusive answer; a non-nil error means the
@@ -525,11 +672,11 @@ func tokenProfileHealth(tool, name string) (*health.ProfileHealth, health.Health
 		ph = &health.ProfileHealth{}
 	}
 
-	token, _, err := vault.ReadTokenProfile(tool, name)
+	token, meta, err := vault.ReadTokenProfile(tool, name)
 	if err != nil {
 		return ph, health.StatusCritical
 	}
-	if err := authfile.ValidateTokenFormat(tool, token); err != nil {
+	if err := authfile.ValidateProfileToken(tool, token, meta); err != nil {
 		return ph, health.StatusWarning
 	}
 	// Long-lived tokens carry no expiry metadata, which the generic scorer

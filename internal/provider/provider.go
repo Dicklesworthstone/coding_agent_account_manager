@@ -232,6 +232,24 @@ var providerMetaRegistry = map[string]ProviderMeta{
 		AccountURL:  "https://cursor.com/settings",
 		Description: "Cursor account settings",
 	},
+	"deepseek": {
+		ID:          "deepseek",
+		DisplayName: "DeepSeek",
+		AccountURL:  "https://platform.deepseek.com/",
+		Description: "DeepSeek open platform (API keys)",
+	},
+	"ollama": {
+		ID:          "ollama",
+		DisplayName: "Ollama",
+		AccountURL:  "https://ollama.com/",
+		Description: "Ollama (local/remote server, no auth)",
+	},
+	"quick": {
+		ID:          "quick",
+		DisplayName: "Amazon Quick",
+		AccountURL:  "https://aws.amazon.com/quicksuite/",
+		Description: "Amazon Quick desktop agent (local instance)",
+	},
 }
 
 // GetProviderMeta returns metadata for a provider by ID.

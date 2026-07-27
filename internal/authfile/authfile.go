@@ -323,6 +323,28 @@ func CursorAuthFiles() AuthFileSet {
 	}
 }
 
+// DeepSeekAuthFiles returns the (empty) auth file set for DeepSeek. DeepSeek
+// is an env-injection-only provider: auth is an API key stored in token
+// profiles and injected as DEEPSEEK_API_KEY; there are no auth files to swap.
+func DeepSeekAuthFiles() AuthFileSet {
+	return AuthFileSet{Tool: "deepseek"}
+}
+
+// OllamaAuthFiles returns the (empty) auth file set for Ollama. Ollama is an
+// env-injection-only provider: profiles store a server endpoint URL injected
+// as OLLAMA_HOST; there is no authentication and no auth files to swap.
+func OllamaAuthFiles() AuthFileSet {
+	return AuthFileSet{Tool: "ollama"}
+}
+
+// QuickAuthFiles returns the (empty) auth file set for Amazon Quick. Quick is
+// an env-injection-only provider: profiles store the local desktop agent's
+// WebSocket endpoint + per-launch bearer token; there are no auth files to
+// swap.
+func QuickAuthFiles() AuthFileSet {
+	return AuthFileSet{Tool: "quick"}
+}
+
 // GetAuthFileSet returns the AuthFileSet for the given provider name.
 func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 	switch strings.ToLower(provider) {
@@ -340,6 +362,12 @@ func GetAuthFileSet(provider string) (AuthFileSet, bool) {
 		return OpenCodeAuthFiles(), true
 	case "cursor", "cur":
 		return CursorAuthFiles(), true
+	case "deepseek":
+		return DeepSeekAuthFiles(), true
+	case "ollama":
+		return OllamaAuthFiles(), true
+	case "quick":
+		return QuickAuthFiles(), true
 	default:
 		return AuthFileSet{}, false
 	}

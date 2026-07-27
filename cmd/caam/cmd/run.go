@@ -204,11 +204,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		// cooling down, rotate to another token profile.
 		tokenProfile = rotateTokenProfileIfCoolingDown(tool, tokenProfile, db, selector, quiet)
 
-		token, _, err := vault.ReadTokenProfile(tool, tokenProfile)
+		token, meta, err := vault.ReadTokenProfile(tool, tokenProfile)
 		if err != nil {
 			return fmt.Errorf("read token profile %s/%s: %w", tool, tokenProfile, err)
 		}
-		tokenEnv, err = authfile.TokenEnv(tool, tokenProfile, token)
+		tokenEnv, err = authfile.ProfileEnv(tool, tokenProfile, token, meta)
 		if err != nil {
 			return err
 		}
@@ -232,11 +232,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		activeProfileName = res.Selected
 		if vault.IsTokenProfile(tool, activeProfileName) {
 			// Rotation picked a token profile: inject env instead of swapping.
-			token, _, err := vault.ReadTokenProfile(tool, activeProfileName)
+			token, meta, err := vault.ReadTokenProfile(tool, activeProfileName)
 			if err != nil {
 				return fmt.Errorf("read token profile %s/%s: %w", tool, activeProfileName, err)
 			}
-			tokenEnv, err = authfile.TokenEnv(tool, activeProfileName, token)
+			tokenEnv, err = authfile.ProfileEnv(tool, activeProfileName, token, meta)
 			if err != nil {
 				return err
 			}
