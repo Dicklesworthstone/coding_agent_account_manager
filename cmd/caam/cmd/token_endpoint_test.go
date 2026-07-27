@@ -3,8 +3,11 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -316,6 +319,64 @@ func TestTokenLs_ShowsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(s, "endpoint") || !strings.Contains(s, "deepseek") {
 		t.Errorf("token ls output missing type/provider:\n%s", s)
+	}
+}
+
+func TestLs_EndpointProfileTypeSuffix(t *testing.T) {
+	setupTokenTest(t)
+	resetEndpointFlags(t)
+
+	if err := vault.SaveEndpointProfile("ollama", "local", "http://127.0.0.1:11434", "", ""); err != nil {
+		t.Fatalf("SaveEndpointProfile error: %v", err)
+	}
+	if err := vault.SaveTokenProfile("deepseek", "main", "sk-0123456789abcdef01234567", ""); err != nil {
+		t.Fatalf("SaveTokenProfile error: %v", err)
+	}
+
+	// Text mode: the suffix names the true profile type, mirroring status.
+	t.Cleanup(func() { _ = lsCmd.Flags().Set("json", "false") })
+	for _, tt := range []struct {
+		tool string
+		want string
+	}{
+		{"ollama", "local [endpoint]"},
+		{"deepseek", "main [token]"},
+	} {
+		_ = lsCmd.Flags().Set("json", "false")
+		oldStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		os.Stdout = w
+		lsErr := runLs(lsCmd, []string{tt.tool})
+		w.Close()
+		os.Stdout = oldStdout
+		if lsErr != nil {
+			t.Fatalf("runLs(%s) error: %v", tt.tool, lsErr)
+		}
+		data, _ := io.ReadAll(r)
+		if !strings.Contains(string(data), tt.want) {
+			t.Errorf("ls %s output missing %q:\n%s", tt.tool, tt.want, data)
+		}
+	}
+
+	// JSON mode: the type field carries the true profile type.
+	_ = lsCmd.Flags().Set("json", "true")
+	var out bytes.Buffer
+	lsCmd.SetOut(&out)
+	if err := runLs(lsCmd, []string{"ollama"}); err != nil {
+		t.Fatalf("runLs --json error: %v", err)
+	}
+	var parsed lsOutput
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("parse ls JSON: %v\n%s", err, out.String())
+	}
+	if len(parsed.Profiles) != 1 {
+		t.Fatalf("profiles = %d, want 1", len(parsed.Profiles))
+	}
+	if parsed.Profiles[0].Type != authfile.ProfileTypeEndpoint {
+		t.Errorf("type = %q, want %q", parsed.Profiles[0].Type, authfile.ProfileTypeEndpoint)
 	}
 }
 

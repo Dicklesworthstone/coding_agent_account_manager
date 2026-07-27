@@ -1180,6 +1180,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
 			isToken := vault.IsTokenProfile(tool, p)
+			profileType := lsProfileType(tool, p, isToken)
 			var status health.HealthStatus
 			if isToken {
 				ph, status = tokenProfileHealth(tool, p)
@@ -1193,7 +1194,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Name:   p,
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
-					Type:   lsProfileType(isToken),
+					Type:   profileType,
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
@@ -1214,8 +1215,8 @@ func runLs(cmd *cobra.Command, args []string) error {
 				if authfile.IsSystemProfile(p) {
 					displayName = fmt.Sprintf("%s [system]", p)
 				}
-				if isToken {
-					displayName = fmt.Sprintf("%s [token]", displayName)
+				if profileType != "" {
+					displayName = fmt.Sprintf("%s [%s]", displayName, profileType)
 				}
 
 				email, plan := formatIdentityDisplay(id)
@@ -1288,6 +1289,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
 			isToken := vault.IsTokenProfile(tool, p)
+			profileType := lsProfileType(tool, p, isToken)
 			var status health.HealthStatus
 			if isToken {
 				ph, status = tokenProfileHealth(tool, p)
@@ -1301,7 +1303,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Name:   p,
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
-					Type:   lsProfileType(isToken),
+					Type:   profileType,
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
@@ -1322,8 +1324,8 @@ func runLs(cmd *cobra.Command, args []string) error {
 				if authfile.IsSystemProfile(p) {
 					displayName = fmt.Sprintf("%s [system]", p)
 				}
-				if isToken {
-					displayName = fmt.Sprintf("%s [token]", displayName)
+				if profileType != "" {
+					displayName = fmt.Sprintf("%s [%s]", displayName, profileType)
 				}
 
 				email, plan := formatIdentityDisplay(id)
@@ -1341,12 +1343,17 @@ func runLs(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// lsProfileType maps the token-profile flag to the lsProfile.Type value.
-func lsProfileType(isToken bool) string {
-	if isToken {
-		return authfile.ProfileTypeToken
+// lsProfileType returns the lsProfile.Type value: the env-injection profile
+// type ("token" or "endpoint") read from the profile's meta.json — mirroring
+// what `caam status` reports — or "" for file-swap profiles.
+func lsProfileType(tool, name string, isToken bool) string {
+	if !isToken {
+		return ""
 	}
-	return ""
+	if _, meta, err := vault.ReadTokenProfile(tool, name); err == nil && meta.Type != "" {
+		return meta.Type
+	}
+	return authfile.ProfileTypeToken
 }
 
 func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
