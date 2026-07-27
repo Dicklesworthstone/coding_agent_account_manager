@@ -1,0 +1,28 @@
+Generate 1 LEGO-themed illustration for the caam README architecture view —
+caam is one account manager over ten AI-coding-CLI providers, routing
+credentials from a central vault to whichever tool is being launched.
+Save to /Users/christianmc/projects/caam/assets/ as caam-architecture.png.
+
+Image: caam-architecture.png, landscape 1536x1024:
+A LEGO factory-floor diorama seen at a gentle three-quarter angle, slightly
+elevated: on the left, a neat arc of ten small distinct grey LEGO terminal
+stations (each a slightly different little machine — different heights,
+screens, antennae — but all plain grey). Grey cables and conveyor tracks run
+from every station toward the center-right, converging on one large central
+switchboard-vault build: a cabinet of small drawers glowing translucent
+teal, topped with a patch-panel of sockets, with exactly one teal-lit cable
+plugged through to a single running workstation on the far right whose
+screen area is a plain glowing teal tile. The story: many machines, one
+vault, one live routed credential. One minifig operator plugs the teal
+cable into the patch panel; a second minifig restocks a teal drawer with a
+small translucent cartridge. Style bible: light-grey LEGO terminal-workshop
+floor on a white seamless backdrop, gentle three-quarter camera angle
+slightly elevated, glowing translucent teal is the ONLY accent color,
+everything else grey/white, studio softbox lighting. Mood: clean, bright,
+studio-lit product-photography style on a plain light backdrop, shallow
+depth of field, photorealistic LEGO render. NO text in the image.
+
+Self-critique: LEGO aesthetic convincing, composition readable at
+README-banner size, no text/typos, the contrast "ten grey stations, one
+teal vault routing one live credential" reads instantly. Regenerate until
+good. Return final file paths.

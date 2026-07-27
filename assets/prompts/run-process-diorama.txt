@@ -1,0 +1,29 @@
+Generate 1 LEGO-themed illustration for the caam README process view — the
+"caam run claude" launch sequence: pick a credential profile off the shelf,
+pass it through a scrubbing airlock that strips stray ambient junk, carry
+it by conveyor into the tool being started.
+Save to /Users/christianmc/projects/caam/assets/ as caam-run-process.png.
+
+Image: caam-run-process.png, landscape 1536x1024:
+A LEGO assembly-line diorama seen at a gentle three-quarter angle, slightly
+elevated, read strictly left to right: first, a grey shelf rack holding a
+row of small translucent teal cartridges (one slot empty); next, a boxy
+grey airlock chamber with round porthole windows, where loose mismatched
+grey clutter bricks are visibly being blown off a parcel into a bin
+beneath; then a grey conveyor belt carrying the single glowing teal
+cartridge onward; finally the conveyor feeds into the back of a grey
+terminal workstation just powering up, its screen area a plain glowing teal
+tile. The story: one profile leaves the shelf, gets scrubbed clean, and is
+injected into the freshly started tool. One minifig engineer lifts the teal
+cartridge from the shelf; a second minifig operates the airlock's big grey
+lever. Style bible: light-grey LEGO terminal-workshop floor on a white
+seamless backdrop, gentle three-quarter camera angle slightly elevated,
+glowing translucent teal is the ONLY accent color, everything else
+grey/white, studio softbox lighting. Mood: clean, bright, studio-lit
+product-photography style on a plain light backdrop, shallow depth of
+field, photorealistic LEGO render. NO text in the image.
+
+Self-critique: LEGO aesthetic convincing, composition readable at
+README-banner size, no text/typos, the left-to-right sequence
+"shelf → airlock scrub → conveyor → powered-up terminal" reads instantly.
+Regenerate until good. Return final file paths.

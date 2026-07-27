@@ -270,9 +270,16 @@ wait
 
 *Fork addition. This section and the next describe features that exist only in this fork.*
 
-<p align="center"><img src="assets/diagrams/architecture.svg" alt="Architecture: caam CLI over a profile vault and SQLite history, feeding a runner that scrubs and injects env before spawning the child process" width="820"></p>
+<p align="center"><img src="assets/caam-architecture.png" alt="LEGO diorama: ten grey provider stations wired into a central teal switchboard-vault routing one credential to a running workstation" width="820"></p>
 
-*How the system is shaped: one CLI over local state; the runner scrubs ambient auth env and injects the profile's own before spawning the child CLI.*
+*How the system is shaped — many tools, one vault: every provider CLI wires into the central switchboard-vault, which routes exactly one credential to the tool being launched.*
+
+| In the scene | Meaning |
+|---|---|
+| the grey stations | the provider CLIs — claude, codex, gemini, agy, grok, deepseek, ollama, quick, opencode, cursor |
+| teal drawer cabinet | the credential vault: file-swap, token, and endpoint profiles |
+| patch panel + one teal cable | active-profile selection — one credential routed per launch |
+| workstation, teal screen | the child CLI process caam spawns |
 
 On macOS, recent Claude Code builds keep the OAuth credential in the system Keychain, which has exactly one slot and no way to point the CLI at another. File-swap profiles capture `~/.claude.json` without the credential, so every switch lands on a forced `/login`.
 
@@ -304,9 +311,21 @@ For the default token profile, `caam run claude` and `caam exec claude <name>` i
 
 **Cooldowns and rotation apply.** Token profiles are first-class in health, cooldowns, and rotation. `caam cooldown set claude/work --minutes 30` works as usual, and when the default token profile is cooling down, `caam run claude` rotates to another token profile before launching. Health checks are passive (format/expiry); `caam validate claude work --active` makes one cheap authenticated call against Claude's OAuth usage endpoint to confirm the token is live.
 
-<p align="center"><img src="assets/diagrams/token-run-flow.svg" alt="Flow: caam run claude resolves the default token profile, rotates past cooldowns, reads the vaulted token, scrubs ambient auth vars, injects the token env, spawns claude" width="560"></p>
+<p align="center"><img src="assets/caam-run-process.png" alt="LEGO diorama: a teal profile cartridge leaves a shelf, passes a scrubbing airlock shedding grey bricks, rides a conveyor into a powering-up terminal" width="820"></p>
 
-*How a run moves: resolve the default token profile (rotating past cooldowns), read the vaulted token, scrub ambient auth vars, inject, spawn.*
+*The launch sequence of `caam run claude`: a profile leaves the shelf, is scrubbed clean of ambient auth, and is injected into the freshly started tool.*
+
+| In the scene | Meaning |
+|---|---|
+| shelf of teal cartridges | token/endpoint profiles stored in the vault (mode 0600) |
+| lifted cartridge | default-profile resolution — `.active-token` marker, cooldown rotation |
+| airlock shedding grey bricks | ambient auth env scrub (`ANTHROPIC_*`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`…) |
+| conveyor | env injection: the profile's own `CLAUDE_CODE_OAUTH_TOKEN` + per-profile `CLAUDE_CONFIG_DIR` |
+| powered-up terminal | the spawned claude child (PTY, rate-limit watch) |
+
+<p align="center"><img src="assets/diagrams/token-run-flow.svg" alt="Flow diagram: caam run claude resolves the default token profile, rotates past cooldowns, reads the vaulted token, scrubs ambient auth vars, injects the token env, spawns claude" width="820"></p>
+
+*The exact resolve path — branching and env var names precisely, complementing the diorama above.*
 
 ---
 
@@ -340,10 +359,6 @@ Notes:
 - **Anthropic-compatible endpoints** (GLM, Moonshot/Kimi, anything else speaking the Anthropic API) reuse the `claude` provider: `--base-url` points the `claude` binary at the service with its issued token, isolated in its own `CLAUDE_CONFIG_DIR`. A claude endpoint profile must always name its base URL; there is no default, and the URL must be `https://` (the bearer token would travel cleartext over plain http). `http`/`ws` remain accepted for ollama and quick, which are localhost-typical.
 - **ollama** endpoint profiles take no token at all; `caam token add ollama <name>` reads nothing from stdin.
 - Endpoint profiles show as `name [endpoint]` in `caam ls` and `name (endpoint)` in `caam status`.
-
-<p align="center"><img src="assets/diagrams/provider-credential-map.svg" alt="Map of credential kinds: upstream file-swap vault vs the fork's token profiles and endpoint profiles, all feeding caam run/exec" width="820"></p>
-
-*Three credential kinds: upstream's file-swap vault, and the fork's token and endpoint profiles — both env-injected at launch.*
 
 ---
 
