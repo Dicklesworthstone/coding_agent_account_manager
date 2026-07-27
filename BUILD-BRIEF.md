@@ -45,6 +45,17 @@ Branch reconcile/local-patches. All tests green.
 - ollama: endpoint profiles (OLLAMA_HOST), no auth; health = GET /api/tags.
 - anthropic-compatible endpoints (GLM, Moonshot/Kimi): claude-provider variant profile
   carrying ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
+- quick (Amazon Quick): endpoint+bearer profile for the LOCAL desktop agent
+  instance — WebSocket endpoint (default ws://localhost:8771) + per-launch
+  bearer token (VITE_INSTANCE_TOKEN). No cloud API; the desktop app's bundled
+  agent server is the backend. Health = cheap HTTP/WS reachability ping on the
+  endpoint with a short timeout. Reference harness: ~/vc/quick-cli/quick.ts
+  (READ-ONLY reference — do not modify that repo).
+
+Endpoint-bearing profile kinds (ollama, quick, anthropic-compat claude) share
+ONE "endpoint profile" representation in the vault (endpoint URL + optional
+bearer token), designed once and reused; rotation/cooldown/status/ls treat all
+of them first-class, same as WS2 token profiles.
 
 ### WS4 (later, optional) — Darwin Keychain fallback
 security(1) read/write of "Claude Code-credentials" for vaulting the interactive login
