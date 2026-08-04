@@ -482,6 +482,7 @@ Examples:
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
   caam shallow-spawn codex-bob --reload-daemon -- codex
+  caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
 Use 'caam shallow-spawn <name> --print-env' to print the environment that
 WOULD be applied without executing anything (useful for shell wrappers).
@@ -489,7 +490,14 @@ WOULD be applied without executing anything (useful for shell wrappers).
 --reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
 auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
 new identity takes effect. It is a shallow-spawn flag (place it BEFORE '--'),
-consumed here and never forwarded to the spawned command.`,
+consumed here and never forwarded to the spawned command.
+
+--effort <level> (codex only) sets the model reasoning effort for the spawned
+codex command. Codex has no '--effort' CLI flag (that spelling is a Claude-ism);
+its knob is the config key 'model_reasoning_effort', so caam translates
+'--effort xhigh' into '-c model_reasoning_effort=xhigh' injected right after
+the codex binary (issue #63). Like --reload-daemon it is a shallow-spawn flag:
+place it BEFORE '--'; it errors when the spawned command is not codex.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runShallowSpawn,
 }
@@ -498,6 +506,7 @@ func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
+	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
 }
 
@@ -598,6 +607,16 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		printCodexDaemonWarning(cmd.ErrOrStderr(), shallowCodexDaemonCheck("codex", reloadDaemon, set["CODEX_HOME"]))
 	}
 
+	// Reasoning-effort plumb-through (#63): codex has no `--effort` CLI flag
+	// (that spelling comes from Claude-side muscle memory); its knob is the
+	// `model_reasoning_effort` config key. Translate our --effort flag into the
+	// `-c` form codex actually accepts, injected right after the binary so it
+	// applies regardless of any codex subcommand that follows.
+	effort, _ := cmd.Flags().GetString("effort")
+	if rest, err = injectCodexEffort(rest, effort); err != nil {
+		return err
+	}
+
 	binPath, err := exec.LookPath(rest[0])
 	if err != nil {
 		return fmt.Errorf("lookup %q: %w", rest[0], err)
@@ -627,6 +646,37 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// On Unix, exec the target so signals/exit propagate naturally and we
 	// don't add a stray caam process to the tree.
 	return spawnExec(binPath, rest, envSlice)
+}
+
+// injectCodexEffort translates shallow-spawn's --effort flag into the config
+// override codex actually understands (`-c model_reasoning_effort=<effort>`),
+// injected immediately after the codex binary in argv (issue #63).
+//
+// It is fail-closed on misuse: --effort with a non-codex command is an error
+// (Claude & friends have no equivalent knob we could safely map), and an argv
+// that already carries its own model_reasoning_effort override is left alone —
+// the user's explicit spelling wins and we error rather than silently stacking
+// two conflicting overrides. An empty effort is a no-op passthrough.
+func injectCodexEffort(argv []string, effort string) ([]string, error) {
+	effort = strings.TrimSpace(effort)
+	if effort == "" || len(argv) == 0 {
+		return argv, nil
+	}
+	if filepath.Base(argv[0]) != "codex" {
+		return nil, fmt.Errorf("--effort is codex-only (it maps to codex's model_reasoning_effort config key), but the spawned command is %q", argv[0])
+	}
+	for _, a := range argv[1:] {
+		if strings.Contains(a, "model_reasoning_effort") {
+			return nil, fmt.Errorf("--effort %s conflicts with %q already present in the codex command; drop one of them", effort, a)
+		}
+		if a == "--effort" || strings.HasPrefix(a, "--effort=") {
+			return nil, fmt.Errorf("codex has no --effort flag; use `caam shallow-spawn <name> --effort %s -- codex ...` (before the --) and caam will inject `-c model_reasoning_effort=%s` for you", effort, effort)
+		}
+	}
+	out := make([]string, 0, len(argv)+2)
+	out = append(out, argv[0], "-c", "model_reasoning_effort="+effort)
+	out = append(out, argv[1:]...)
+	return out, nil
 }
 
 // spawnExec replaces the current process image with the target on Unix.

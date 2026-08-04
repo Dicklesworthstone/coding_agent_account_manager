@@ -116,6 +116,7 @@ func newShallowTestRoot() *cobra.Command {
 	spawn.Flags().Bool("print-env", false, "")
 	spawn.Flags().Bool("reload-daemon", false, "")
 	spawn.Flags().Bool("allow-agent-view", false, "")
+	spawn.Flags().String("effort", "", "")
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
@@ -555,5 +556,117 @@ func TestShallowSpawnNoCommand(t *testing.T) {
 	_, _, err := runCmdCaptured(t, "shallow-spawn", "alice")
 	if err == nil {
 		t.Fatalf("expected error when no command provided")
+	}
+}
+
+// TestInjectCodexEffort unit-tests the --effort → `-c model_reasoning_effort=`
+// translation (issue #63): codex has no --effort CLI flag, so caam injects the
+// config-key spelling right after the codex binary, fails closed for non-codex
+// commands, and refuses to stack a second effort override on top of one the
+// user already spelled out.
+func TestInjectCodexEffort(t *testing.T) {
+	t.Run("empty effort is a no-op", func(t *testing.T) {
+		in := []string{"codex", "--model", "gpt-5.6-sol"}
+		out, err := injectCodexEffort(in, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Join(out, " ") != strings.Join(in, " ") {
+			t.Fatalf("argv changed without --effort: %v", out)
+		}
+	})
+
+	t.Run("injects config override after codex binary", func(t *testing.T) {
+		out, err := injectCodexEffort([]string{"codex", "--model", "gpt-5.6-sol", "--yolo"}, "xhigh")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "codex -c model_reasoning_effort=xhigh --model gpt-5.6-sol --yolo"
+		if strings.Join(out, " ") != want {
+			t.Fatalf("argv = %q, want %q", strings.Join(out, " "), want)
+		}
+	})
+
+	t.Run("full codex path still recognized", func(t *testing.T) {
+		out, err := injectCodexEffort([]string{"/usr/local/bin/codex", "exec", "hi"}, "high")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := "/usr/local/bin/codex -c model_reasoning_effort=high exec hi"
+		if strings.Join(out, " ") != want {
+			t.Fatalf("argv = %q, want %q", strings.Join(out, " "), want)
+		}
+	})
+
+	t.Run("non-codex command fails closed", func(t *testing.T) {
+		if _, err := injectCodexEffort([]string{"claude", "--print", "hi"}, "high"); err == nil {
+			t.Fatal("expected error for non-codex command")
+		}
+	})
+
+	t.Run("explicit user override wins by erroring, not stacking", func(t *testing.T) {
+		_, err := injectCodexEffort([]string{"codex", "-c", "model_reasoning_effort=low"}, "high")
+		if err == nil || !strings.Contains(err.Error(), "conflicts") {
+			t.Fatalf("expected conflict error, got %v", err)
+		}
+	})
+
+	t.Run("literal --effort in child args gets a redirect hint", func(t *testing.T) {
+		_, err := injectCodexEffort([]string{"codex", "--effort", "xhigh"}, "high")
+		if err == nil || !strings.Contains(err.Error(), "codex has no --effort flag") {
+			t.Fatalf("expected redirect hint, got %v", err)
+		}
+	})
+}
+
+// TestShallowSpawnEffortFlag proves the end-to-end wiring of --effort (#63)
+// through the real command tree: a codex shallow-spawn with --effort xhigh
+// execs codex with `-c model_reasoning_effort=xhigh` injected ahead of the
+// user's own flags, and the caam-level flag itself is never forwarded.
+func TestShallowSpawnEffortFlag(t *testing.T) {
+	_, realHome := shallowEnv(t)
+
+	// Real codex identity so `shallow-profile create --tool codex` works.
+	codexDir := filepath.Join(realHome, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"OPENAI_API_KEY":null}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "cx", "--tool", "codex",
+		"--from-file", filepath.Join(codexDir, "auth.json"), "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fake codex binary on PATH so exec.LookPath resolves.
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Stub the exec and the host daemon scan.
+	var got []string
+	origExec := spawnExec
+	spawnExec = func(_ string, args []string, _ []string) error { got = args; return nil }
+	t.Cleanup(func() { spawnExec = origExec })
+	origCheck := shallowCodexDaemonCheck
+	shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
+	t.Cleanup(func() { shallowCodexDaemonCheck = origCheck })
+
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx", "--effort", "xhigh", "--",
+		"codex", "--model", "gpt-5.6-sol", "--yolo"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	want := "codex -c model_reasoning_effort=xhigh --model gpt-5.6-sol --yolo"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("exec argv = %q, want %q", strings.Join(got, " "), want)
+	}
+
+	// And --effort with a non-codex child refuses instead of silently dropping.
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx", "--effort", "xhigh", "--",
+		"sh", "-c", "true"); err == nil {
+		t.Fatal("expected --effort with non-codex child to fail closed")
 	}
 }
