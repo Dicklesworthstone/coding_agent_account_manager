@@ -1,6 +1,8 @@
 package exec
 
 import (
+	"context"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
@@ -248,4 +251,107 @@ func TestSmartRunner_WithRotation(t *testing.T) {
 	if sr.rotation != selector {
 		t.Error("rotation selector not set correctly")
 	}
+}
+
+// =============================================================================
+// UseGlobalEnv Regression (issue #64)
+// =============================================================================
+
+// envTrackingProvider wraps mockProvider (exec_test.go) to count Env calls, so
+// tests can prove whether SmartRunner asked for the provider's isolated env.
+type envTrackingProvider struct {
+	mockProvider
+	envCalls int
+}
+
+func (p *envTrackingProvider) Env(_ context.Context, _ *profile.Profile) (map[string]string, error) {
+	p.envCalls++
+	return p.mockProvider.envVars, p.mockProvider.envErr
+}
+
+// TestSmartRunner_Run_UseGlobalEnv is the regression test for issue #64:
+// vault-based `caam run` sets UseGlobalEnv=true, but SmartRunner.Run used to
+// call Provider.Env unconditionally, replacing HOME/CODEX_HOME with the
+// isolated profile paths and pointing codex at a profile dir that is not
+// logged in. SmartRunner must honor UseGlobalEnv exactly like Runner.Run.
+func TestSmartRunner_Run_UseGlobalEnv(t *testing.T) {
+	// Mock the spawned command with a trivially-succeeding shell so the PTY
+	// path runs for real while letting us inspect the env caam handed it.
+	var captured *exec.Cmd
+	origExec := ExecCommand
+	ExecCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "sh", "-c", "true")
+		captured = cmd
+		return cmd
+	}
+	t.Cleanup(func() { ExecCommand = origExec })
+
+	isolatedHome := "/isolated/codex_home"
+	newProv := func() *envTrackingProvider {
+		return &envTrackingProvider{mockProvider: mockProvider{
+			id:         "codex", // codex has a login handler, so we stay on the SmartRunner path
+			defaultBin: "codex",
+			envVars: map[string]string{
+				"HOME":       "/isolated/home",
+				"CODEX_HOME": isolatedHome,
+			},
+		}}
+	}
+
+	run := func(t *testing.T, prov *envTrackingProvider, useGlobal bool) []string {
+		t.Helper()
+		captured = nil
+		store := profile.NewStore(t.TempDir())
+		prof, err := store.Create("codex", "vault-active", "oauth")
+		if err != nil {
+			t.Fatalf("create profile: %v", err)
+		}
+		sr := NewSmartRunner(NewRunner(provider.NewRegistry()), SmartRunnerOptions{})
+		if err := sr.Run(context.Background(), RunOptions{
+			Profile:      prof,
+			Provider:     prov,
+			NoLock:       true,
+			UseGlobalEnv: useGlobal,
+		}); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if captured == nil {
+			t.Fatal("ExecCommand was never invoked (fell off the SmartRunner path?)")
+		}
+		return captured.Env
+	}
+
+	hasEnv := func(env []string, want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("vault run keeps the global environment", func(t *testing.T) {
+		prov := newProv()
+		env := run(t, prov, true)
+		if prov.envCalls != 0 {
+			t.Fatalf("Provider.Env called %d times; UseGlobalEnv must skip it entirely", prov.envCalls)
+		}
+		if hasEnv(env, "CODEX_HOME="+isolatedHome) {
+			t.Fatalf("isolated CODEX_HOME leaked into a UseGlobalEnv run: %v", env)
+		}
+		if hasEnv(env, "HOME=/isolated/home") {
+			t.Fatalf("isolated HOME leaked into a UseGlobalEnv run: %v", env)
+		}
+	})
+
+	t.Run("isolated run still applies provider env", func(t *testing.T) {
+		prov := newProv()
+		env := run(t, prov, false)
+		if prov.envCalls != 1 {
+			t.Fatalf("Provider.Env called %d times, want 1", prov.envCalls)
+		}
+		if !hasEnv(env, "CODEX_HOME="+isolatedHome) {
+			t.Fatalf("provider env missing from isolated run: %v", env)
+		}
+	})
 }

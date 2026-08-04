@@ -210,10 +210,16 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 		defer opts.Profile.Unlock()
 	}
 
-	// Get env
-	providerEnv, err := opts.Provider.Env(ctx, opts.Profile)
-	if err != nil {
-		return fmt.Errorf("get provider env: %w", err)
+	// Get env. Honor UseGlobalEnv exactly like Runner.Run does (issue #64):
+	// vault-based runs (`caam run`) swap auth files inside the REAL home, so
+	// injecting the provider's isolated-profile env (HOME, CODEX_HOME, ...)
+	// would point the tool at a profile directory that is not logged in.
+	var providerEnv map[string]string
+	if !opts.UseGlobalEnv {
+		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
+		if err != nil {
+			return fmt.Errorf("get provider env: %w", err)
+		}
 	}
 
 	// Build command
