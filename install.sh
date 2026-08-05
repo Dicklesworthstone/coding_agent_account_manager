@@ -842,6 +842,34 @@ verify_release_assets() {
                 "$checksums_path" 2>&1) && verified=1
         fi
 
+        # Attempt 3: repo-pinned release signing key. Releases built outside
+        # GitHub Actions (e.g. during a hosted-CI outage) cannot carry a
+        # GHA-OIDC keyless certificate, so they are signed with the caam
+        # release key instead (private key held offline; public key pinned
+        # below and tracked as cosign.pub in the repository). Verification
+        # remains fail-closed: an invalid or missing signature is still a
+        # hard error.
+        if [ "$verified" -ne 1 ]; then
+            local pinned_key="$tmp_dir/caam-release-cosign.pub"
+            cat > "$pinned_key" <<'CAAM_COSIGN_PUB'
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAET112znudShcqRJa54SUK3FQ0tPkT
+SgexbObsFmiXKDRv3IrWP4kRNNkIDdjoZpR3McuGgzkt5+aJgn09yO+HVA==
+-----END PUBLIC KEY-----
+CAAM_COSIGN_PUB
+            cosign_out=$(cosign verify-blob \
+                --key "$pinned_key" \
+                --bundle "$signature_path" \
+                "$checksums_path" 2>&1) && verified=1
+            if [ "$verified" -ne 1 ] && cosign verify-blob --help 2>/dev/null | grep -q -- '--new-bundle-format'; then
+                cosign_out=$(cosign verify-blob \
+                    --new-bundle-format \
+                    --key "$pinned_key" \
+                    --bundle "$signature_path" \
+                    "$checksums_path" 2>&1) && verified=1
+            fi
+        fi
+
         if [ "$verified" -ne 1 ]; then
             print_error "Signature verification failed."
             # Surface cosign's real error instead of hiding it — the actual
