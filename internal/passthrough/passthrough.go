@@ -33,6 +33,34 @@ var DefaultPassthroughs = []string{
 	".local/bin",        // User binaries
 }
 
+// isolatedXDGEntries are entry names under the XDG config/data/state roots
+// that must NEVER be passed through into a profile. They are (or can contain)
+// per-account state for the providers caam isolates — symlinking them would
+// collapse the isolation the profile exists to provide — or they are caam's
+// own data root (which contains the vault and every profile's credentials).
+//
+// The deny list intentionally covers ALL providers, not just the profile's
+// own: a claude profile passing through the real "claude-code" config dir
+// would expose the real account's auth.json inside the "isolated" profile.
+var isolatedXDGEntries = map[string]bool{
+	"caam":        true, // caam's own data (vault + all profiles' credentials)
+	"claude":      true,
+	"claude-code": true,
+	"codex":       true,
+	"gemini":      true,
+	"antigravity": true,
+	"agy":         true,
+	"opencode":    true,
+	"cursor":      true,
+	"grok":        true,
+}
+
+// IsIsolatedXDGEntry reports whether an entry name under an XDG root is on
+// the deny list and must not be passed through into a profile.
+func IsIsolatedXDGEntry(name string) bool {
+	return isolatedXDGEntries[strings.ToLower(name)]
+}
+
 // Status represents the state of a passthrough symlink.
 type Status struct {
 	Path         string // Relative path from HOME
@@ -122,6 +150,120 @@ func (m *Manager) SetupPassthroughs(pseudoHome string) error {
 		// Create symlink
 		if err := os.Symlink(realPath, linkPath); err != nil {
 			return fmt.Errorf("create symlink for %s: %w", relPath, err)
+		}
+	}
+
+	return nil
+}
+
+// realXDGConfigHome returns the real user's XDG config directory, honoring
+// XDG_CONFIG_HOME only when it points outside the profile being set up.
+func (m *Manager) realXDGConfigHome() string {
+	if v := os.Getenv("XDG_CONFIG_HOME"); v != "" {
+		return v
+	}
+	return filepath.Join(m.realHome, ".config")
+}
+
+// realXDGDataHome returns the real user's XDG data directory.
+func (m *Manager) realXDGDataHome() string {
+	if v := os.Getenv("XDG_DATA_HOME"); v != "" {
+		return v
+	}
+	return filepath.Join(m.realHome, ".local", "share")
+}
+
+// realXDGStateHome returns the real user's XDG state directory.
+func (m *Manager) realXDGStateHome() string {
+	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
+		return v
+	}
+	return filepath.Join(m.realHome, ".local", "state")
+}
+
+// SetupXDGPassthroughs creates per-entry symlinks for the XDG config, data,
+// and state directories so tools that keep their credentials under ~/.config,
+// ~/.local/share, or ~/.local/state (gh, vercel, shopify, supabase, atuin,
+// uv, ...) keep working inside a profile (issue #69).
+//
+// Profile isolation redirects HOME and XDG_CONFIG_HOME into the profile, which
+// silently relocates all three XDG roots (data and state default to
+// $HOME/.local/...). Before this, only a handful of $HOME dotfiles were passed
+// through, so every XDG-based CLI lost its credentials — most visibly gh,
+// whose absence surfaces as a baffling git "could not read Username" error.
+//
+// Entries are linked one at a time (never the whole root) so the provider auth
+// directories caam deliberately isolates stay real, private directories inside
+// the profile. Isolation rules, in order:
+//   - deny-listed entries (all providers' auth dirs + caam's own data root)
+//     are never linked;
+//   - an entry that already exists in the profile as a real file/dir is left
+//     untouched (the profile owns it);
+//   - existing symlinks are refreshed to point at the current real path.
+func (m *Manager) SetupXDGPassthroughs(pseudoHome, pseudoXDGConfig string) error {
+	pairs := []struct{ realDir, targetDir string }{
+		{m.realXDGConfigHome(), pseudoXDGConfig},
+		{m.realXDGDataHome(), filepath.Join(pseudoHome, ".local", "share")},
+		{m.realXDGStateHome(), filepath.Join(pseudoHome, ".local", "state")},
+	}
+
+	for _, pair := range pairs {
+		if pair.targetDir == "" || pair.realDir == "" {
+			continue
+		}
+		absTarget, err := filepath.Abs(pair.targetDir)
+		if err != nil {
+			continue
+		}
+		absReal, err := filepath.Abs(pair.realDir)
+		if err != nil {
+			continue
+		}
+		// Never link a root into itself (e.g. XDG_DATA_HOME already pointing
+		// inside the profile).
+		if absReal == absTarget || strings.HasPrefix(absReal, absTarget+string(os.PathSeparator)) {
+			continue
+		}
+
+		entries, err := os.ReadDir(absReal)
+		if err != nil {
+			continue // Real root missing: nothing to pass through.
+		}
+
+		if err := os.MkdirAll(absTarget, 0700); err != nil {
+			return fmt.Errorf("create %s: %w", absTarget, err)
+		}
+
+		for _, entry := range entries {
+			name := entry.Name()
+			if IsIsolatedXDGEntry(name) {
+				continue
+			}
+
+			linkPath := filepath.Join(absTarget, name)
+			// Path traversal guard (defensive; entry names come from ReadDir).
+			if filepath.Dir(linkPath) != absTarget {
+				continue
+			}
+
+			realPath := filepath.Join(absReal, name)
+			if info, err := os.Lstat(linkPath); err == nil {
+				if info.Mode()&os.ModeSymlink == 0 {
+					// A real file/dir in the profile wins: it is either a
+					// provider-managed dir or something the profile created.
+					continue
+				}
+				if current, err := os.Readlink(linkPath); err == nil && current == realPath {
+					continue // Already correct.
+				}
+				if err := os.Remove(linkPath); err != nil {
+					return fmt.Errorf("refresh symlink %s: %w", linkPath, err)
+				}
+			}
+
+			if err := os.Symlink(realPath, linkPath); err != nil {
+				return fmt.Errorf("create symlink %s: %w", linkPath, err)
+			}
 		}
 	}
 

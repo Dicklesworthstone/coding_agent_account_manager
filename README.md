@@ -134,6 +134,19 @@ caam exec codex personal@gmail.com -- "review code"
 
 Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `.ssh`, `.gitconfig`, etc.
 
+**What is and isn't isolated inside a profile:**
+
+| Path | Treatment | Why |
+|---|---|---|
+| Provider auth dirs (`~/.claude` credentials, `~/.config/claude-code`, `$CODEX_HOME`, `~/.gemini`, `~/.config/opencode`, ...) | isolated (real dirs) | The whole point: per-account credentials. |
+| `~/.ssh`, `~/.gitconfig`, `~/.gnupg`, `~/.aws`, `~/.cargo`, `~/.npm`, `~/.local/bin` | symlink → real home | Dev tooling passes through. |
+| Other `$XDG_CONFIG_HOME` entries (`gh`, `atuin`, `uv`, `shopify-*`, ...) | per-entry symlink → real `~/.config` | XDG-based CLIs keep their credentials — without this, `gh` silently logs out and `git push` fails with `could not read Username for 'https://github.com'` (issue #69). |
+| Other `~/.local/share` and `~/.local/state` entries (`com.vercel.cli`, `supabase`, ...) | per-entry symlink → real home | Same: `HOME` redirection silently relocates the XDG data/state dirs. |
+| `~/.local/share/caam` | never passed through | Contains the vault and every profile's credentials. |
+| Claude `~/.claude/skills`, `plugins`, `commands`, `agents` | symlink → real home | User tooling, not account state — shared so sessions inside a profile keep their skills. |
+
+Passthrough symlinks are refreshed on every `caam exec`, so tools installed after profile creation are picked up automatically.
+
 **Use when:** You need two accounts running at the same time in different terminals.
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)

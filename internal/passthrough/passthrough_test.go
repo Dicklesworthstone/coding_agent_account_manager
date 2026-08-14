@@ -636,3 +636,111 @@ func TestManagerWithEmptyPaths(t *testing.T) {
 		t.Errorf("RemovePassthroughs() error = %v", err)
 	}
 }
+
+// =============================================================================
+// SetupXDGPassthroughs Tests (issue #69)
+// =============================================================================
+
+func TestSetupXDGPassthroughs(t *testing.T) {
+	realHome := t.TempDir()
+	profileDir := t.TempDir()
+	pseudoHome := filepath.Join(profileDir, "home")
+	pseudoXDG := filepath.Join(profileDir, "xdg_config")
+	if err := os.MkdirAll(pseudoHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(pseudoXDG, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure the XDG env vars do not point somewhere unexpected during the test.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+
+	// Real ~/.config with a credential-bearing dir (gh), an isolated provider
+	// dir (claude-code), and a plain file (mimeapps.list).
+	mustMkdir := func(p string) {
+		t.Helper()
+		if err := os.MkdirAll(p, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustMkdir(filepath.Join(realHome, ".config", "gh"))
+	mustMkdir(filepath.Join(realHome, ".config", "claude-code"))
+	if err := os.WriteFile(filepath.Join(realHome, ".config", "mimeapps.list"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Real ~/.local/share with vercel creds, the caam data root, and claude data.
+	mustMkdir(filepath.Join(realHome, ".local", "share", "com.vercel.cli"))
+	mustMkdir(filepath.Join(realHome, ".local", "share", "caam"))
+	mustMkdir(filepath.Join(realHome, ".local", "share", "claude"))
+	// Real ~/.local/state.
+	mustMkdir(filepath.Join(realHome, ".local", "state", "opencode"))
+	mustMkdir(filepath.Join(realHome, ".local", "state", "syncthing"))
+
+	// The profile already owns a real claude-code dir (provider isolation).
+	profileClaudeCode := filepath.Join(pseudoXDG, "claude-code")
+	mustMkdir(profileClaudeCode)
+
+	m := &Manager{realHome: realHome}
+	if err := m.SetupXDGPassthroughs(pseudoHome, pseudoXDG); err != nil {
+		t.Fatalf("SetupXDGPassthroughs() error = %v", err)
+	}
+
+	assertLink := func(linkPath, wantTarget string) {
+		t.Helper()
+		target, err := os.Readlink(linkPath)
+		if err != nil {
+			t.Fatalf("readlink %s: %v", linkPath, err)
+		}
+		if target != wantTarget {
+			t.Errorf("symlink %s -> %q, want %q", linkPath, target, wantTarget)
+		}
+	}
+	assertAbsent := func(p string) {
+		t.Helper()
+		if _, err := os.Lstat(p); err == nil {
+			t.Errorf("%s should not exist", p)
+		}
+	}
+
+	// Credential-bearing entries are passed through.
+	assertLink(filepath.Join(pseudoXDG, "gh"), filepath.Join(realHome, ".config", "gh"))
+	assertLink(filepath.Join(pseudoXDG, "mimeapps.list"), filepath.Join(realHome, ".config", "mimeapps.list"))
+	assertLink(filepath.Join(pseudoHome, ".local", "share", "com.vercel.cli"), filepath.Join(realHome, ".local", "share", "com.vercel.cli"))
+	assertLink(filepath.Join(pseudoHome, ".local", "state", "syncthing"), filepath.Join(realHome, ".local", "state", "syncthing"))
+
+	// Provider auth dirs and caam's own data root are never passed through.
+	assertAbsent(filepath.Join(pseudoHome, ".local", "share", "caam"))
+	assertAbsent(filepath.Join(pseudoHome, ".local", "share", "claude"))
+	assertAbsent(filepath.Join(pseudoHome, ".local", "state", "opencode"))
+
+	// The profile's real claude-code dir is left untouched (not replaced by a link).
+	info, err := os.Lstat(profileClaudeCode)
+	if err != nil {
+		t.Fatalf("lstat profile claude-code: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("profile claude-code dir was replaced by a symlink")
+	}
+
+	// Idempotent: running again succeeds and keeps links valid.
+	if err := m.SetupXDGPassthroughs(pseudoHome, pseudoXDG); err != nil {
+		t.Fatalf("second SetupXDGPassthroughs() error = %v", err)
+	}
+	assertLink(filepath.Join(pseudoXDG, "gh"), filepath.Join(realHome, ".config", "gh"))
+}
+
+func TestIsIsolatedXDGEntry(t *testing.T) {
+	for _, name := range []string{"caam", "claude", "claude-code", "codex", "gemini", "opencode", "cursor", "grok", "CAAM", "Claude-Code"} {
+		if !IsIsolatedXDGEntry(name) {
+			t.Errorf("IsIsolatedXDGEntry(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"gh", "atuin", "uv", "com.vercel.cli", "systemd"} {
+		if IsIsolatedXDGEntry(name) {
+			t.Errorf("IsIsolatedXDGEntry(%q) = true, want false", name)
+		}
+	}
+}

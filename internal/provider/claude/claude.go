@@ -168,6 +168,22 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 		return fmt.Errorf("setup passthroughs: %w", err)
 	}
 
+	// Pass through XDG config/data/state entries so XDG-based CLIs (gh,
+	// vercel, atuin, ...) keep their credentials inside the profile. Provider
+	// auth dirs are deny-listed and stay isolated (issue #69).
+	if err := mgr.SetupXDGPassthroughs(homePath, prof.XDGConfigPath()); err != nil {
+		return fmt.Errorf("setup xdg passthroughs: %w", err)
+	}
+
+	// Share non-account Claude assets (skills, plugins, slash commands, agent
+	// definitions) from the real ~/.claude into the profile's isolated
+	// .claude. Isolation is per-account credentials, not the user's tooling:
+	// without these links a session inside the profile silently loses every
+	// user-level skill and plugin (issue #69 follow-up finding).
+	if err := shareClaudeUserAssets(mgr.RealHome(), claudeDir); err != nil {
+		return fmt.Errorf("share claude user assets: %w", err)
+	}
+
 	// If using API key mode, set up the apiKeyHelper configuration
 	if provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
 		if err := p.setupAPIKeyHelper(prof); err != nil {
@@ -175,6 +191,44 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 		}
 	}
 
+	return nil
+}
+
+// sharedClaudeAssetEntries are entries of ~/.claude that carry no account
+// state and should be shared into a profile's isolated .claude directory.
+// Credentials (.credentials.json/.credentials.lock), settings.json
+// (apiKeyHelper may be per-profile), and session state stay isolated.
+var sharedClaudeAssetEntries = []string{"skills", "plugins", "commands", "agents"}
+
+// shareClaudeUserAssets symlinks non-account Claude assets from the real
+// ~/.claude into the profile's .claude directory. An entry that already
+// exists in the profile as a real file/dir is left untouched; existing
+// symlinks are refreshed.
+func shareClaudeUserAssets(realHome, profileClaudeDir string) error {
+	realClaude := filepath.Join(realHome, ".claude")
+	for _, name := range sharedClaudeAssetEntries {
+		realPath := filepath.Join(realClaude, name)
+		if _, err := os.Stat(realPath); err != nil {
+			continue // Not present in the real home.
+		}
+
+		linkPath := filepath.Join(profileClaudeDir, name)
+		if info, err := os.Lstat(linkPath); err == nil {
+			if info.Mode()&os.ModeSymlink == 0 {
+				continue // Profile owns a real copy; leave it alone.
+			}
+			if current, err := os.Readlink(linkPath); err == nil && current == realPath {
+				continue
+			}
+			if err := os.Remove(linkPath); err != nil {
+				return fmt.Errorf("refresh %s symlink: %w", name, err)
+			}
+		}
+
+		if err := os.Symlink(realPath, linkPath); err != nil {
+			return fmt.Errorf("link %s: %w", name, err)
+		}
+	}
 	return nil
 }
 

@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
@@ -133,6 +135,27 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)
+		}
+
+		// Refresh passthrough symlinks (HOME dotfiles + XDG config/data/state
+		// entries) on every isolated run. Profiles created before the XDG
+		// passthrough existed — or before a new tool was installed in the real
+		// home — get healed here instead of requiring re-creation (issue #69).
+		// Best-effort: a failure to lay down convenience symlinks must not
+		// block running the tool.
+		if pseudoHome := providerEnv["HOME"]; pseudoHome != "" {
+			if mgr, perr := passthrough.NewManager(); perr == nil && pseudoHome != mgr.RealHome() {
+				if serr := mgr.SetupPassthroughs(pseudoHome); serr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: refresh passthroughs: %v\n", serr)
+				}
+				xdgConfig := providerEnv["XDG_CONFIG_HOME"]
+				if xdgConfig == "" {
+					xdgConfig = filepath.Join(pseudoHome, ".config")
+				}
+				if serr := mgr.SetupXDGPassthroughs(pseudoHome, xdgConfig); serr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: refresh xdg passthroughs: %v\n", serr)
+				}
+			}
 		}
 	}
 

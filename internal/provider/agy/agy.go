@@ -175,6 +175,13 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 		return fmt.Errorf("setup passthroughs: %w", err)
 	}
 
+	// With HOME redirected, XDG config/data/state default to paths inside the
+	// profile; pass through the real entries so XDG-based CLIs keep their
+	// credentials (issue #69).
+	if err := mgr.SetupXDGPassthroughs(homePath, filepath.Join(homePath, ".config")); err != nil {
+		return fmt.Errorf("setup xdg passthroughs: %w", err)
+	}
+
 	return nil
 }
 
