@@ -550,3 +550,106 @@ func TestLocalRandomString(t *testing.T) {
 		}
 	})
 }
+
+// =============================================================================
+// Issue #65: filter wiring, machine status mirroring, full-sync recording
+// =============================================================================
+
+func TestFilterProfiles(t *testing.T) {
+	profiles := []ProfileRef{
+		{Provider: "claude", Profile: "work"},
+		{Provider: "claude", Profile: "personal"},
+		{Provider: "codex", Profile: "work"},
+	}
+
+	if got := filterProfiles(profiles, "", ""); len(got) != 3 {
+		t.Errorf("no filter: got %d profiles, want 3", len(got))
+	}
+	if got := filterProfiles(profiles, "claude", ""); len(got) != 2 {
+		t.Errorf("provider filter: got %d profiles, want 2", len(got))
+	}
+	got := filterProfiles(profiles, "codex", "work")
+	if len(got) != 1 || got[0].Provider != "codex" || got[0].Profile != "work" {
+		t.Errorf("provider+profile filter: got %v, want [codex/work]", got)
+	}
+	if got := filterProfiles(profiles, "gemini", ""); len(got) != 0 {
+		t.Errorf("non-matching filter: got %d profiles, want 0", len(got))
+	}
+	if got := filterProfiles(profiles, "", "work"); len(got) != 2 {
+		t.Errorf("profile-only filter: got %d profiles, want 2", len(got))
+	}
+}
+
+func TestMirrorMachinePersistsRecordSync(t *testing.T) {
+	base := t.TempDir()
+	state := NewSyncState(base)
+
+	// The syncer's own pool holds one machine.
+	own := NewMachine("laptop", "192.168.1.10")
+	if err := state.Pool.AddMachine(own); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Syncer{state: state}
+
+	// The CLI passes in a distinct Machine object with the same ID (it loads
+	// its own copy of the sync state).
+	callerCopy := &Machine{ID: own.ID, Name: own.Name, Address: own.Address}
+	callerCopy.RecordSync()
+	s.mirrorMachine(callerCopy)
+
+	if own.Status != StatusOnline {
+		t.Errorf("own.Status = %q, want %q", own.Status, StatusOnline)
+	}
+	if own.LastSync.IsZero() {
+		t.Error("own.LastSync should be set after mirrorMachine")
+	}
+
+	// Error status mirrors too.
+	callerCopy.SetError("boom")
+	s.mirrorMachine(callerCopy)
+	if own.Status != StatusError || own.LastError != "boom" {
+		t.Errorf("own status/error = %q/%q, want error/boom", own.Status, own.LastError)
+	}
+}
+
+func TestRecordFullSyncPersists(t *testing.T) {
+	base := t.TempDir()
+	state := NewSyncState(base)
+	s := &Syncer{state: state}
+
+	if !state.Pool.LastFullSync.IsZero() {
+		t.Fatal("LastFullSync should start zero")
+	}
+	s.RecordFullSync()
+	if state.Pool.LastFullSync.IsZero() {
+		t.Error("RecordFullSync did not set LastFullSync")
+	}
+
+	// Persist and reload: the timestamp must survive.
+	if err := state.Save(); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	reloaded := NewSyncPool()
+	reloaded.SetBasePath(base)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("load pool: %v", err)
+	}
+	if reloaded.LastFullSync.IsZero() {
+		t.Error("LastFullSync not persisted to pool.json")
+	}
+}
+
+func TestSyncerProgressEmit(t *testing.T) {
+	var events []ProgressEvent
+	s := &Syncer{}
+	// No callback: must not panic.
+	s.emit(ProgressEvent{Stage: StagePlan})
+
+	s.Progress = func(ev ProgressEvent) { events = append(events, ev) }
+	s.emit(ProgressEvent{Stage: StagePlan, Total: 5})
+	s.emit(ProgressEvent{Stage: StageCompare, Index: 1})
+	if len(events) != 2 || events[0].Stage != StagePlan || events[0].Total != 5 || events[1].Stage != StageCompare {
+		t.Errorf("unexpected events: %+v", events)
+	}
+}

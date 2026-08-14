@@ -65,6 +65,38 @@ type SyncResult struct {
 	Error error
 }
 
+// ProgressStage identifies the phase a ProgressEvent describes.
+type ProgressStage string
+
+const (
+	// StagePlan is emitted once per machine after the profile union is known.
+	StagePlan ProgressStage = "plan"
+	// StageCompare is emitted before each profile's freshness comparison.
+	StageCompare ProgressStage = "compare"
+	// StageResult is emitted after a push/pull (or failed) operation completes.
+	StageResult ProgressStage = "result"
+)
+
+// ProgressEvent is a streaming update emitted during a machine sync so the
+// CLI can show per-profile progress instead of going silent for the entire
+// SFTP walk (issue #65).
+type ProgressEvent struct {
+	Stage   ProgressStage
+	Machine *Machine
+	// Total is the number of profiles that will be examined (StagePlan).
+	Total int
+	// Index is the 1-based index of the profile being examined (StageCompare).
+	Index int
+	// Profile is the profile being examined (StageCompare, StageResult).
+	Profile ProfileRef
+	// Result is the completed operation (StageResult only).
+	Result *SyncResult
+}
+
+// ProgressFunc receives streaming ProgressEvents. It is called synchronously
+// from the sync loop, so implementations should be fast.
+type ProgressFunc func(ProgressEvent)
+
 // Syncer performs sync operations between local and remote machines.
 type Syncer struct {
 	// pool manages SSH connections.
@@ -78,6 +110,9 @@ type Syncer struct {
 
 	// remoteVaultPath is the remote vault directory path pattern.
 	remoteVaultPath string
+
+	// Progress, when non-nil, receives streaming updates during sync.
+	Progress ProgressFunc
 }
 
 // SyncerConfig configures a Syncer instance.
@@ -132,12 +167,21 @@ func (s *Syncer) Close() error {
 
 // SyncWithMachine synchronizes all profiles with a single machine.
 func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult, error) {
+	return s.SyncWithMachineFiltered(ctx, m, "", "")
+}
+
+// SyncWithMachineFiltered synchronizes profiles with a single machine,
+// optionally restricted to a provider and/or a profile name. Empty filters
+// mean "all". This is what wires the `caam sync --provider/--profile` flags
+// (issue #65: they were declared but never applied).
+func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, providerFilter, profileFilter string) ([]*SyncResult, error) {
 	results := []*SyncResult{}
 
 	// 1. Connect to remote
 	client, err := s.pool.Get(m)
 	if err != nil {
 		m.SetError(err.Error())
+		s.mirrorMachine(m)
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
@@ -153,21 +197,25 @@ func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult
 		return nil, fmt.Errorf("list remote profiles: %w", err)
 	}
 
-	// 4. Merge profile lists (union)
-	allProfiles := mergeProfileLists(localProfiles, remoteProfiles)
+	// 4. Merge profile lists (union), then apply filters
+	allProfiles := filterProfiles(mergeProfileLists(localProfiles, remoteProfiles), providerFilter, profileFilter)
+
+	s.emit(ProgressEvent{Stage: StagePlan, Machine: m, Total: len(allProfiles)})
 
 	// 5. For each profile, compare and sync
-	for _, p := range allProfiles {
+	for i, p := range allProfiles {
 		select {
 		case <-ctx.Done():
 			return results, ctx.Err()
 		default:
 		}
 
+		s.emit(ProgressEvent{Stage: StageCompare, Machine: m, Index: i + 1, Total: len(allProfiles), Profile: p})
+
 		op, err := s.determineSyncOperation(client, m, p)
 		if err != nil {
 			// Log error but continue with other profiles
-			results = append(results, &SyncResult{
+			failed := &SyncResult{
 				Operation: &SyncOperation{
 					Provider:  p.Provider,
 					Profile:   p.Profile,
@@ -176,7 +224,9 @@ func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult
 				},
 				Success: false,
 				Error:   err,
-			})
+			}
+			results = append(results, failed)
+			s.emit(ProgressEvent{Stage: StageResult, Machine: m, Profile: p, Result: failed})
 			continue
 		}
 
@@ -186,6 +236,7 @@ func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult
 
 		result := s.executeOperation(client, op)
 		results = append(results, result)
+		s.emit(ProgressEvent{Stage: StageResult, Machine: m, Profile: p, Result: result})
 
 		// Record in history
 		action := string(op.Direction)
@@ -209,7 +260,70 @@ func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult
 		}
 	}
 
+	// The machine was reachable and the profile walk completed: record the
+	// sync on the caller's Machine and mirror it into the Syncer's own pool
+	// so it is persisted on Close(). Before this, RecordSync was never called
+	// from any production path and `caam sync status` showed "never" forever
+	// (issue #65).
+	m.RecordSync()
+	s.mirrorMachine(m)
+
 	return results, nil
+}
+
+// mirrorMachine copies the status/last-sync fields of m onto the Syncer's own
+// pool entry with the same ID. Callers (the CLI) load their own SyncState, so
+// the Machine pointers they pass in are distinct objects from the ones this
+// Syncer's state will persist on Close(); without mirroring, status updates
+// were lost and pool.json kept "last_sync": "0001-01-01T00:00:00Z".
+func (s *Syncer) mirrorMachine(m *Machine) {
+	if s.state == nil || s.state.Pool == nil || m == nil {
+		return
+	}
+	own := s.state.Pool.GetMachine(m.ID)
+	if own == nil || own == m {
+		return
+	}
+	own.Status = m.Status
+	own.LastSync = m.LastSync
+	own.LastError = m.LastError
+	own.LastErrorAt = m.LastErrorAt
+}
+
+// RecordFullSync marks the timestamp of a completed full (unfiltered) sync in
+// the Syncer's own pool, which is persisted on Close().
+func (s *Syncer) RecordFullSync() {
+	if s.state == nil || s.state.Pool == nil {
+		return
+	}
+	s.state.Pool.RecordFullSync()
+}
+
+// emit sends a progress event if a Progress callback is registered.
+func (s *Syncer) emit(ev ProgressEvent) {
+	if s.Progress != nil {
+		s.Progress(ev)
+	}
+}
+
+// filterProfiles restricts a profile list to a provider and/or profile name.
+// Empty filters pass everything through. Matching is exact (case-sensitive),
+// consistent with vault directory names.
+func filterProfiles(profiles []ProfileRef, provider, profile string) []ProfileRef {
+	if provider == "" && profile == "" {
+		return profiles
+	}
+	var out []ProfileRef
+	for _, p := range profiles {
+		if provider != "" && p.Provider != provider {
+			continue
+		}
+		if profile != "" && p.Profile != profile {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // SyncProfileWithMachine syncs a specific profile with a specific machine.
@@ -228,6 +342,7 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 	client, err := s.pool.Get(m)
 	if err != nil {
 		m.SetError(err.Error())
+		s.mirrorMachine(m)
 		return &SyncResult{
 			Operation: &SyncOperation{
 				Provider:  provider,
@@ -281,6 +396,11 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 		Error:     errorToString(result.Error),
 		Duration:  result.Duration,
 	})
+
+	if result.Success {
+		m.RecordSync()
+		s.mirrorMachine(m)
+	}
 
 	return result, nil
 }
@@ -355,6 +475,8 @@ func (s *Syncer) SyncProfile(ctx context.Context, provider, profile string) ([]*
 
 		if result.Success {
 			s.state.RemoveFromQueue(provider, profile, m.ID)
+			m.RecordSync()
+			s.mirrorMachine(m)
 		} else {
 			s.state.AddToQueue(provider, profile, m.ID, errorToString(result.Error))
 		}

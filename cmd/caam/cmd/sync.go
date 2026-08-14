@@ -277,6 +277,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	machineName, _ := cmd.Flags().GetString("machine")
+	providerFilter, _ := cmd.Flags().GetString("provider")
+	profileFilter, _ := cmd.Flags().GetString("profile")
+
+	if profileFilter != "" && providerFilter == "" {
+		return fmt.Errorf("--profile requires --provider (profile names are only unique within a provider)")
+	}
 
 	machines := state.Pool.ListMachines()
 	if machineName != "" {
@@ -293,10 +299,14 @@ func runSync(cmd *cobra.Command, args []string) error {
 		for _, m := range machines {
 			fmt.Fprintf(cmd.OutOrStdout(), "  %s (%s)\n", m.Name, m.Address)
 		}
+		if providerFilter != "" || profileFilter != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "Filter: provider=%q profile=%q\n", providerFilter, profileFilter)
+		}
 		return nil
 	}
 
-	fmt.Fprintf(cmd.OutOrStdout(), "Syncing with %d machine(s)...\n\n", len(machines))
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "Syncing with %d machine(s)...\n\n", len(machines))
 
 	// Create syncer with configuration
 	syncer, err := sync.NewSyncer(sync.DefaultSyncerConfig())
@@ -305,48 +315,77 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 	defer syncer.Close()
 
-	// Build context
-	ctx := cmd.Context()
-
-	var allResults []*sync.SyncResult
-	for _, m := range machines {
-		fmt.Fprintf(cmd.OutOrStdout(), "  %s (%s):\n", m.Name, m.Address)
-
-		results, err := syncer.SyncWithMachine(ctx, m)
-		if err != nil {
-			fmt.Fprintf(cmd.OutOrStdout(), "    ✗ Error: %v\n\n", err)
-			continue
+	// Stream per-profile progress as it happens: the freshness walk over SFTP
+	// can take minutes on large vaults, and previously nothing was printed
+	// until the whole machine finished, which looked like a hang (issue #65).
+	midDots := false
+	endDots := func() {
+		if midDots {
+			fmt.Fprintln(out)
+			midDots = false
 		}
-
-		if len(results) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "    ✓ All profiles up to date")
-			fmt.Fprintln(cmd.OutOrStdout())
-			continue
-		}
-
-		for _, r := range results {
+	}
+	syncer.Progress = func(ev sync.ProgressEvent) {
+		switch ev.Stage {
+		case sync.StagePlan:
+			fmt.Fprintf(out, "    comparing %d profile(s) ", ev.Total)
+			midDots = true
+		case sync.StageCompare:
+			fmt.Fprint(out, ".")
+			midDots = true
+		case sync.StageResult:
+			endDots()
+			r := ev.Result
 			profile := fmt.Sprintf("%s/%s", r.Operation.Provider, r.Operation.Profile)
 			if r.Success {
 				switch r.Operation.Direction {
 				case sync.SyncPush:
-					fmt.Fprintf(cmd.OutOrStdout(), "    ✓ %s: pushed (local fresher)\n", profile)
+					fmt.Fprintf(out, "    ✓ %s: pushed (local fresher)\n", profile)
 				case sync.SyncPull:
-					fmt.Fprintf(cmd.OutOrStdout(), "    ✓ %s: pulled (remote fresher)\n", profile)
+					fmt.Fprintf(out, "    ✓ %s: pulled (remote fresher)\n", profile)
 				case sync.SyncSkip:
-					fmt.Fprintf(cmd.OutOrStdout(), "    ✓ %s: up to date\n", profile)
+					fmt.Fprintf(out, "    ✓ %s: up to date\n", profile)
 				}
 			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "    ✗ %s: %v\n", profile, r.Error)
+				fmt.Fprintf(out, "    ✗ %s: %v\n", profile, r.Error)
 			}
 		}
-		fmt.Fprintln(cmd.OutOrStdout())
+	}
+
+	// Build context
+	ctx := cmd.Context()
+
+	var allResults []*sync.SyncResult
+	machineFailures := 0
+	for _, m := range machines {
+		fmt.Fprintf(out, "  %s (%s):\n", m.Name, m.Address)
+
+		results, err := syncer.SyncWithMachineFiltered(ctx, m, providerFilter, profileFilter)
+		endDots()
+		if err != nil {
+			machineFailures++
+			fmt.Fprintf(out, "    ✗ Error: %v\n\n", err)
+			continue
+		}
+
+		if len(results) == 0 {
+			fmt.Fprintln(out, "    ✓ All profiles up to date")
+		}
+		fmt.Fprintln(out)
 
 		allResults = append(allResults, results...)
 	}
 
+	// A completed unfiltered sync against every pool machine counts as a full
+	// sync; persist the timestamp so `caam sync status` stops saying "never".
+	if machineName == "" && providerFilter == "" && profileFilter == "" &&
+		len(machines) > 0 && machineFailures == 0 {
+		syncer.RecordFullSync()
+	}
+
 	// Print summary
 	stats := sync.AggregateResults(allResults)
-	fmt.Fprintf(cmd.OutOrStdout(), "Sync complete: %d pushed, %d pulled, %d up to date, %d errors\n",
+	fmt.Fprintf(out, "Sync complete: %d pushed, %d pulled, %d up to date, %d errors\n",
 		stats.Pushed, stats.Pulled, stats.Skipped, stats.Failed)
 
 	return nil
