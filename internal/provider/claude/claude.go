@@ -414,6 +414,15 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 		status.LoggedIn = true
 	}
 
+	// XDG-aware Claude Code builds see the XDG_CONFIG_HOME this profile's env
+	// sets and write their credentials under xdg_config/claude-code/ instead of
+	// the legacy ~/.claude/ — a profile logged in via `caam exec` + /login was
+	// reported "Logged in: false" without this probe (issue #70).
+	xdgCredentialsPath := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+	if _, err := os.Stat(xdgCredentialsPath); err == nil {
+		status.LoggedIn = true
+	}
+
 	// API key mode can be configured via settings.json or env var
 	if !status.LoggedIn && provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
 		settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
