@@ -134,8 +134,13 @@ func (p *Profile) LoadIdentity() {
 			filepath.Join(p.CodexHomePath(), "auth.json"),
 		}, identity.ExtractFromCodexAuth)
 	case "claude":
+		// XDG-aware Claude Code builds honor the XDG_CONFIG_HOME /
+		// CLAUDE_CONFIG_DIR the profile env sets and write .credentials.json
+		// under xdg_config/claude-code/ instead of the legacy home/.claude/.
+		// Probe both, legacy first (issue #70).
 		id = loadIdentityFromPaths([]string{
 			filepath.Join(p.HomePath(), ".claude", ".credentials.json"),
+			filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"),
 		}, identity.ExtractFromClaudeCredentials)
 	case "gemini":
 		candidates := []string{

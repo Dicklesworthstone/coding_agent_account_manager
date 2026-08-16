@@ -1926,9 +1926,12 @@ var loginCmd = &cobra.Command{
 This runs the tool's native login command with the profile's isolated environment,
 so the auth credentials are stored in the profile's directory.
 
+Not supported for claude: Claude Code's OAuth flow cannot be driven externally.
+Instead run 'caam profile add claude <name>', then 'caam exec claude <name>' and
+type /login inside the session — the credentials land in the profile.
+
 Examples:
   caam login codex work     # Login to work profile
-  caam login claude home    # Login to home profile
   caam login codex work --device-code  # Device code flow (if supported)`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -1943,8 +1946,9 @@ Examples:
 		// specific message up front instead of the generic failure path.
 		if tool == "claude" {
 			return fmt.Errorf("caam login is not supported for the claude provider — " +
-				"use Claude Code's built-in /login flow instead (run `claude`, then type /login). " +
-				"See the docs for details")
+				"use Claude Code's built-in /login flow instead. For an isolated profile: " +
+				"`caam profile add claude <name>`, then `caam exec claude <name>` and run " +
+				"/login inside the session; the credentials land in the profile automatically")
 		}
 
 		prov, ok := registry.Get(tool)

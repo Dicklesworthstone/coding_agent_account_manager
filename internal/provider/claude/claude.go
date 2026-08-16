@@ -17,6 +17,7 @@
 // - This makes these become profile-scoped:
 //   - ${XDG_CONFIG_HOME}/claude-code/auth.json
 //   - ${CLAUDE_CONFIG_DIR}/auth.json
+//   - ${CLAUDE_CONFIG_DIR}/.credentials.json (XDG-aware builds; issue #70)
 //   - ${HOME}/.claude.json
 //   - ${HOME}/.claude/settings.json
 //
@@ -101,6 +102,16 @@ func claudeConfigDirForProfile(prof *profile.Profile) string {
 
 func claudeAuthPathForProfile(prof *profile.Profile) string {
 	return filepath.Join(claudeConfigDirForProfile(prof), "auth.json")
+}
+
+// claudeXDGCredentialsPathForProfile returns the XDG-side credentials file for
+// a profile. XDG-aware Claude Code builds honor the XDG_CONFIG_HOME /
+// CLAUDE_CONFIG_DIR the profile env sets and write .credentials.json under
+// xdg_config/claude-code/ instead of the legacy home/.claude/ — every probe of
+// the legacy path must also probe this one, or a working, authenticated
+// profile reads as logged out (issue #70).
+func claudeXDGCredentialsPathForProfile(prof *profile.Profile) string {
+	return filepath.Join(claudeConfigDirForProfile(prof), ".credentials.json")
 }
 
 // AuthFiles returns the auth file specifications for Claude Code.
@@ -376,6 +387,7 @@ func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
 	// Remove auth files
 	authPaths := []string{
 		claudeAuthPathForProfile(prof),
+		claudeXDGCredentialsPathForProfile(prof),
 		filepath.Join(prof.HomePath(), ".claude.json"),
 		filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
 		filepath.Join(prof.HomePath(), ".claude", "settings.json"),
@@ -411,6 +423,15 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 	// Primary credentials file for newer Claude Code versions.
 	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
 	if _, err := os.Stat(credentialsPath); err == nil {
+		status.LoggedIn = true
+	}
+
+	// XDG-aware Claude Code builds write .credentials.json under
+	// xdg_config/claude-code/ (the CLAUDE_CONFIG_DIR the profile env sets)
+	// instead of the legacy home/.claude/. Without this probe a profile logged
+	// in via `caam exec` + /login reported "Logged in: false" while the seat
+	// worked fine (issue #70).
+	if _, err := os.Stat(claudeXDGCredentialsPathForProfile(prof)); err == nil {
 		status.LoggedIn = true
 	}
 
@@ -799,6 +820,12 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 	claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
 	authJsonPath := claudeAuthPathForProfile(prof)
 	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+	if !fileExists(credentialsPath) {
+		// XDG-aware Claude Code builds write credentials under
+		// xdg_config/claude-code/ instead of the legacy home/.claude/
+		// (issue #70).
+		credentialsPath = claudeXDGCredentialsPathForProfile(prof)
+	}
 	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
 
 	claudeJsonExists := fileExists(claudeJsonPath)

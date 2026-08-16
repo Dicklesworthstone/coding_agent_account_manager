@@ -1442,3 +1442,73 @@ func TestStoreAllTags(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// LoadIdentity Tests (issue #70)
+// =============================================================================
+
+// writeClaudeCredentials writes a minimal Claude .credentials.json at path.
+func writeClaudeCredentials(t *testing.T, path, subscriptionType string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken":      "sk-test",
+			"subscriptionType": subscriptionType,
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLoadIdentity_ClaudeXDGCredentials is a regression test for issue #70:
+// XDG-aware Claude Code builds write credentials under
+// xdg_config/claude-code/.credentials.json (the CLAUDE_CONFIG_DIR the profile
+// env sets), not the legacy home/.claude/ path. LoadIdentity probed only the
+// legacy path, so a fully authenticated profile carried no identity.
+func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
+	t.Run("XDG-side credentials only", func(t *testing.T) {
+		prof := &Profile{
+			Name:     "second",
+			Provider: "claude",
+			BasePath: t.TempDir(),
+		}
+		writeClaudeCredentials(t,
+			filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json"), "max")
+
+		prof.LoadIdentity()
+		if prof.Identity == nil {
+			t.Fatal("Identity should be loaded from XDG-side credentials (issue #70)")
+		}
+		if prof.Identity.PlanType != "max" {
+			t.Errorf("PlanType = %q, want %q", prof.Identity.PlanType, "max")
+		}
+	})
+
+	t.Run("legacy home-side credentials win when both exist", func(t *testing.T) {
+		prof := &Profile{
+			Name:     "second",
+			Provider: "claude",
+			BasePath: t.TempDir(),
+		}
+		writeClaudeCredentials(t,
+			filepath.Join(prof.HomePath(), ".claude", ".credentials.json"), "legacy-plan")
+		writeClaudeCredentials(t,
+			filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json"), "xdg-plan")
+
+		prof.LoadIdentity()
+		if prof.Identity == nil {
+			t.Fatal("Identity should be loaded")
+		}
+		if prof.Identity.PlanType != "legacy-plan" {
+			t.Errorf("PlanType = %q, want legacy path to take precedence", prof.Identity.PlanType)
+		}
+	})
+}

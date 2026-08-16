@@ -560,6 +560,41 @@ func TestLogout(t *testing.T) {
 		}
 	})
 
+	t.Run("removes XDG-side .credentials.json (issue #70)", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		prof := &profile.Profile{
+			Name:     "test",
+			Provider: "claude",
+			BasePath: tmpDir,
+		}
+
+		p := New()
+		p.PrepareProfile(context.Background(), prof)
+
+		// XDG-aware Claude Code builds store credentials here; if Logout
+		// leaves the file behind, Status keeps reporting LoggedIn=true.
+		credPath := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+		os.MkdirAll(filepath.Dir(credPath), 0700)
+		if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"accessToken":"sk-test"}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := p.Logout(context.Background(), prof); err != nil {
+			t.Fatalf("Logout() error = %v", err)
+		}
+
+		if _, err := os.Stat(credPath); !os.IsNotExist(err) {
+			t.Error("XDG-side .credentials.json should be removed after Logout")
+		}
+		status, err := p.Status(context.Background(), prof)
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if status.LoggedIn {
+			t.Error("LoggedIn should be false after Logout")
+		}
+	})
+
 	t.Run("handles non-existent auth files", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		prof := &profile.Profile{
@@ -634,6 +669,35 @@ func TestStatus(t *testing.T) {
 		}
 		if !status.LoggedIn {
 			t.Error("LoggedIn should be true when .claude.json exists")
+		}
+	})
+
+	t.Run("logged in when XDG-side .credentials.json exists (issue #70)", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		prof := &profile.Profile{
+			Name:     "test",
+			Provider: "claude",
+			BasePath: tmpDir,
+		}
+
+		p := New()
+		p.PrepareProfile(context.Background(), prof)
+
+		// XDG-aware Claude Code builds write credentials under
+		// xdg_config/claude-code/ (the CLAUDE_CONFIG_DIR the profile env
+		// sets), not the legacy home/.claude/ path.
+		credPath := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+		os.MkdirAll(filepath.Dir(credPath), 0700)
+		if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"accessToken":"sk-test"}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		status, err := p.Status(context.Background(), prof)
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if !status.LoggedIn {
+			t.Error("LoggedIn should be true when XDG-side .credentials.json exists (issue #70)")
 		}
 	})
 
