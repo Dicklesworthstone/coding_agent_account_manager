@@ -1512,3 +1512,110 @@ func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
 		}
 	})
 }
+
+// =============================================================================
+// LoadIdentity Precedence Tests (issue #72)
+// =============================================================================
+
+// writeClaudeCredentialsExpiring writes a Claude .credentials.json at path
+// with the given subscriptionType and expiresAt (epoch millis; <= 0 omits).
+func writeClaudeCredentialsExpiring(t *testing.T, path, subscriptionType string, expiresAtMillis int64) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oauth := map[string]interface{}{
+		"accessToken":      "sk-test",
+		"subscriptionType": subscriptionType,
+	}
+	if expiresAtMillis > 0 {
+		oauth["expiresAt"] = expiresAtMillis
+	}
+	data, err := json.Marshal(map[string]interface{}{"claudeAiOauth": oauth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLoadIdentity_ClaudeStaleLegacyPrecedence is a regression test for issue
+// #72: a stale (expired or corrupt) legacy home/.claude/.credentials.json
+// must not shadow fresh XDG-side credentials, and when both are valid the
+// fresher expiry wins.
+func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
+	legacyPath := func(prof *Profile) string {
+		return filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+	}
+	xdgPath := func(prof *Profile) string {
+		return filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+	}
+	newProf := func(t *testing.T) *Profile {
+		return &Profile{Name: "precedence", Provider: "claude", BasePath: t.TempDir()}
+	}
+	now := time.Now()
+	past := now.Add(-2 * time.Hour).UnixMilli()
+	future := now.Add(4 * time.Hour).UnixMilli()
+	fresher := now.Add(8 * time.Hour).UnixMilli()
+
+	t.Run("expired legacy falls through to fresh XDG", func(t *testing.T) {
+		prof := newProf(t)
+		writeClaudeCredentialsExpiring(t, legacyPath(prof), "legacy-plan", past)
+		writeClaudeCredentialsExpiring(t, xdgPath(prof), "xdg-plan", future)
+
+		prof.LoadIdentity()
+		if prof.Identity == nil {
+			t.Fatal("Identity should be loaded")
+		}
+		if prof.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want fresh XDG identity to win over expired legacy (issue #72)", prof.Identity.PlanType)
+		}
+	})
+
+	t.Run("corrupt legacy falls through to valid XDG", func(t *testing.T) {
+		prof := newProf(t)
+		if err := os.MkdirAll(filepath.Dir(legacyPath(prof)), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(legacyPath(prof), []byte("{not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		writeClaudeCredentialsExpiring(t, xdgPath(prof), "xdg-plan", future)
+
+		prof.LoadIdentity()
+		if prof.Identity == nil {
+			t.Fatal("Identity should be loaded")
+		}
+		if prof.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want XDG identity when legacy file is corrupt", prof.Identity.PlanType)
+		}
+	})
+
+	t.Run("both valid: fresher expiry wins", func(t *testing.T) {
+		prof := newProf(t)
+		writeClaudeCredentialsExpiring(t, legacyPath(prof), "legacy-plan", future)
+		writeClaudeCredentialsExpiring(t, xdgPath(prof), "xdg-plan", fresher)
+
+		prof.LoadIdentity()
+		if prof.Identity == nil {
+			t.Fatal("Identity should be loaded")
+		}
+		if prof.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want the fresher-expiry (XDG) identity", prof.Identity.PlanType)
+		}
+
+		// Mirror case: legacy fresher -> legacy wins.
+		prof2 := newProf(t)
+		writeClaudeCredentialsExpiring(t, legacyPath(prof2), "legacy-plan", fresher)
+		writeClaudeCredentialsExpiring(t, xdgPath(prof2), "xdg-plan", future)
+
+		prof2.LoadIdentity()
+		if prof2.Identity == nil {
+			t.Fatal("Identity should be loaded")
+		}
+		if prof2.Identity.PlanType != "legacy-plan" {
+			t.Errorf("PlanType = %q, want the fresher-expiry (legacy) identity", prof2.Identity.PlanType)
+		}
+	})
+}

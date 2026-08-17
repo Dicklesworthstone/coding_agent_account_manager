@@ -137,8 +137,11 @@ func (p *Profile) LoadIdentity() {
 		// XDG-aware Claude Code builds honor the XDG_CONFIG_HOME /
 		// CLAUDE_CONFIG_DIR the profile env sets and write .credentials.json
 		// under xdg_config/claude-code/ instead of the legacy home/.claude/.
-		// Probe both, legacy first (issue #70).
-		id = loadIdentityFromPaths([]string{
+		// Probe both, legacy first (issue #70) — but a stale or corrupt
+		// legacy file must not shadow fresh XDG-side credentials (issue
+		// #72), so prefer whichever candidate is unexpired, breaking ties
+		// on the fresher expiry.
+		id = loadIdentityPreferValid([]string{
 			filepath.Join(p.HomePath(), ".claude", ".credentials.json"),
 			filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"),
 		}, identity.ExtractFromClaudeCredentials)
@@ -202,6 +205,43 @@ func (p *Profile) CountAuthFiles() int {
 		})
 	}
 	return count
+}
+
+// loadIdentityPreferValid extracts an identity from every readable candidate
+// path and returns the best one: an unexpired identity beats an expired one,
+// within the same tier the fresher expiry wins (an identity without an expiry
+// ranks oldest), and remaining ties keep the earlier-listed path. Extraction
+// errors fall through to later candidates, matching loadIdentityFromPaths.
+// This keeps a stale legacy credential file from shadowing a fresh one while
+// preserving the listed precedence when both are equally usable (issue #72).
+func loadIdentityPreferValid(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
+	var best *identity.Identity
+	now := time.Now()
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		id, err := extractor(path)
+		if err != nil || id == nil {
+			continue
+		}
+		if best == nil || identityFresher(id, best, now) {
+			best = id
+		}
+	}
+	return best
+}
+
+// identityFresher reports whether a should be preferred over b. An identity
+// with a zero ExpiresAt counts as unexpired (no expiry info) but ranks oldest
+// for the freshness tie-break.
+func identityFresher(a, b *identity.Identity, now time.Time) bool {
+	aValid := a.ExpiresAt.IsZero() || !a.ExpiresAt.Before(now)
+	bValid := b.ExpiresAt.IsZero() || !b.ExpiresAt.Before(now)
+	if aValid != bValid {
+		return aValid
+	}
+	return a.ExpiresAt.After(b.ExpiresAt)
 }
 
 func loadIdentityFromPaths(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {

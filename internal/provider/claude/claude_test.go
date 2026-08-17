@@ -1019,7 +1019,6 @@ func TestAPIKeyModeLifecycle(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // DetectExistingAuth Tests
 // =============================================================================
@@ -1325,4 +1324,167 @@ func writeJSON(t *testing.T, path string, data interface{}) {
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// =============================================================================
+// Credential Precedence Tests (issue #72)
+// =============================================================================
+
+// writeCredentialsFileAt writes a Claude .credentials.json at path with the
+// given expiresAt (epoch millis). expiresAtMillis <= 0 omits the field.
+func writeCredentialsFileAt(t *testing.T, path string, expiresAtMillis int64) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oauth := map[string]interface{}{
+		"accessToken": "sk-test",
+	}
+	if expiresAtMillis > 0 {
+		oauth["expiresAt"] = expiresAtMillis
+	}
+	data, err := json.Marshal(map[string]interface{}{"claudeAiOauth": oauth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestValidateTokenPassive_CredentialPrecedence is a regression test for
+// issue #72: a stale (expired or corrupt) legacy home/.claude/ credentials
+// file must not shadow fresh XDG-side credentials, and when both are valid
+// the fresher expiry wins.
+func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
+	newProf := func(t *testing.T) *profile.Profile {
+		return &profile.Profile{
+			Name:     "precedence",
+			Provider: "claude",
+			BasePath: t.TempDir(),
+		}
+	}
+	legacyPath := func(prof *profile.Profile) string {
+		return filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+	}
+	xdgPath := func(prof *profile.Profile) string {
+		return filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+	}
+	p := New()
+	now := time.Now()
+	past := now.Add(-2 * time.Hour).UnixMilli()
+	future := now.Add(4 * time.Hour).UnixMilli()
+	fresher := now.Add(8 * time.Hour).UnixMilli()
+
+	t.Run("expired legacy falls through to fresh XDG", func(t *testing.T) {
+		prof := newProf(t)
+		writeCredentialsFileAt(t, legacyPath(prof), past)
+		writeCredentialsFileAt(t, xdgPath(prof), future)
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if !result.Valid {
+			t.Fatalf("expired legacy file should not shadow fresh XDG credentials (issue #72); got error: %s", result.Error)
+		}
+		if got := result.ExpiresAt.UnixMilli(); got != future {
+			t.Errorf("ExpiresAt = %d, want XDG-side expiry %d", got, future)
+		}
+	})
+
+	t.Run("corrupt legacy falls through to fresh XDG", func(t *testing.T) {
+		prof := newProf(t)
+		if err := os.MkdirAll(filepath.Dir(legacyPath(prof)), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(legacyPath(prof), []byte("{not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		writeCredentialsFileAt(t, xdgPath(prof), future)
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if !result.Valid {
+			t.Fatalf("corrupt legacy file should not shadow valid XDG credentials (issue #72); got error: %s", result.Error)
+		}
+	})
+
+	t.Run("both valid: fresher XDG expiry wins", func(t *testing.T) {
+		prof := newProf(t)
+		writeCredentialsFileAt(t, legacyPath(prof), future)
+		writeCredentialsFileAt(t, xdgPath(prof), fresher)
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if !result.Valid {
+			t.Fatalf("expected valid; got error: %s", result.Error)
+		}
+		if got := result.ExpiresAt.UnixMilli(); got != fresher {
+			t.Errorf("ExpiresAt = %d, want fresher XDG expiry %d", got, fresher)
+		}
+	})
+
+	t.Run("both valid: fresher legacy expiry wins", func(t *testing.T) {
+		prof := newProf(t)
+		writeCredentialsFileAt(t, legacyPath(prof), fresher)
+		writeCredentialsFileAt(t, xdgPath(prof), future)
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if !result.Valid {
+			t.Fatalf("expected valid; got error: %s", result.Error)
+		}
+		if got := result.ExpiresAt.UnixMilli(); got != fresher {
+			t.Errorf("ExpiresAt = %d, want fresher legacy expiry %d", got, fresher)
+		}
+	})
+
+	t.Run("both expired reports the fresher expiry", func(t *testing.T) {
+		prof := newProf(t)
+		older := now.Add(-4 * time.Hour).UnixMilli()
+		writeCredentialsFileAt(t, legacyPath(prof), older)
+		writeCredentialsFileAt(t, xdgPath(prof), past)
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if result.Valid {
+			t.Fatal("expected invalid when both credential files are expired")
+		}
+		if result.Error != "token has expired" {
+			t.Errorf("Error = %q, want %q", result.Error, "token has expired")
+		}
+		if got := result.ExpiresAt.UnixMilli(); got != past {
+			t.Errorf("ExpiresAt = %d, want fresher (least stale) expiry %d", got, past)
+		}
+	})
+
+	t.Run("corrupt legacy alone still reports parse error", func(t *testing.T) {
+		prof := newProf(t)
+		if err := os.MkdirAll(filepath.Dir(legacyPath(prof)), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(legacyPath(prof), []byte("{not json"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := p.ValidateToken(context.Background(), prof, true)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if result.Valid {
+			t.Fatal("expected invalid for a lone corrupt credentials file")
+		}
+		if !strings.Contains(result.Error, "invalid .credentials.json") {
+			t.Errorf("Error = %q, want invalid .credentials.json parse error", result.Error)
+		}
+	})
 }

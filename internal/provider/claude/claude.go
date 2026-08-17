@@ -819,18 +819,20 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 	// Check auth files exist
 	claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
 	authJsonPath := claudeAuthPathForProfile(prof)
-	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
-	if !fileExists(credentialsPath) {
-		// XDG-aware Claude Code builds write credentials under
-		// xdg_config/claude-code/ instead of the legacy home/.claude/
-		// (issue #70).
-		credentialsPath = claudeXDGCredentialsPathForProfile(prof)
-	}
+	// XDG-aware Claude Code builds write credentials under
+	// xdg_config/claude-code/ instead of the legacy home/.claude/ (issue
+	// #70). A stale or corrupt legacy file must not shadow fresh XDG-side
+	// credentials (issue #72): probe both candidates and pick whichever is
+	// valid, preferring the fresher expiry when both are.
+	credentials := pickClaudeCredentials([]string{
+		filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
+		claudeXDGCredentialsPathForProfile(prof),
+	})
 	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
 
 	claudeJsonExists := fileExists(claudeJsonPath)
 	authJsonExists := fileExists(authJsonPath)
-	credentialsExists := fileExists(credentialsPath)
+	credentialsExists := credentials != nil
 	settingsExists := fileExists(settingsPath)
 
 	if !claudeJsonExists && !authJsonExists && !credentialsExists {
@@ -855,16 +857,15 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 		return result, nil
 	}
 
-	// Check .credentials.json if it exists
+	// Check the selected .credentials.json candidate if any exists.
 	if credentialsExists {
-		creds, err := loadClaudeCredentials(credentialsPath)
-		if err != nil {
+		if credentials.parseErr != nil {
 			result.Valid = false
-			result.Error = fmt.Sprintf("invalid .credentials.json: %v", err)
+			result.Error = fmt.Sprintf("invalid .credentials.json: %v", credentials.parseErr)
 			return result, nil
 		}
-		if creds.expiresAt != nil {
-			result.ExpiresAt = *creds.expiresAt
+		if credentials.expiresAt != nil {
+			result.ExpiresAt = *credentials.expiresAt
 			if result.ExpiresAt.Before(timeNow()) {
 				result.Valid = false
 				result.Error = "token has expired"
@@ -1074,6 +1075,71 @@ func loadClaudeCredentials(path string) (*credentialsInfo, error) {
 		info.expiresAt = &exp
 	}
 	return info, nil
+}
+
+// claudeCredCandidate is one probed .credentials.json candidate.
+type claudeCredCandidate struct {
+	path      string
+	parseErr  error
+	expiresAt *time.Time
+}
+
+// pickClaudeCredentials probes candidate .credentials.json paths (listed in
+// precedence order, legacy home/.claude/ first) and returns the best existing
+// candidate, or nil when none exist. A candidate that parses and is unexpired
+// beats one that is corrupt or expired; within the same tier the fresher
+// expiry wins (a candidate without an expiry ranks oldest), and remaining
+// ties keep the earlier-listed candidate. This stops a stale or corrupt
+// legacy file from shadowing fresh XDG-side credentials (issue #72) while
+// preserving legacy-first precedence when both are equally usable.
+func pickClaudeCredentials(paths []string) *claudeCredCandidate {
+	var best *claudeCredCandidate
+	now := timeNow()
+	for _, path := range paths {
+		if !fileExists(path) {
+			continue
+		}
+		cand := &claudeCredCandidate{path: path}
+		if info, err := loadClaudeCredentials(path); err != nil {
+			cand.parseErr = err
+		} else {
+			cand.expiresAt = info.expiresAt
+		}
+		if best == nil || credCandidateBetter(cand, best, now) {
+			best = cand
+		}
+	}
+	return best
+}
+
+// credCandidateBetter reports whether a should be preferred over b.
+func credCandidateBetter(a, b *claudeCredCandidate, now time.Time) bool {
+	aUsable := credCandidateUsable(a, now)
+	bUsable := credCandidateUsable(b, now)
+	if aUsable != bUsable {
+		return aUsable
+	}
+	// Same usability tier: strictly fresher expiry wins; on ties the earlier
+	// (legacy-first) candidate is kept.
+	return credCandidateExpiry(a).After(credCandidateExpiry(b))
+}
+
+// credCandidateUsable reports whether the candidate parsed and is unexpired.
+// A parseable file without an expiry timestamp counts as usable.
+func credCandidateUsable(c *claudeCredCandidate, now time.Time) bool {
+	if c.parseErr != nil {
+		return false
+	}
+	return c.expiresAt == nil || !c.expiresAt.Before(now)
+}
+
+// credCandidateExpiry returns the candidate's expiry, or the zero time when
+// it has none (ranking it oldest for freshness comparisons).
+func credCandidateExpiry(c *claudeCredCandidate) time.Time {
+	if c.expiresAt == nil {
+		return time.Time{}
+	}
+	return *c.expiresAt
 }
 
 func parseExpiryTime(s string) (time.Time, error) {
