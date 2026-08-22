@@ -499,6 +499,8 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		Type          string   `json:"type,omitempty"`       // user|system
 		CreatedBy     string   `json:"created_by,omitempty"` // user|auto|first-activate
 		OriginalPaths []string `json:"original_paths,omitempty"`
+		Identity      string   `json:"identity,omitempty"`      // Human-readable account identity (email when known)
+		IdentityKeys  []string `json:"identity_keys,omitempty"` // Namespaced identity keys used for matching (issue #73)
 	}{
 		Tool:          tool,
 		Profile:       profile,
@@ -507,6 +509,17 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		Type:          "user",
 		CreatedBy:     "user",
 		OriginalPaths: originalPaths,
+	}
+	// Record a rotation-stable account identity next to the snapshot so
+	// ActiveProfile can still recognize this profile after the tool rotates
+	// its tokens — even if the snapshot's settings file goes missing or
+	// unparseable later (issue #73). Claude only: the other tools carry their
+	// identity inside the credential file itself.
+	if tool == "claude" {
+		if keys := claudeLiveIdentityKeys(fileSet); len(keys) > 0 {
+			meta.Identity = claudeIdentityLabel(keys)
+			meta.IdentityKeys = keys
+		}
 	}
 	if IsSystemProfile(profile) {
 		meta.Type = "system"
@@ -626,6 +639,13 @@ func (v *Vault) ResnapshotOutgoing(fileSet AuthFileSet, outgoing, target string)
 	}
 	if !HasAuthFiles(fileSet) {
 		return nil // nothing live to capture
+	}
+	// Claude: a live credentials file that lost its refresh token is the
+	// residue of a failed refresh (seen in the #73 field data). Re-snapshotting
+	// it would overwrite a possibly still-valid vault copy with a dead one, so
+	// leave the vault alone and let the switch proceed.
+	if fileSet.Tool == "claude" && claudeLiveCredentialsIncomplete(fileSet) {
+		return nil
 	}
 
 	// Only re-snapshot if the outgoing profile still actually exists in the
@@ -812,6 +832,23 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 			if err := restoreClaudeUserSettings(srcPath, spec.Path); err != nil {
 				return fmt.Errorf("restore %s: %w", spec.Path, err)
 			}
+			restored++
+			if spec.Required {
+				requiredFound = true
+			} else {
+				optionalFound = true
+			}
+			continue
+		}
+
+		// Claude twin of the Codex freshness guard below (issue #73). Claude
+		// Code rotates both tokens in place while a profile is active; if the
+		// LIVE credentials belong to the SAME account as this snapshot and are
+		// strictly fresher, restoring the snapshot would replace working tokens
+		// with an expired access token and an already-consumed refresh token
+		// (Anthropic then forces an interactive /login). Keep the live file.
+		if fileSet.Tool == "claude" && filename == claudeCredentialsFile &&
+			v.claudeLiveIsNewer(fileSet, profileDir, spec.Path, srcPath) {
 			restored++
 			if spec.Required {
 				requiredFound = true
@@ -1092,7 +1129,19 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		}
 	}
 
-	return systemMatch, nil // Fall back to system profile, or "" if no match
+	if systemMatch != "" {
+		return systemMatch, nil // Fall back to a system profile that matched byte-for-byte
+	}
+
+	// Claude rotates both OAuth tokens in place while a profile is active, so
+	// the token hash above stops matching the profile's own snapshot after the
+	// first refresh. Fall back to the account identity carried by
+	// ~/.claude.json (and recorded in meta.json at backup time) — issue #73.
+	if fileSet.Tool == "claude" {
+		return v.claudeActiveProfileByIdentity(fileSet, profiles), nil
+	}
+
+	return "", nil
 }
 
 // HasAuthFiles checks if the tool currently has auth files present.
@@ -1500,11 +1549,13 @@ func stableClaudeHash(path string) (string, error) {
 	}
 }
 
-// hashClaudeCredentials hashes the identity-bearing fields from Claude's
-// .credentials.json: the accessToken and refreshToken from claudeAiOauth.
-// These tokens uniquely identify the authenticated account. Volatile fields
-// like expiresAt are excluded since they change on token refresh without
-// changing the account identity.
+// hashClaudeCredentials hashes the accessToken and refreshToken from
+// claudeAiOauth in Claude's .credentials.json. Volatile fields like expiresAt
+// are excluded. Note that the tokens themselves are rotated in place by
+// Claude Code every few hours of use, so this hash identifies a particular
+// token generation, not the account: ActiveProfile treats it as the
+// exact-snapshot match and falls back to the account identity carried by
+// ~/.claude.json when it no longer matches (issue #73).
 func hashClaudeCredentials(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -2088,26 +2139,283 @@ func codexLiveIsNewer(livePath, snapshotPath string) bool {
 	return liveTS.After(snapTS)
 }
 
-// claudeProfileIdentity extracts identity from a Claude vault profile.
-// It checks .claude.json for the oauthAccount field (typically email),
-// then falls back to .credentials.json JWT parsing.
-func (v *Vault) claudeProfileIdentity(profileDir string) string {
-	// Try .claude.json first -- has oauthAccount field
-	settingsPath := filepath.Join(profileDir, ".claude.json")
-	if data, err := os.ReadFile(settingsPath); err == nil {
-		var root map[string]interface{}
-		if err := json.Unmarshal(data, &root); err == nil {
-			if acct := jsonString(root, "oauthAccount"); acct != "" {
-				return acct
-			}
-			if uid := jsonString(root, "userID"); uid != "" {
-				return uid
+// Claude account identity (issue #73).
+//
+// Claude Code rotates BOTH tokens in ~/.claude/.credentials.json in place
+// every few hours of use, so anything derived from token bytes stops matching
+// its own vault snapshot after the first refresh. The rotation-stable
+// identity lives in ~/.claude.json: oauthAccount.accountUuid and
+// oauthAccount.emailAddress (plus the hashed top-level userID). Access tokens
+// are opaque (sk-ant-oat…), not JWTs, so there is nothing to decode.
+//
+// The helpers below derive identity KEYS — one per available field, each
+// namespaced so a uuid can never collide with an email — and two sides match
+// when they share any key. Deriving several keys keeps matching robust when
+// one side is an older snapshot that lacks a field the other side carries.
+
+const (
+	claudeSettingsFile    = ".claude.json"
+	claudeCredentialsFile = ".credentials.json"
+)
+
+// claudeIdentityKeys derives namespaced identity keys from a parsed
+// .claude.json. Returns nil when the file carries no identity.
+func claudeIdentityKeys(root map[string]interface{}) []string {
+	var keys []string
+	switch acct := root["oauthAccount"].(type) {
+	case map[string]interface{}:
+		if uuid := strings.ToLower(strings.TrimSpace(jsonString(acct, "accountUuid"))); uuid != "" {
+			keys = append(keys, "uuid:"+uuid)
+		}
+		if email := strings.ToLower(strings.TrimSpace(jsonString(acct, "emailAddress"))); email != "" {
+			keys = append(keys, "email:"+email)
+		}
+	case string:
+		// Legacy shape: a bare account string.
+		if acct = strings.ToLower(strings.TrimSpace(acct)); acct != "" {
+			keys = append(keys, "account:"+acct)
+		}
+	}
+	if uid := strings.TrimSpace(jsonString(root, "userID")); uid != "" {
+		keys = append(keys, "userid:"+uid)
+	}
+	return keys
+}
+
+// claudeIdentityKeysFromFile parses a .claude.json at path and derives its
+// identity keys. Unreadable or unparseable files yield nil.
+func claudeIdentityKeysFromFile(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	return claudeIdentityKeys(root)
+}
+
+// claudeIdentityLabel picks the human-facing identity out of a key set:
+// email, else account uuid, else the legacy account string, else userID.
+func claudeIdentityLabel(keys []string) string {
+	for _, prefix := range []string{"email:", "uuid:", "account:", "userid:"} {
+		for _, key := range keys {
+			if strings.HasPrefix(key, prefix) {
+				return strings.TrimPrefix(key, prefix)
 			}
 		}
 	}
+	return ""
+}
+
+// identityKeysIntersect reports whether two key sets share any key.
+func identityKeysIntersect(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, key := range a {
+		seen[key] = struct{}{}
+	}
+	for _, key := range b {
+		if _, ok := seen[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeIdentityKeys appends the keys of extra that base does not already hold.
+func mergeIdentityKeys(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base))
+	for _, key := range base {
+		seen[key] = struct{}{}
+	}
+	for _, key := range extra {
+		if _, ok := seen[key]; !ok {
+			base = append(base, key)
+			seen[key] = struct{}{}
+		}
+	}
+	return base
+}
+
+// claudeFileSetPath returns the live path registered in fileSet for the named
+// Claude file (by base name), or "" when the set does not include it.
+func claudeFileSetPath(fileSet AuthFileSet, name string) string {
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) == name {
+			return spec.Path
+		}
+	}
+	return ""
+}
+
+// claudeLiveIdentityKeys derives the identity of the currently logged-in
+// Claude account from the live ~/.claude.json.
+func claudeLiveIdentityKeys(fileSet AuthFileSet) []string {
+	settingsPath := claudeFileSetPath(fileSet, claudeSettingsFile)
+	if settingsPath == "" {
+		return nil
+	}
+	return claudeIdentityKeysFromFile(settingsPath)
+}
+
+// claudeProfileIdentityKeys derives a vault profile's identity from its
+// .claude.json snapshot, merged with whatever Backup recorded in meta.json so
+// matching survives a missing or unparseable snapshot.
+func (v *Vault) claudeProfileIdentityKeys(profileDir string) []string {
+	keys := claudeIdentityKeysFromFile(filepath.Join(profileDir, claudeSettingsFile))
+	if metaKeys := profileMetaIdentityKeys(profileDir); len(metaKeys) > 0 {
+		keys = mergeIdentityKeys(keys, metaKeys)
+	}
+	return keys
+}
+
+// profileMetaIdentityKeys reads the identity_keys Backup stored in a
+// profile's meta.json (nil when absent).
+func profileMetaIdentityKeys(profileDir string) []string {
+	data, err := os.ReadFile(filepath.Join(profileDir, "meta.json"))
+	if err != nil {
+		return nil
+	}
+	var meta struct {
+		IdentityKeys []string `json:"identity_keys"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil
+	}
+	return meta.IdentityKeys
+}
+
+// claudeActiveProfileByIdentity is the rotation-tolerant fallback used by
+// ActiveProfile when no profile matches the live token bytes: the profile
+// whose recorded account identity matches the live ~/.claude.json is the
+// active one. User-named profiles win over system profiles (_backup_* etc.),
+// which can legitimately carry the same account.
+func (v *Vault) claudeActiveProfileByIdentity(fileSet AuthFileSet, profiles []string) string {
+	liveKeys := claudeLiveIdentityKeys(fileSet)
+	if len(liveKeys) == 0 {
+		return ""
+	}
+
+	systemMatch := ""
+	for _, profile := range profiles {
+		profileKeys := v.claudeProfileIdentityKeys(v.ProfilePath(fileSet.Tool, profile))
+		if !identityKeysIntersect(liveKeys, profileKeys) {
+			continue
+		}
+		if !IsSystemProfile(profile) {
+			return profile
+		}
+		if systemMatch == "" {
+			systemMatch = profile
+		}
+	}
+	return systemMatch
+}
+
+// readClaudeOAuth returns the claudeAiOauth object of a Claude credentials
+// file, or ok=false when the file is unreadable, unparseable, or has no
+// OAuth block (API-key mode).
+func readClaudeOAuth(path string) (oauth map[string]interface{}, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, false
+	}
+	oauth, ok = root["claudeAiOauth"].(map[string]interface{})
+	return oauth, ok
+}
+
+// claudeOAuthExpiry extracts claudeAiOauth.expiresAt as an integer epoch
+// (Claude Code writes milliseconds). Any unit works as long as the two files
+// being compared use the same one.
+func claudeOAuthExpiry(oauth map[string]interface{}) (int64, bool) {
+	switch n := oauth["expiresAt"].(type) {
+	case float64:
+		return int64(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	case string:
+		i, err := json.Number(strings.TrimSpace(n)).Int64()
+		return i, err == nil
+	}
+	return 0, false
+}
+
+// claudeLiveCredentialsIncomplete reports whether the live Claude
+// credentials carry an OAuth block that is missing its access or refresh
+// token — the residue of a failed refresh. A file without any OAuth block
+// (API-key mode) is not considered incomplete.
+func claudeLiveCredentialsIncomplete(fileSet AuthFileSet) bool {
+	credsPath := claudeFileSetPath(fileSet, claudeCredentialsFile)
+	if credsPath == "" {
+		return false
+	}
+	oauth, ok := readClaudeOAuth(credsPath)
+	if !ok {
+		return false
+	}
+	return jsonString(oauth, "accessToken") == "" || jsonString(oauth, "refreshToken") == ""
+}
+
+// claudeLiveIsNewer reports whether the LIVE Claude credentials at livePath
+// belong to the SAME account as the vault snapshot at snapshotPath (profile
+// profileDir) AND were refreshed strictly more recently. When true, Restore
+// must not clobber the live file: doing so would replay an expired access
+// token plus an already-consumed refresh token and force an interactive
+// /login (issue #73).
+//
+// Conservative by construction — any uncertainty (missing/unparseable file,
+// unknown identity on either side, different identity, a live file missing a
+// token, equal-or-older live expiry) returns false so the normal verbatim
+// copy proceeds. Cross-account switches and first-time restores are never
+// blocked.
+func (v *Vault) claudeLiveIsNewer(fileSet AuthFileSet, profileDir, livePath, snapshotPath string) bool {
+	liveOAuth, ok := readClaudeOAuth(livePath)
+	if !ok {
+		return false
+	}
+	snapOAuth, ok := readClaudeOAuth(snapshotPath)
+	if !ok {
+		return false
+	}
+
+	// Only guard when it is unambiguously the SAME account.
+	if !identityKeysIntersect(claudeLiveIdentityKeys(fileSet), v.claudeProfileIdentityKeys(profileDir)) {
+		return false
+	}
+
+	// A live file missing either token is failed-refresh residue, never "newer".
+	if jsonString(liveOAuth, "accessToken") == "" || jsonString(liveOAuth, "refreshToken") == "" {
+		return false
+	}
+
+	liveExp, liveOK := claudeOAuthExpiry(liveOAuth)
+	snapExp, snapOK := claudeOAuthExpiry(snapOAuth)
+	if !liveOK || !snapOK {
+		return false
+	}
+	return liveExp > snapExp
+}
+
+// claudeProfileIdentity extracts the human-facing identity of a Claude vault
+// profile: the account identity from its .claude.json snapshot / meta.json
+// (email when known), falling back to JWT claims in .credentials.json for
+// legacy token formats.
+func (v *Vault) claudeProfileIdentity(profileDir string) string {
+	if label := claudeIdentityLabel(v.claudeProfileIdentityKeys(profileDir)); label != "" {
+		return label
+	}
 
 	// Try .credentials.json -- parse JWT from claudeAiOauth.accessToken
-	credsPath := filepath.Join(profileDir, ".credentials.json")
+	credsPath := filepath.Join(profileDir, claudeCredentialsFile)
 	if data, err := os.ReadFile(credsPath); err == nil {
 		var root map[string]interface{}
 		if err := json.Unmarshal(data, &root); err == nil {
