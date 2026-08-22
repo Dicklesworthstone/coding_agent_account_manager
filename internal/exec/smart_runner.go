@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
+	"golang.org/x/term"
 )
 
 // ExecCommand allows mocking exec.CommandContext in tests
@@ -248,8 +249,21 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 		cmd.Dir = opts.WorkDir
 	}
 
+	// Terminal proxying (issue #74): when stdin is a real terminal, the child's
+	// PTY is created at that terminal's size and follows it, the terminal is
+	// switched to raw mode so keystrokes reach the child un-echoed and
+	// un-interpreted, and stdin is relayed into the PTY. See terminal_proxy.go.
+	stdinFd := int(os.Stdin.Fd())
+	interactive := term.IsTerminal(stdinFd)
+	ptyOpts := pty.DefaultOptions()
+	if interactive {
+		if rows, cols, ok := terminalSize(stdinFd); ok {
+			ptyOpts.Rows, ptyOpts.Cols = rows, cols
+		}
+	}
+
 	// Create PTY controller
-	ctrl, err := pty.NewController(cmd, nil)
+	ctrl, err := pty.NewController(cmd, ptyOpts)
 	if err != nil {
 		return fmt.Errorf("create pty controller: %w", err)
 	}
@@ -260,6 +274,27 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	if err := ctrl.Start(); err != nil {
 		return fmt.Errorf("start pty: %w", err)
 	}
+
+	// restoreTerminal puts the real terminal back into its pre-run state. It
+	// is called explicitly as soon as the child has exited (before anything
+	// else is printed) and deferred as a safety net for early returns.
+	restoreTerminal := func() {}
+	if interactive {
+		if state, rawErr := term.MakeRaw(stdinFd); rawErr == nil {
+			var once sync.Once
+			restoreTerminal = func() {
+				once.Do(func() { _ = term.Restore(stdinFd, state) })
+			}
+		}
+		stopResize := watchTerminalResize(stdinFd, ctrl)
+		defer stopResize()
+	}
+	defer restoreTerminal()
+
+	// Relay input into the child's PTY. This runs for pipes as well as
+	// terminals so `echo prompt | caam run ...` reaches the tool; the goroutine
+	// ends when stdin is exhausted or the PTY closes.
+	go relayStdin(os.Stdin, ctrl)
 
 	var capture *codexSessionCapture
 	if opts.Provider.ID() == "codex" {
@@ -284,6 +319,10 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	cancelMonitor()
 	<-monitorDone
 	r.wg.Wait()
+
+	// The child is gone and its output fully drained: give the terminal back
+	// before any further (cooked-mode) output such as warnings below.
+	restoreTerminal()
 
 	// Update profile metadata
 	now := time.Now()
