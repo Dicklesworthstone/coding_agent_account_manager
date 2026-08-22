@@ -4,6 +4,7 @@ package pty
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,10 +71,20 @@ func (c *unixController) Start() error {
 		c.cmd.Env = append(os.Environ(), c.opts.Env...)
 	}
 
-	// Start the command with a PTY
+	// Start the command with a PTY. A zero dimension would hand the child a
+	// 0x0 terminal (most TUIs then guess 80x24 and never recover), so fall
+	// back to the defaults for any axis the caller left unset.
 	winSize := &pty.Winsize{
 		Rows: c.opts.Rows,
 		Cols: c.opts.Cols,
+	}
+	if defaults := DefaultOptions(); winSize.Rows == 0 || winSize.Cols == 0 {
+		if winSize.Rows == 0 {
+			winSize.Rows = defaults.Rows
+		}
+		if winSize.Cols == 0 {
+			winSize.Cols = defaults.Cols
+		}
 	}
 
 	ptmx, err := pty.StartWithSize(c.cmd, winSize)
@@ -111,6 +122,56 @@ func (c *unixController) InjectRaw(data []byte) error {
 	return nil
 }
 
+// readPollInterval bounds each wait for PTY output so callers that loop on
+// ReadOutput/WaitForPattern observe context cancellation promptly.
+const readPollInterval = 100 * time.Millisecond
+
+// waitReadable blocks until the PTY master has data to read, the slave side
+// hung up, or timeout elapses (readable == hungUp == false).
+//
+// It uses poll(2) instead of the os.File read deadline on purpose: a PTY
+// master is not deadline-capable on every platform. On macOS, kqueue refuses
+// /dev/ptmx, so Go never registers the master with its poller and
+// SetReadDeadline fails with "file type does not support deadline" — which
+// made every deadline-based read path return an error on the first call and
+// the wrapped tool's output vanish entirely. ReadLine has always used this
+// poll-based approach; ReadOutput and WaitForPattern now share it.
+func waitReadable(fd int, timeout time.Duration) (readable, hungUp bool, err error) {
+	ms := int(timeout / time.Millisecond)
+	for {
+		pollFd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, perr := unix.Poll(pollFd, ms)
+		if perr != nil {
+			if perr == syscall.EINTR {
+				continue
+			}
+			return false, false, fmt.Errorf("poll pty: %w", perr)
+		}
+		if n == 0 {
+			return false, false, nil
+		}
+		revents := pollFd[0].Revents
+		if revents&unix.POLLNVAL != 0 {
+			return false, false, fmt.Errorf("poll pty: descriptor is closed")
+		}
+		return revents&unix.POLLIN != 0, revents&(unix.POLLHUP|unix.POLLERR) != 0, nil
+	}
+}
+
+// readAfterPoll performs a single read once waitReadable reported data. A
+// read failure caused by the slave side being gone (EIO on Linux, EOF on the
+// BSDs/macOS) is normalized to io.EOF so callers can stop cleanly.
+func readAfterPoll(ptmx *os.File, buf []byte) (int, error) {
+	nread, err := ptmx.Read(buf)
+	if err != nil {
+		if err == io.EOF || errors.Is(err, syscall.EIO) {
+			return nread, io.EOF
+		}
+		return nread, fmt.Errorf("read from pty: %w", err)
+	}
+	return nread, nil
+}
+
 // ReadOutput reads all available output from the PTY without blocking indefinitely.
 func (c *unixController) ReadOutput() (string, error) {
 	c.mu.Lock()
@@ -125,29 +186,24 @@ func (c *unixController) ReadOutput() (string, error) {
 	ptmx := c.ptmx
 	c.mu.Unlock()
 
-	// Set a short deadline to poll for data
-	if err := ptmx.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-		return "", fmt.Errorf("set read deadline: %w", err)
+	readable, hungUp, err := waitReadable(int(ptmx.Fd()), readPollInterval)
+	if err != nil {
+		return "", err
+	}
+	if !readable {
+		if hungUp {
+			return "", io.EOF // Process exited and nothing is left to drain
+		}
+		return "", nil // No data available within the poll interval
 	}
 
 	buf := make([]byte, 4096)
-	nread, err := ptmx.Read(buf)
+	nread, err := readAfterPoll(ptmx, buf)
 	if nread > 0 {
 		return string(buf[:nread]), nil
 	}
-
 	if err != nil {
-		if os.IsTimeout(err) {
-			return "", nil // No data available within timeout
-		}
-		if err == io.EOF {
-			return "", io.EOF // Process exited, signal caller to stop reading
-		}
-		// Check for path error which wraps the syscall error
-		if pathErr, ok := err.(*os.PathError); ok && pathErr.Timeout() {
-			return "", nil
-		}
-		return "", fmt.Errorf("read from pty: %w", err)
+		return "", err
 	}
 	return "", nil
 }
@@ -240,6 +296,7 @@ func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Reg
 
 	var output []byte
 	buf := make([]byte, 4096)
+	fd := int(ptmx.Fd())
 
 	for {
 		// Check context cancellation first
@@ -252,31 +309,27 @@ func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Reg
 		default:
 		}
 
-		// Set a short deadline to check context periodically
-		if err := ptmx.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-			return string(output), fmt.Errorf("set read deadline: %w", err)
+		// Short poll so the context is re-checked periodically
+		readable, hungUp, err := waitReadable(fd, readPollInterval)
+		if err != nil {
+			return string(output), err
+		}
+		if !readable {
+			if hungUp {
+				return string(output), io.EOF
+			}
+			continue // Nothing yet, check context and retry
 		}
 
-		nread, err := ptmx.Read(buf)
+		nread, err := readAfterPoll(ptmx, buf)
 		if nread > 0 {
 			output = append(output, buf[:nread]...)
 			if pattern.Match(output) {
 				return string(output), nil
 			}
 		}
-
 		if err != nil {
-			if err == io.EOF {
-				return string(output), io.EOF
-			}
-			if os.IsTimeout(err) {
-				continue // Timeout, check context and retry
-			}
-			// Check for path error
-			if pathErr, ok := err.(*os.PathError); ok && pathErr.Timeout() {
-				continue
-			}
-			return string(output), fmt.Errorf("read from pty: %w", err)
+			return string(output), err
 		}
 	}
 }
@@ -331,6 +384,29 @@ func (c *unixController) Signal(sig Signal) error {
 	}
 
 	return c.cmd.Process.Signal(s)
+}
+
+// Resize sets the PTY window size (TIOCSWINSZ on the master). The kernel
+// delivers SIGWINCH to the child's foreground process group, exactly as a
+// real terminal emulator would on a window resize.
+func (c *unixController) Resize(rows, cols uint16) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.started {
+		return fmt.Errorf("controller not started")
+	}
+	if c.closed {
+		return ErrClosed
+	}
+	if rows == 0 || cols == 0 {
+		return fmt.Errorf("invalid window size %dx%d: both dimensions must be non-zero", rows, cols)
+	}
+
+	if err := pty.Setsize(c.ptmx, &pty.Winsize{Rows: rows, Cols: cols}); err != nil {
+		return fmt.Errorf("set pty size: %w", err)
+	}
+	return nil
 }
 
 // Close terminates the PTY and cleans up resources.

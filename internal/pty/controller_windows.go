@@ -62,6 +62,10 @@ func (c *windowsController) Signal(sig Signal) error {
 	return ErrNotSupported
 }
 
+func (c *windowsController) Resize(rows, cols uint16) error {
+	return ErrNotSupported
+}
+
 func (c *windowsController) Close() error {
 	return nil
 }

@@ -55,6 +55,11 @@ type Controller interface {
 	// Signal sends a signal to the running process (e.g., SIGINT).
 	Signal(sig Signal) error
 
+	// Resize sets the PTY window size. The child is notified the way a real
+	// terminal would notify it (SIGWINCH on Unix), so full-screen programs
+	// redraw at the new size. Both dimensions must be non-zero.
+	Resize(rows, cols uint16) error
+
 	// Close terminates the PTY and cleans up resources.
 	// If the command is still running, it will be killed.
 	Close() error
