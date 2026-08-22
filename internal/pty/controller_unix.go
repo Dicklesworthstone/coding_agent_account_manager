@@ -104,19 +104,28 @@ func (c *unixController) InjectCommand(cmd string) error {
 }
 
 // InjectRaw writes raw bytes to the PTY.
+//
+// The write itself happens outside the controller mutex: a PTY master write
+// blocks once the child's input buffer is full (a few KiB) until the child
+// reads, and relayed keystrokes are written continuously. Holding the lock
+// across a blocked write would wedge ReadOutput and Close behind it, leaving
+// the wrapper unable to drain output or tear down a stuck child.
 func (c *unixController) InjectRaw(data []byte) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if !c.started {
+		c.mu.Unlock()
 		return fmt.Errorf("controller not started")
 	}
 	if c.closed {
+		c.mu.Unlock()
 		return ErrClosed
 	}
+	ptmx := c.ptmx
+	c.mu.Unlock()
 
-	_, err := c.ptmx.Write(data)
-	if err != nil {
+	// A concurrent Close may race this write; os.File makes that safe and the
+	// write then reports the closed descriptor instead of corrupting state.
+	if _, err := ptmx.Write(data); err != nil {
 		return fmt.Errorf("write to pty: %w", err)
 	}
 	return nil

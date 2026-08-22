@@ -786,6 +786,15 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
+	// Capture the live Claude identity BEFORE any file is overwritten: the
+	// freshness guard below must compare against the account that is logged
+	// in right now, not against the snapshot's settings once those have been
+	// copied over the live ~/.claude.json (issue #73).
+	var liveClaudeKeys []string
+	if fileSet.Tool == "claude" {
+		liveClaudeKeys = claudeLiveIdentityKeys(fileSet)
+	}
+
 	restored := 0
 	requiredFound := false
 	optionalFound := false
@@ -848,7 +857,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		// with an expired access token and an already-consumed refresh token
 		// (Anthropic then forces an interactive /login). Keep the live file.
 		if fileSet.Tool == "claude" && filename == claudeCredentialsFile &&
-			v.claudeLiveIsNewer(fileSet, profileDir, spec.Path, srcPath) {
+			v.claudeLiveIsNewer(liveClaudeKeys, profileDir, spec.Path, srcPath) {
 			restored++
 			if spec.Required {
 				requiredFound = true
@@ -2145,8 +2154,13 @@ func codexLiveIsNewer(livePath, snapshotPath string) bool {
 // every few hours of use, so anything derived from token bytes stops matching
 // its own vault snapshot after the first refresh. The rotation-stable
 // identity lives in ~/.claude.json: oauthAccount.accountUuid and
-// oauthAccount.emailAddress (plus the hashed top-level userID). Access tokens
-// are opaque (sk-ant-oat…), not JWTs, so there is nothing to decode.
+// oauthAccount.emailAddress. Access tokens are opaque (sk-ant-oat…), not
+// JWTs, so there is nothing to decode.
+//
+// The top-level userID is deliberately NOT an identity key: it is a
+// per-installation identifier that every account logged in on the same
+// machine shares (verified across seven distinct accounts in one vault), so
+// keying on it would make unrelated accounts match each other.
 //
 // The helpers below derive identity KEYS — one per available field, each
 // namespaced so a uuid can never collide with an email — and two sides match
@@ -2176,9 +2190,6 @@ func claudeIdentityKeys(root map[string]interface{}) []string {
 			keys = append(keys, "account:"+acct)
 		}
 	}
-	if uid := strings.TrimSpace(jsonString(root, "userID")); uid != "" {
-		keys = append(keys, "userid:"+uid)
-	}
 	return keys
 }
 
@@ -2197,9 +2208,9 @@ func claudeIdentityKeysFromFile(path string) []string {
 }
 
 // claudeIdentityLabel picks the human-facing identity out of a key set:
-// email, else account uuid, else the legacy account string, else userID.
+// email, else account uuid, else the legacy account string.
 func claudeIdentityLabel(keys []string) string {
-	for _, prefix := range []string{"email:", "uuid:", "account:", "userid:"} {
+	for _, prefix := range []string{"email:", "uuid:", "account:"} {
 		for _, key := range keys {
 			if strings.HasPrefix(key, prefix) {
 				return strings.TrimPrefix(key, prefix)
@@ -2367,17 +2378,18 @@ func claudeLiveCredentialsIncomplete(fileSet AuthFileSet) bool {
 
 // claudeLiveIsNewer reports whether the LIVE Claude credentials at livePath
 // belong to the SAME account as the vault snapshot at snapshotPath (profile
-// profileDir) AND were refreshed strictly more recently. When true, Restore
-// must not clobber the live file: doing so would replay an expired access
-// token plus an already-consumed refresh token and force an interactive
-// /login (issue #73).
+// profileDir) AND were refreshed strictly more recently. liveKeys is the
+// live account identity captured before Restore touched any file. When true,
+// Restore must not clobber the live file: doing so would replay an expired
+// access token plus an already-consumed refresh token and force an
+// interactive /login (issue #73).
 //
 // Conservative by construction — any uncertainty (missing/unparseable file,
 // unknown identity on either side, different identity, a live file missing a
 // token, equal-or-older live expiry) returns false so the normal verbatim
 // copy proceeds. Cross-account switches and first-time restores are never
 // blocked.
-func (v *Vault) claudeLiveIsNewer(fileSet AuthFileSet, profileDir, livePath, snapshotPath string) bool {
+func (v *Vault) claudeLiveIsNewer(liveKeys []string, profileDir, livePath, snapshotPath string) bool {
 	liveOAuth, ok := readClaudeOAuth(livePath)
 	if !ok {
 		return false
@@ -2388,7 +2400,7 @@ func (v *Vault) claudeLiveIsNewer(fileSet AuthFileSet, profileDir, livePath, sna
 	}
 
 	// Only guard when it is unambiguously the SAME account.
-	if !identityKeysIntersect(claudeLiveIdentityKeys(fileSet), v.claudeProfileIdentityKeys(profileDir)) {
+	if !identityKeysIntersect(liveKeys, v.claudeProfileIdentityKeys(profileDir)) {
 		return false
 	}
 

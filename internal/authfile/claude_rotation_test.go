@@ -240,6 +240,30 @@ func TestActiveProfileIdentityMatchesOnAnySharedKey(t *testing.T) {
 	}
 }
 
+func TestActiveProfileIdentityIgnoresSharedMachineUserID(t *testing.T) {
+	// Claude Code's top-level userID is per-installation: every account that
+	// logs in on one machine carries the same value. Two different accounts
+	// that share it must never be treated as the same identity.
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("alice", aliceGen1, claudeRotationSettings(rotAliceUUID, rotAliceEmail, "shared-machine-userid", 1))
+	f.writeLive(
+		claudeRotationCreds("sk-ant-oat01-bob-gen9", "sk-ant-ort01-bob-gen9", 9999),
+		claudeRotationSettings(rotBobUUID, rotBobEmail, "shared-machine-userid", 3),
+	)
+
+	if got := f.active(); got != "" {
+		t.Fatalf("ActiveProfile = %q, want no match: a shared userID is not an account identity", got)
+	}
+
+	// The restore guard must likewise not mistake bob's fresher live file for alice's.
+	if err := f.vault.Restore(f.fileSet, "alice"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := readFixtureFile(t, f.liveCreds); got != aliceGen1 {
+		t.Fatalf("restore kept another account's credentials because of a shared userID: %s", got)
+	}
+}
+
 func TestActiveProfileNoIdentityWithoutLiveSettings(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))
@@ -266,8 +290,11 @@ func TestBackupRecordsClaudeIdentityInMeta(t *testing.T) {
 		t.Errorf("meta identity = %v, want %q", meta["identity"], rotAliceEmail)
 	}
 	keys, _ := meta["identity_keys"].([]interface{})
-	want := map[string]bool{"uuid:" + rotAliceUUID: true, "email:" + rotAliceEmail: true, "userid:" + rotAliceUser: true}
+	want := map[string]bool{"uuid:" + rotAliceUUID: true, "email:" + rotAliceEmail: true}
 	for _, k := range keys {
+		if fmt.Sprint(k) == "userid:"+rotAliceUser {
+			t.Errorf("meta identity_keys must not carry the per-installation userID: %v", keys)
+		}
 		delete(want, fmt.Sprint(k))
 	}
 	if len(want) != 0 {
@@ -417,10 +444,10 @@ func TestClaudeIdentityKeys(t *testing.T) {
 		root string
 		want []string
 	}{
-		{"full account", aliceSettings(1), []string{"uuid:" + rotAliceUUID, "email:" + rotAliceEmail, "userid:" + rotAliceUser}},
+		{"full account", aliceSettings(1), []string{"uuid:" + rotAliceUUID, "email:" + rotAliceEmail}},
 		{"normalizes case and whitespace", `{"oauthAccount":{"accountUuid":" ABCD ","emailAddress":" Alice@Example.com "}}`, []string{"uuid:abcd", "email:alice@example.com"}},
 		{"legacy string account", `{"oauthAccount":"Legacy@Example.com"}`, []string{"account:legacy@example.com"}},
-		{"userID only", `{"userID":"u-1"}`, []string{"userid:u-1"}},
+		{"userID alone is not an identity (per-installation value)", `{"userID":"u-1"}`, nil},
 		{"no identity", `{"numStartups":3}`, nil},
 	}
 	for _, tc := range cases {
