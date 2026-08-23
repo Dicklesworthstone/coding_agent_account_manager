@@ -40,28 +40,42 @@ func mustStart(t *testing.T, name string, args []string, opts *Options) Controll
 	return ctrl
 }
 
+// sttySizeReports asserts that a fresh `stty size` child reports the wanted
+// dimensions. `stty size` writes once and exits instantly, which exposes the
+// darwin fast-exit output race (see fastexit_test.go), so empty-output
+// EOF/timeout results are retried a bounded number of times; a child that
+// actually reports the WRONG size (e.g. the 0x0-terminal regression this
+// guards against) produces non-empty output and fails immediately.
+func sttySizeReports(t *testing.T, opts *Options, wantRows, wantCols int) {
+	t.Helper()
+	want := regexp.MustCompile(fmt.Sprintf(`\b%d %d\b`, wantRows, wantCols))
+	for attempt := 0; attempt < fastExitAttempts; attempt++ {
+		ctrl := mustStart(t, "stty", []string{"size"}, opts)
+		out, err := ctrl.WaitForPattern(context.Background(), want, 5*time.Second)
+		_ = ctrl.Close()
+		if want.MatchString(out) {
+			return
+		}
+		if strings.TrimSpace(out) == "" && (err == io.EOF || err == ErrTimeout) {
+			t.Logf("attempt %d: fast-exit output lost to the darwin PTY race; retrying", attempt)
+			continue
+		}
+		t.Fatalf("child did not report the requested %dx%d size: %v (output %q)", wantRows, wantCols, err, out)
+	}
+	t.Fatalf("child output lost on all %d attempts (darwin fast-exit race would be expected to pass at least once)", fastExitAttempts)
+}
+
 func TestStartHonorsRequestedSize(t *testing.T) {
 	requireStty(t)
 	// stty reports the size of its stdin, which is the PTY slave.
-	ctrl := mustStart(t, "stty", []string{"size"}, &Options{Rows: 47, Cols: 238})
-
-	out, err := ctrl.WaitForPattern(context.Background(), regexp.MustCompile(`\b47 238\b`), 5*time.Second)
-	if err != nil {
-		t.Fatalf("child did not report the requested 47x238 size: %v (output %q)", err, out)
-	}
+	sttySizeReports(t, &Options{Rows: 47, Cols: 238}, 47, 238)
 }
 
 func TestStartDefaultsZeroDimensions(t *testing.T) {
 	requireStty(t)
 	// An Options with unset dimensions must not hand the child a 0x0 terminal.
-	ctrl := mustStart(t, "stty", []string{"size"}, &Options{})
-
 	defaults := DefaultOptions()
-	want := regexp.MustCompile(fmt.Sprintf(`\b%d %d\b`, defaults.Rows, defaults.Cols))
-	out, err := ctrl.WaitForPattern(context.Background(), want, 5*time.Second)
-	if err != nil {
-		t.Fatalf("child did not report the default %dx%d size: %v (output %q)", defaults.Rows, defaults.Cols, err, out)
-	}
+	sttySizeReports(t, &Options{}, int(defaults.Rows), int(defaults.Cols))
 }
 
 func TestResizeDeliversNewSizeToChild(t *testing.T) {
@@ -119,28 +133,39 @@ func TestReadOutputDrainsThenReportsEOF(t *testing.T) {
 	// Exercises the poll-based reader end to end: data is delivered, and once
 	// the child has exited the reader reports io.EOF instead of spinning or
 	// failing with a deadline error (the macOS failure mode before #74).
-	ctrl := mustStart(t, "echo", []string{"READ_OUTPUT_MARKER"}, nil)
+	// EOF-promptness is deterministic; the marker's DELIVERY is subject to
+	// the darwin fast-exit race (see fastexit_test.go), hence the bounded
+	// retry on empty output.
+	for attempt := 0; attempt < fastExitAttempts; attempt++ {
+		ctrl := mustStart(t, "echo", []string{"READ_OUTPUT_MARKER"}, nil)
 
-	var collected strings.Builder
-	deadline := time.Now().Add(5 * time.Second)
-	sawEOF := false
-	for time.Now().Before(deadline) {
-		out, err := ctrl.ReadOutput()
-		collected.WriteString(out)
-		if err == io.EOF {
-			sawEOF = true
-			break
+		var collected strings.Builder
+		deadline := time.Now().Add(5 * time.Second)
+		sawEOF := false
+		for time.Now().Before(deadline) {
+			out, err := ctrl.ReadOutput()
+			collected.WriteString(out)
+			if err == io.EOF {
+				sawEOF = true
+				break
+			}
+			if err != nil {
+				t.Fatalf("ReadOutput: %v (collected %q)", err, collected.String())
+			}
 		}
-		if err != nil {
-			t.Fatalf("ReadOutput: %v (collected %q)", err, collected.String())
+		_ = ctrl.Close()
+		if !sawEOF {
+			t.Fatalf("ReadOutput never reported EOF after the child exited (collected %q)", collected.String())
 		}
+		if strings.Contains(collected.String(), "READ_OUTPUT_MARKER") {
+			return
+		}
+		if strings.TrimSpace(collected.String()) != "" {
+			t.Fatalf("child output was corrupted rather than lost: %q", collected.String())
+		}
+		t.Logf("attempt %d: fast-exit output lost to the darwin PTY race; retrying", attempt)
 	}
-	if !sawEOF {
-		t.Fatalf("ReadOutput never reported EOF after the child exited (collected %q)", collected.String())
-	}
-	if !strings.Contains(collected.String(), "READ_OUTPUT_MARKER") {
-		t.Fatalf("child output was not delivered: %q", collected.String())
-	}
+	t.Fatalf("child output lost on all %d attempts", fastExitAttempts)
 }
 
 func TestNotifyResizeDeliversAndStops(t *testing.T) {

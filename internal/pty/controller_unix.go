@@ -27,6 +27,45 @@ type unixController struct {
 	mu      sync.Mutex
 	started bool
 	closed  bool
+	exited  bool // set once the internal waiter observes the child's exit
+
+	waitOnce sync.Once
+	waitCode int
+	waitErr  error
+}
+
+// exitedNow reports whether the wrapped process is known to have exited.
+func (c *unixController) exitedNow() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exited
+}
+
+// doWait reaps the child exactly once and records the outcome. Start spawns
+// it in the background so readers learn about child exit even when the
+// caller never invokes Wait (on Darwin no POLLHUP ever arrives, because the
+// controller holds a slave descriptor open — see Start). Public Wait and
+// Close route through it too; sync.Once makes the underlying cmd.Wait safe
+// against double invocation.
+func (c *unixController) doWait() (int, error) {
+	c.waitOnce.Do(func() {
+		err := c.cmd.Wait()
+
+		c.mu.Lock()
+		c.exited = true
+		c.mu.Unlock()
+
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				c.waitCode, c.waitErr = exitErr.ExitCode(), nil
+				return
+			}
+			c.waitCode, c.waitErr = -1, fmt.Errorf("wait: %w", err)
+			return
+		}
+		c.waitCode, c.waitErr = 0, nil
+	})
+	return c.waitCode, c.waitErr
 }
 
 // NewController creates a new PTY controller wrapping the given command.
@@ -87,6 +126,17 @@ func (c *unixController) Start() error {
 		}
 	}
 
+	// KNOWN DARWIN LIMITATION: for a child that writes and exits near
+	// instantly, macOS can discard the final PTY output before the parent
+	// reads it (observed as poll reporting POLLIN|POLLHUP while read returns
+	// EOF, or as the data never surfacing at all). Experiments holding a
+	// parent-side slave open preserve the buffer in most schedules but wedge
+	// a ctty session leader in exit (unreapable, state E) and still lose
+	// output under load, so no reader-side arrangement fully fixes it; the
+	// standard creack/pty session semantics (child owns the slave and the
+	// controlling terminal) are kept. Interactive children — the actual
+	// `caam run` use case — are unaffected: their output is drained while
+	// they run.
 	ptmx, err := pty.StartWithSize(c.cmd, winSize)
 	if err != nil {
 		return fmt.Errorf("start pty: %w", err)
@@ -94,6 +144,11 @@ func (c *unixController) Start() error {
 
 	c.ptmx = ptmx
 	c.started = true
+
+	// Reap the child in the background so readers observe end-of-output via
+	// the exited flag promptly even if the caller never invokes Wait (see
+	// doWait).
+	go func() { _, _ = c.doWait() }()
 
 	return nil
 }
@@ -201,7 +256,26 @@ func (c *unixController) ReadOutput() (string, error) {
 	}
 	if !readable {
 		if hungUp {
-			return "", io.EOF // Process exited and nothing is left to drain
+			// All slave descriptors are gone. On macOS/BSD, poll(2) can
+			// report POLLHUP without POLLIN while final output still sits
+			// in the master buffer, so attempt one drain read (safe here:
+			// with the slave gone it returns data or EIO/EOF, never
+			// blocks). It yields that output, or io.EOF once empty.
+			buf := make([]byte, 4096)
+			nread, rerr := readAfterPoll(ptmx, buf)
+			if nread > 0 {
+				return string(buf[:nread]), nil
+			}
+			if rerr != nil && rerr != io.EOF {
+				return "", rerr
+			}
+			return "", io.EOF // Slave gone and nothing was left to drain
+		}
+		if c.exitedNow() {
+			// The child is known to have exited and the poll interval
+			// elapsed with no data and no hangup: nothing is left to read.
+			// Report EOF promptly instead of spinning until POLLHUP shows.
+			return "", io.EOF
 		}
 		return "", nil // No data available within the poll interval
 	}
@@ -252,6 +326,11 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 			return string(line), fmt.Errorf("poll pty: %w", err)
 		}
 		if n == 0 {
+			if c.exitedNow() {
+				// Child exited and the poll timed out with no data and no
+				// hangup: nothing is left to read. Report EOF promptly.
+				return string(line), io.EOF
+			}
 			continue
 		}
 		revents := pollFd[0].Revents
@@ -259,6 +338,22 @@ func (c *unixController) ReadLine(ctx context.Context) (string, error) {
 			return string(line), fmt.Errorf("pty poll error: revents=%d", revents)
 		}
 		if revents&unix.POLLHUP != 0 && revents&unix.POLLIN == 0 {
+			// The child may have written a final line and exited before we
+			// polled; on macOS/BSD that surfaces as bare POLLHUP with the
+			// output still buffered. Drain one byte here (the next loop
+			// iteration polls and drains again) and only report EOF once
+			// the buffer is empty (readAfterPoll normalizes Linux's EIO).
+			nread, rerr := readAfterPoll(ptmx, buf)
+			if nread > 0 {
+				line = append(line, buf[0])
+				if buf[0] == '\n' {
+					return string(line), nil
+				}
+				continue
+			}
+			if rerr != nil && rerr != io.EOF {
+				return string(line), rerr
+			}
 			return string(line), io.EOF
 		}
 
@@ -325,6 +420,30 @@ func (c *unixController) WaitForPattern(ctx context.Context, pattern *regexp.Reg
 		}
 		if !readable {
 			if hungUp {
+				// POLLHUP without POLLIN can still leave the child's final
+				// output buffered in the master (macOS/BSD). Drain it fully
+				// before reporting EOF, and keep matching as we drain
+				// (safe: with all slaves gone, reads return data or
+				// EIO/EOF, never block).
+				for {
+					nread, rerr := readAfterPoll(ptmx, buf)
+					if nread > 0 {
+						output = append(output, buf[:nread]...)
+						if pattern.Match(output) {
+							return string(output), nil
+						}
+						continue
+					}
+					if rerr != nil && rerr != io.EOF {
+						return string(output), rerr
+					}
+					return string(output), io.EOF
+				}
+			}
+			if c.exitedNow() {
+				// Child exited and the poll interval elapsed with no data
+				// and no hangup: nothing is left to read. Report EOF
+				// promptly instead of spinning until POLLHUP shows.
 				return string(output), io.EOF
 			}
 			continue // Nothing yet, check context and retry
@@ -350,17 +469,9 @@ func (c *unixController) Wait() (int, error) {
 		c.mu.Unlock()
 		return -1, fmt.Errorf("controller not started")
 	}
-	cmd := c.cmd
 	c.mu.Unlock()
 
-	err := cmd.Wait()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), nil
-		}
-		return -1, fmt.Errorf("wait: %w", err)
-	}
-	return 0, nil
+	return c.doWait()
 }
 
 // Signal sends a signal to the running process.
@@ -437,6 +548,7 @@ func (c *unixController) Close() error {
 		}
 	}
 
+
 	// Kill the process if still running
 	if c.cmd != nil && c.cmd.Process != nil {
 		// Try graceful termination first
@@ -445,7 +557,7 @@ func (c *unixController) Close() error {
 		// Give it a moment to exit
 		done := make(chan struct{})
 		go func() {
-			c.cmd.Wait()
+			_, _ = c.doWait()
 			close(done)
 		}()
 
