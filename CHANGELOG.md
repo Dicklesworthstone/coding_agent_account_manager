@@ -8,6 +8,15 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [v0.1.17] — 2026-08-23
+
+### Fixed
+
+- **`caam run` is now a transparent terminal proxy** — resolves #74. The proxied PTY inherits the real terminal's window size at startup and follows it via SIGWINCH forwarding (new `Controller.Resize`/`NotifyResize`), the outer terminal enters raw mode (with restore on all exit paths) so keystroke escape bytes are relayed to the child instead of being echoed onto the output stream, and stdin is relayed verbatim. ([`0abb987`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0abb987), [`78f7ba0`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/78f7ba0))
+- **macOS PTY reads no longer fail instantly** — the PTY master is not deadline-capable on macOS (kqueue refuses `/dev/ptmx`), so `ReadOutput`/`WaitForPattern` now share `ReadLine`'s poll(2)-based approach instead of `SetReadDeadline`. Previously every deadline-based read errored on the first call and the wrapped tool's output vanished. ([`0abb987`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/0abb987))
+- **Claude vault profiles survive refresh-token rotation** — resolves #73. `ActiveProfile` matching now keys on rotation-stable account identity (OAuth `account` uuid/email persisted in profile metadata) instead of raw token bytes, a Claude twin of the Codex freshness comparison decides restore direction, and `ResnapshotOutgoing` refuses to overwrite a snapshot with empty-refresh-token residue — so activate no longer forces a re-login after every rotation. The per-installation `userID` is deliberately excluded from identity (it is shared across accounts on one machine). ([`63ca467`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/63ca467), [`4d2af22`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/4d2af22))
+- **PTY child reaping is single-flight** — `Wait` and `Close` previously raced two `cmd.Wait` calls; the child is now reaped exactly once, readers report EOF promptly once it exits, and buffered output is drained on POLLHUP before EOF is reported (Linux previously dropped it). A known Darwin kernel race that can discard the final output of a child that writes and exits near-instantly is documented in `internal/pty` and absorbed by bounded retries in the tests. ([`f3228cd`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/f3228cd))
+
 ## [Unreleased] — since v0.1.10 (2026-01-21)
 
 > 67 commits on `main` after v0.1.10, spanning 2026-01-21 through 2026-03-21.
