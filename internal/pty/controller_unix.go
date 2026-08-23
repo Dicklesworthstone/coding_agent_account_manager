@@ -42,11 +42,11 @@ func (c *unixController) exitedNow() bool {
 }
 
 // doWait reaps the child exactly once and records the outcome. Start spawns
-// it in the background so readers learn about child exit even when the
-// caller never invokes Wait (on Darwin no POLLHUP ever arrives, because the
-// controller holds a slave descriptor open — see Start). Public Wait and
+// it in the background so readers learn about child exit promptly (via the
+// exited flag) even when the caller never invokes Wait. Public Wait and
 // Close route through it too; sync.Once makes the underlying cmd.Wait safe
-// against double invocation.
+// against double invocation (previously Wait followed by Close raced two
+// cmd.Wait calls).
 func (c *unixController) doWait() (int, error) {
 	c.waitOnce.Do(func() {
 		err := c.cmd.Wait()
@@ -547,7 +547,6 @@ func (c *unixController) Close() error {
 			firstErr = fmt.Errorf("close pty: %w", err)
 		}
 	}
-
 
 	// Kill the process if still running
 	if c.cmd != nil && c.cmd.Process != nil {
