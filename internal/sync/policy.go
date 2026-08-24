@@ -2,6 +2,8 @@ package sync
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -153,7 +155,10 @@ func NewPolicyResolver(providerOverrides, profileOverrides map[string]string) *P
 			r.invalid = append(r.invalid, fmt.Sprintf("sync_policy.profiles[%q] = %q", key, raw))
 			continue
 		}
-		r.profileOverrides[strings.ToLower(strings.TrimSpace(key))] = mode
+		// Provider IDs are case-insensitive; profile names are
+		// case-SENSITIVE vault directory names (consistent with
+		// filterProfiles and `caam sync --profile`).
+		r.profileOverrides[normalizeProfileKey(key)] = mode
 	}
 	sort.Strings(r.invalid)
 	return r
@@ -170,14 +175,25 @@ func LoadPolicyResolver() *PolicyResolver {
 	return NewPolicyResolver(cfg.SyncPolicy.Providers, cfg.SyncPolicy.Profiles)
 }
 
+// normalizeProfileKey canonicalizes a "provider/profile" override key:
+// the provider segment is lowercased, the profile segment (everything after
+// the first slash) keeps its exact case — vault profile directory names are
+// case-sensitive.
+func normalizeProfileKey(key string) string {
+	key = strings.TrimSpace(key)
+	if i := strings.IndexByte(key, '/'); i >= 0 {
+		return strings.ToLower(key[:i]) + key[i:]
+	}
+	return strings.ToLower(key)
+}
+
 // ModeFor resolves the effective sync mode for a provider/profile pair.
 func (r *PolicyResolver) ModeFor(provider, profile string) SyncMode {
 	if r == nil {
 		return DefaultModeForProvider(provider)
 	}
 	prov := strings.ToLower(strings.TrimSpace(provider))
-	key := prov + "/" + strings.TrimSpace(profile)
-	if mode, ok := r.profileOverrides[strings.ToLower(key)]; ok {
+	if mode, ok := r.profileOverrides[prov+"/"+strings.TrimSpace(profile)]; ok {
 		return mode
 	}
 	if mode, ok := r.providerOverrides[prov]; ok {
@@ -290,6 +306,31 @@ func applyHostLocalDecision(op *SyncOperation, localExists, remoteExists bool, l
 		}
 	}
 	return op
+}
+
+// downgradeIfNoMetadata converts a planned metadata-only transfer into a
+// silent skip when the source side has no allowlisted metadata to offer.
+// Without this, a legacy payload-only vault directory would produce a
+// misleading zero-file "pushed metadata" result (and a history entry) on
+// every single sync, since the destination side never comes into existence.
+func downgradeIfNoMetadata(op *SyncOperation, sourceHasMetadata bool) *SyncOperation {
+	if op.PayloadExcluded && !sourceHasMetadata &&
+		(op.Direction == SyncPush || op.Direction == SyncPull) {
+		op.Direction = SyncSkip
+		op.Note = ""
+	}
+	return op
+}
+
+// localMetadataPresent reports whether a local profile directory holds at
+// least one allowlisted metadata file.
+func localMetadataPresent(dir string) bool {
+	for name := range metadataSyncAllowlist {
+		if fi, err := os.Stat(filepath.Join(dir, name)); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // HistoryAction is the action string recorded in sync history for this

@@ -72,9 +72,13 @@ func TestPolicyResolverPrecedence(t *testing.T) {
 	if got := r.ModeFor("gemini", "other"); got != ModeHostLocal {
 		t.Errorf("gemini/other = %q, want host-local (provider override)", got)
 	}
-	// Case-insensitive profile key lookup.
+	// Provider segment of a profile key is case-insensitive…
 	if got := r.ModeFor("gemini", "Main"); got != ModeReplicate {
-		t.Errorf("gemini/Main = %q, want replicate (profile override, case-insensitive)", got)
+		t.Errorf("gemini/Main = %q, want replicate (provider segment case-insensitive)", got)
+	}
+	// …but the profile segment is case-SENSITIVE, matching vault dir names.
+	if got := r.ModeFor("gemini", "main"); got != ModeHostLocal {
+		t.Errorf("gemini/main = %q, want host-local (profile name case differs from override)", got)
 	}
 	// Invalid override value is ignored → capability default applies (fail closed).
 	if got := r.ModeFor("codex", "anything"); got != ModeHostLocal {
@@ -236,6 +240,52 @@ func TestApplyHostLocalDecision(t *testing.T) {
 			t.Errorf("got (%q, %q)", op.Direction, op.Note)
 		}
 	})
+}
+
+func TestDowngradeIfNoMetadata(t *testing.T) {
+	mk := func(dir SyncDirection, excluded bool, note string) *SyncOperation {
+		return &SyncOperation{Direction: dir, PayloadExcluded: excluded, Note: note}
+	}
+
+	// Metadata-only push with nothing to offer → silent skip.
+	op := downgradeIfNoMetadata(mk(SyncPush, true, noteHostLocalMetadataOnly), false)
+	if op.Direction != SyncSkip || op.Note != "" {
+		t.Errorf("push without metadata: got (%q, %q), want silent skip", op.Direction, op.Note)
+	}
+	// Metadata-only pull with metadata present → unchanged.
+	op = downgradeIfNoMetadata(mk(SyncPull, true, noteHostLocalMetadataOnly), true)
+	if op.Direction != SyncPull || op.Note != noteHostLocalMetadataOnly {
+		t.Errorf("pull with metadata: got (%q, %q), want unchanged", op.Direction, op.Note)
+	}
+	// Full replicate push is never downgraded, even with no metadata.
+	op = downgradeIfNoMetadata(mk(SyncPush, false, ""), false)
+	if op.Direction != SyncPush {
+		t.Errorf("replicate push: got %q, want push", op.Direction)
+	}
+	// Skip stays skip.
+	op = downgradeIfNoMetadata(mk(SyncSkip, true, noteHostLocalDiverged), false)
+	if op.Direction != SyncSkip || op.Note != noteHostLocalDiverged {
+		t.Errorf("skip: got (%q, %q), want note preserved", op.Direction, op.Note)
+	}
+}
+
+func TestLocalMetadataPresent(t *testing.T) {
+	dir := t.TempDir()
+	if localMetadataPresent(dir) {
+		t.Error("empty dir must have no metadata")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if localMetadataPresent(dir) {
+		t.Error("payload-only dir must have no metadata")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !localMetadataPresent(dir) {
+		t.Error("meta.json must count as metadata")
+	}
 }
 
 func TestHistoryAction(t *testing.T) {

@@ -668,7 +668,38 @@ func (s *Syncer) determineHostLocalOperation(client *SSHClient, m *Machine, p Pr
 		remoteFresh, _ = s.getRemoteFreshness(client, p)
 	}
 
-	return applyHostLocalDecision(op, localExists, remoteExists, localFresh, remoteFresh, authfile.IsSystemProfile(p.Profile)), nil
+	op = applyHostLocalDecision(op, localExists, remoteExists, localFresh, remoteFresh, authfile.IsSystemProfile(p.Profile))
+
+	// A planned metadata seed is only real if the source side actually has
+	// allowlisted metadata to offer; legacy payload-only vault dirs would
+	// otherwise report a zero-file "pushed metadata" on every sync.
+	switch op.Direction {
+	case SyncPush:
+		op = downgradeIfNoMetadata(op, localMetadataPresent(localPath))
+	case SyncPull:
+		has, err := s.remoteMetadataPresent(client, remotePath)
+		if err != nil {
+			return nil, fmt.Errorf("remote error: %v", err)
+		}
+		op = downgradeIfNoMetadata(op, has)
+	}
+
+	return op, nil
+}
+
+// remoteMetadataPresent reports whether the remote profile directory holds
+// at least one allowlisted metadata file.
+func (s *Syncer) remoteMetadataPresent(client *SSHClient, remotePath string) (bool, error) {
+	for name := range metadataSyncAllowlist {
+		exists, err := client.FileExists(posixJoin(remotePath, name))
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // executeOperation executes a sync operation.

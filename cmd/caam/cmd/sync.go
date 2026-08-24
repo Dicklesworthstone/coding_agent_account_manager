@@ -358,10 +358,11 @@ func runSync(cmd *cobra.Command, args []string) error {
 						fmt.Fprintf(out, "    ✓ %s: up to date\n", profile)
 					}
 				}
-				// Policy warnings (e.g. forced replicate of a rotating
+				// Policy warnings (forced replicate of a rotating
 				// credential) print even on success — they flag hazard,
-				// not failure.
-				if r.Operation.Note != "" && r.Operation.Direction != sync.SyncSkip {
+				// not failure. Metadata-only transfers already carry
+				// their explanation in the line above.
+				if r.Operation.Note != "" && r.Operation.Direction != sync.SyncSkip && !r.Operation.PayloadExcluded {
 					fmt.Fprintf(out, "      ⚠ %s\n", r.Operation.Note)
 				}
 			} else {
