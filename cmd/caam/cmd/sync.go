@@ -340,11 +340,29 @@ func runSync(cmd *cobra.Command, args []string) error {
 			if r.Success {
 				switch r.Operation.Direction {
 				case sync.SyncPush:
-					fmt.Fprintf(out, "    ✓ %s: pushed (local fresher)\n", profile)
+					if r.Operation.PayloadExcluded {
+						fmt.Fprintf(out, "    ✓ %s: pushed metadata (host-local: payload never syncs)\n", profile)
+					} else {
+						fmt.Fprintf(out, "    ✓ %s: pushed (local fresher)\n", profile)
+					}
 				case sync.SyncPull:
-					fmt.Fprintf(out, "    ✓ %s: pulled (remote fresher)\n", profile)
+					if r.Operation.PayloadExcluded {
+						fmt.Fprintf(out, "    ✓ %s: pulled metadata (host-local: payload never syncs)\n", profile)
+					} else {
+						fmt.Fprintf(out, "    ✓ %s: pulled (remote fresher)\n", profile)
+					}
 				case sync.SyncSkip:
-					fmt.Fprintf(out, "    ✓ %s: up to date\n", profile)
+					if r.Operation.Note != "" {
+						fmt.Fprintf(out, "    · %s: %s\n", profile, r.Operation.Note)
+					} else {
+						fmt.Fprintf(out, "    ✓ %s: up to date\n", profile)
+					}
+				}
+				// Policy warnings (e.g. forced replicate of a rotating
+				// credential) print even on success — they flag hazard,
+				// not failure.
+				if r.Operation.Note != "" && r.Operation.Direction != sync.SyncSkip {
+					fmt.Fprintf(out, "      ⚠ %s\n", r.Operation.Note)
 				}
 			} else {
 				fmt.Fprintf(out, "    ✗ %s: %v\n", profile, r.Error)
@@ -450,6 +468,19 @@ func runSyncStatus(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Fprintf(out, "  %-15s %-20s %-10s %s\n", m.Name, m.Address, status, lastSync)
 		}
+	}
+
+	fmt.Fprintln(out)
+
+	// Sync policy (issue #66): what actually crosses machines per provider.
+	resolver := sync.LoadPolicyResolver()
+	fmt.Fprintln(out, "Sync policy (credential payload movement):")
+	for _, prov := range sync.SyncedProviders() {
+		mode, why := resolver.Explain(prov)
+		fmt.Fprintf(out, "  %-10s %-11s (%s)\n", prov, string(mode), why)
+	}
+	for _, bad := range resolver.InvalidEntries() {
+		fmt.Fprintf(out, "  ⚠ ignored invalid config entry: %s\n", bad)
 	}
 
 	fmt.Fprintln(out)
@@ -1182,17 +1213,25 @@ func runSyncStatusJSON(state *sync.SyncState, out io.Writer) error {
 	}
 
 	type statusJSON struct {
-		LocalMachine string        `json:"local_machine,omitempty"`
-		AutoSync     bool          `json:"auto_sync"`
-		LastFullSync *time.Time    `json:"last_full_sync,omitempty"`
-		Machines     []machineJSON `json:"machines"`
-		QueuePending int           `json:"queue_pending"`
-		HistoryCount int           `json:"history_count"`
+		LocalMachine string            `json:"local_machine,omitempty"`
+		AutoSync     bool              `json:"auto_sync"`
+		LastFullSync *time.Time        `json:"last_full_sync,omitempty"`
+		Machines     []machineJSON     `json:"machines"`
+		SyncPolicy   map[string]string `json:"sync_policy"`
+		QueuePending int               `json:"queue_pending"`
+		HistoryCount int               `json:"history_count"`
 	}
 
 	output := statusJSON{
-		AutoSync: state.Pool.AutoSync,
-		Machines: []machineJSON{}, // Initialize as empty array, not nil
+		AutoSync:   state.Pool.AutoSync,
+		Machines:   []machineJSON{}, // Initialize as empty array, not nil
+		SyncPolicy: map[string]string{},
+	}
+
+	resolver := sync.LoadPolicyResolver()
+	for _, prov := range sync.SyncedProviders() {
+		mode, _ := resolver.Explain(prov)
+		output.SyncPolicy[prov] = string(mode)
 	}
 
 	if state.Identity != nil {

@@ -64,6 +64,23 @@ type Config struct {
 
 	// Backup configures automatic backup scheduling.
 	Backup BackupConfig `json:"backup,omitempty"`
+
+	// SyncPolicy configures how credential payloads replicate between
+	// machines during `caam sync` (issue #66). Providers with rotating
+	// OAuth refresh-token families default to "host-local" (payload never
+	// syncs; metadata still does); set an override here to force
+	// "replicate" for a provider or an individual profile.
+	SyncPolicy SyncPolicyConfig `json:"sync_policy,omitempty"`
+}
+
+// SyncPolicyConfig holds user overrides for multi-machine credential sync
+// modes. Keys in Providers are provider IDs ("claude", "codex", ...); keys
+// in Profiles are "provider/profile" pairs. Values are "replicate" or
+// "host-local". Profile entries take precedence over provider entries,
+// which take precedence over the built-in capability defaults.
+type SyncPolicyConfig struct {
+	Providers map[string]string `json:"providers,omitempty"`
+	Profiles  map[string]string `json:"profiles,omitempty"`
 }
 
 // DefaultConfig returns the default configuration.

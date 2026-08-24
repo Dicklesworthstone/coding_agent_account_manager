@@ -42,6 +42,17 @@ type SyncOperation struct {
 
 	// RemoteFreshness is the freshness of the remote token.
 	RemoteFreshness *TokenFreshness
+
+	// Mode is the sync policy mode resolved for this profile (issue #66).
+	Mode SyncMode
+
+	// PayloadExcluded is true when policy prevents the credential payload
+	// from crossing machines; only allowlisted metadata files transfer.
+	PayloadExcluded bool
+
+	// Note carries a policy explanation or warning to surface to the user
+	// (e.g. host-local divergence, rotating-replicate hazard).
+	Note string
 }
 
 // SyncResult represents the result of a sync operation.
@@ -111,6 +122,10 @@ type Syncer struct {
 	// remoteVaultPath is the remote vault directory path pattern.
 	remoteVaultPath string
 
+	// policy resolves the credential sync mode per provider/profile
+	// (issue #66). Nil falls back to capability defaults.
+	policy *PolicyResolver
+
 	// Progress, when non-nil, receives streaming updates during sync.
 	Progress ProgressFunc
 }
@@ -126,6 +141,11 @@ type SyncerConfig struct {
 
 	// ConnectOptions configures SSH connections.
 	ConnectOptions ConnectOptions
+
+	// Policy resolves credential sync modes (issue #66). If nil, the
+	// resolver is loaded from the caam config (falling back to provider
+	// capability defaults). Tests inject a resolver here.
+	Policy *PolicyResolver
 }
 
 // DefaultSyncerConfig returns a default configuration.
@@ -151,11 +171,20 @@ func NewSyncer(config SyncerConfig) (*Syncer, error) {
 		config.RemoteVaultPath = DefaultSyncerConfig().RemoteVaultPath
 	}
 
+	policy := config.Policy
+	if policy == nil {
+		// Every production Syncer flows through here (CLI sync, queue
+		// retries, autosync, TUI), so policy enforcement cannot be
+		// bypassed by construction path.
+		policy = LoadPolicyResolver()
+	}
+
 	return &Syncer{
 		pool:            NewConnectionPool(config.ConnectOptions),
 		state:           state,
 		vaultPath:       config.VaultPath,
 		remoteVaultPath: config.RemoteVaultPath,
+		policy:          policy,
 	}, nil
 }
 
@@ -230,8 +259,18 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 			continue
 		}
 
-		if op == nil || op.Direction == SyncSkip {
+		if op == nil || (op.Direction == SyncSkip && op.Note == "") {
 			continue // Already in sync
+		}
+
+		if op.Direction == SyncSkip {
+			// Policy-informational skip (e.g. host-local divergence):
+			// surface it to the user, but it is not a transfer — no
+			// history entry, no queue interaction.
+			skipped := &SyncResult{Operation: op, Success: true}
+			results = append(results, skipped)
+			s.emit(ProgressEvent{Stage: StageResult, Machine: m, Profile: p, Result: skipped})
+			continue
 		}
 
 		result := s.executeOperation(client, op)
@@ -239,7 +278,7 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 		s.emit(ProgressEvent{Stage: StageResult, Machine: m, Profile: p, Result: result})
 
 		// Record in history
-		action := string(op.Direction)
+		action := op.HistoryAction()
 		s.state.AddToHistory(HistoryEntry{
 			Timestamp: time.Now(),
 			Trigger:   "manual",
@@ -391,7 +430,7 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 		Provider:  provider,
 		Profile:   profile,
 		Machine:   m.Name,
-		Action:    string(op.Direction),
+		Action:    op.HistoryAction(),
 		Success:   result.Success,
 		Error:     errorToString(result.Error),
 		Duration:  result.Duration,
@@ -467,7 +506,7 @@ func (s *Syncer) SyncProfile(ctx context.Context, provider, profile string) ([]*
 			Provider:  provider,
 			Profile:   profile,
 			Machine:   m.Name,
-			Action:    string(op.Direction),
+			Action:    op.HistoryAction(),
 			Success:   result.Success,
 			Error:     errorToString(result.Error),
 			Duration:  result.Duration,
@@ -513,6 +552,11 @@ func (s *Syncer) SyncAll(ctx context.Context) ([]*SyncResult, error) {
 
 // determineSyncOperation determines what sync operation is needed for a profile.
 func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p ProfileRef) (*SyncOperation, error) {
+	mode := s.policy.ModeFor(p.Provider, p.Profile)
+	if mode == ModeHostLocal {
+		return s.determineHostLocalOperation(client, m, p)
+	}
+
 	localFresh, localErr := s.getLocalFreshness(p)
 	remoteFresh, remoteErr := s.getRemoteFreshness(client, p)
 
@@ -528,6 +572,7 @@ func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p Profile
 		Machine:         m,
 		LocalFreshness:  localFresh,
 		RemoteFreshness: remoteFresh,
+		Mode:            mode,
 	}
 
 	switch {
@@ -561,18 +606,69 @@ func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p Profile
 	case CompareFreshness(localFresh, remoteFresh):
 		// Local is fresher: push
 		op.Direction = SyncPush
-		return op, nil
+		return warnIfRotatingReplicate(op), nil
 
 	case CompareFreshness(remoteFresh, localFresh):
 		// Remote is fresher: pull
 		op.Direction = SyncPull
-		return op, nil
+		return warnIfRotatingReplicate(op), nil
 
 	default:
 		// Equal freshness: no action
 		op.Direction = SyncSkip
 		return op, nil
 	}
+}
+
+// warnIfRotatingReplicate attaches the revocation-hazard warning to a
+// replicate push/pull of a rotating-OAuth credential when BOTH machines
+// already hold a copy: converging two live generations of one refresh-token
+// family is the #19 incident class. Reaching this path requires an explicit
+// user override, since rotating providers default to host-local.
+func warnIfRotatingReplicate(op *SyncOperation) *SyncOperation {
+	if ProviderRotatesCredentials(op.Provider) &&
+		op.LocalFreshness != nil && op.RemoteFreshness != nil {
+		op.Note = rotatingReplicateWarning(op.Provider)
+	}
+	return op
+}
+
+// determineHostLocalOperation plans the sync for a host-local profile:
+// payload never moves; metadata may seed a machine that lacks the profile;
+// divergence between two live grants is surfaced, not merged.
+func (s *Syncer) determineHostLocalOperation(client *SSHClient, m *Machine, p ProfileRef) (*SyncOperation, error) {
+	op := &SyncOperation{
+		Provider: p.Provider,
+		Profile:  p.Profile,
+		Machine:  m,
+	}
+
+	localPath := filepath.Join(s.vaultPath, p.Provider, p.Profile)
+	localExists := false
+	if st, err := os.Stat(localPath); err == nil && st.IsDir() {
+		localExists = true
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("local error: %v", err)
+	}
+
+	remotePath := posixJoin(s.remoteVaultPath, p.Provider, p.Profile)
+	remoteExists, err := client.FileExists(remotePath)
+	if err != nil {
+		return nil, fmt.Errorf("remote error: %v", err)
+	}
+
+	// Freshness is best-effort here: host-local profiles may legitimately
+	// hold only metadata (no parseable credential), which must not error
+	// the operation — it only disables the divergence comparison.
+	var localFresh, remoteFresh *TokenFreshness
+	if localExists {
+		localFresh, _ = s.getLocalFreshness(p)
+	}
+	if remoteExists {
+		remoteFresh, _ = s.getRemoteFreshness(client, p)
+	}
+
+	return applyHostLocalDecision(op, localExists, remoteExists, localFresh, remoteFresh, authfile.IsSystemProfile(p.Profile)), nil
 }
 
 // executeOperation executes a sync operation.
@@ -585,12 +681,12 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 
 	switch op.Direction {
 	case SyncPush:
-		err := s.pushProfile(client, op.Provider, op.Profile)
+		err := s.pushProfile(client, op.Provider, op.Profile, op.PayloadExcluded)
 		result.Error = err
 		result.Success = err == nil
 
 	case SyncPull:
-		err := s.pullProfile(client, op.Provider, op.Profile)
+		err := s.pullProfile(client, op.Provider, op.Profile, op.PayloadExcluded)
 		result.Error = err
 		result.Success = err == nil
 
@@ -602,8 +698,10 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 	return result
 }
 
-// pushProfile pushes a local profile to the remote machine.
-func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error {
+// pushProfile pushes a local profile to the remote machine. With
+// metadataOnly (host-local policy), only allowlisted metadata files are
+// written; credential payload never leaves this machine.
+func (s *Syncer) pushProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
 	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
@@ -612,6 +710,12 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error 
 	files, err := s.readLocalProfileFiles(localPath)
 	if err != nil {
 		return fmt.Errorf("read local files: %w", err)
+	}
+	if metadataOnly {
+		files = filterMetadataFiles(files)
+		if len(files) == 0 {
+			return nil // nothing safe to transfer; not an error
+		}
 	}
 
 	// Write to remote
@@ -625,8 +729,10 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string) error 
 	return nil
 }
 
-// pullProfile pulls a remote profile to the local machine.
-func (s *Syncer) pullProfile(client *SSHClient, provider, profile string) error {
+// pullProfile pulls a remote profile to the local machine. With
+// metadataOnly (host-local policy), only allowlisted metadata files are
+// fetched; the remote credential payload is never copied here.
+func (s *Syncer) pullProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
 	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
@@ -635,6 +741,19 @@ func (s *Syncer) pullProfile(client *SSHClient, provider, profile string) error 
 	remoteFiles, err := client.ListDir(remotePath)
 	if err != nil {
 		return fmt.Errorf("list remote files: %w", err)
+	}
+
+	if metadataOnly {
+		filtered := remoteFiles[:0:0]
+		for _, fi := range remoteFiles {
+			if !fi.IsDir() && isMetadataFile(fi.Name()) {
+				filtered = append(filtered, fi)
+			}
+		}
+		remoteFiles = filtered
+		if len(remoteFiles) == 0 {
+			return nil // no metadata to seed; avoid creating an empty stub dir
+		}
 	}
 
 	// Ensure local directory exists

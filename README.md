@@ -806,7 +806,18 @@ Run `caam paths` to see current locations. If they change in a tool update, we'l
 
 **Q: Can I sync the vault across machines?**
 
-Don't. Auth tokens often contain machine-specific identifiers (device IDs, etc.). Backup and restore on each machine separately. Don't copy vault directories between machines.
+With care — and `caam sync` is now provider-aware about what is safe to move. Claude and Codex subscription OAuth uses a **rotating refresh-token family**: every refresh consumes the current refresh token, and replaying a stale copy from another machine can trip the provider's reuse detection and revoke the whole family (this bricked a real account — see issue #19). So by default those providers are **host-local**: `caam sync` replicates their profile *metadata* (so every machine knows the logical account exists) but never their credential payload — each machine keeps its own independent grant via `caam add`. Gemini, OpenCode, and Cursor keep the old bidirectional `replicate` behavior. You can override per provider or per profile in `~/.config/caam/config.json`:
+
+```json
+{
+  "sync_policy": {
+    "providers": { "codex": "replicate" },
+    "profiles":  { "claude/build-host": "replicate" }
+  }
+}
+```
+
+Forcing `replicate` for a rotating provider prints a loud warning whenever both machines already hold diverged copies, because converging them is exactly the revocation hazard. `caam sync status` shows the resolved policy per provider.
 
 **Q: What's the difference between vault profiles and isolated profiles?**
 

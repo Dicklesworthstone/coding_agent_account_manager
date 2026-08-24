@@ -8,7 +8,13 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
-## [v0.1.17] — 2026-08-23
+## [Unreleased]
+
+### Changed — safety
+
+- **Rotating-OAuth credential payloads no longer replicate between machines by default** — first slice of #66. Claude and Codex subscription OAuth uses rotating refresh-token families (replaying a stale copy can revoke the whole family — the #19 incident class), so their profiles now default to a new `host-local` sync mode: `caam sync` still replicates non-secret profile metadata (`meta.json`), but the credential payload never crosses machines; each machine keeps its own grant. Gemini/OpenCode/Cursor keep the previous `replicate` behavior, unknown providers fail closed to `host-local`, and `_`-prefixed system profiles never propagate. Override per provider or profile via `sync_policy` in `config.json`; forcing `replicate` for a rotating provider warns loudly when both machines hold diverged copies. `caam sync status` (and its `--json` output) now report the resolved policy; metadata-only transfers are logged as `push-meta`/`pull-meta`. The full `handoff` lease mode from the #66 proposal is deliberately deferred.
+
+
 
 ### Fixed
 
