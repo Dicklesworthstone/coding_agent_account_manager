@@ -189,15 +189,34 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	var checksumsAsset *Asset
 	var signatureAsset *Asset
 
+	// binaryAssetName() deliberately returns a PATTERN, not a literal: it does
+	// not know the version, so it emits caam_*_<os>_<arch>.<ext>. Comparing that
+	// with == can never match a real asset name, which made `caam update` fail
+	// with "binary asset not found" on every platform even though the asset was
+	// present. Match around the wildcard instead.
+	//
+	// Deliberately not filepath.Match: these are asset names, not paths, and on
+	// Windows filepath.Match treats '\\' as an escape character.
+	assetPrefix, assetSuffix, assetIsPattern := strings.Cut(assetName, "*")
+
 	for i := range release.Assets {
 		asset := &release.Assets[i]
 		switch asset.Name {
-		case assetName:
-			binaryAsset = asset
 		case "SHA256SUMS":
 			checksumsAsset = asset
 		case "SHA256SUMS.sig":
 			signatureAsset = asset
+		default:
+			if binaryAsset != nil {
+				continue
+			}
+			if assetIsPattern {
+				if strings.HasPrefix(asset.Name, assetPrefix) && strings.HasSuffix(asset.Name, assetSuffix) {
+					binaryAsset = asset
+				}
+			} else if asset.Name == assetName {
+				binaryAsset = asset
+			}
 		}
 	}
 

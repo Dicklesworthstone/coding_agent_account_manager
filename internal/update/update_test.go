@@ -3,10 +3,13 @@ package update
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -53,6 +56,44 @@ func TestBinaryAssetName(t *testing.T) {
 	// Should be a pattern with wildcard
 	if name[0:5] != "caam_" {
 		t.Errorf("expected name to start with 'caam_', got %q", name)
+	}
+}
+
+// TestBinaryAssetNameMatchesPublishedAssets pins the thing that actually broke:
+// binaryAssetName() returns a PATTERN, and the release scan must match it
+// against real asset names. The previous test only asserted the pattern was
+// non-empty and started with "caam_", so it stayed green while `caam update`
+// failed with "binary asset not found" on every platform (issue #75).
+func TestBinaryAssetNameMatchesPublishedAssets(t *testing.T) {
+	u := New(DefaultConfig())
+	pattern := u.binaryAssetName()
+
+	prefix, suffix, isPattern := strings.Cut(pattern, "*")
+	if !isPattern {
+		t.Fatalf("expected a wildcard pattern, got %q", pattern)
+	}
+
+	// Real asset names from the v0.1.17 release, goreleaser's
+	// caam_VERSION_OS_ARCH.ext shape.
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	for _, version := range []string{"0.1.17", "0.1.18", "1.0.0", "1.2.3-rc.1"} {
+		assetName := fmt.Sprintf("caam_%s_%s_%s.%s", version, runtime.GOOS, runtime.GOARCH, ext)
+		if !strings.HasPrefix(assetName, prefix) || !strings.HasSuffix(assetName, suffix) {
+			t.Errorf("pattern %q does not match published asset name %q", pattern, assetName)
+		}
+	}
+
+	// And it must NOT match another platform's asset.
+	otherOS := "linux"
+	if runtime.GOOS == "linux" {
+		otherOS = "darwin"
+	}
+	wrongPlatform := fmt.Sprintf("caam_0.1.17_%s_%s.tar.gz", otherOS, runtime.GOARCH)
+	if strings.HasPrefix(wrongPlatform, prefix) && strings.HasSuffix(wrongPlatform, suffix) {
+		t.Errorf("pattern %q wrongly matches other-platform asset %q", pattern, wrongPlatform)
 	}
 }
 
