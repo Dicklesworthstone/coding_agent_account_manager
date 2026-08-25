@@ -77,11 +77,11 @@ type UpdateResult struct {
 
 // CheckResult represents the result of a version check.
 type CheckResult struct {
-	CurrentVersion string
-	LatestVersion  string
+	CurrentVersion  string
+	LatestVersion   string
 	UpdateAvailable bool
-	Release        *Release
-	Channel        Channel
+	Release         *Release
+	Channel         Channel
 }
 
 // Config holds update configuration.

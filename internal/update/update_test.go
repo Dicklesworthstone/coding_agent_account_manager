@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -69,7 +68,6 @@ func TestBinaryAssetName(t *testing.T) {
 // with "caam_", which stayed green throughout. This asserts selection instead.
 func TestBinaryAssetSelection(t *testing.T) {
 	u := New(DefaultConfig())
-	patternParts := strings.Split(u.binaryAssetName(), "*")
 
 	ext := "tar.gz"
 	if runtime.GOOS == "windows" {
@@ -78,39 +76,23 @@ func TestBinaryAssetSelection(t *testing.T) {
 	want := fmt.Sprintf("caam_0.1.17_%s_%s.%s", runtime.GOOS, runtime.GOARCH, ext)
 
 	// The exact asset list published for v0.1.17, per issue #75.
-	assets := []string{
-		"caam_0.1.17_darwin_amd64.tar.gz",
-		"caam_0.1.17_darwin_arm64.tar.gz",
-		"caam_0.1.17_linux_amd64.tar.gz",
-		"caam_0.1.17_linux_arm64.tar.gz",
-		"caam_0.1.17_windows_amd64.zip",
-		"release-manifest.json",
-		"SHA256SUMS",
-		"SHA256SUMS.sig",
+	assets := []Asset{
+		{Name: "caam_0.1.17_darwin_amd64.tar.gz"},
+		{Name: "caam_0.1.17_darwin_arm64.tar.gz"},
+		{Name: "caam_0.1.17_linux_amd64.tar.gz"},
+		{Name: "caam_0.1.17_linux_arm64.tar.gz"},
+		{Name: "caam_0.1.17_windows_amd64.zip"},
+		{Name: "release-manifest.json"},
+		{Name: "SHA256SUMS"},
+		{Name: "SHA256SUMS.sig"},
 	}
 
-	var got string
-	matches := 0
-	for _, name := range assets {
-		if name == "SHA256SUMS" || name == "SHA256SUMS.sig" {
-			continue
-		}
-		if matchPattern(name, patternParts) {
-			matches++
-			if got == "" {
-				got = name
-			}
-		}
+	got := selectBinaryAsset(assets, u.binaryAssetName())
+	if got == nil {
+		t.Fatalf("selectBinaryAsset returned nil for pattern %q; this is issue #75", u.binaryAssetName())
 	}
-
-	if got == "" {
-		t.Fatalf("no asset matched pattern %q; this is issue #75", u.binaryAssetName())
-	}
-	if got != want {
-		t.Errorf("selected %q, want %q", got, want)
-	}
-	if matches != 1 {
-		t.Errorf("pattern %q matched %d assets, want exactly 1", u.binaryAssetName(), matches)
+	if got.Name != want {
+		t.Errorf("selected %q, want %q", got.Name, want)
 	}
 }
 
@@ -118,7 +100,6 @@ func TestBinaryAssetSelection(t *testing.T) {
 // the wildcard exists for.
 func TestBinaryAssetSelectionAcrossVersions(t *testing.T) {
 	u := New(DefaultConfig())
-	patternParts := strings.Split(u.binaryAssetName(), "*")
 
 	ext := "tar.gz"
 	if runtime.GOOS == "windows" {
@@ -126,9 +107,14 @@ func TestBinaryAssetSelectionAcrossVersions(t *testing.T) {
 	}
 	for _, v := range []string{"0.1.17", "0.1.18", "1.0.0", "1.2.3-rc.1"} {
 		name := fmt.Sprintf("caam_%s_%s_%s.%s", v, runtime.GOOS, runtime.GOARCH, ext)
-		if !matchPattern(name, patternParts) {
-			t.Errorf("pattern %q failed to match published asset %q", u.binaryAssetName(), name)
+		got := selectBinaryAsset([]Asset{{Name: name}}, u.binaryAssetName())
+		if got == nil {
+			t.Errorf("selectBinaryAsset failed to match published asset %q", name)
 		}
+	}
+	// SHA256SUMS must never be selected as the binary.
+	if got := selectBinaryAsset([]Asset{{Name: "SHA256SUMS"}}, u.binaryAssetName()); got != nil {
+		t.Errorf("selectBinaryAsset wrongly selected %q", got.Name)
 	}
 }
 
@@ -375,10 +361,10 @@ ghi789  SHA256SUMS.sig
 	}
 
 	tests := []struct {
-		name        string
-		assetName   string
-		wantHash    string
-		wantErr     bool
+		name      string
+		assetName string
+		wantHash  string
+		wantErr   bool
 	}{
 		{
 			name:      "exact match",
