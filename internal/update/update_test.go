@@ -59,41 +59,76 @@ func TestBinaryAssetName(t *testing.T) {
 	}
 }
 
-// TestBinaryAssetNameMatchesPublishedAssets pins the thing that actually broke:
-// binaryAssetName() returns a PATTERN, and the release scan must match it
-// against real asset names. The previous test only asserted the pattern was
-// non-empty and started with "caam_", so it stayed green while `caam update`
-// failed with "binary asset not found" on every platform (issue #75).
-func TestBinaryAssetNameMatchesPublishedAssets(t *testing.T) {
+// TestBinaryAssetSelection pins issue #75: binaryAssetName() returns a PATTERN,
+// and the release scan in Update() must resolve it with matchPattern(). It
+// previously compared with ==, so no asset could ever match and `caam update`
+// reported "binary asset not found" on every platform while the asset was
+// plainly present in the release.
+//
+// The old TestBinaryAssetName only asserted the pattern was non-empty and began
+// with "caam_", which stayed green throughout. This asserts selection instead.
+func TestBinaryAssetSelection(t *testing.T) {
 	u := New(DefaultConfig())
-	pattern := u.binaryAssetName()
+	patternParts := strings.Split(u.binaryAssetName(), "*")
 
-	prefix, suffix, isPattern := strings.Cut(pattern, "*")
-	if !isPattern {
-		t.Fatalf("expected a wildcard pattern, got %q", pattern)
-	}
-
-	// Real asset names from the v0.1.17 release, goreleaser's
-	// caam_VERSION_OS_ARCH.ext shape.
 	ext := "tar.gz"
 	if runtime.GOOS == "windows" {
 		ext = "zip"
 	}
-	for _, version := range []string{"0.1.17", "0.1.18", "1.0.0", "1.2.3-rc.1"} {
-		assetName := fmt.Sprintf("caam_%s_%s_%s.%s", version, runtime.GOOS, runtime.GOARCH, ext)
-		if !strings.HasPrefix(assetName, prefix) || !strings.HasSuffix(assetName, suffix) {
-			t.Errorf("pattern %q does not match published asset name %q", pattern, assetName)
+	want := fmt.Sprintf("caam_0.1.17_%s_%s.%s", runtime.GOOS, runtime.GOARCH, ext)
+
+	// The exact asset list published for v0.1.17, per issue #75.
+	assets := []string{
+		"caam_0.1.17_darwin_amd64.tar.gz",
+		"caam_0.1.17_darwin_arm64.tar.gz",
+		"caam_0.1.17_linux_amd64.tar.gz",
+		"caam_0.1.17_linux_arm64.tar.gz",
+		"caam_0.1.17_windows_amd64.zip",
+		"release-manifest.json",
+		"SHA256SUMS",
+		"SHA256SUMS.sig",
+	}
+
+	var got string
+	matches := 0
+	for _, name := range assets {
+		if name == "SHA256SUMS" || name == "SHA256SUMS.sig" {
+			continue
+		}
+		if matchPattern(name, patternParts) {
+			matches++
+			if got == "" {
+				got = name
+			}
 		}
 	}
 
-	// And it must NOT match another platform's asset.
-	otherOS := "linux"
-	if runtime.GOOS == "linux" {
-		otherOS = "darwin"
+	if got == "" {
+		t.Fatalf("no asset matched pattern %q; this is issue #75", u.binaryAssetName())
 	}
-	wrongPlatform := fmt.Sprintf("caam_0.1.17_%s_%s.tar.gz", otherOS, runtime.GOARCH)
-	if strings.HasPrefix(wrongPlatform, prefix) && strings.HasSuffix(wrongPlatform, suffix) {
-		t.Errorf("pattern %q wrongly matches other-platform asset %q", pattern, wrongPlatform)
+	if got != want {
+		t.Errorf("selected %q, want %q", got, want)
+	}
+	if matches != 1 {
+		t.Errorf("pattern %q matched %d assets, want exactly 1", u.binaryAssetName(), matches)
+	}
+}
+
+// TestBinaryAssetSelectionAcrossVersions guards the version-independence that
+// the wildcard exists for.
+func TestBinaryAssetSelectionAcrossVersions(t *testing.T) {
+	u := New(DefaultConfig())
+	patternParts := strings.Split(u.binaryAssetName(), "*")
+
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	for _, v := range []string{"0.1.17", "0.1.18", "1.0.0", "1.2.3-rc.1"} {
+		name := fmt.Sprintf("caam_%s_%s_%s.%s", v, runtime.GOOS, runtime.GOARCH, ext)
+		if !matchPattern(name, patternParts) {
+			t.Errorf("pattern %q failed to match published asset %q", u.binaryAssetName(), name)
+		}
 	}
 }
 

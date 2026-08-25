@@ -193,11 +193,12 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	// not know the version, so it emits caam_*_<os>_<arch>.<ext>. Comparing that
 	// with == can never match a real asset name, which made `caam update` fail
 	// with "binary asset not found" on every platform even though the asset was
-	// present. Match around the wildcard instead.
+	// present (issue #75).
 	//
-	// Deliberately not filepath.Match: these are asset names, not paths, and on
-	// Windows filepath.Match treats '\\' as an escape character.
-	assetPrefix, assetSuffix, assetIsPattern := strings.Cut(assetName, "*")
+	// verify.go already resolves the checksum entry with matchPattern(); the
+	// asset scan simply never used it. Reuse the same helper so both paths
+	// agree on what "matches" means.
+	binaryAsset = selectBinaryAsset(release.Assets, assetName)
 
 	for i := range release.Assets {
 		asset := &release.Assets[i]
@@ -206,17 +207,6 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 			checksumsAsset = asset
 		case "SHA256SUMS.sig":
 			signatureAsset = asset
-		default:
-			if binaryAsset != nil {
-				continue
-			}
-			if assetIsPattern {
-				if strings.HasPrefix(asset.Name, assetPrefix) && strings.HasSuffix(asset.Name, assetSuffix) {
-					binaryAsset = asset
-				}
-			} else if asset.Name == assetName {
-				binaryAsset = asset
-			}
 		}
 	}
 
@@ -397,6 +387,28 @@ func (u *Updater) binaryAssetName() string {
 	// Match goreleaser naming: caam_VERSION_OS_ARCH.ext
 	// Since we fetch the release, we'll use a pattern that doesn't include version
 	return fmt.Sprintf("caam_*_%s_%s.%s", osName, archName, ext)
+}
+
+// selectBinaryAsset picks the release asset matching pattern, which may contain
+// a '*' wildcard because binaryAssetName() does not know the release version.
+//
+// This must NOT be an equality comparison: the pattern contains a literal '*',
+// so == can never match a published asset name. That was issue #75 -- every
+// platform reported "binary asset not found" while the asset was present.
+// verify.go already resolved its checksum entry with matchPattern(); this makes
+// the asset scan agree.
+func selectBinaryAsset(assets []Asset, pattern string) *Asset {
+	patternParts := strings.Split(pattern, "*")
+	for i := range assets {
+		asset := &assets[i]
+		if asset.Name == "SHA256SUMS" || asset.Name == "SHA256SUMS.sig" {
+			continue
+		}
+		if matchPattern(asset.Name, patternParts) {
+			return asset
+		}
+	}
+	return nil
 }
 
 // downloadFile downloads a URL to a local file.
