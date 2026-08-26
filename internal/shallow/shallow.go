@@ -174,6 +174,18 @@ func layoutFor(provider string) (*providerLayout, error) {
 	}
 }
 
+// PrimaryCredentialRel returns the HOME-relative path of a provider's primary
+// credential file inside a shallow profile (e.g. ".codex/auth.json"), so other
+// packages can locate the credential a shallow runtime actually serves without
+// re-deriving the layout.
+func PrimaryCredentialRel(provider string) (string, error) {
+	layout, err := layoutFor(provider)
+	if err != nil {
+		return "", err
+	}
+	return layout.primaryCredRel, nil
+}
+
 // topComponent returns the first path element of a slash- or OS-separated
 // relpath (e.g. ".gemini/antigravity-cli/x" -> ".gemini").
 func topComponent(rel string) string {

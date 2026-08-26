@@ -1962,6 +1962,17 @@ Examples:
 		}
 
 		ctx := context.Background()
+
+		// Remember the generation this login is about to replace so the
+		// post-login check can point at every caam layer still holding it
+		// (issue #76): a fresh login typically rotates the refresh token,
+		// which revokes the copies the vault and shallow runtimes still serve.
+		profileAuthPath, trackLayers := loginProfileAuthPath(tool, prof)
+		var prevAuth []byte
+		if trackLayers {
+			prevAuth, _ = os.ReadFile(profileAuthPath)
+		}
+
 		deviceCode, _ := cmd.Flags().GetBool("device-code")
 		if deviceCode {
 			deviceCodeProv, ok := prov.(provider.DeviceCodeProvider)
@@ -1978,6 +1989,13 @@ Examples:
 		}
 
 		fmt.Printf("\nLogin complete for %s/%s\n", tool, name)
+
+		if trackLayers {
+			if freshAuth, err := os.ReadFile(profileAuthPath); err == nil {
+				stale := findStaleLoginLayers(prevAuth, freshAuth, collectLoginLayerCandidates(tool, name, vault, nil))
+				printStaleLoginLayers(cmd.ErrOrStderr(), tool, name, prof, profileAuthPath, stale)
+			}
+		}
 		return nil
 	},
 }
