@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -122,24 +125,129 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 	return writeAuthFile(path, auth)
 }
 
-// VerifyCodexToken verifies if a token works.
+// CodexVerifyURL is the authenticated endpoint VerifyCodexToken probes. It is
+// a variable (like CodexTokenURL) so tests can point it at a local server.
+var CodexVerifyURL = "https://api.openai.com/v1/me"
+
+const (
+	// codexVerifyAttempts bounds the probe to one retry: a second attempt is
+	// made only after a transient answer (429 or 5xx), never after a 401/403.
+	codexVerifyAttempts = 2
+	// codexVerifyRetryDelay is the pause before the retry when the provider
+	// does not send a usable Retry-After header.
+	codexVerifyRetryDelay = 750 * time.Millisecond
+	// codexVerifyRetryMax caps a Retry-After value so a doctor run cannot be
+	// stalled by an aggressive server hint.
+	codexVerifyRetryMax = 3 * time.Second
+)
+
+// TokenVerifyError reports a non-2xx answer from the token verification
+// endpoint. The status code is preserved so callers can tell a definitive
+// rejection (401/403) apart from a transient failure (429/5xx) instead of
+// collapsing every non-200 answer into "token rejected".
+type TokenVerifyError struct {
+	StatusCode int
+	// Attempts is how many requests were made before giving up (1 or 2).
+	Attempts int
+}
+
+func (e *TokenVerifyError) Error() string {
+	if e.Attempts > 1 {
+		return fmt.Sprintf("token verification failed with status %d after %d attempts", e.StatusCode, e.Attempts)
+	}
+	return fmt.Sprintf("token verification failed with status %d", e.StatusCode)
+}
+
+// Rejected reports whether the provider definitively refused the credential.
+func (e *TokenVerifyError) Rejected() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+}
+
+// Transient reports whether the failure says nothing about the credential
+// itself: rate limiting or a server-side error.
+func (e *TokenVerifyError) Transient() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// VerifyCodexToken probes whether an access token is accepted by the API.
+//
+// A nil return means the token was accepted (2xx). Any other status is
+// returned as a *TokenVerifyError carrying that status; transient statuses
+// (429, 5xx) are retried once after a short, bounded delay before being
+// reported. Transport failures and context cancellation are returned wrapped
+// as "request failed: ..." and carry no status.
 func VerifyCodexToken(ctx context.Context, token string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.openai.com/v1/me", nil)
-	if err != nil {
+	if err := validateTokenEndpoint(CodexVerifyURL, []string{"api.openai.com"}); err != nil {
 		return err
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	var last *TokenVerifyError
+	for attempt := 1; attempt <= codexVerifyAttempts; attempt++ {
+		status, retryAfter, err := codexVerifyOnce(ctx, client, token)
+		if err != nil {
+			return fmt.Errorf("request failed: %w", err)
+		}
+		if status >= 200 && status < 300 {
+			return nil
+		}
+		last = &TokenVerifyError{StatusCode: status, Attempts: attempt}
+		if !last.Transient() || attempt == codexVerifyAttempts {
+			return last
+		}
+		if err := sleepContext(ctx, codexVerifyBackoff(retryAfter)); err != nil {
+			return fmt.Errorf("request failed: %w", err)
+		}
+	}
+	return last
+}
+
+// codexVerifyOnce performs a single probe and returns the HTTP status plus the
+// raw Retry-After header. The body is discarded: the probe only needs the
+// status, and reading a bounded prefix lets the connection be reused.
+func codexVerifyOnce(ctx context.Context, client *http.Client, token string) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, CodexVerifyURL, nil)
+	if err != nil {
+		return 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
+		return 0, "", err
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode, resp.Header.Get("Retry-After"), nil
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("token verification failed with status %d", resp.StatusCode)
+// codexVerifyBackoff turns a Retry-After header into the delay before the
+// single retry. Only the delay-seconds form is honored (an HTTP-date would
+// need clock comparison for a one-shot retry and is not worth it); anything
+// unparseable or non-positive falls back to the default, and every value is
+// capped so the probe stays bounded.
+func codexVerifyBackoff(retryAfter string) time.Duration {
+	delay := codexVerifyRetryDelay
+	if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs > 0 {
+		delay = time.Duration(secs) * time.Second
 	}
+	if delay > codexVerifyRetryMax {
+		delay = codexVerifyRetryMax
+	}
+	return delay
+}
 
-	return nil
+// sleepContext waits for d or until ctx is done, whichever comes first.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

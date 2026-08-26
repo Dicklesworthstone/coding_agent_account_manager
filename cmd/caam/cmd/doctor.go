@@ -4,6 +4,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	osexec "os/exec"
@@ -1137,34 +1138,74 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	defer cancel()
 
 	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
-		name := fmt.Sprintf("%s/%s token", tool, profileName)
-		errMsg := err.Error()
-		// Distinguish network/timeout errors from actual auth rejections.
-		// Network errors should be warnings (tokens may be fine), not failures.
-		if strings.Contains(errMsg, "request failed:") || strings.Contains(errMsg, "context deadline exceeded") {
-			return &CheckResult{
-				Name:    name,
-				Status:  "warn",
-				Message: "could not verify token (network error)",
-				Details: fmt.Sprintf(
-					"Live API probe for %s/%s failed with: %s\n"+
-						"This may be a transient network issue. The token may still be valid.",
-					tool, profileName, errMsg),
-			}
-		}
-		return &CheckResult{
-			Name:   name,
-			Status: "fail",
-			Message: "access token rejected by API",
-			Details: fmt.Sprintf(
-				"The stored access token for %s/%s was rejected by the Codex API.\n"+
-					"This usually means the refresh token was consumed by another process\n"+
-					"(refresh_token_reused). Re-authenticate with: 'caam login %s %s'",
-				tool, profileName, tool, profileName),
-		}
+		return classifyCodexProbeError(tool, profileName, err)
 	}
 
 	return nil // Token is valid
+}
+
+// classifyCodexProbeError maps a VerifyCodexToken failure onto a doctor check.
+//
+// Only a definitive rejection by the provider (HTTP 401/403) is a failure.
+// Rate limiting, server-side errors, and transport problems say nothing about
+// the stored credential, so they are reported as warnings that keep the HTTP
+// status for diagnosis instead of being misread as a consumed refresh token
+// (issue #78). Refresh-token reuse is never diagnosed here because the probe
+// never exercises the refresh token.
+func classifyCodexProbeError(tool, profileName string, err error) *CheckResult {
+	name := fmt.Sprintf("%s/%s token", tool, profileName)
+
+	var verifyErr *refresh.TokenVerifyError
+	if errors.As(err, &verifyErr) {
+		status := verifyErr.StatusCode
+		switch {
+		case verifyErr.Rejected():
+			return &CheckResult{
+				Name:    name,
+				Status:  "fail",
+				Message: fmt.Sprintf("access token rejected by API (HTTP %d)", status),
+				Details: fmt.Sprintf(
+					"The Codex API answered HTTP %d for the stored access token of %s/%s.\n"+
+						"Common causes: the token expired without a successful refresh, or the\n"+
+						"refresh token was consumed by another process (refresh_token_reused).\n"+
+						"Re-authenticate with: 'caam login %s %s'",
+					status, tool, profileName, tool, profileName),
+			}
+		case verifyErr.Transient():
+			return &CheckResult{
+				Name:    name,
+				Status:  "warn",
+				Message: fmt.Sprintf("could not verify token (HTTP %d, transient)", status),
+				Details: fmt.Sprintf(
+					"Live API probe for %s/%s answered HTTP %d after %d attempt(s).\n"+
+						"This is rate limiting or a provider-side error, not a credential rejection;\n"+
+						"the token may still be valid. Re-run 'caam doctor' later to confirm.",
+					tool, profileName, status, verifyErr.Attempts),
+			}
+		default:
+			return &CheckResult{
+				Name:    name,
+				Status:  "warn",
+				Message: fmt.Sprintf("could not verify token (unexpected HTTP %d)", status),
+				Details: fmt.Sprintf(
+					"Live API probe for %s/%s answered HTTP %d, which is neither an acceptance\n"+
+						"nor a credential rejection. The token may still be valid.",
+					tool, profileName, status),
+			}
+		}
+	}
+
+	// Transport failure, timeout, or cancellation: the request never produced
+	// a verdict, so the token may be fine.
+	return &CheckResult{
+		Name:    name,
+		Status:  "warn",
+		Message: "could not verify token (network error)",
+		Details: fmt.Sprintf(
+			"Live API probe for %s/%s failed with: %s\n"+
+				"This may be a transient network issue. The token may still be valid.",
+			tool, profileName, err.Error()),
+	}
 }
 
 // checkTokenValidation validates auth tokens for all profiles.

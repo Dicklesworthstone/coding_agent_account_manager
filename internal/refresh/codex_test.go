@@ -3,11 +3,15 @@ package refresh
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRefreshCodexToken(t *testing.T) {
@@ -213,27 +217,168 @@ func TestRefreshCodexToken_InvalidJSON(t *testing.T) {
 // VerifyCodexToken Tests
 // =============================================================================
 
-func TestVerifyCodexToken_Success(t *testing.T) {
+func TestVerifyCodexToken(t *testing.T) {
+	// Issue #78: every non-200 answer used to collapse into one error that
+	// doctor reported as "access token rejected by API". The probe must keep
+	// the status, retry transient answers exactly once, and never retry a
+	// definitive rejection.
+	tests := []struct {
+		name         string
+		statuses     []int // answers in request order; the last one repeats
+		wantErr      bool
+		wantStatus   int
+		wantAttempts int
+		wantRejected bool
+		wantTransit  bool
+	}{
+		{name: "200 accepted", statuses: []int{200}, wantAttempts: 1},
+		{name: "204 accepted", statuses: []int{204}, wantAttempts: 1},
+		{name: "401 rejected without retry", statuses: []int{401}, wantErr: true, wantStatus: 401, wantAttempts: 1, wantRejected: true},
+		{name: "403 rejected without retry", statuses: []int{403}, wantErr: true, wantStatus: 403, wantAttempts: 1, wantRejected: true},
+		{name: "429 then 200 recovers", statuses: []int{429, 200}, wantAttempts: 2},
+		{name: "503 then 200 recovers", statuses: []int{503, 200}, wantAttempts: 2},
+		{name: "500 twice is transient", statuses: []int{500, 500}, wantErr: true, wantStatus: 500, wantAttempts: 2, wantTransit: true},
+		{name: "429 then 401 is rejected", statuses: []int{429, 401}, wantErr: true, wantStatus: 401, wantAttempts: 2, wantRejected: true},
+		{name: "404 is neither", statuses: []int{404}, wantErr: true, wantStatus: 404, wantAttempts: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+					t.Errorf("unexpected auth header: %q", got)
+				}
+				idx := calls
+				if idx >= len(tt.statuses) {
+					idx = len(tt.statuses) - 1
+				}
+				calls++
+				w.WriteHeader(tt.statuses[idx])
+			}))
+			defer server.Close()
+
+			oldURL := CodexVerifyURL
+			CodexVerifyURL = server.URL
+			defer func() { CodexVerifyURL = oldURL }()
+
+			err := VerifyCodexToken(context.Background(), "test-token")
+			if calls != tt.wantAttempts {
+				t.Errorf("expected %d request(s), server saw %d", tt.wantAttempts, calls)
+			}
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("expected success, got %v", err)
+				}
+				return
+			}
+			var verifyErr *TokenVerifyError
+			if !errors.As(err, &verifyErr) {
+				t.Fatalf("expected *TokenVerifyError, got %T: %v", err, err)
+			}
+			if verifyErr.StatusCode != tt.wantStatus {
+				t.Errorf("StatusCode = %d, want %d", verifyErr.StatusCode, tt.wantStatus)
+			}
+			if verifyErr.Attempts != tt.wantAttempts {
+				t.Errorf("Attempts = %d, want %d", verifyErr.Attempts, tt.wantAttempts)
+			}
+			if verifyErr.Rejected() != tt.wantRejected {
+				t.Errorf("Rejected() = %v, want %v", verifyErr.Rejected(), tt.wantRejected)
+			}
+			if verifyErr.Transient() != tt.wantTransit {
+				t.Errorf("Transient() = %v, want %v", verifyErr.Transient(), tt.wantTransit)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("status %d", tt.wantStatus)) {
+				t.Errorf("error text should name the status: %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestVerifyCodexToken_TransportFailureCarriesNoStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := server.URL
+	server.Close() // connection refused from here on
+
+	oldURL := CodexVerifyURL
+	CodexVerifyURL = url
+	defer func() { CodexVerifyURL = oldURL }()
+
+	err := VerifyCodexToken(context.Background(), "test-token")
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	var verifyErr *TokenVerifyError
+	if errors.As(err, &verifyErr) {
+		t.Fatalf("transport failure must not be a TokenVerifyError: %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "request failed:") {
+		t.Errorf("transport failures keep the 'request failed:' prefix, got %q", err.Error())
+	}
+}
+
+func TestVerifyCodexToken_CancelledDuringBackoff(t *testing.T) {
+	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			t.Errorf("expected GET, got %s", r.Method)
-		}
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "Bearer test-token" {
-			t.Errorf("unexpected auth header: %s", authHeader)
-		}
-		w.WriteHeader(http.StatusOK)
+		calls++
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer server.Close()
 
-	// Override URL via test helper - we need to test with real endpoint
-	// Skip this test since VerifyCodexToken uses a hardcoded URL
-	t.Skip("VerifyCodexToken uses hardcoded URL, tested via integration tests")
+	oldURL := CodexVerifyURL
+	CodexVerifyURL = server.URL
+	defer func() { CodexVerifyURL = oldURL }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := VerifyCodexToken(ctx, "test-token")
+	if calls != 1 {
+		t.Errorf("expected the retry to be abandoned, server saw %d requests", calls)
+	}
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("cancellation should cut the backoff short, took %s", elapsed)
+	}
 }
 
-func TestVerifyCodexToken_Unauthorized(t *testing.T) {
-	// Skip since VerifyCodexToken uses hardcoded URL
-	t.Skip("VerifyCodexToken uses hardcoded URL, tested via integration tests")
+func TestVerifyCodexToken_RefusesNonAllowlistedHost(t *testing.T) {
+	oldURL := CodexVerifyURL
+	CodexVerifyURL = "https://evil.example.com/v1/me"
+	defer func() { CodexVerifyURL = oldURL }()
+
+	err := VerifyCodexToken(context.Background(), "test-token")
+	if err == nil || !strings.Contains(err.Error(), "not allowlisted") {
+		t.Fatalf("expected allowlist refusal, got %v", err)
+	}
+}
+
+func TestCodexVerifyBackoff(t *testing.T) {
+	tests := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", codexVerifyRetryDelay},
+		{"garbage", codexVerifyRetryDelay},
+		{"0", codexVerifyRetryDelay},
+		{"-5", codexVerifyRetryDelay},
+		{"1", time.Second},
+		{" 2 ", 2 * time.Second},
+		{"120", codexVerifyRetryMax},
+		{"Wed, 21 Oct 2015 07:28:00 GMT", codexVerifyRetryDelay},
+	}
+	for _, tt := range tests {
+		if got := codexVerifyBackoff(tt.header); got != tt.want {
+			t.Errorf("codexVerifyBackoff(%q) = %s, want %s", tt.header, got, tt.want)
+		}
+	}
 }
 
 // =============================================================================
