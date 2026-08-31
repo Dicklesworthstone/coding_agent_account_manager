@@ -301,23 +301,53 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 
-	// If file parsing succeeds and provides an expiry, treat it as authoritative
-	if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = expInfo.ExpiresAt
+	// Live credential wins over the vault snapshot. Vault copies freeze at
+	// backup/activate time; Claude refreshes the live file in place. Status
+	// used to treat a days-stale snapshot expiry as "Token expired" while
+	// the live token was hours from expiry (agent-factory-21fp).
+	liveExp := parseLiveProfileExpiry(tool, profileName)
+	if liveExp == nil || liveExp.ExpiresAt.IsZero() {
+		liveExp = parseToolLiveExpiry(tool)
 	}
-
-	// Fallback: when the vault snapshot yields no usable expiry, derive health
-	// from the profile's own live credential instead of leaving TokenExpiresAt
-	// zero (which caps the verdict at 🟡 Warning forever, even for a perfectly
-	// healthy live token — issue #60). Adopted profiles symlink their auth dir
-	// to the live location, so this reads the real, current token.
-	if ph.TokenExpiresAt.IsZero() {
-		if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-			ph.TokenExpiresAt = liveExp.ExpiresAt
-		}
+	if liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+		ph.TokenExpiresAt = liveExp.ExpiresAt
+		ph.HasRefreshToken = liveExp.HasRefreshToken
+		ph.ExpiryLive = true
+	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+		ph.TokenExpiresAt = expInfo.ExpiresAt
+		ph.HasRefreshToken = expInfo.HasRefreshToken
+		ph.ExpiryLive = false
 	}
 
 	return ph
+}
+
+// parseToolLiveExpiry reads expiry from the process-live auth location
+// (the files `caam status` already confirmed exist), not from a vault copy.
+func parseToolLiveExpiry(tool string) *health.ExpiryInfo {
+	switch tool {
+	case "claude":
+		info, err := health.ParseClaudeExpiry("")
+		if err != nil {
+			return nil
+		}
+		return info
+	case "codex":
+		home, _ := os.UserHomeDir()
+		info, err := health.ParseCodexExpiry(filepath.Join(home, ".codex", "auth.json"))
+		if err != nil {
+			return nil
+		}
+		return info
+	case "gemini":
+		info, err := health.ParseGeminiExpiry("")
+		if err != nil {
+			return nil
+		}
+		return info
+	default:
+		return nil
+	}
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
@@ -354,7 +384,26 @@ func getProfileHealthWithIdentity(tool, profileName string) (*health.ProfileHeal
 	ph := buildProfileHealth(tool, profileName)
 	id := getVaultIdentity(tool, profileName)
 	applyIdentityToHealth(tool, profileName, ph, id)
+	attachActiveCooldown(tool, profileName, ph)
 	return ph, id
+}
+
+func attachActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
+	if ph == nil {
+		return
+	}
+	db, err := getDB()
+	if err != nil || db == nil {
+		return
+	}
+	now := time.Now()
+	cooldown, err := db.ActiveCooldown(tool, profileName, now)
+	if err != nil || cooldown == nil {
+		return
+	}
+	if cooldown.CooldownUntil.After(now) {
+		ph.CooldownUntil = cooldown.CooldownUntil
+	}
 }
 
 func getVaultIdentity(tool, profileName string) *identity.Identity {
@@ -915,6 +964,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			if !ph.TokenExpiresAt.IsZero() {
 				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+			}
+			if reason := health.PrimaryReason(status, ph); reason != "" {
+				st.Health.Reason = reason
 			}
 			// Get cooldown info
 			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})

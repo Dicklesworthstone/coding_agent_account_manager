@@ -206,11 +206,19 @@ func TestCalculateStatus(t *testing.T) {
 			expected: StatusUnknown,
 		},
 		{
-			name: "expired token",
+			name: "expired live token",
+			health: &ProfileHealth{
+				TokenExpiresAt: time.Now().Add(-1 * time.Hour),
+				ExpiryLive:     true,
+			},
+			expected: StatusCritical,
+		},
+		{
+			name: "expired snapshot without live confirmation",
 			health: &ProfileHealth{
 				TokenExpiresAt: time.Now().Add(-1 * time.Hour),
 			},
-			expected: StatusCritical,
+			expected: StatusUnknown,
 		},
 		{
 			name: "expiring soon token",
@@ -487,8 +495,8 @@ func TestStorage_GetStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStatus failed: %v", err)
 	}
-	if status != StatusCritical {
-		t.Errorf("expected StatusCritical for expired token, got %v", status)
+	if status != StatusUnknown {
+		t.Errorf("expected StatusUnknown for stored snapshot expiry (not live-confirmed), got %v", status)
 	}
 }
 

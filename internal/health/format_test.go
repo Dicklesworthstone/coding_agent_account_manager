@@ -133,10 +133,32 @@ func TestFormatStatusWithReason(t *testing.T) {
 			contains: []string{"🟡", "Token expires"},
 		},
 		{
-			name:     "Expired",
-			status:   StatusCritical,
-			health:   &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour)},
+			name:   "Expired live token",
+			status: StatusCritical,
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-time.Hour),
+				ExpiryLive:     true,
+			},
 			contains: []string{"🔴", "Token expired"},
+		},
+		{
+			name:   "Rate limited outranks stale expiry",
+			status: StatusWarning,
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-5 * 24 * time.Hour),
+				ExpiryLive:     false,
+				CooldownUntil:  now.Add(16 * time.Minute),
+			},
+			contains: []string{"🟡", "Rate limited"},
+		},
+		{
+			name:   "Stale snapshot expiry is not Token expired",
+			status: StatusUnknown,
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-5 * 24 * time.Hour),
+				ExpiryLive:     false,
+			},
+			contains: []string{"⚪", "Unknown"},
 		},
 		{
 			name:     "With errors",
@@ -183,17 +205,31 @@ func TestFormatRecommendation(t *testing.T) {
 			empty:    true,
 		},
 		{
-			name:     "Expired token",
+			name:     "Expired timestamp alone does not recommend login",
 			provider: "claude",
 			profile:  "test",
 			health:   &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour)},
+			empty:    true,
+		},
+		{
+			name:     "Confirmed live expiry with errors recommends login",
+			provider: "claude",
+			profile:  "test",
+			health:   &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), ExpiryLive: true, ErrorCount1h: 1},
 			contains: "login",
 		},
 		{
-			name:     "Expiring token",
+			name:     "Rate limited recommends wait, not login",
+			provider: "claude",
+			profile:  "main",
+			health:   &ProfileHealth{TokenExpiresAt: now.Add(-5 * 24 * time.Hour), CooldownUntil: now.Add(16 * time.Minute)},
+			contains: "Rate limited",
+		},
+		{
+			name:     "Expiring live token",
 			provider: "codex",
 			profile:  "work",
-			health:   &ProfileHealth{TokenExpiresAt: now.Add(30 * time.Minute)},
+			health:   &ProfileHealth{TokenExpiresAt: now.Add(30 * time.Minute), ExpiryLive: true},
 			contains: "refresh",
 		},
 		{
@@ -222,6 +258,9 @@ func TestFormatRecommendation(t *testing.T) {
 			} else {
 				if !strings.Contains(got, tt.contains) {
 					t.Errorf("FormatRecommendation() = %q, want to contain %q", got, tt.contains)
+				}
+				if strings.Contains(tt.contains, "Rate limited") && strings.Contains(got, "caam login") {
+					t.Errorf("FormatRecommendation() = %q, must not recommend login for a rate-limit cap", got)
 				}
 			}
 		})

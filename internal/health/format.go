@@ -99,6 +99,45 @@ func FormatTimeRemaining(expiry time.Time) string {
 	}
 }
 
+// PrimaryReason is the single cause shown on `caam status`. A rate-limit
+// cooldown outranks a stale snapshot expiry so a cap is never reported as
+// "Token expired" (agent-factory-21fp).
+func PrimaryReason(status HealthStatus, h *ProfileHealth) string {
+	if h == nil {
+		return ""
+	}
+	now := time.Now()
+	if !h.CooldownUntil.IsZero() && h.CooldownUntil.After(now) {
+		return fmt.Sprintf("Rate limited (resets in %s)", formatDurationNatural(h.CooldownUntil.Sub(now)))
+	}
+	if !h.TokenExpiresAt.IsZero() {
+		ttl := time.Until(h.TokenExpiresAt)
+		if ttl <= 0 {
+			if !h.ExpiryLive {
+				return "" // stale snapshot — unknown, never "Token expired"
+			}
+			if h.HasRefreshToken && h.ErrorCount1h == 0 {
+				return "" // access token expired, refresh still valid — self-healing
+			}
+			return "Token expired"
+		}
+		if ttl < time.Hour {
+			return fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl))
+		}
+	}
+	if h.ErrorCount1h > 0 {
+		if h.ErrorCount1h == 1 {
+			return "1 recent error"
+		}
+		return fmt.Sprintf("%d recent errors", h.ErrorCount1h)
+	}
+	if h.Penalty >= 1.0 {
+		return "High penalty from errors"
+	}
+	_ = status
+	return ""
+}
+
 // FormatStatusWithReason returns a detailed status string with explanation.
 // Example: "🟡 Warning - Token expires in 12 minutes"
 func FormatStatusWithReason(status HealthStatus, health *ProfileHealth, opts FormatOptions) string {
@@ -106,33 +145,8 @@ func FormatStatusWithReason(status HealthStatus, health *ProfileHealth, opts For
 	statusStr := status.String()
 
 	var reasons []string
-
-	if health != nil {
-		// Check token expiry
-		if !health.TokenExpiresAt.IsZero() {
-			ttl := time.Until(health.TokenExpiresAt)
-			if ttl <= 0 {
-				reasons = append(reasons, "Token expired")
-			} else if ttl < 15*time.Minute {
-				reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
-			} else if ttl < time.Hour {
-				reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
-			}
-		}
-
-		// Check errors
-		if health.ErrorCount1h > 0 {
-			if health.ErrorCount1h == 1 {
-				reasons = append(reasons, "1 recent error")
-			} else {
-				reasons = append(reasons, fmt.Sprintf("%d recent errors", health.ErrorCount1h))
-			}
-		}
-
-		// Check penalty
-		if health.Penalty >= 1.0 {
-			reasons = append(reasons, "High penalty from errors")
-		}
+	if reason := PrimaryReason(status, health); reason != "" {
+		reasons = append(reasons, reason)
 	}
 
 	var result string
@@ -166,12 +180,28 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 
 	var recs []string
 
-	// Check token expiry
+	now := time.Now()
+	if !health.CooldownUntil.IsZero() && health.CooldownUntil.After(now) {
+		recs = append(recs, fmt.Sprintf(
+			"Rate limited; wait for reset in %s. Do not re-login — a cap clears on its timer. Note: claude login is machine-wide and would disrupt every live claude pane.",
+			formatDurationNatural(health.CooldownUntil.Sub(now)),
+		))
+		return strings.Join(recs, "\n")
+	}
+
+	// Never recommend a machine-wide re-login from a timestamp alone.
+	// Require an observed auth failure (error_count > 0) and a LIVE expiry
+	// that is actually past, with no refresh token (agent-factory-21fp).
 	if !health.TokenExpiresAt.IsZero() {
 		ttl := time.Until(health.TokenExpiresAt)
 		if ttl <= 0 {
-			recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
-		} else if ttl < time.Hour {
+			if health.ExpiryLive && health.ErrorCount1h > 0 && !health.HasRefreshToken {
+				recs = append(recs, fmt.Sprintf(
+					"Run \"caam login %s %s\" to re-authenticate. Note: claude login is machine-wide and would disrupt every live claude pane on this box.",
+					provider, profile,
+				))
+			}
+		} else if ttl < time.Hour && health.ExpiryLive {
 			recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to refresh expiring token", provider, profile))
 		}
 	}

@@ -79,11 +79,21 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	score := 0.0
 	now := time.Now()
 
-	// Factor 1: Token expiry (primary)
-	if h.TokenExpiresAt.IsZero() {
-		// Unknown expiry - neutral
-	} else if h.TokenExpiresAt.Before(now) {
-		score -= 1.0 // Expired
+	// An active rate-limit cooldown is the real constraint. It must score as
+	// a warning (the cap is real) and must not be outranked by a stale
+	// snapshot expiry that would otherwise go critical (agent-factory-21fp).
+	rateLimited := !h.CooldownUntil.IsZero() && h.CooldownUntil.After(now)
+	staleSnapshotExpiry := !h.TokenExpiresAt.IsZero() && h.TokenExpiresAt.Before(now) && !h.ExpiryLive
+	refreshableAccessExpiry := !h.TokenExpiresAt.IsZero() && h.TokenExpiresAt.Before(now) && h.ExpiryLive && h.HasRefreshToken && h.ErrorCount1h == 0
+	confirmedExpiry := !h.TokenExpiresAt.IsZero() && h.TokenExpiresAt.Before(now) && h.ExpiryLive && !refreshableAccessExpiry
+
+	// Factor 1: Token expiry (primary) — only the LIVE credential counts.
+	if h.TokenExpiresAt.IsZero() || staleSnapshotExpiry {
+		// Unknown / stale snapshot: neutral.
+	} else if refreshableAccessExpiry {
+		score += 1.0 // access token expired, refresh still valid — self-healing, silent
+	} else if confirmedExpiry {
+		score -= 1.0 // Expired live access token without a usable refresh
 	} else {
 		ttl := h.TokenExpiresAt.Sub(now)
 		switch {
@@ -125,23 +135,29 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		status = StatusWarning
 	}
 
-	// Override if token is strictly expired or critical errors met
-	if !h.TokenExpiresAt.IsZero() {
-		if h.TokenExpiresAt.Before(now) {
+	// Override if the LIVE token is strictly expired, or critical errors met.
+	// A stale snapshot expiry with error_count 0 reports unknown, never
+	// critical — that was the 2026-08-30 misroute (agent-factory-21fp).
+	if staleSnapshotExpiry && h.ErrorCount1h == 0 && !rateLimited {
+		status = StatusUnknown
+	} else if confirmedExpiry {
+		status = StatusCritical
+	} else if !h.TokenExpiresAt.IsZero() && h.TokenExpiresAt.After(now) {
+		ttl := h.TokenExpiresAt.Sub(now)
+		criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
+		warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
+		if criticalTTL > 0 && ttl <= criticalTTL {
 			status = StatusCritical
-		} else {
-			ttl := h.TokenExpiresAt.Sub(now)
-			criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
-			warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
-			if criticalTTL > 0 && ttl <= criticalTTL {
-				status = StatusCritical
-			} else if warningTTL > 0 && ttl <= warningTTL {
-				// If within warning window (e.g. < 1h), ensure at least Warning
-				if status == StatusHealthy {
-					status = StatusWarning
-				}
+		} else if warningTTL > 0 && ttl <= warningTTL {
+			// If within warning window (e.g. < 1h), ensure at least Warning
+			if status == StatusHealthy {
+				status = StatusWarning
 			}
 		}
+	}
+
+	if rateLimited && status == StatusHealthy {
+		status = StatusWarning
 	}
 
 	if h.ErrorCount1h >= config.ErrorCountCritical {

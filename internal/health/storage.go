@@ -39,6 +39,21 @@ type ProfileHealth struct {
 
 	// LastChecked is when health was last verified.
 	LastChecked time.Time `json:"last_checked,omitempty"`
+
+	// HasRefreshToken is true when the live credential still has a refresh
+	// token. An expired access token with a valid refresh token is normal
+	// self-healing, not a human-login event (agent-factory-21fp).
+	HasRefreshToken bool `json:"-"`
+
+	// ExpiryLive is true when TokenExpiresAt was read from the live credential
+	// on this call, not from a vault/health.json snapshot. A stale snapshot
+	// must never be reported as "Token expired" / critical (agent-factory-21fp).
+	ExpiryLive bool `json:"-"`
+
+	// CooldownUntil is an active rate-limit cooldown, filled by the reporting
+	// path from limit_events. When set, status is "rate limited", not token
+	// expired — even if a stale snapshot expiry is in the past.
+	CooldownUntil time.Time `json:"-"`
 }
 
 // HealthStore holds health data for all profiles.

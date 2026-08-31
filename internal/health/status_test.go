@@ -29,12 +29,42 @@ func TestCalculateHealth(t *testing.T) {
 			expectedStatus: StatusHealthy,
 		},
 		{
-			name: "Expired token",
+			name: "Expired live token without refresh is critical",
 			health: &ProfileHealth{
 				TokenExpiresAt: now.Add(-1 * time.Minute),
 				ErrorCount1h:   0,
+				ExpiryLive:     true,
 			},
 			expectedStatus: StatusCritical,
+		},
+		{
+			name: "Stale snapshot expiry with no errors is unknown, never critical",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-5 * 24 * time.Hour),
+				ErrorCount1h:   0,
+				ExpiryLive:     false,
+			},
+			expectedStatus: StatusUnknown,
+		},
+		{
+			name: "Expired live access token with refresh and no errors is not critical",
+			health: &ProfileHealth{
+				TokenExpiresAt:  now.Add(-1 * time.Minute),
+				ErrorCount1h:    0,
+				ExpiryLive:      true,
+				HasRefreshToken: true,
+			},
+			expectedStatus: StatusHealthy,
+		},
+		{
+			name: "Rate-limited cooldown outranks stale snapshot expiry",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-5 * 24 * time.Hour),
+				ErrorCount1h:   0,
+				ExpiryLive:     false,
+				CooldownUntil:  now.Add(16 * time.Minute),
+			},
+			expectedStatus: StatusWarning,
 		},
 		{
 			name: "Expiring soon (warning)",

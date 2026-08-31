@@ -511,24 +511,8 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 }
 
 func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) string {
-	// Use thresholds from health.DefaultHealthConfig()
-	cfg := health.DefaultHealthConfig()
-
-	if status == health.StatusCritical {
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
-			return "token expired"
-		}
-		if ph.ErrorCount1h >= cfg.ErrorCountCritical {
-			return fmt.Sprintf("high error rate (%d errors in 1h)", ph.ErrorCount1h)
-		}
-	}
-	if status == health.StatusWarning {
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) < 24*time.Hour {
-			return "token expiring soon"
-		}
-		if ph.ErrorCount1h >= cfg.ErrorCountWarning {
-			return fmt.Sprintf("elevated error rate (%d errors in 1h)", ph.ErrorCount1h)
-		}
+	if reason := health.PrimaryReason(status, ph); reason != "" {
+		return reason
 	}
 	return ""
 }
