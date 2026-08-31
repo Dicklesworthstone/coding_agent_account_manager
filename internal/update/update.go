@@ -102,6 +102,9 @@ type Config struct {
 	// BackupDir is where to store backup copies.
 	// If empty, uses the same directory as the executable.
 	BackupDir string
+	// APIBase overrides the GitHub API base URL (tests). If empty,
+	// GitHubAPIBase is used.
+	APIBase string
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -131,6 +134,9 @@ func New(config Config) *Updater {
 	}
 	if config.HTTPClient == nil {
 		config.HTTPClient = &http.Client{Timeout: 60 * time.Second}
+	}
+	if config.APIBase == "" {
+		config.APIBase = GitHubAPIBase
 	}
 	return &Updater{config: config}
 }
@@ -188,6 +194,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	var binaryAsset *Asset
 	var checksumsAsset *Asset
 	var signatureAsset *Asset
+	var minisigAsset *Asset
 
 	// binaryAssetName() deliberately returns a PATTERN, not a literal: it does
 	// not know the version, so it emits caam_*_<os>_<arch>.<ext>. Comparing that
@@ -207,8 +214,15 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 			checksumsAsset = asset
 		case "SHA256SUMS.sig":
 			signatureAsset = asset
+		case "SHA256SUMS.minisig":
+			minisigAsset = asset
 		}
 	}
+
+	// Releases >= MinisignRequiredFromVersion are signed with minisign
+	// (embedded key, pure-Go, fail-closed). Older releases were signed by
+	// GitHub Actions with cosign keyless and keep that legacy path (#77).
+	useMinisign := MinisignRequired(result.ToVersion)
 
 	if binaryAsset == nil {
 		return nil, fmt.Errorf("binary asset not found: %s", assetName)
@@ -216,7 +230,11 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	if checksumsAsset == nil {
 		return nil, fmt.Errorf("checksums asset not found: SHA256SUMS")
 	}
-	if signatureAsset == nil {
+	if useMinisign {
+		if minisigAsset == nil {
+			return nil, fmt.Errorf("signature asset not found: SHA256SUMS.minisig (required for releases >= %s)", MinisignRequiredFromVersion)
+		}
+	} else if signatureAsset == nil {
 		return nil, fmt.Errorf("signature asset not found: SHA256SUMS.sig")
 	}
 
@@ -242,19 +260,29 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 
 	// Download checksums and signature
 	checksumsPath := filepath.Join(tmpDir, "SHA256SUMS")
-	signaturePath := filepath.Join(tmpDir, "SHA256SUMS.sig")
 	archivePath := filepath.Join(tmpDir, assetName)
 
 	if err := u.downloadFile(ctx, checksumsAsset.BrowserDownloadURL, checksumsPath); err != nil {
 		return nil, fmt.Errorf("download checksums: %w", err)
 	}
-	if err := u.downloadFile(ctx, signatureAsset.BrowserDownloadURL, signaturePath); err != nil {
-		return nil, fmt.Errorf("download signature: %w", err)
-	}
 
-	// Verify signature
-	if err := VerifySignature(ctx, checksumsPath, signaturePath, release.TagName, u.config.Owner, u.config.Repo); err != nil {
-		return nil, fmt.Errorf("verify signature: %w", err)
+	// Verify the SHA256SUMS signature before trusting any checksum in it.
+	if useMinisign {
+		minisigPath := filepath.Join(tmpDir, "SHA256SUMS.minisig")
+		if err := u.downloadFile(ctx, minisigAsset.BrowserDownloadURL, minisigPath); err != nil {
+			return nil, fmt.Errorf("download minisign signature: %w", err)
+		}
+		if err := VerifyMinisign(checksumsPath, minisigPath); err != nil {
+			return nil, fmt.Errorf("verify signature: %w", err)
+		}
+	} else {
+		signaturePath := filepath.Join(tmpDir, "SHA256SUMS.sig")
+		if err := u.downloadFile(ctx, signatureAsset.BrowserDownloadURL, signaturePath); err != nil {
+			return nil, fmt.Errorf("download signature: %w", err)
+		}
+		if err := VerifySignature(ctx, checksumsPath, signaturePath, release.TagName, u.config.Owner, u.config.Repo); err != nil {
+			return nil, fmt.Errorf("verify signature: %w", err)
+		}
 	}
 
 	// Download binary archive
@@ -303,7 +331,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 
 // fetchLatestRelease fetches the latest release based on channel.
 func (u *Updater) fetchLatestRelease(ctx context.Context) (*Release, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/releases", GitHubAPIBase, u.config.Owner, u.config.Repo)
+	url := fmt.Sprintf("%s/repos/%s/%s/releases", u.config.APIBase, u.config.Owner, u.config.Repo)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -345,7 +373,7 @@ func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error
 	if !strings.HasPrefix(tag, "v") {
 		tag = "v" + tag
 	}
-	url := fmt.Sprintf("%s/repos/%s/%s/releases/tags/%s", GitHubAPIBase, u.config.Owner, u.config.Repo, tag)
+	url := fmt.Sprintf("%s/repos/%s/%s/releases/tags/%s", u.config.APIBase, u.config.Owner, u.config.Repo, tag)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -401,7 +429,7 @@ func selectBinaryAsset(assets []Asset, pattern string) *Asset {
 	patternParts := strings.Split(pattern, "*")
 	for i := range assets {
 		asset := &assets[i]
-		if asset.Name == "SHA256SUMS" || asset.Name == "SHA256SUMS.sig" {
+		if asset.Name == "SHA256SUMS" || asset.Name == "SHA256SUMS.sig" || asset.Name == "SHA256SUMS.minisig" {
 			continue
 		}
 		if matchPattern(asset.Name, patternParts) {

@@ -6,6 +6,7 @@ go 1.24.0
 toolchain go1.24.4
 
 require (
+	aead.dev/minisign v0.3.0
 	github.com/charmbracelet/bubbles v0.20.0
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/glamour v0.10.0

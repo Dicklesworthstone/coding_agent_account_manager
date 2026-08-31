@@ -882,7 +882,43 @@ verifies, and installs the right archive for your platform automatically.
 
 ### Verify Release Artifacts
 
-Each release ships with signed checksums:
+Each release ships a `SHA256SUMS` file signed with
+[minisign](https://jedisct1.github.io/minisign/) (releases v0.1.18 and later).
+The signing key is held by the maintainer:
+
+```
+untrusted comment: caam release signing key (minisign key 1BBD79B28BF718D0)
+RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+```
+
+To verify a release by hand, download `SHA256SUMS`, `SHA256SUMS.minisig`, and
+your platform archive from the release page, then:
+
+```bash
+# 1. Verify the signature on the checksums file
+minisign -Vm SHA256SUMS -P RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+
+# 2. Verify the archive against the signed checksums
+sha256sum -c SHA256SUMS --ignore-missing
+# macOS fallback:
+# shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+The same public key is embedded in the `caam` binary itself, so `caam update`
+performs this verification in pure Go — fail-closed, with no external tools
+required.
+
+**Trust model.** Releases up to v0.1.17 were built by GitHub Actions and
+signed keylessly with cosign, pinned to the release workflow's OIDC identity
+(`.github/workflows/release.yml@refs/tags/<tag>`, issuer
+`token.actions.githubusercontent.com`). Releases moved off GitHub Actions
+permanently, and that identity is unattainable outside Actions — no non-CI
+release could ever verify (see issue #77). From v0.1.18, releases are built on
+maintainer-controlled hosts and signed with the maintainer-held minisign key
+above; what you trust is that key (and this README/binary pinning it) rather
+than GitHub's CI identity chain. Verification is strictly fail-closed in both
+the updater and the install script. For old releases (≤ v0.1.17) the legacy
+cosign verification still applies:
 
 ```bash
 cosign verify-blob \
@@ -890,10 +926,6 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity "https://github.com/Dicklesworthstone/coding_agent_account_manager/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
   SHA256SUMS
-
-sha256sum -c SHA256SUMS
-# macOS fallback:
-# shasum -a 256 -c SHA256SUMS
 ```
 
 ### Alternative: Install Script

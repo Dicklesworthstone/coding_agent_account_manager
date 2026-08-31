@@ -776,12 +776,17 @@ verify_release_assets() {
         return 0
     fi
 
-    local checksums_url signature_url
+    local checksums_url signature_url minisig_url
     checksums_url=$(printf '%s' "$release_json" | select_named_asset "SHA256SUMS") || true
     signature_url=$(printf '%s' "$release_json" | select_named_asset "SHA256SUMS.sig") || true
+    minisig_url=$(printf '%s' "$release_json" | select_named_asset "SHA256SUMS.minisig") || true
 
-    if [ -z "$checksums_url" ] || [ -z "$signature_url" ]; then
-        print_error "Release is missing SHA256SUMS or SHA256SUMS.sig assets."
+    if [ -z "$checksums_url" ]; then
+        print_error "Release is missing the SHA256SUMS asset."
+        return 1
+    fi
+    if [ -z "$minisig_url" ] && [ -z "$signature_url" ]; then
+        print_error "Release is missing SHA256SUMS.minisig (and legacy SHA256SUMS.sig) assets."
         return 1
     fi
 
@@ -793,12 +798,51 @@ verify_release_assets() {
         print_error "Failed to download SHA256SUMS."
         return 1
     fi
-    if ! download_file "$signature_url" "$signature_path"; then
-        print_error "Failed to download SHA256SUMS.sig."
-        return 1
-    fi
 
-    if ! command -v cosign >/dev/null 2>&1; then
+    # Releases >= 0.1.18 are signed with minisign (maintainer release key,
+    # pinned below and embedded in the caam binary). Older releases carry a
+    # cosign keyless signature from GitHub Actions; that legacy path follows.
+    if [ -n "$minisig_url" ]; then
+        local minisig_path="$tmp_dir/SHA256SUMS.minisig"
+        if ! download_file "$minisig_url" "$minisig_path"; then
+            print_error "Failed to download SHA256SUMS.minisig."
+            return 1
+        fi
+        if ! command -v minisign >/dev/null 2>&1; then
+            if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
+                print_warn "minisign not found — skipping signature verification (CI/non-interactive mode)."
+                print_warn "Install minisign for signature verification in production."
+                # Fall through to checksum-only verification below
+            else
+                error "minisign is required to verify release signatures."
+                error ""
+                error "Install minisign:"
+                error "  macOS:         brew install minisign"
+                error "  Ubuntu/Debian: sudo apt install minisign"
+                error "  Other:         https://jedisct1.github.io/minisign/"
+                error ""
+                error "Or bypass verification (not recommended for security):"
+                error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
+                return 1
+            fi
+        else
+            local minisign_pub="$tmp_dir/caam-release-minisign.pub"
+            cat > "$minisign_pub" <<'CAAM_MINISIGN_PUB'
+untrusted comment: caam release signing key (minisign key 1BBD79B28BF718D0)
+RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+CAAM_MINISIGN_PUB
+            local minisign_out=""
+            if ! minisign_out=$(minisign -V -p "$minisign_pub" -m "$checksums_path" -x "$minisig_path" 2>&1); then
+                print_error "Signature verification failed."
+                if [ -n "$minisign_out" ]; then
+                    printf '%s\n' "$minisign_out" | while IFS= read -r line; do
+                        print_error "  minisign: $line"
+                    done
+                fi
+                return 1
+            fi
+        fi
+    elif ! command -v cosign >/dev/null 2>&1; then
         if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
             print_warn "cosign not found — skipping signature verification (CI/non-interactive mode)."
             print_warn "Install cosign for signature verification in production."
@@ -816,6 +860,11 @@ verify_release_assets() {
             return 1
         fi
     else
+        if ! download_file "$signature_url" "$signature_path"; then
+            print_error "Failed to download SHA256SUMS.sig."
+            return 1
+        fi
+
         local identity="https://github.com/${REPO_OWNER}/${REPO_NAME}/.github/workflows/release.yml@refs/tags/${version}"
         local cosign_out=""
         local verified=0

@@ -8,13 +8,53 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
-## [Unreleased]
+## [0.1.18] - 2026-08-31
+
+### Security — release verification moved to minisign (resolves #77)
+
+- **Releases are now signed with minisign instead of cosign keyless.** The
+  updater verified `SHA256SUMS.sig` against a GitHub-Actions OIDC certificate
+  identity (`.github/workflows/release.yml@refs/tags/<tag>`), which only an
+  Actions run can mint — and releases moved off Actions permanently, so no
+  release could ever verify again. From v0.1.18, each release publishes
+  `SHA256SUMS.minisig`, a minisign signature over `SHA256SUMS` made with the
+  maintainer-held release key (minisign key ID `1BBD79B28BF718D0`; public key
+  `RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70`, embedded in the
+  binary and pinned in the README).
+- **Verification is pure Go and fail-closed** (`aead.dev/minisign`): a
+  missing `SHA256SUMS.minisig`, a signature by any other key, or tampered
+  checksums is a hard error — unlike the old path, which silently skipped
+  verification on hosts without the cosign CLI. The archive's SHA256 is then
+  checked against the verified `SHA256SUMS`.
+- **Version-gated for compatibility**: releases `< 0.1.18` keep the legacy
+  cosign verification path unchanged; releases `>= 0.1.18` require minisign.
+  `install.sh` gained the same minisign path (with the key pinned in the
+  script) and keeps its cosign fallback for old releases.
+
+### Fixed
+
+- **`caam update` can find its own release assets again** — resolves #75. The
+  updater compared its version-wildcard asset pattern
+  (`caam_*_<os>_<arch>.tar.gz`) against real asset names with `==`, which can
+  never match, so every platform reported `binary asset not found` while the
+  asset was plainly present. Asset selection now reuses the same wildcard
+  matcher as checksum resolution ([`413cdd6`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/413cdd6), [`21539da`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/21539da), [`c56b8ab`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/c56b8ab)).
+  Note: binaries `<= 0.1.17` carry the broken matcher and cannot self-update
+  out of it — upgrade once via `brew upgrade caam`, the install script, or a
+  manual download; from 0.1.18 on, `caam update` works again.
+- **`caam next`/`caam run` fall back loudly** when `--usage-aware`/`--precheck`
+  hit a provider that doesn't support usage probing ([`9470ef0`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/9470ef0)).
+- **Claude onboarding state survives authenticated shallow profiles** ([`5469e53`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/5469e53)).
+- **`caam doctor` no longer misreports transient Codex probe answers** as
+  credential rejections ([`ce81e9d`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/ce81e9d)).
+- **Codex login layer naming** for vault/shallow layers left on a revoked
+  generation ([`1a9a76c`](https://github.com/Dicklesworthstone/coding_agent_account_manager/commit/1a9a76c)).
 
 ### Changed — safety
 
 - **Rotating-OAuth credential payloads no longer replicate between machines by default** — first slice of #66. Claude and Codex subscription OAuth uses rotating refresh-token families (replaying a stale copy can revoke the whole family — the #19 incident class), so their profiles now default to a new `host-local` sync mode: `caam sync` still replicates non-secret profile metadata (`meta.json`), but the credential payload never crosses machines; each machine keeps its own grant. Gemini/OpenCode/Cursor keep the previous `replicate` behavior, unknown providers fail closed to `host-local`, and `_`-prefixed system profiles never propagate. Override per provider or profile via `sync_policy` in `config.json`; forcing `replicate` for a rotating provider warns loudly when both machines hold diverged copies. `caam sync status` (and its `--json` output) now report the resolved policy; metadata-only transfers are logged as `push-meta`/`pull-meta`. The full `handoff` lease mode from the #66 proposal is deliberately deferred.
 
-
+## [0.1.17] - 2026-08-23
 
 ### Fixed
 

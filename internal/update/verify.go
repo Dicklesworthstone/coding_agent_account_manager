@@ -16,9 +16,72 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"aead.dev/minisign"
 )
 
-// VerifySignature verifies the cosign signature on the checksums file.
+// MinisignPublicKey is the maintainer's release-signing public key
+// (minisign key ID 1BBD79B28BF718D0). Releases from v0.1.18 onward publish
+// SHA256SUMS.minisig, a minisign signature over the SHA256SUMS asset, made
+// with the corresponding secret key.
+//
+// The key is embedded so verification is pure Go and fail-closed: no external
+// tooling, no network trust roots, no CI-identity coupling (issue #77).
+const MinisignPublicKey = "RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70"
+
+// MinisignRequiredFromVersion is the first release version whose SHA256SUMS
+// must be signed with minisign. Releases before it were signed with cosign
+// keyless (GitHub Actions OIDC) and keep the legacy verification path.
+const MinisignRequiredFromVersion = "0.1.18"
+
+// MinisignRequired reports whether a release at the given version must carry
+// a SHA256SUMS.minisig signature verifiable with MinisignPublicKey.
+func MinisignRequired(version string) bool {
+	return compareVersions(version, MinisignRequiredFromVersion) >= 0
+}
+
+// VerifyMinisign verifies the minisign signature on the checksums file using
+// the embedded MinisignPublicKey. Unlike the legacy cosign path, this is
+// fail-closed: any missing file, parse failure, key mismatch, or bad
+// signature is an error.
+func VerifyMinisign(checksumsPath, signaturePath string) error {
+	message, err := os.ReadFile(checksumsPath)
+	if err != nil {
+		return fmt.Errorf("read checksums file: %w", err)
+	}
+	signature, err := os.ReadFile(signaturePath)
+	if err != nil {
+		return fmt.Errorf("read minisign signature: %w", err)
+	}
+	return verifyMinisignBytes(MinisignPublicKey, message, signature)
+}
+
+// verifyMinisignBytes verifies signature over message against the given
+// base64-encoded minisign public key.
+func verifyMinisignBytes(publicKey string, message, signature []byte) error {
+	var pk minisign.PublicKey
+	if err := pk.UnmarshalText([]byte(publicKey)); err != nil {
+		return fmt.Errorf("parse embedded minisign public key: %w", err)
+	}
+
+	var sig minisign.Signature
+	if err := sig.UnmarshalText(signature); err != nil {
+		return fmt.Errorf("parse minisign signature: %w", err)
+	}
+	if sig.KeyID != pk.ID() {
+		return fmt.Errorf("minisign signature made by key %X, want release key %X", sig.KeyID, pk.ID())
+	}
+
+	if !minisign.Verify(pk, message, signature) {
+		return fmt.Errorf("minisign signature verification failed: SHA256SUMS does not match SHA256SUMS.minisig")
+	}
+	return nil
+}
+
+// VerifySignature verifies the legacy cosign keyless signature on the
+// checksums file. It applies only to releases older than
+// MinisignRequiredFromVersion, which were built and signed by GitHub Actions;
+// newer releases are signed with minisign and verified by VerifyMinisign.
 // It requires cosign to be installed on the system.
 func VerifySignature(ctx context.Context, checksumsPath, signaturePath, tag, owner, repo string) error {
 	// Check if cosign is available

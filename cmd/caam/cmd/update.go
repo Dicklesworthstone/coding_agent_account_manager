@@ -35,7 +35,8 @@ var updateCmd = &cobra.Command{
 
 The update process:
   1. Fetches release metadata from GitHub
-  2. Verifies cosign signature on SHA256SUMS
+  2. Verifies the signature on SHA256SUMS (minisign with the embedded
+     release key for releases >= 0.1.18; legacy cosign for older releases)
   3. Verifies SHA256 checksum of the binary archive
   4. Creates a backup of the current binary
   5. Atomically replaces the binary
