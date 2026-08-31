@@ -169,7 +169,7 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	provider := tool
 	switch {
 	case fromVault != "":
-		vaultProvider, primary, extras, label, err := resolveVaultProvider(fromVault)
+		vaultProvider, primary, extras, vaultClaudeJSON, label, err := resolveVaultProvider(fromVault)
 		if err != nil {
 			return emit(err)
 		}
@@ -180,6 +180,13 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		opts.CredentialSource = primary
 		opts.ExtraSources = extras
 		opts.CredentialFromLabel = label
+		// Prefer the vault profile's own saved .claude.json (which carries the
+		// matching onboarding/readiness state for these credentials) over the
+		// real HOME's, unless the user overrode it with --from-claude-json
+		// (issue #80).
+		if opts.SourceClaudeJSON == "" && vaultClaudeJSON != "" {
+			opts.SourceClaudeJSON = vaultClaudeJSON
+		}
 	case fromFile != "":
 		if provider == "" {
 			provider = "claude"
@@ -249,21 +256,23 @@ func shallowSpawnHintBin(provider string) string {
 // resolveVaultProvider parses a "<tool>/<profile>" --from-vault spec and returns
 // the provider id, the absolute path to the profile's PRIMARY credential file,
 // a map of optional extra source files (dest-relpath -> source-path) for
-// multi-file providers, and a human-readable label. The primary file must
-// exist; optional files are included only when present.
-func resolveVaultProvider(spec string) (provider, primary string, extras map[string]string, label string, err error) {
+// multi-file providers, the path to the vault profile's saved .claude.json
+// state file (claude only, "" when absent — issue #80), and a human-readable
+// label. The primary file must exist; optional files are included only when
+// present.
+func resolveVaultProvider(spec string) (provider, primary string, extras map[string]string, claudeState, label string, err error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
-		return "", "", nil, "", fmt.Errorf("--from-vault requires <tool>/<profile>")
+		return "", "", nil, "", "", fmt.Errorf("--from-vault requires <tool>/<profile>")
 	}
 	parts := strings.SplitN(spec, "/", 2)
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		return "", "", nil, "", fmt.Errorf("--from-vault must be in the form <tool>/<profile>, got %q", spec)
+		return "", "", nil, "", "", fmt.Errorf("--from-vault must be in the form <tool>/<profile>, got %q", spec)
 	}
 	tool := strings.ToLower(strings.TrimSpace(parts[0]))
 	prof := strings.TrimSpace(parts[1])
 	if vault == nil {
-		return "", "", nil, "", fmt.Errorf("vault not initialized")
+		return "", "", nil, "", "", fmt.Errorf("vault not initialized")
 	}
 	dir := vault.ProfilePath(tool, prof)
 	label = "vault:" + tool + "/" + prof
@@ -272,17 +281,25 @@ func resolveVaultProvider(spec string) (provider, primary string, extras map[str
 	case "claude":
 		primary = filepath.Join(dir, ".credentials.json")
 		if _, err := os.Stat(primary); err != nil {
-			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing .credentials.json: %w", tool, prof, err)
+			return "", "", nil, "", "", fmt.Errorf("vault profile %s/%s missing .credentials.json: %w", tool, prof, err)
+		}
+		// The vault also snapshots ~/.claude.json alongside the credentials.
+		// That snapshot carries the onboarding/readiness state that MATCHES
+		// these credentials, so prefer it as the shallow profile's state seed
+		// when it exists (issue #80). Optional: older vault profiles may lack
+		// it, in which case the real-HOME/skeleton fallback still applies.
+		if st := filepath.Join(dir, ".claude.json"); fileIsRegular(st) {
+			claudeState = st
 		}
 	case "codex":
 		primary = filepath.Join(dir, "auth.json")
 		if _, err := os.Stat(primary); err != nil {
-			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing auth.json: %w", tool, prof, err)
+			return "", "", nil, "", "", fmt.Errorf("vault profile %s/%s missing auth.json: %w", tool, prof, err)
 		}
 	case "agy":
 		primary = filepath.Join(dir, "antigravity-oauth-token")
 		if _, err := os.Stat(primary); err != nil {
-			return "", "", nil, "", fmt.Errorf("vault profile %s/%s missing antigravity-oauth-token: %w", tool, prof, err)
+			return "", "", nil, "", "", fmt.Errorf("vault profile %s/%s missing antigravity-oauth-token: %w", tool, prof, err)
 		}
 		// Optional Google identity files, mapped to their shallow destinations.
 		optional := map[string]string{
@@ -298,9 +315,16 @@ func resolveVaultProvider(spec string) (provider, primary string, extras map[str
 			}
 		}
 	default:
-		return "", "", nil, "", fmt.Errorf("--from-vault does not support tool %q for shallow profiles (supported: %s)", tool, strings.Join(shallow.SupportedProviders(), ", "))
+		return "", "", nil, "", "", fmt.Errorf("--from-vault does not support tool %q for shallow profiles (supported: %s)", tool, strings.Join(shallow.SupportedProviders(), ", "))
 	}
-	return tool, primary, extras, label, nil
+	return tool, primary, extras, claudeState, label, nil
+}
+
+// fileIsRegular reports whether path exists and is a regular file (following
+// symlinks). Used for optional vault-side files where absence is fine.
+func fileIsRegular(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 // shallowProfileListCmd lists existing shallow profiles.

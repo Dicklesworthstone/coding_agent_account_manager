@@ -584,6 +584,9 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 		if err := m.writeClaudeJSON(home, opts); err != nil {
 			return err
 		}
+		if err := m.ensureClaudeOnboarding(home, opts); err != nil {
+			return err
+		}
 	case "codex":
 		// Seed the shallow config.toml from the user's real ~/.codex/config.toml
 		// (preserving [mcp_servers.*] and every other user section), THEN force
@@ -622,6 +625,71 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 	}
 	if err := writeFileAtomic(claudeJSONPath, []byte("{}\n"), 0o600); err != nil {
 		return fmt.Errorf("write skeleton .claude.json: %w", err)
+	}
+	return nil
+}
+
+// ensureClaudeOnboarding merges the minimum non-secret readiness marker
+// ({"hasCompletedOnboarding": true}) into <home>/.claude.json when — and only
+// when — the profile was seeded from real credentials but its staged state
+// lacks the marker. Without it an authenticated shallow profile passes
+// `claude auth status` and headless `claude --print` calls yet still drags the
+// interactive TUI through first-run theme setup and a redundant OAuth flow
+// (issue #80). Workspace trust is a separate, project-specific prompt and is
+// deliberately NOT seeded here.
+//
+// Deliberately conservative:
+//   - No credential source (an intentionally empty profile) → untouched, so
+//     the normal first-run login flow is preserved.
+//   - A staged credential file that is empty, or not a JSON object with
+//     content → untouched (nothing shows the source is authenticated).
+//   - A staged .claude.json that is not a JSON object, or that already
+//     carries hasCompletedOnboarding (true OR false) → untouched; the seed
+//     source's own onboarding state is preserved verbatim, never overwritten.
+//
+// The merge adds only this one key on top of the staged state — every
+// version-specific source field survives — and the result is written
+// atomically with mode 0600. Sources are never modified: this runs against
+// the staging copy inside the shallow HOME.
+func (m *Manager) ensureClaudeOnboarding(home string, opts CreateOptions) error {
+	if opts.CredentialSource == "" {
+		return nil
+	}
+	credPath := filepath.Join(home, ".claude", ".credentials.json")
+	cred, err := os.ReadFile(credPath)
+	if err != nil || strings.TrimSpace(string(cred)) == "" {
+		return nil
+	}
+	var credObj map[string]json.RawMessage
+	if json.Unmarshal(cred, &credObj) != nil || len(credObj) == 0 {
+		return nil
+	}
+
+	claudeJSONPath := filepath.Join(home, ".claude.json")
+	raw, err := os.ReadFile(claudeJSONPath)
+	if err != nil {
+		return nil
+	}
+	var state map[string]json.RawMessage
+	if json.Unmarshal(raw, &state) != nil || state == nil {
+		// Not a JSON object (or JSON null) — leave whatever the seed source
+		// provided alone rather than clobbering it with a rewrite.
+		if strings.TrimSpace(string(raw)) != "null" {
+			return nil
+		}
+		state = map[string]json.RawMessage{}
+	}
+	if _, ok := state["hasCompletedOnboarding"]; ok {
+		return nil
+	}
+	state["hasCompletedOnboarding"] = json.RawMessage("true")
+	merged, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("merge onboarding state into .claude.json: %w", err)
+	}
+	merged = append(merged, '\n')
+	if err := writeFileAtomic(claudeJSONPath, merged, 0o600); err != nil {
+		return fmt.Errorf("write onboarded .claude.json: %w", err)
 	}
 	return nil
 }

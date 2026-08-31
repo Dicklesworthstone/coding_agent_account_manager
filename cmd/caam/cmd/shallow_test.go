@@ -670,3 +670,92 @@ func TestShallowSpawnEffortFlag(t *testing.T) {
 		t.Fatal("expected --effort with non-codex child to fail closed")
 	}
 }
+
+// Issue #80: a claude --from-vault source must prefer the vault profile's own
+// saved .claude.json (the state that MATCHES those credentials) over the real
+// HOME's, while an explicit --from-claude-json still wins over both.
+func TestShallowCreateVaultPrefersVaultClaudeJSON(t *testing.T) {
+	base, _ := shallowEnv(t)
+
+	caamHome := os.Getenv("CAAM_HOME")
+	vaultDir := filepath.Join(caamHome, "data", "vault", "claude", "alice")
+	if err := os.MkdirAll(vaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"fake"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	vaultState := `{"hasCompletedOnboarding":true,"fromVaultSnapshot":true}`
+	if err := os.WriteFile(filepath.Join(vaultDir, ".claude.json"), []byte(vaultState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice",
+		"--from-vault", "claude/alice", "--json"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	staged, err := os.ReadFile(filepath.Join(base, "alice", ".claude.json"))
+	if err != nil {
+		t.Fatalf("read staged .claude.json: %v", err)
+	}
+	if string(staged) != vaultState {
+		t.Fatalf("staged .claude.json should come from the vault snapshot; got %s", staged)
+	}
+
+	// Explicit --from-claude-json outranks the vault snapshot.
+	explicit := filepath.Join(t.TempDir(), "explicit.json")
+	explicitState := `{"hasCompletedOnboarding":true,"fromExplicitFlag":true}`
+	if err := os.WriteFile(explicit, []byte(explicitState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice2",
+		"--from-vault", "claude/alice", "--from-claude-json", explicit, "--json"); err != nil {
+		t.Fatalf("create with --from-claude-json: %v", err)
+	}
+	staged2, err := os.ReadFile(filepath.Join(base, "alice2", ".claude.json"))
+	if err != nil {
+		t.Fatalf("read staged .claude.json: %v", err)
+	}
+	if string(staged2) != explicitState {
+		t.Fatalf("--from-claude-json should outrank the vault snapshot; got %s", staged2)
+	}
+}
+
+// Issue #80: an authenticated vault source WITHOUT a saved .claude.json falls
+// back to the real HOME state and still gets the onboarding marker merged in.
+func TestShallowCreateVaultWithoutSnapshotMergesOnboarding(t *testing.T) {
+	base, _ := shallowEnv(t)
+
+	caamHome := os.Getenv("CAAM_HOME")
+	vaultDir := filepath.Join(caamHome, "data", "vault", "claude", "bob")
+	if err := os.MkdirAll(vaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"fake"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "bob",
+		"--from-vault", "claude/bob", "--json"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	staged, err := os.ReadFile(filepath.Join(base, "bob", ".claude.json"))
+	if err != nil {
+		t.Fatalf("read staged .claude.json: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(staged, &m); err != nil {
+		t.Fatalf("staged .claude.json invalid: %v\n%s", err, staged)
+	}
+	if string(m["hasCompletedOnboarding"]) != "true" {
+		t.Fatalf("onboarding marker not merged; staged = %s", staged)
+	}
+	// The real HOME's {"x":1} content (from fakeShallowHome) must survive.
+	if string(m["x"]) != "1" {
+		t.Fatalf("real HOME state fields dropped; staged = %s", staged)
+	}
+}
