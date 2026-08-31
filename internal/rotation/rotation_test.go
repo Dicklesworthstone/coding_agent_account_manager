@@ -334,6 +334,209 @@ func TestAlgorithmConstants(t *testing.T) {
 	}
 }
 
+// timePtr returns a pointer to t.
+func timePtr(t time.Time) *time.Time {
+	return &t
+}
+
+// TestDrainPolicyABCase is the A/B test case from issue #81:
+//   - Profile A: 90% used, resets in one hour.
+//   - Profile B: 5% used, resets in six days.
+//
+// In drain-before-reset mode, A should win (its quota expires soonest and it
+// is still under the safety ceiling). Under the default availability policy,
+// B should win — proving drain is strictly opt-in.
+func TestDrainPolicyABCase(t *testing.T) {
+	now := time.Now()
+	usageData := map[string]*UsageInfo{
+		"profile-a": {
+			ProfileName:    "profile-a",
+			PrimaryPercent: 90,
+			AvailScore:     10,
+			// One hour out (plus a few seconds so the selector's own clock,
+			// read slightly later, still formats the horizon as "1h").
+			ResetsAt: timePtr(now.Add(1*time.Hour + 30*time.Second)),
+		},
+		"profile-b": {
+			ProfileName:    "profile-b",
+			PrimaryPercent: 5,
+			AvailScore:     95,
+			ResetsAt:       timePtr(now.Add(6 * 24 * time.Hour)),
+		},
+	}
+
+	t.Run("drain prefers soonest reset", func(t *testing.T) {
+		s := NewSelector(AlgorithmSmart, nil, nil)
+		s.SetRNG(rand.New(rand.NewSource(42)))
+		s.SetPolicy(PolicyDrain)
+		s.SetUsageData(usageData)
+
+		result, err := s.Select("codex", []string{"profile-a", "profile-b"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Selected != "profile-a" {
+			t.Errorf("drain policy selected %q, expected 'profile-a' (soonest reset)", result.Selected)
+		}
+
+		// Explanation shape from issue #81:
+		// "chose X: resets in 42m, 91% used; fallback Y held in reserve"
+		for _, want := range []string{"chose profile-a", "resets in 1h", "90% used", "fallback profile-b held in reserve"} {
+			if !strings.Contains(result.Explanation, want) {
+				t.Errorf("explanation %q missing %q", result.Explanation, want)
+			}
+		}
+	})
+
+	t.Run("default availability policy is unchanged", func(t *testing.T) {
+		s := NewSelector(AlgorithmSmart, nil, nil)
+		s.SetRNG(rand.New(rand.NewSource(42)))
+		// No SetPolicy call: default must remain availability-first.
+		s.SetUsageData(usageData)
+
+		result, err := s.Select("codex", []string{"profile-a", "profile-b"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Selected != "profile-b" {
+			t.Errorf("default policy selected %q, expected 'profile-b' (most headroom)", result.Selected)
+		}
+		if result.Explanation != "" {
+			t.Errorf("default policy should not emit a drain explanation, got %q", result.Explanation)
+		}
+	})
+}
+
+// TestDrainPolicyCeiling verifies the headroom ceiling: a profile at or above
+// the ceiling is held in reserve even if its quota resets soonest.
+func TestDrainPolicyCeiling(t *testing.T) {
+	now := time.Now()
+	usageData := map[string]*UsageInfo{
+		"nearly-empty": {
+			ProfileName:    "nearly-empty",
+			PrimaryPercent: 96, // above the default 95% ceiling
+			AvailScore:     4,
+			ResetsAt:       timePtr(now.Add(1 * time.Hour)),
+		},
+		"fresh": {
+			ProfileName:    "fresh",
+			PrimaryPercent: 5,
+			AvailScore:     95,
+			ResetsAt:       timePtr(now.Add(6 * 24 * time.Hour)),
+		},
+	}
+
+	t.Run("default ceiling holds 96% profile in reserve", func(t *testing.T) {
+		s := NewSelector(AlgorithmSmart, nil, nil)
+		s.SetPolicy(PolicyDrain)
+		s.SetUsageData(usageData)
+
+		result, err := s.Select("codex", []string{"nearly-empty", "fresh"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Selected != "fresh" {
+			t.Errorf("selected %q, expected 'fresh' (nearly-empty is above the 95%% ceiling)", result.Selected)
+		}
+	})
+
+	t.Run("raised ceiling re-enables drain candidate", func(t *testing.T) {
+		s := NewSelector(AlgorithmSmart, nil, nil)
+		s.SetPolicy(PolicyDrain)
+		s.SetDrainCeiling(98)
+		s.SetUsageData(usageData)
+
+		result, err := s.Select("codex", []string{"nearly-empty", "fresh"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Selected != "nearly-empty" {
+			t.Errorf("selected %q, expected 'nearly-empty' under a 98%% ceiling", result.Selected)
+		}
+	})
+
+	t.Run("secondary window counts toward the ceiling", func(t *testing.T) {
+		s := NewSelector(AlgorithmSmart, nil, nil)
+		s.SetPolicy(PolicyDrain)
+		data := map[string]*UsageInfo{
+			"weekly-capped": {
+				ProfileName:      "weekly-capped",
+				PrimaryPercent:   10,
+				SecondaryPercent: 97, // weekly cap nearly exhausted
+				AvailScore:       10,
+				ResetsAt:         timePtr(now.Add(30 * time.Minute)),
+			},
+			"fresh": {
+				ProfileName:    "fresh",
+				PrimaryPercent: 5,
+				AvailScore:     95,
+				ResetsAt:       timePtr(now.Add(6 * 24 * time.Hour)),
+			},
+		}
+		s.SetUsageData(data)
+
+		result, err := s.Select("codex", []string{"weekly-capped", "fresh"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Selected != "fresh" {
+			t.Errorf("selected %q, expected 'fresh' (weekly-capped secondary window is above the ceiling)", result.Selected)
+		}
+	})
+}
+
+// TestDrainPolicyNoResetData verifies that with no drain-eligible candidates
+// (no reset timestamps), drain falls back to availability-ranked reserves.
+func TestDrainPolicyNoResetData(t *testing.T) {
+	usageData := map[string]*UsageInfo{
+		"alpha": {ProfileName: "alpha", PrimaryPercent: 60, AvailScore: 40},
+		"beta":  {ProfileName: "beta", PrimaryPercent: 20, AvailScore: 80},
+	}
+
+	s := NewSelector(AlgorithmSmart, nil, nil)
+	s.SetPolicy(PolicyDrain)
+	s.SetUsageData(usageData)
+
+	result, err := s.Select("codex", []string{"alpha", "beta"}, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Selected != "beta" {
+		t.Errorf("selected %q, expected 'beta' (highest availability among reserves)", result.Selected)
+	}
+	if !strings.Contains(result.Explanation, "no drain-eligible profile") {
+		t.Errorf("explanation %q should note there was no drain-eligible profile", result.Explanation)
+	}
+}
+
+func TestSetPolicyIgnoresUnknown(t *testing.T) {
+	s := NewSelector(AlgorithmSmart, nil, nil)
+	if s.policy != PolicyAvailability {
+		t.Fatalf("default policy = %q, expected availability", s.policy)
+	}
+	s.SetPolicy(Policy("bogus"))
+	if s.policy != PolicyAvailability {
+		t.Errorf("unknown policy changed selector policy to %q", s.policy)
+	}
+	s.SetPolicy(PolicyDrain)
+	if s.policy != PolicyDrain {
+		t.Errorf("policy = %q, expected drain", s.policy)
+	}
+
+	// Ceiling bounds
+	if s.drainCeiling != DefaultDrainCeiling {
+		t.Fatalf("default ceiling = %d, expected %d", s.drainCeiling, DefaultDrainCeiling)
+	}
+	s.SetDrainCeiling(0)
+	if s.drainCeiling != DefaultDrainCeiling {
+		t.Errorf("out-of-range ceiling was applied: %d", s.drainCeiling)
+	}
+	s.SetDrainCeiling(80)
+	if s.drainCeiling != 80 {
+		t.Errorf("ceiling = %d, expected 80", s.drainCeiling)
+	}
+}
+
 func TestSetAvoidRecent(t *testing.T) {
 	s := NewSelector(AlgorithmSmart, nil, nil)
 

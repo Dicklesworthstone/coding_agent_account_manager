@@ -189,10 +189,11 @@ func (u *UsageInfo) IsNearLimit(threshold float64) bool {
 	return false
 }
 
-// TimeUntilReset returns the shortest time until any window resets.
-func (u *UsageInfo) TimeUntilReset() time.Duration {
+// EarliestReset returns the earliest known reset time across all windows.
+// Returns the zero time if no window has a reset timestamp.
+func (u *UsageInfo) EarliestReset() time.Time {
 	if u == nil {
-		return 0
+		return time.Time{}
 	}
 
 	var earliest time.Time
@@ -222,6 +223,12 @@ func (u *UsageInfo) TimeUntilReset() time.Duration {
 		}
 	}
 
+	return earliest
+}
+
+// TimeUntilReset returns the shortest time until any window resets.
+func (u *UsageInfo) TimeUntilReset() time.Duration {
+	earliest := u.EarliestReset()
 	if earliest.IsZero() {
 		return 0
 	}

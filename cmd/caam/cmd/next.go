@@ -42,6 +42,7 @@ func init() {
 	nextCmd.Flags().BoolP("quiet", "q", false, "minimal output")
 	nextCmd.Flags().Bool("force", false, "activate even if profile is in cooldown")
 	nextCmd.Flags().String("algorithm", "", "override rotation algorithm (smart, round_robin, random)")
+	nextCmd.Flags().String("policy", "", "override rotation policy: availability (default), drain (prefer soonest-resetting usable quota; pair with --usage-aware)")
 	nextCmd.Flags().Bool("usage-aware", false, "fetch real-time rate limits to inform selection")
 	nextCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	rootCmd.AddCommand(nextCmd)
@@ -53,6 +54,13 @@ func runNext(cmd *cobra.Command, args []string) error {
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	force, _ := cmd.Flags().GetBool("force")
 	algoOverride, _ := cmd.Flags().GetString("algorithm")
+	policyOverride, _ := cmd.Flags().GetString("policy")
+	policyOverride = strings.ToLower(policyOverride)
+	switch policyOverride {
+	case "", "availability", "drain":
+	default:
+		return fmt.Errorf("unknown policy: %s (supported: availability, drain)", policyOverride)
+	}
 	usageAware, _ := cmd.Flags().GetBool("usage-aware")
 	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
 
@@ -122,9 +130,12 @@ func runNext(cmd *cobra.Command, args []string) error {
 		spmCfg = config.DefaultSPMConfig()
 	}
 
-	// Override algorithm if specified
+	// Override algorithm/policy if specified
 	if algoOverride != "" {
 		spmCfg.Stealth.Rotation.Algorithm = algoOverride
+	}
+	if policyOverride != "" {
+		spmCfg.Stealth.Rotation.Policy = policyOverride
 	}
 
 	// Open database for health/cooldown checks
@@ -160,7 +171,11 @@ func runNext(cmd *cobra.Command, args []string) error {
 
 	// If rotation selected the same profile (can happen with smart algorithm),
 	// use round_robin to force rotation to a different profile.
-	if selection.Selected == currentProfile && len(profiles) > 1 {
+	// Exception: under the drain policy (issue #81), staying on the profile
+	// whose quota resets soonest is the whole point — don't force a rotation
+	// away from it.
+	if selection.Selected == currentProfile && len(profiles) > 1 &&
+		spmCfg.Stealth.Rotation.Policy != "drain" {
 		spmCfg.Stealth.Rotation.Algorithm = "round_robin"
 		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
 		if err != nil {
@@ -268,20 +283,7 @@ func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotat
 			continue
 		}
 
-		info := &rotation.UsageInfo{
-			ProfileName: r.ProfileName,
-			AvailScore:  r.Usage.AvailabilityScore(),
-			Error:       r.Usage.Error,
-		}
-
-		if r.Usage.PrimaryWindow != nil {
-			info.PrimaryPercent = r.Usage.PrimaryWindow.UsedPercent
-		}
-		if r.Usage.SecondaryWindow != nil {
-			info.SecondaryPercent = r.Usage.SecondaryWindow.UsedPercent
-		}
-
-		usageData[r.ProfileName] = info
+		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage)
 	}
 
 	return usageData
@@ -303,6 +305,7 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	applyRotationPolicy(selector, spmCfg, "")
 
 	// Set usage data if available
 	if usageData != nil {

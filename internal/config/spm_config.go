@@ -130,6 +130,16 @@ type CooldownConfig struct {
 type RotationConfig struct {
 	Enabled   bool   `yaml:"enabled"`   // Master switch for rotation feature
 	Algorithm string `yaml:"algorithm"` // "smart" | "round_robin" | "random"
+
+	// Policy selects the ranking policy (issue #81):
+	// "availability" (default) maximizes immediate headroom — unchanged behavior.
+	// "drain" (opt-in) prefers the profile whose quota resets soonest, among
+	// profiles under DrainHeadroomCeiling, so expiring quota is used first.
+	Policy string `yaml:"policy"`
+
+	// DrainHeadroomCeiling is the percent-used ceiling for the drain policy
+	// (1-100). Profiles at or above it are held in reserve. Default: 95.
+	DrainHeadroomCeiling int `yaml:"drain_headroom_ceiling"`
 }
 
 // SafetyConfig contains data safety and recovery settings.
@@ -337,8 +347,10 @@ func DefaultSPMConfig() *SPMConfig {
 				TrackLimitHits: true,
 			},
 			Rotation: RotationConfig{
-				Enabled:   false, // Opt-in
-				Algorithm: "smart",
+				Enabled:              false, // Opt-in
+				Algorithm:            "smart",
+				Policy:               "availability", // Drain-before-reset is opt-in ("drain")
+				DrainHeadroomCeiling: 95,
 			},
 		},
 		Safety: SafetyConfig{
@@ -596,6 +608,13 @@ func (c *SPMConfig) Validate() error {
 	validAlgorithms := map[string]bool{"smart": true, "round_robin": true, "random": true}
 	if c.Stealth.Rotation.Algorithm != "" && !validAlgorithms[c.Stealth.Rotation.Algorithm] {
 		return fmt.Errorf("stealth.rotation.algorithm must be one of: smart, round_robin, random")
+	}
+	validPolicies := map[string]bool{"availability": true, "drain": true}
+	if c.Stealth.Rotation.Policy != "" && !validPolicies[c.Stealth.Rotation.Policy] {
+		return fmt.Errorf("stealth.rotation.policy must be one of: availability, drain")
+	}
+	if c.Stealth.Rotation.DrainHeadroomCeiling < 0 || c.Stealth.Rotation.DrainHeadroomCeiling > 100 {
+		return fmt.Errorf("stealth.rotation.drain_headroom_ceiling must be between 0 and 100")
 	}
 
 	// Safety validation

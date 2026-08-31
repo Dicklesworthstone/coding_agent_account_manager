@@ -74,6 +74,7 @@ func init() {
 	runCmd.Flags().Duration("cooldown", 60*time.Minute, "cooldown duration after rate limit")
 	runCmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
 	runCmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
+	runCmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
 	runCmd.Flags().Bool("precheck", false, "check usage levels before running and switch if near limit")
 	runCmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for precheck switching (0-1)")
 }
@@ -114,6 +115,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("unknown algorithm: %s (supported: smart, round_robin, random)", algorithmStr)
 	}
 
+	// Parse policy (issue #81: drain is opt-in; availability is the default)
+	policyStr, _ := cmd.Flags().GetString("policy")
+	policyStr = strings.ToLower(policyStr)
+	switch policyStr {
+	case "", "availability", "drain":
+	default:
+		return fmt.Errorf("unknown policy: %s (supported: availability, drain)", policyStr)
+	}
+
 	// Initialize vault
 	if vault == nil {
 		vault = authfile.NewVault(authfile.DefaultVaultPath())
@@ -137,6 +147,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		spmCfg = config.DefaultSPMConfig()
 	}
 
+	// CLI --policy overrides the configured rotation policy
+	if policyStr != "" {
+		spmCfg.Stealth.Rotation.Policy = policyStr
+	}
+
 	// Get working directory
 	cwd, err := getWd()
 	if err != nil {
@@ -147,7 +162,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
 	if precheck && (tool == "claude" || tool == "codex") {
-		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm); switched && !quiet {
+		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg); switched && !quiet {
 			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
@@ -167,6 +182,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 	// Initialize Rotation Selector
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	applyRotationPolicy(selector, spmCfg, "")
 
 	// Initialize Runner
 	if runner == nil {
@@ -292,7 +308,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 // runPrecheck checks current usage levels and switches profile if near limit.
 // Returns true if a switch was performed.
-func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm) bool {
+func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig) bool {
 	// Get current profile's access token
 	vaultDir := authfile.DefaultVaultPath()
 
@@ -353,22 +369,12 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 		if r.Usage == nil {
 			continue
 		}
-		info := &rotation.UsageInfo{
-			ProfileName: r.ProfileName,
-			AvailScore:  r.Usage.AvailabilityScore(),
-			Error:       r.Usage.Error,
-		}
-		if r.Usage.PrimaryWindow != nil {
-			info.PrimaryPercent = r.Usage.PrimaryWindow.UsedPercent
-		}
-		if r.Usage.SecondaryWindow != nil {
-			info.SecondaryPercent = r.Usage.SecondaryWindow.UsedPercent
-		}
-		usageData[r.ProfileName] = info
+		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage)
 	}
 
 	// Use rotation selector with usage data
 	selector := rotation.NewSelector(algorithm, nil, db)
+	applyRotationPolicy(selector, spmCfg, "")
 	selector.SetUsageData(usageData)
 
 	result, err := selector.Select(tool, allProfiles, currentProfile)

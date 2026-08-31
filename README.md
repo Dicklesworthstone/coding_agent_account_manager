@@ -439,7 +439,13 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 - `--max-retries N` — Maximum retry attempts on rate limit (default: 1)
 - `--cooldown DURATION` — Cooldown duration after rate limit (default: 60m)
 - `--algorithm NAME` — Rotation algorithm: smart, round_robin, random
+- `--policy NAME` — Rotation policy: availability (default), drain
 - `--quiet` — Suppress profile switch notifications
+
+**Rotation policies** (`--policy` on `caam precheck`, `caam next`, and `caam run`, or `stealth.rotation.policy` in `~/.caam/spm_config.yaml`):
+
+- `availability` (default) — maximize immediate headroom; this is the existing behavior and remains unchanged unless you opt in to another policy.
+- `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Profiles at/above the ceiling or without a known reset time are held in reserve, ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
 
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile

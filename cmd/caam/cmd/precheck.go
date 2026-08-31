@@ -51,33 +51,35 @@ func init() {
 	precheckCmd.Flags().Bool("no-fetch", false, "skip real-time API fetch (use cached/health data)")
 	precheckCmd.Flags().Duration("timeout", 30*time.Second, "timeout for API fetches")
 	precheckCmd.Flags().String("algorithm", "", "override rotation algorithm (smart, round_robin, random)")
+	precheckCmd.Flags().String("policy", "", "override rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
 	rootCmd.AddCommand(precheckCmd)
 }
 
 // PrecheckResult contains the structured output for precheck.
 type PrecheckResult struct {
-	Provider    string                `json:"provider"`
-	Recommended *ProfileRecommendation `json:"recommended,omitempty"`
+	Provider    string                  `json:"provider"`
+	Recommended *ProfileRecommendation  `json:"recommended,omitempty"`
 	Backups     []ProfileRecommendation `json:"backups"`
-	InCooldown  []CooldownProfile      `json:"in_cooldown"`
-	Alerts      []PrecheckAlert        `json:"alerts"`
-	Summary     *UsageSummary          `json:"summary"`
-	Forecast    *RotationForecast      `json:"forecast,omitempty"`
-	Algorithm   string                 `json:"algorithm"`
-	FetchedAt   time.Time              `json:"fetched_at"`
+	InCooldown  []CooldownProfile       `json:"in_cooldown"`
+	Alerts      []PrecheckAlert         `json:"alerts"`
+	Summary     *UsageSummary           `json:"summary"`
+	Forecast    *RotationForecast       `json:"forecast,omitempty"`
+	Algorithm   string                  `json:"algorithm"`
+	Explanation string                  `json:"explanation,omitempty"`
+	FetchedAt   time.Time               `json:"fetched_at"`
 }
 
 // ProfileRecommendation represents a profile with its recommendation data.
 type ProfileRecommendation struct {
-	Name           string   `json:"name"`
-	Score          float64  `json:"score"`
-	UsagePercent   int      `json:"usage_percent"`
-	AvailScore     int      `json:"availability_score"`
-	HealthStatus   string   `json:"health_status"`
-	TokenExpiry    string   `json:"token_expiry,omitempty"`
-	TimeToDepletion string  `json:"time_to_depletion,omitempty"`
-	Reasons        []string `json:"reasons"`
-	PoolStatus     string   `json:"pool_status"`
+	Name            string   `json:"name"`
+	Score           float64  `json:"score"`
+	UsagePercent    int      `json:"usage_percent"`
+	AvailScore      int      `json:"availability_score"`
+	HealthStatus    string   `json:"health_status"`
+	TokenExpiry     string   `json:"token_expiry,omitempty"`
+	TimeToDepletion string   `json:"time_to_depletion,omitempty"`
+	Reasons         []string `json:"reasons"`
+	PoolStatus      string   `json:"pool_status"`
 }
 
 // CooldownProfile represents a profile in cooldown.
@@ -89,29 +91,29 @@ type CooldownProfile struct {
 
 // PrecheckAlert represents an alert for the precheck.
 type PrecheckAlert struct {
-	Type      string `json:"type"`
-	Profile   string `json:"profile,omitempty"`
-	Message   string `json:"message"`
-	Urgency   string `json:"urgency"`
-	Action    string `json:"action,omitempty"`
+	Type    string `json:"type"`
+	Profile string `json:"profile,omitempty"`
+	Message string `json:"message"`
+	Urgency string `json:"urgency"`
+	Action  string `json:"action,omitempty"`
 }
 
 // UsageSummary contains aggregate usage information.
 type UsageSummary struct {
-	TotalProfiles   int    `json:"total_profiles"`
-	ReadyProfiles   int    `json:"ready_profiles"`
-	CooldownCount   int    `json:"cooldown_count"`
-	AvgUsagePercent int    `json:"avg_usage_percent"`
-	HealthyCount    int    `json:"healthy_count"`
-	WarningCount    int    `json:"warning_count"`
-	CriticalCount   int    `json:"critical_count"`
+	TotalProfiles   int `json:"total_profiles"`
+	ReadyProfiles   int `json:"ready_profiles"`
+	CooldownCount   int `json:"cooldown_count"`
+	AvgUsagePercent int `json:"avg_usage_percent"`
+	HealthyCount    int `json:"healthy_count"`
+	WarningCount    int `json:"warning_count"`
+	CriticalCount   int `json:"critical_count"`
 }
 
 // RotationForecast contains rotation prediction data.
 type RotationForecast struct {
-	NextRotation     string `json:"next_rotation,omitempty"`
-	RecommendedWait  string `json:"recommended_wait,omitempty"`
-	ProfilesUntilReset int  `json:"profiles_until_reset"`
+	NextRotation       string `json:"next_rotation,omitempty"`
+	RecommendedWait    string `json:"recommended_wait,omitempty"`
+	ProfilesUntilReset int    `json:"profiles_until_reset"`
 }
 
 func runPrecheckCmd(cmd *cobra.Command, args []string) error {
@@ -119,6 +121,13 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	noFetch, _ := cmd.Flags().GetBool("no-fetch")
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	algoOverride, _ := cmd.Flags().GetString("algorithm")
+	policyOverride, _ := cmd.Flags().GetString("policy")
+	policyOverride = strings.ToLower(policyOverride)
+	switch policyOverride {
+	case "", "availability", "drain":
+	default:
+		return fmt.Errorf("unknown policy: %s (supported: availability, drain)", policyOverride)
+	}
 
 	// Default to claude if no provider specified
 	provider := "claude"
@@ -209,23 +218,13 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStoreInst, db)
+	applyRotationPolicy(selector, spmCfg, policyOverride)
 
 	// Set usage data for smart selection
 	if len(usageMap) > 0 {
 		rotationUsage := make(map[string]*rotation.UsageInfo)
 		for name, info := range usageMap {
-			ru := &rotation.UsageInfo{
-				ProfileName: name,
-				AvailScore:  info.AvailabilityScore(),
-				Error:       info.Error,
-			}
-			if info.PrimaryWindow != nil {
-				ru.PrimaryPercent = info.PrimaryWindow.UsedPercent
-			}
-			if info.SecondaryWindow != nil {
-				ru.SecondaryPercent = info.SecondaryWindow.UsedPercent
-			}
-			rotationUsage[name] = ru
+			rotationUsage[name] = toRotationUsageInfo(name, info)
 		}
 		selector.SetUsageData(rotationUsage)
 	}
@@ -271,6 +270,9 @@ func buildPrecheckResult(
 		Alerts:     make([]PrecheckAlert, 0),
 		Algorithm:  algorithm,
 		FetchedAt:  time.Now(),
+	}
+	if selection != nil {
+		result.Explanation = selection.Explanation
 	}
 
 	// Summary counters
@@ -468,6 +470,9 @@ func precheckOutputBrief(w io.Writer, result *PrecheckResult) error {
 	if rec.UsagePercent > 0 {
 		extra = fmt.Sprintf(" (%d%% used)", rec.UsagePercent)
 	}
+	if result.Explanation != "" {
+		extra += " - " + result.Explanation
+	}
 	fmt.Fprintf(w, "%s: %s%s\n", result.Provider, rec.Name, extra)
 	return nil
 }
@@ -491,6 +496,11 @@ func precheckOutputTable(w io.Writer, result *PrecheckResult) error {
 			fmt.Fprintf(w, " [%s]", rec.HealthStatus)
 		}
 		fmt.Fprintln(w)
+
+		// Policy explanation (drain policy, issue #81)
+		if result.Explanation != "" {
+			fmt.Fprintf(w, "    Why: %s\n", result.Explanation)
+		}
 
 		// Usage bar
 		if rec.UsagePercent > 0 || rec.AvailScore > 0 {
