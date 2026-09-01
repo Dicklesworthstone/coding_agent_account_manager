@@ -161,6 +161,18 @@ Tests live alongside implementation in `_test.go` files within each package. Tes
 - Edge cases (empty input, max values, boundary conditions)
 - Error conditions
 
+### Test Isolation (MANDATORY)
+
+Every package that has tests carries a `main_test.go` whose `TestMain` calls
+`testutil.RunIsolated(m)`. It points `HOME`, the XDG base directories, and the
+tool-specific home variables at a fresh temporary tree, unsets ambient API
+keys, and puts no-op stand-ins for the agent CLIs and browser openers first on
+`PATH`. Production code exercised by tests (auth restore, `caam add`, wrap)
+resolves `os.UserHomeDir()` and launches real CLIs; without this guard a plain
+`go test ./...` on a machine with live logins overwrote `~/.claude.json` and
+opened OAuth browser windows. `TestEveryTestPackageIsolatesHome` fails the
+suite when a package is missing the guard, so add the file with the package.
+
 ### Running Tests
 
 ```bash

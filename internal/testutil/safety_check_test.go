@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -297,5 +298,63 @@ func findProjectRoot(t *testing.T) string {
 			t.Fatalf("Could not find project root (go.mod)")
 		}
 		dir = parent
+	}
+}
+
+// TestEveryTestPackageIsolatesHome fails when a package with tests has no
+// TestMain that calls RunIsolated. TestNoRealHomeWrites above scans test
+// sources for dangerous patterns, but the writers that actually corrupted a
+// developer's ~/.claude.json live in production code the tests call
+// (authfile restore, wrap, the CLI commands), which no source scan can see.
+// The runtime guard in RunIsolated is the real protection; this test keeps it
+// from eroding as packages are added.
+func TestEveryTestPackageIsolatesHome(t *testing.T) {
+	rootDir := findProjectRoot(t)
+
+	testFiles := map[string][]string{}
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && (info.Name() == ".git" || info.Name() == "vendor") {
+			return filepath.SkipDir
+		}
+		if strings.HasSuffix(path, "_test.go") {
+			dir := filepath.Dir(path)
+			testFiles[dir] = append(testFiles[dir], path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to walk directory: %v", err)
+	}
+
+	var missing []string
+	for dir, files := range testFiles {
+		isolated := false
+		for _, file := range files {
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Errorf("Failed to read %s: %v", file, err)
+				continue
+			}
+			src := string(content)
+			if strings.Contains(src, "func TestMain(") && strings.Contains(src, "RunIsolated(") {
+				isolated = true
+				break
+			}
+		}
+		if !isolated {
+			relDir, _ := filepath.Rel(rootDir, dir)
+			missing = append(missing, relDir)
+		}
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d package(s) with tests do not run under an isolated HOME:\n\n  %s\n\n"+
+			"FIX: add a main_test.go whose TestMain calls testutil.RunIsolated(m). "+
+			"Without it, `go test` on a machine with live logins can overwrite real auth files.",
+			len(missing), strings.Join(missing, "\n  "))
 	}
 }
