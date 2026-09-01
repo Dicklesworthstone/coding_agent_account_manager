@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/spf13/cobra"
@@ -610,5 +611,78 @@ func TestFormatIdentityDisplay_ClaudeEmptyEmail(t *testing.T) {
 				t.Errorf("formatIdentityDisplay() plan = %q, want %q", gotPlan, tc.wantPlan)
 			}
 		})
+	}
+}
+
+// TestGetVaultIdentity_ClaudeEmailFromSettings covers the whole status/ls
+// display path: a vault Claude profile whose .credentials.json carries no
+// email must still report the one its .claude.json snapshot holds, instead of
+// falling through to "n/a".
+func TestGetVaultIdentity_ClaudeEmailFromSettings(t *testing.T) {
+	prevVault := vault
+	t.Cleanup(func() { vault = prevVault })
+
+	vaultDir := t.TempDir()
+	vault = authfile.NewVault(vaultDir)
+
+	profileDir := vault.ProfilePath("claude", "work")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	credentials := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max","expiresAt":1788000000000}}`
+	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(credentials), 0600); err != nil {
+		t.Fatalf("write .credentials.json: %v", err)
+	}
+	settings := `{"oauthAccount":{"accountUuid":"uuid-work","emailAddress":"work@example.com"}}`
+	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), []byte(settings), 0600); err != nil {
+		t.Fatalf("write .claude.json: %v", err)
+	}
+
+	id := getVaultIdentity("claude", "work")
+	if id == nil {
+		t.Fatal("getVaultIdentity returned nil")
+	}
+	if id.Email != "work@example.com" {
+		t.Errorf("Email = %q, want %q", id.Email, "work@example.com")
+	}
+	if id.AccountID != "uuid-work" {
+		t.Errorf("AccountID = %q, want %q", id.AccountID, "uuid-work")
+	}
+
+	email, plan := formatIdentityDisplay(id)
+	if email != "work@example.com" {
+		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "work@example.com")
+	}
+	if plan != "Pro" { // "max" normalizes to pro, FormatPlanType capitalizes
+		t.Errorf("formatIdentityDisplay() plan = %q, want %q", plan, "Pro")
+	}
+}
+
+// A Claude profile with no .claude.json keeps the existing "n/a" display.
+func TestGetVaultIdentity_ClaudeNoSettingsFile(t *testing.T) {
+	prevVault := vault
+	t.Cleanup(func() { vault = prevVault })
+
+	vaultDir := t.TempDir()
+	vault = authfile.NewVault(vaultDir)
+
+	profileDir := vault.ProfilePath("claude", "solo")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	credentials := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max"}}`
+	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(credentials), 0600); err != nil {
+		t.Fatalf("write .credentials.json: %v", err)
+	}
+
+	id := getVaultIdentity("claude", "solo")
+	if id == nil {
+		t.Fatal("getVaultIdentity returned nil")
+	}
+	if id.Email != "" {
+		t.Errorf("Email = %q, want empty", id.Email)
+	}
+	if email, _ := formatIdentityDisplay(id); email != "n/a" {
+		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "n/a")
 	}
 }

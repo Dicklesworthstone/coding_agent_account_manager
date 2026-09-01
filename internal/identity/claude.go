@@ -5,17 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
+// claudeSettingsFile is the Claude Code settings file that carries the account
+// identity block.
+const claudeSettingsFile = ".claude.json"
+
 // ExtractFromClaudeCredentials reads Claude .credentials.json and extracts identity.
 //
-// IMPORTANT: Current Claude auth files (as of early 2026) do NOT include:
-//   - accountId: No longer present in claudeAiOauth
-//   - email: No longer present in claudeAiOauth
-//
-// These fields will return empty strings. Only expiresAt and subscriptionType
-// are reliably present. Callers should handle empty identity fields gracefully.
+// Current Claude auth files (as of early 2026) carry only expiresAt and
+// subscriptionType in claudeAiOauth: accountId and email are no longer written
+// there. The account identity lives in the .claude.json that accompanies the
+// credentials, under oauthAccount (accountUuid / emailAddress /
+// organizationName), so that file supplies whatever the credentials omit.
+// Whatever the credentials still carry wins, and a missing or unparseable
+// .claude.json simply leaves the identity fields empty.
 //
 // See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001)
 func ExtractFromClaudeCredentials(path string) (*Identity, error) {
@@ -34,19 +40,81 @@ func ExtractFromClaudeCredentials(path string) (*Identity, error) {
 
 	identity := &Identity{Provider: "claude"}
 
-	raw, ok := root["claudeAiOauth"].(map[string]interface{})
-	if !ok {
-		return identity, nil
+	if raw, ok := root["claudeAiOauth"].(map[string]interface{}); ok {
+		identity.AccountID = valueAsString(raw["accountId"])
+		identity.PlanType = valueAsString(raw["subscriptionType"])
+		identity.Email = valueAsString(raw["email"])
+		if exp, ok := parseEpoch(raw["expiresAt"]); ok {
+			identity.ExpiresAt = exp
+		}
 	}
 
-	identity.AccountID = valueAsString(raw["accountId"])
-	identity.PlanType = valueAsString(raw["subscriptionType"])
-	identity.Email = valueAsString(raw["email"])
-	if exp, ok := parseEpoch(raw["expiresAt"]); ok {
-		identity.ExpiresAt = exp
-	}
+	applyClaudeSettingsIdentity(identity, path)
 
 	return identity, nil
+}
+
+// claudeOAuthAccount is the identity block of a .claude.json. The file also
+// carries per-project session history and runs to hundreds of kilobytes, so
+// it is decoded into this struct rather than a generic map: the decoder then
+// walks the rest of the document without allocating it.
+type claudeOAuthAccount struct {
+	AccountUUID      string `json:"accountUuid"`
+	EmailAddress     string `json:"emailAddress"`
+	OrganizationName string `json:"organizationName"`
+}
+
+// applyClaudeSettingsIdentity fills the identity fields absent from
+// .credentials.json out of the oauthAccount block of the .claude.json that
+// accompanies it. Fields already read from the credentials are left alone.
+func applyClaudeSettingsIdentity(identity *Identity, credentialsPath string) {
+	for _, settingsPath := range claudeSettingsCandidates(credentialsPath) {
+		account, ok := readClaudeOAuthAccount(settingsPath)
+		if !ok {
+			continue
+		}
+		if identity.Email == "" {
+			identity.Email = account.EmailAddress
+		}
+		if identity.AccountID == "" {
+			identity.AccountID = account.AccountUUID
+		}
+		if identity.Organization == "" {
+			identity.Organization = account.OrganizationName
+		}
+		return
+	}
+}
+
+// claudeSettingsCandidates lists the .claude.json locations that pair with a
+// .credentials.json at credentialsPath: the same directory (vault profile
+// snapshots and CLAUDE_CONFIG_DIR layouts keep the two side by side) and its
+// parent (the live ~/.claude/.credentials.json pairs with ~/.claude.json).
+func claudeSettingsCandidates(credentialsPath string) []string {
+	dir := filepath.Dir(credentialsPath)
+	return []string{
+		filepath.Join(dir, claudeSettingsFile),
+		filepath.Join(filepath.Dir(dir), claudeSettingsFile),
+	}
+}
+
+// readClaudeOAuthAccount parses the oauthAccount block out of a .claude.json.
+// The bool reports whether the file yielded any identity at all: unreadable,
+// unparseable, oauthAccount-less, and legacy bare-string oauthAccount files
+// all report false so the next candidate path gets a turn.
+func readClaudeOAuthAccount(path string) (claudeOAuthAccount, bool) {
+	var root struct {
+		OAuthAccount claudeOAuthAccount `json:"oauthAccount"`
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return claudeOAuthAccount{}, false
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return claudeOAuthAccount{}, false
+	}
+	return root.OAuthAccount, root.OAuthAccount != claudeOAuthAccount{}
 }
 
 func parseEpoch(value interface{}) (time.Time, bool) {

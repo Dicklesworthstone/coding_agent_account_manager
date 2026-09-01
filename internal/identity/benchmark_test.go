@@ -3,6 +3,9 @@ package identity
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -87,16 +90,16 @@ func BenchmarkJWTParsingLargeClaims(b *testing.B) {
 // BenchmarkJWTClaimExtraction focuses on the claim extraction overhead.
 func BenchmarkJWTClaimExtraction(b *testing.B) {
 	claims := map[string]interface{}{
-		"email":             "user@example.com",
+		"email":              "user@example.com",
 		"preferred_username": "testuser",
-		"organization":      "acme-corp",
-		"org":               "acme",
-		"org_name":          "ACME Corporation",
-		"plan_type":         "enterprise",
-		"subscription_type": "max",
-		"account_id":        "acc_123",
-		"user_id":           "usr_456",
-		"exp":               time.Now().Add(time.Hour).Unix(),
+		"organization":       "acme-corp",
+		"org":                "acme",
+		"org_name":           "ACME Corporation",
+		"plan_type":          "enterprise",
+		"subscription_type":  "max",
+		"account_id":         "acc_123",
+		"user_id":            "usr_456",
+		"exp":                time.Now().Add(time.Hour).Unix(),
 	}
 	token := buildTestJWT(claims)
 
@@ -131,4 +134,52 @@ func BenchmarkJWTParsingParallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// BenchmarkClaudeCredentialsWithSettings measures identity extraction when the
+// oauthAccount fallback has to parse a realistically large .claude.json
+// (vault snapshots run from tens of KB to a few hundred KB, since the file
+// also carries per-project session history).
+func BenchmarkClaudeCredentialsWithSettings(b *testing.B) {
+	dir := b.TempDir()
+	credentials := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max","expiresAt":1788000000000}}`
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(credentials), 0600); err != nil {
+		b.Fatalf("write .credentials.json: %v", err)
+	}
+
+	projects := make(map[string]interface{}, 400)
+	for i := 0; i < 400; i++ {
+		projects[fmt.Sprintf("/home/user/code/project-%d", i)] = map[string]interface{}{
+			"allowedTools": []string{"Bash", "Read", "Edit", "Write"},
+			"history":      []string{strings.Repeat("a recorded prompt line ", 20)},
+		}
+	}
+	settings, err := json.Marshal(map[string]interface{}{
+		"userID":   "per-installation-id",
+		"projects": projects,
+		"oauthAccount": map[string]interface{}{
+			"accountUuid":      "0552aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+			"emailAddress":     "bench@example.com",
+			"organizationName": "bench-org",
+		},
+	})
+	if err != nil {
+		b.Fatalf("marshal settings: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), settings, 0600); err != nil {
+		b.Fatalf("write .claude.json: %v", err)
+	}
+	b.Logf(".claude.json size: %d bytes", len(settings))
+
+	path := filepath.Join(dir, ".credentials.json")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id, err := ExtractFromClaudeCredentials(path)
+		if err != nil {
+			b.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+		}
+		if id.Email == "" {
+			b.Fatal("expected email from oauthAccount")
+		}
+	}
 }
