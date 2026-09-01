@@ -1,6 +1,9 @@
 package health
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // HealthStatus represents the overall health state of a profile.
 type HealthStatus int
@@ -41,6 +44,41 @@ func (s HealthStatus) Icon() string {
 		return "🔴"
 	default:
 		return "⚪"
+	}
+}
+
+// PlanTier ranks subscription plans by the usage headroom they buy. Health
+// scoring and rotation scoring both reward better plans; they rank through
+// this one function so the two can never disagree about what "better" means,
+// and so the stored plan can keep the provider's real spelling ("max")
+// instead of being collapsed to a spelling the scorers happen to know.
+type PlanTier int
+
+const (
+	// PlanTierUnrated is a free plan, a blank value, or a spelling caam does
+	// not recognize (e.g. "claude_pro_2025"). It earns no bonus.
+	PlanTierUnrated PlanTier = iota
+	// PlanTierStandard is an entry paid seat: pro, plus, team.
+	PlanTierStandard
+	// PlanTierHighVolume is a premium individual seat with a substantially
+	// larger quota: Claude Max, Gemini Ultra, and similar.
+	PlanTierHighVolume
+	// PlanTierEnterprise is a negotiated enterprise contract.
+	PlanTierEnterprise
+)
+
+// PlanTierOf maps a plan string, in any case and with surrounding whitespace,
+// to its tier. Unknown values are unrated rather than guessed at.
+func PlanTierOf(planType string) PlanTier {
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "enterprise":
+		return PlanTierEnterprise
+	case "max", "ultra", "premium":
+		return PlanTierHighVolume
+	case "pro", "plus", "team":
+		return PlanTierStandard
+	default:
+		return PlanTierUnrated
 	}
 }
 
@@ -106,11 +144,14 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score -= 0.5
 	}
 
-	// Factor 3: Plan type bonus
-	switch h.PlanType {
-	case "enterprise":
+	// Factor 3: Plan type bonus, ranked through PlanTierOf so it agrees with
+	// the rotation scorer.
+	switch PlanTierOf(h.PlanType) {
+	case PlanTierEnterprise:
 		score += 0.3
-	case "pro", "team":
+	case PlanTierHighVolume:
+		score += 0.25
+	case PlanTierStandard:
 		score += 0.2
 	}
 

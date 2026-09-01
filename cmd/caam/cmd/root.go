@@ -524,16 +524,13 @@ func primePlanTypes(tool string, profiles []string) {
 	}
 }
 
+// normalizePlanType canonicalizes the spelling of a provider-reported plan so
+// storage, display, and scoring agree on one form. It does not collapse
+// tiers: a Claude Max account reports subscriptionType "max" and keeps
+// reading "max" in `caam status`, `caam ls`, and --json output. Scoring
+// ranks plans through health.PlanTierOf rather than by spelling.
 func normalizePlanType(planType string) string {
-	plan := strings.ToLower(strings.TrimSpace(planType))
-	switch plan {
-	case "max", "ultra", "plus", "premium":
-		return "pro"
-	case "enterprise", "team", "pro", "free":
-		return plan
-	default:
-		return plan
-	}
+	return strings.ToLower(strings.TrimSpace(planType))
 }
 
 func formatIdentityDisplay(id *identity.Identity) (string, string) {

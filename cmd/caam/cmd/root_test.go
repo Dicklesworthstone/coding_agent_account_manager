@@ -614,6 +614,36 @@ func TestFormatIdentityDisplay_ClaudeEmptyEmail(t *testing.T) {
 	}
 }
 
+// TestNormalizePlanType guards PR #87: normalization only canonicalizes the
+// spelling and never collapses tiers, so a Claude Max account keeps reading
+// "max" in storage, display, and --json output.
+func TestNormalizePlanType(t *testing.T) {
+	tests := map[string]string{
+		"max":        "max",
+		" Max ":      "max",
+		"ULTRA":      "ultra",
+		"plus":       "plus",
+		"premium":    "premium",
+		"pro":        "pro",
+		"team":       "team",
+		"enterprise": "enterprise",
+		"free":       "free",
+		"":           "",
+		"custom_x":   "custom_x",
+	}
+	for in, want := range tests {
+		if got := normalizePlanType(in); got != want {
+			t.Errorf("normalizePlanType(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	id := &identity.Identity{Provider: "claude", PlanType: "max"}
+	normalizeIdentityPlan(id)
+	if _, plan := formatIdentityDisplay(id); plan != "Max" {
+		t.Errorf("display plan = %q, want %q", plan, "Max")
+	}
+}
+
 // TestGetVaultIdentity_ClaudeEmailFromClaudeJSON covers the status/ls display
 // path for PR #85: a vault Claude profile whose .credentials.json carries no
 // email still reports the one in its .claude.json snapshot, and a profile
