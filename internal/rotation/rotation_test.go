@@ -2,9 +2,12 @@ package rotation
 
 import (
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 func TestNewSelector(t *testing.T) {
@@ -549,5 +552,80 @@ func TestSetAvoidRecent(t *testing.T) {
 	s.SetAvoidRecent(2 * time.Hour)
 	if s.avoidRecent != 2*time.Hour {
 		t.Errorf("avoidRecent = %v, expected 2h", s.avoidRecent)
+	}
+}
+
+// TestPlanBonus_RanksMaxAtLeastAsHighAsPro guards the fix for Claude Max
+// accounts being stored as "pro": the rotation bonus must follow the shared
+// health.PlanTierOf ordering rather than a private list that only knew "pro".
+func TestPlanBonus_RanksMaxAtLeastAsHighAsPro(t *testing.T) {
+	free := planBonus("free")
+	pro := planBonus("pro")
+	team := planBonus("team")
+	max := planBonus("max")
+	ultra := planBonus("ultra")
+	enterprise := planBonus("enterprise")
+
+	if pro <= free {
+		t.Errorf("pro bonus %v must beat free bonus %v", pro, free)
+	}
+	if team != pro {
+		t.Errorf("team bonus %v must match pro bonus %v", team, pro)
+	}
+	if max < pro {
+		t.Errorf("max bonus %v must be at least pro bonus %v", max, pro)
+	}
+	if ultra < pro {
+		t.Errorf("ultra bonus %v must be at least pro bonus %v", ultra, pro)
+	}
+	if enterprise < max {
+		t.Errorf("enterprise bonus %v must be at least max bonus %v", enterprise, max)
+	}
+	if got := planBonus("claude_pro_2025"); got != 0 {
+		t.Errorf("unrecognized plan bonus = %v, want 0", got)
+	}
+}
+
+// TestSelectSmart_ExplainsMaxPlanByName exercises the bonus through the real
+// scoring path: a Max account must be explained as "Max plan", not "Pro plan".
+func TestSelectSmart_ExplainsMaxPlanByName(t *testing.T) {
+	store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	expiry := time.Now().Add(24 * time.Hour)
+
+	if err := store.UpdateProfile("claude", "maxacct", &health.ProfileHealth{
+		TokenExpiresAt: expiry,
+		PlanType:       "max",
+	}); err != nil {
+		t.Fatalf("UpdateProfile(maxacct) error = %v", err)
+	}
+	if err := store.UpdateProfile("claude", "proacct", &health.ProfileHealth{
+		TokenExpiresAt: expiry,
+		PlanType:       "pro",
+	}); err != nil {
+		t.Fatalf("UpdateProfile(proacct) error = %v", err)
+	}
+
+	s := NewSelector(AlgorithmSmart, store, nil)
+	result, err := s.Select("claude", []string{"maxacct", "proacct"}, "")
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	// Selection between two equally healthy profiles is jittered, so assert on
+	// the scored explanations rather than on which profile came out on top.
+	reasons := map[string]string{}
+	for _, alt := range result.Alternatives {
+		var texts []string
+		for _, r := range alt.Reasons {
+			texts = append(texts, r.Text)
+		}
+		reasons[alt.Name] = strings.Join(texts, "|")
+	}
+
+	if got := reasons["maxacct"]; !strings.Contains(got, "Max plan") {
+		t.Errorf("reasons for maxacct = %q, want one containing %q", got, "Max plan")
+	}
+	if got := reasons["proacct"]; !strings.Contains(got, "Pro plan") {
+		t.Errorf("reasons for proacct = %q, want one containing %q", got, "Pro plan")
 	}
 }

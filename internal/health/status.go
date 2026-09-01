@@ -1,6 +1,9 @@
 package health
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // HealthStatus represents the overall health state of a profile.
 type HealthStatus int
@@ -41,6 +44,44 @@ func (s HealthStatus) Icon() string {
 		return "🔴"
 	default:
 		return "⚪"
+	}
+}
+
+// PlanTier ranks a subscription plan by the usage headroom it buys. Health
+// scoring and rotation scoring both rank plans, so the ordering lives here once
+// instead of in a switch per package: adding a plan means editing PlanTierOf
+// and nothing else.
+type PlanTier int
+
+const (
+	// PlanTierUnrated covers free plans, blank values, and provider-specific
+	// strings we do not recognize (for example "claude_pro_2025"). These earn
+	// no scoring bonus.
+	PlanTierUnrated PlanTier = iota
+	// PlanTierStandard covers entry paid seats: pro, plus, team.
+	PlanTierStandard
+	// PlanTierHighVolume covers premium individual seats with substantially
+	// larger quotas: Claude Max, Gemini Ultra, and similar.
+	PlanTierHighVolume
+	// PlanTierEnterprise covers negotiated enterprise contracts, which have
+	// the most headroom and are the safest to route work to.
+	PlanTierEnterprise
+)
+
+// PlanTierOf maps a plan string (as stored by normalizePlanType: lowercase and
+// trimmed) to its tier. Unknown values are deliberately unrated rather than
+// guessed at, so a new provider spelling degrades to "no bonus" instead of a
+// wrong one.
+func PlanTierOf(planType string) PlanTier {
+	switch strings.ToLower(strings.TrimSpace(planType)) {
+	case "enterprise":
+		return PlanTierEnterprise
+	case "max", "ultra", "premium":
+		return PlanTierHighVolume
+	case "pro", "plus", "team":
+		return PlanTierStandard
+	default:
+		return PlanTierUnrated
 	}
 }
 
@@ -106,12 +147,17 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score -= 0.5
 	}
 
-	// Factor 3: Plan type bonus
-	switch h.PlanType {
-	case "enterprise":
+	// Factor 3: Plan type bonus, ranked by PlanTierOf so this agrees with the
+	// rotation scorer.
+	switch PlanTierOf(h.PlanType) {
+	case PlanTierEnterprise:
 		score += 0.3
-	case "pro", "team":
+	case PlanTierHighVolume:
+		score += 0.25
+	case PlanTierStandard:
 		score += 0.2
+	case PlanTierUnrated:
+		// Free/unknown plans get no bonus.
 	}
 
 	// Factor 4: Penalty (from errors, with decay)

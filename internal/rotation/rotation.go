@@ -525,23 +525,10 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 				}
 
 				// Plan type bonus
-				switch h.PlanType {
-				case "enterprise":
-					score.Score += 30
+				if bonus := planBonus(h.PlanType); bonus > 0 {
+					score.Score += bonus
 					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Enterprise plan",
-						Positive: true,
-					})
-				case "pro":
-					score.Score += 20
-					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Pro plan",
-						Positive: true,
-					})
-				case "team":
-					score.Score += 20
-					score.Reasons = append(score.Reasons, Reason{
-						Text:     "Team plan",
+						Text:     fmt.Sprintf("%s plan", health.FormatPlanType(h.PlanType)),
 						Positive: true,
 					})
 				}
@@ -651,6 +638,22 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 		Algorithm:    AlgorithmSmart,
 		Alternatives: scores,
 	}, nil
+}
+
+// planBonus converts a subscription plan into rotation score points. The
+// ranking itself lives in health.PlanTierOf so that this scorer and the health
+// scorer cannot drift apart; only the point values are local.
+func planBonus(planType string) float64 {
+	switch health.PlanTierOf(planType) {
+	case health.PlanTierEnterprise:
+		return 30
+	case health.PlanTierHighVolume:
+		return 25
+	case health.PlanTierStandard:
+		return 20
+	default:
+		return 0
+	}
 }
 
 // isInCooldown checks if a profile is currently in cooldown.

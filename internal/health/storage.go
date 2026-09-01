@@ -34,7 +34,9 @@ type ProfileHealth struct {
 	// PenaltyUpdatedAt is when the penalty was last updated.
 	PenaltyUpdatedAt time.Time `json:"penalty_updated_at,omitempty"`
 
-	// PlanType is the subscription tier (free, pro, enterprise).
+	// PlanType is the subscription tier as the provider reports it, lowercased
+	// (free, pro, plus, team, max, ultra, premium, enterprise). Ranked by
+	// PlanTierOf; never collapsed to a single paid spelling.
 	PlanType string `json:"plan_type,omitempty"`
 
 	// LastChecked is when health was last verified.

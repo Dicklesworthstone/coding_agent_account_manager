@@ -224,6 +224,14 @@ func FormatPlanType(planType string) string {
 		return "Team"
 	case "free":
 		return "Free"
+	case "max":
+		return "Max"
+	case "ultra":
+		return "Ultra"
+	case "plus":
+		return "Plus"
+	case "premium":
+		return "Premium"
 	default:
 		if planType == "" {
 			return ""

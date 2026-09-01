@@ -177,3 +177,73 @@ func TestCalculateHealthRateLimitCap(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanTierOf(t *testing.T) {
+	tests := []struct {
+		plan string
+		want PlanTier
+	}{
+		{"enterprise", PlanTierEnterprise},
+		{"ENTERPRISE", PlanTierEnterprise},
+		{"max", PlanTierHighVolume},
+		{"Max", PlanTierHighVolume},
+		{"ultra", PlanTierHighVolume},
+		{"premium", PlanTierHighVolume},
+		{"pro", PlanTierStandard},
+		{"plus", PlanTierStandard},
+		{"team", PlanTierStandard},
+		{"free", PlanTierUnrated},
+		{"", PlanTierUnrated},
+		{"claude_pro_2025", PlanTierUnrated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.plan, func(t *testing.T) {
+			if got := PlanTierOf(tt.plan); got != tt.want {
+				t.Errorf("PlanTierOf(%q) = %v, want %v", tt.plan, got, tt.want)
+			}
+		})
+	}
+
+	if !(PlanTierOf("max") >= PlanTierOf("pro")) {
+		t.Error("max must rank at least as high as pro")
+	}
+	if !(PlanTierOf("enterprise") >= PlanTierOf("max")) {
+		t.Error("enterprise must rank at least as high as max")
+	}
+}
+
+// TestCalculateHealth_PlanBonusKeepsMaxAtLeastAsGoodAsPro guards the fix for
+// Max accounts being stored as "pro": now that the real plan survives, the
+// scoring must not punish a Max account for no longer saying "pro".
+func TestCalculateHealth_PlanBonusKeepsMaxAtLeastAsGoodAsPro(t *testing.T) {
+	config := DefaultHealthConfig()
+	expiry := time.Now().Add(24 * time.Hour)
+
+	scoreFor := func(plan string) float64 {
+		_, score := CalculateHealth(&ProfileHealth{
+			TokenExpiresAt: expiry,
+			PlanType:       plan,
+		}, config)
+		return score
+	}
+
+	free := scoreFor("free")
+	pro := scoreFor("pro")
+	max := scoreFor("max")
+	ultra := scoreFor("ultra")
+	enterprise := scoreFor("enterprise")
+
+	if pro <= free {
+		t.Errorf("pro score %v must beat free score %v", pro, free)
+	}
+	if max < pro {
+		t.Errorf("max score %v must be at least pro score %v", max, pro)
+	}
+	if ultra < pro {
+		t.Errorf("ultra score %v must be at least pro score %v", ultra, pro)
+	}
+	if enterprise < max {
+		t.Errorf("enterprise score %v must be at least max score %v", enterprise, max)
+	}
+}

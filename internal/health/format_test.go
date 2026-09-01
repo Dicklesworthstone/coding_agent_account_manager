@@ -239,6 +239,11 @@ func TestFormatPlanType(t *testing.T) {
 		{"Pro", "Pro"},
 		{"team", "Team"},
 		{"free", "Free"},
+		{"max", "Max"},
+		{"MAX", "Max"},
+		{"ultra", "Ultra"},
+		{"plus", "Plus"},
+		{"premium", "Premium"},
 		{"", ""},
 		{"custom", "custom"},
 	}
