@@ -63,7 +63,8 @@ Layout under ~/orch-homes/<name>/ (claude shown):
 
 Spawn under a shallow identity with:
 
-  caam shallow-spawn <name> -- <tool>
+  caam shallow-spawn <name>            # runs the profile's own provider CLI
+  caam shallow-spawn <name> -- <cmd>   # runs any other command
 
 which sets HOME=~/orch-homes/<name> (plus CODEX_HOME/GEMINI_HOME for those
 providers) and execs the command.`,
@@ -236,7 +237,8 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "  Credentials: %s\n", opts.CredentialFromLabel)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "\nNext steps:\n")
-	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s -- %s\n", name, shallowSpawnHintBin(provider))
+	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s              # opens %s under this profile\n", name, shallowSpawnHintBin(provider))
+	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s -- <cmd>     # or any other command\n", name)
 	return nil
 }
 
@@ -490,11 +492,16 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 
 // shallowSpawnCmd sets HOME=<orch-homes>/<name> and execs the requested command.
 var shallowSpawnCmd = &cobra.Command{
-	Use:   "shallow-spawn <name> -- <cmd> [args...]",
-	Short: "Run a command under a shallow profile's HOME",
-	Long: `Set HOME (and SHALLOW_PROFILE) to the named shallow profile and exec
-the given command. Concurrent invocations under different names hit
+	Use:   "shallow-spawn <name> [-- <cmd> [args...]]",
+	Short: "Open a shallow profile's provider CLI (or any command) under its HOME",
+	Long: `Set HOME (and SHALLOW_PROFILE) to the named shallow profile and exec a
+command under it. Concurrent invocations under different names hit
 independent .credentials.json files and can run truly in parallel.
+
+With no '-- <cmd>' section the profile's own provider CLI is run (claude for
+a claude profile, codex for codex, agy for agy), so "open Claude as alice in
+this terminal" is just 'caam shallow-spawn alice'. Pass '-- <cmd> [args...]'
+to run anything else under the profile instead.
 
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
@@ -502,7 +509,7 @@ profile, so spawned sessions see the same skill library as direct ones.
 Auth/config files stay real and private; nothing is copied or overwritten.
 
 Examples:
-  caam shallow-spawn alice -- claude
+  caam shallow-spawn alice                     # open claude as alice
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
   caam shallow-spawn codex-bob --reload-daemon -- codex
@@ -596,8 +603,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Short form: no '-- <cmd>' means "open this profile's own provider CLI".
 	if len(rest) == 0 {
-		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, shallowSpawnHintBin(provider))
+		rest = []string{shallowSpawnHintBin(provider)}
 	}
 
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
