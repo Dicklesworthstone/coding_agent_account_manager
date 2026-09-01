@@ -168,9 +168,10 @@ caam shallow-profile create bob   --from-vault codex/bob
 caam shallow-profile create carol --from-vault agy/carol
 
 # Spawn concurrent sessions, each pinned to its own identity and provider.
-caam shallow-spawn alice -- claude  &   # session 1, alice's Claude quota
-caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex identity
-caam shallow-spawn carol -- agy     &   # session 3, carol's Antigravity identity
+# With no `-- <cmd>` the profile's own CLI (claude / codex / agy) is run.
+caam shallow-spawn alice &   # session 1, alice's Claude quota
+caam shallow-spawn bob   &   # session 2, bob's Codex identity
+caam shallow-spawn carol &   # session 3, carol's Antigravity identity
 wait
 ```
 
@@ -202,7 +203,8 @@ Per-provider real (private) files — everything else under the provider's home 
 caam shallow-profile create <name> [--tool claude|codex|agy] [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
-caam shallow-spawn <name> -- <cmd> [args...]
+caam shallow-spawn <name>                     # open the profile's own provider CLI (claude / codex / agy) in this terminal
+caam shallow-spawn <name> -- <cmd> [args...]  # or run any other command under the profile
 caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
 caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `-c model_reasoning_effort=xhigh` (codex has no --effort flag)

@@ -295,6 +295,100 @@ func TestShallowSpawnPrintEnv(t *testing.T) {
 	}
 }
 
+// TestShallowSpawnDefaultsToProviderCLI: with no '-- <cmd>' section,
+// shallow-spawn runs the profile's own provider CLI under the shallow HOME,
+// and an explicit command still wins (PR #89).
+func TestShallowSpawnDefaultsToProviderCLI(t *testing.T) {
+	base, realHome := shallowEnv(t)
+
+	// Fake provider binaries so exec.LookPath resolves them without ever
+	// running a real CLI.
+	binDir := t.TempDir()
+	for _, name := range []string{"claude", "codex"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(realHome, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"OPENAI_API_KEY":null}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "cx", "--tool", "codex",
+		"--from-file", filepath.Join(codexDir, "auth.json"), "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotBin string
+	var gotArgs, gotEnv []string
+	origExec := spawnExec
+	spawnExec = func(bin string, args []string, env []string) error {
+		gotBin, gotArgs, gotEnv = bin, args, env
+		return nil
+	}
+	t.Cleanup(func() { spawnExec = origExec })
+	origCheck := shallowCodexDaemonCheck
+	shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
+	t.Cleanup(func() { shallowCodexDaemonCheck = origCheck })
+
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice"); err != nil {
+		t.Fatalf("spawn alice: %v", err)
+	}
+	if gotBin != filepath.Join(binDir, "claude") || len(gotArgs) != 1 || gotArgs[0] != "claude" {
+		t.Fatalf("claude profile: bin=%q args=%v, want the claude stub with argv [claude]", gotBin, gotArgs)
+	}
+	wantHome := "HOME=" + filepath.Join(base, "alice")
+	found := false
+	for _, e := range gotEnv {
+		if e == wantHome {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("default spawn did not set %s", wantHome)
+	}
+
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx"); err != nil {
+		t.Fatalf("spawn cx: %v", err)
+	}
+	if len(gotArgs) != 1 || gotArgs[0] != "codex" {
+		t.Fatalf("codex profile: args=%v, want [codex]", gotArgs)
+	}
+
+	// --effort applies to the defaulted codex command too.
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx", "--effort", "high"); err != nil {
+		t.Fatalf("spawn cx --effort: %v", err)
+	}
+	if strings.Join(gotArgs, " ") != "codex -c model_reasoning_effort=high" {
+		t.Fatalf("codex --effort args=%v, want the injected override", gotArgs)
+	}
+
+	// An explicit command still wins over the default.
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true"); err != nil {
+		t.Fatalf("explicit spawn: %v", err)
+	}
+	if len(gotArgs) != 3 || gotArgs[0] != "sh" {
+		t.Fatalf("explicit args=%v, want [sh -c true]", gotArgs)
+	}
+
+	// --print-env is unaffected: it still prints and never execs.
+	gotBin = ""
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env")
+	if err != nil {
+		t.Fatalf("print-env: %v", err)
+	}
+	if !strings.Contains(stdout, wantHome) || gotBin != "" {
+		t.Fatalf("print-env stdout=%q bin=%q, want HOME line and no exec", stdout, gotBin)
+	}
+}
+
 // TestShallowSpawnExecsCorrectHome injects a fake spawnExec to verify that
 // runShallowSpawn sets HOME correctly and forwards args+bin.
 func TestShallowSpawnExecsCorrectHome(t *testing.T) {
