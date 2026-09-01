@@ -1168,3 +1168,28 @@ func TestShallowSpawnToolConflictsWithExistingProfile(t *testing.T) {
 		t.Fatalf("matching --tool must be accepted: %v", err)
 	}
 }
+
+// TestPrependShallowLocalBin covers the PATH adjustment that keeps Claude
+// Code's "~/.local/bin is not in your PATH" diagnostic quiet under a shallow
+// HOME whose .local/bin is a symlink to the real one.
+func TestPrependShallowLocalBin(t *testing.T) {
+	home := t.TempDir()
+	bin := filepath.Join(home, ".local", "bin")
+	sep := string(os.PathListSeparator)
+
+	if got := prependShallowLocalBin("/usr/bin", home); got != "/usr/bin" {
+		t.Fatalf("missing .local/bin: PATH changed to %q", got)
+	}
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prependShallowLocalBin("/usr/bin", home), bin+sep+"/usr/bin"; got != want {
+		t.Fatalf("prepend: got %q, want %q", got, want)
+	}
+	if got, want := prependShallowLocalBin(bin+sep+"/usr/bin", home), bin+sep+"/usr/bin"; got != want {
+		t.Fatalf("already present: got %q, want %q", got, want)
+	}
+	if got := prependShallowLocalBin("", home); got != bin {
+		t.Fatalf("empty PATH: got %q, want %q", got, bin)
+	}
+}

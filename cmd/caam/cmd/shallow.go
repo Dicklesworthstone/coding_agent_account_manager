@@ -726,6 +726,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	for _, k := range scrub {
 		delete(envMap, k)
 	}
+	envMap["PATH"] = prependShallowLocalBin(envMap["PATH"], prof.Path)
 	envSlice := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envSlice = append(envSlice, k+"="+v)
@@ -805,6 +806,29 @@ func shallowSpawnDoubleSpend(provider, profileHome string) (label string, confli
 		return "", false
 	}
 	return authfile.ClaudeIdentityLabel(profileKeys), true
+}
+
+// prependShallowLocalBin puts <home>/.local/bin first on PATH when that
+// directory exists under the shallow HOME. It is a symlink to the real
+// ~/.local/bin, so nothing new becomes runnable; but tools that check
+// "$HOME/.local/bin is on PATH" as a literal string (Claude Code's system
+// diagnostics warn about its native install otherwise) see the path they
+// expect under the shallow HOME. A PATH that already lists it is returned
+// unchanged.
+func prependShallowLocalBin(path, home string) string {
+	bin := filepath.Join(home, ".local", "bin")
+	if st, err := os.Stat(bin); err != nil || !st.IsDir() {
+		return path
+	}
+	for _, p := range filepath.SplitList(path) {
+		if p == bin {
+			return path
+		}
+	}
+	if path == "" {
+		return bin
+	}
+	return bin + string(os.PathListSeparator) + path
 }
 
 // injectCodexEffort translates shallow-spawn's --effort flag into the config
