@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // ErrNoExpiry indicates that expiry information could not be determined.
@@ -214,13 +216,21 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 //
 // Codex stores auth in $CODEX_HOME/auth.json (default ~/.codex/auth.json).
 //
-// Expected JSON structure:
+// API-key mode uses a flat OAuth structure with an explicit expiry:
 //
 //	{
 //	  "access_token": "...",
 //	  "refresh_token": "...",
 //	  "expires_at": 1734451200,  // Unix timestamp (seconds)
 //	  "token_type": "Bearer"
+//	}
+//
+// ChatGPT mode nests JWTs and records no expiry field at all:
+//
+//	{
+//	  "auth_mode": "chatgpt",
+//	  "tokens": {"id_token": "<jwt>", "access_token": "<jwt>", "refresh_token": "rt.1..."},
+//	  "last_refresh": "2026-08-31T09:23:45Z"
 //	}
 func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 	if authPath == "" {
@@ -232,7 +242,7 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		authPath = filepath.Join(codexHome, "auth.json")
 	}
 
-	info, err := parseOAuthFile(authPath)
+	data, err := os.ReadFile(authPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrNoAuthFile
@@ -240,8 +250,89 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		return nil, err
 	}
 
+	info, err := parseCodexAuth(data)
+	if err != nil {
+		return nil, err
+	}
+
 	info.Source = authPath
 	return info, nil
+}
+
+// codexAuthJSON is the ChatGPT-mode layout written by the Codex CLI, which
+// carries no expiry field: the lifetimes live inside the JWTs themselves.
+type codexAuthJSON struct {
+	IDToken      string `json:"id_token"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+
+	Tokens struct {
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	} `json:"tokens"`
+}
+
+// parseCodexAuth extracts expiry from a Codex auth.json.
+//
+// An explicit expiry field wins when present (API-key mode, and Grok, which
+// reuses this parser). Otherwise the expiry comes from the access_token JWT:
+// Codex authenticates API calls with the access token and refreshes it from
+// refresh_token, while the id_token only supplies identity claims (email,
+// plan, account id) and expires an hour after login. Deriving health from the
+// id_token reports an account that is working right now as expired (#22).
+//
+// The access token's exp is used even when the id_token expires sooner, for
+// the same reason: an expired id_token is the normal steady state of a live
+// Codex session, not a constraint on making requests.
+func parseCodexAuth(data []byte) (*ExpiryInfo, error) {
+	info, err := parseOAuthJSON(data)
+	if err != nil {
+		if !errors.Is(err, ErrNoExpiry) {
+			return nil, err
+		}
+		info = &ExpiryInfo{}
+	}
+
+	var auth codexAuthJSON
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	if auth.Tokens.RefreshToken != "" {
+		info.HasRefreshToken = true
+	}
+
+	if info.ExpiresAt.IsZero() {
+		for _, token := range []string{
+			auth.Tokens.AccessToken, auth.AccessToken,
+			auth.Tokens.IDToken, auth.IDToken,
+		} {
+			if exp := jwtExpiry(token); !exp.IsZero() {
+				info.ExpiresAt = exp
+				break
+			}
+		}
+	}
+
+	if info.ExpiresAt.IsZero() && !info.HasRefreshToken {
+		return nil, ErrNoExpiry
+	}
+
+	return info, nil
+}
+
+// jwtExpiry returns the exp claim of an unvalidated JWT, or the zero time when
+// the token is absent, malformed, or carries no exp.
+func jwtExpiry(token string) time.Time {
+	if token == "" {
+		return time.Time{}
+	}
+	id, err := identity.ExtractFromJWT(token)
+	if err != nil {
+		return time.Time{}
+	}
+	return id.ExpiresAt
 }
 
 // ParseGeminiExpiry extracts token expiry from Gemini CLI auth files.
@@ -356,6 +447,11 @@ func parseOAuthFile(path string) (*ExpiryInfo, error) {
 		return nil, err
 	}
 
+	return parseOAuthJSON(data)
+}
+
+// parseOAuthJSON extracts expiry info from OAuth token file contents.
+func parseOAuthJSON(data []byte) (*ExpiryInfo, error) {
 	var oauth oauthJSON
 	if err := json.Unmarshal(data, &oauth); err != nil {
 		return nil, fmt.Errorf("parse JSON: %w", err)

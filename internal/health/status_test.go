@@ -177,3 +177,29 @@ func TestCalculateHealthRateLimitCap(t *testing.T) {
 		})
 	}
 }
+
+// TestCalculateStatusCodexChatGPTAuth is the end-to-end shape of the bug: a
+// Codex account in active use, whose access token is valid for days but whose
+// id_token expired hours ago, must classify as healthy rather than 🟡 Warning.
+func TestCalculateStatusCodexChatGPTAuth(t *testing.T) {
+	accessExp := time.Now().Add(9 * 24 * time.Hour).Truncate(time.Second)
+	path := writeCodexAuth(t, map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]any{
+			"id_token":      buildTestJWT(t, map[string]any{"email": "codex@example.com", "exp": time.Now().Add(-2 * time.Hour).Unix()}),
+			"access_token":  buildTestJWT(t, map[string]any{"exp": accessExp.Unix()}),
+			"refresh_token": "rt.1.example",
+		},
+		"last_refresh": time.Now().Add(-3 * time.Hour).Format(time.RFC3339),
+	})
+
+	info, err := ParseCodexExpiry(path)
+	if err != nil {
+		t.Fatalf("ParseCodexExpiry error: %v", err)
+	}
+
+	ph := &ProfileHealth{TokenExpiresAt: info.ExpiresAt, PlanType: "pro"}
+	if status := CalculateStatus(ph); status != StatusHealthy {
+		t.Errorf("CalculateStatus() = %v, want %v (token expiry %v)", status, StatusHealthy, ph.TokenExpiresAt)
+	}
+}

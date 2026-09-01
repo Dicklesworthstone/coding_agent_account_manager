@@ -347,3 +347,45 @@ func TestFixture_CodexNoTokens(t *testing.T) {
 		t.Error("expected error for fixture without tokens")
 	}
 }
+
+func TestExtractFromCodexAuth_ExpiryFromAccessToken(t *testing.T) {
+	// Codex authenticates API calls with the access token; the id_token only
+	// carries identity claims and expires an hour after login.
+	accessExp := time.Now().Add(9 * 24 * time.Hour).Truncate(time.Second)
+	path := writeAuthFile(t, map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"id_token":      buildJWT(t, map[string]interface{}{"email": "codex@example.com", "exp": time.Now().Add(-2 * time.Hour).Unix()}),
+			"access_token":  buildJWT(t, map[string]interface{}{"exp": accessExp.Unix()}),
+			"refresh_token": "rt.1.example",
+		},
+	})
+
+	identity, err := ExtractFromCodexAuth(path)
+	if err != nil {
+		t.Fatalf("ExtractFromCodexAuth error: %v", err)
+	}
+	if identity.Email != "codex@example.com" {
+		t.Errorf("Email = %q, want %q (identity claims still come from id_token)", identity.Email, "codex@example.com")
+	}
+	if !identity.ExpiresAt.Equal(accessExp) {
+		t.Errorf("ExpiresAt = %v, want access token exp %v", identity.ExpiresAt, accessExp)
+	}
+}
+
+func TestExtractFromCodexAuth_ExpiryFallsBackToIDToken(t *testing.T) {
+	idExp := time.Now().Add(30 * time.Minute).Truncate(time.Second)
+	path := writeAuthFile(t, map[string]interface{}{
+		"tokens": map[string]interface{}{
+			"id_token":     buildJWT(t, map[string]interface{}{"email": "codex@example.com", "exp": idExp.Unix()}),
+			"access_token": "not-a-jwt",
+		},
+	})
+
+	identity, err := ExtractFromCodexAuth(path)
+	if err != nil {
+		t.Fatalf("ExtractFromCodexAuth error: %v", err)
+	}
+	if !identity.ExpiresAt.Equal(idExp) {
+		t.Errorf("ExpiresAt = %v, want id token exp %v", identity.ExpiresAt, idExp)
+	}
+}

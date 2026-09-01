@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 )
 
 // ExtractFromCodexAuth reads a Codex auth.json file and extracts identity from the JWT.
@@ -34,6 +35,14 @@ func ExtractFromCodexAuth(path string) (*Identity, error) {
 			continue
 		}
 		identity.Provider = "codex"
+		// Identity claims (email, plan, account) come from the id_token, but
+		// its lifetime does not describe the account: Codex authenticates API
+		// calls with the access token, and the id_token expires an hour after
+		// login while the session keeps working. Report the access token's
+		// expiry so a healthy account is not shown as expired (#22).
+		if exp, ok := codexAccessTokenExpiry(auth); ok {
+			identity.ExpiresAt = exp
+		}
 		return identity, nil
 	}
 
@@ -48,39 +57,72 @@ type tokenCandidate struct {
 	source string
 }
 
+// codexTokenCandidates lists the tokens to mine for identity claims, id_tokens
+// first: they carry the account's email, plan, and account id.
 func codexTokenCandidates(auth map[string]interface{}) []tokenCandidate {
+	return append(codexIDTokenCandidates(auth), codexAccessTokenCandidates(auth)...)
+}
+
+func codexIDTokenCandidates(auth map[string]interface{}) []tokenCandidate {
 	candidates := []tokenCandidate{
 		{value: stringFromMap(auth, "id_token"), source: "id_token"},
 		{value: stringFromMap(auth, "idToken"), source: "idToken"},
 	}
 
-	rawTokens, ok := auth["tokens"]
-	if ok {
-		if tokenMap, ok := rawTokens.(map[string]interface{}); ok {
-			candidates = append(candidates,
-				tokenCandidate{value: stringFromMap(tokenMap, "id_token"), source: "tokens.id_token"},
-				tokenCandidate{value: stringFromMap(tokenMap, "idToken"), source: "tokens.idToken"},
-			)
-		}
-	}
-
-	candidates = append(candidates,
-		tokenCandidate{value: stringFromMap(auth, "access_token"), source: "access_token"},
-		tokenCandidate{value: stringFromMap(auth, "accessToken"), source: "accessToken"},
-		tokenCandidate{value: stringFromMap(auth, "token"), source: "token"},
-	)
-
-	if ok {
-		if tokenMap, ok := rawTokens.(map[string]interface{}); ok {
-			candidates = append(candidates,
-				tokenCandidate{value: stringFromMap(tokenMap, "access_token"), source: "tokens.access_token"},
-				tokenCandidate{value: stringFromMap(tokenMap, "accessToken"), source: "tokens.accessToken"},
-				tokenCandidate{value: stringFromMap(tokenMap, "token"), source: "tokens.token"},
-			)
-		}
+	if tokenMap := codexNestedTokens(auth); tokenMap != nil {
+		candidates = append(candidates,
+			tokenCandidate{value: stringFromMap(tokenMap, "id_token"), source: "tokens.id_token"},
+			tokenCandidate{value: stringFromMap(tokenMap, "idToken"), source: "tokens.idToken"},
+		)
 	}
 
 	return candidates
+}
+
+func codexAccessTokenCandidates(auth map[string]interface{}) []tokenCandidate {
+	candidates := []tokenCandidate{
+		{value: stringFromMap(auth, "access_token"), source: "access_token"},
+		{value: stringFromMap(auth, "accessToken"), source: "accessToken"},
+		{value: stringFromMap(auth, "token"), source: "token"},
+	}
+
+	if tokenMap := codexNestedTokens(auth); tokenMap != nil {
+		candidates = append(candidates,
+			tokenCandidate{value: stringFromMap(tokenMap, "access_token"), source: "tokens.access_token"},
+			tokenCandidate{value: stringFromMap(tokenMap, "accessToken"), source: "tokens.accessToken"},
+			tokenCandidate{value: stringFromMap(tokenMap, "token"), source: "tokens.token"},
+		)
+	}
+
+	return candidates
+}
+
+func codexNestedTokens(auth map[string]interface{}) map[string]interface{} {
+	rawTokens, ok := auth["tokens"]
+	if !ok {
+		return nil
+	}
+	tokenMap, ok := rawTokens.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	return tokenMap
+}
+
+// codexAccessTokenExpiry returns the exp claim of the first parseable access
+// token, which is the credential the API actually checks.
+func codexAccessTokenExpiry(auth map[string]interface{}) (time.Time, bool) {
+	for _, candidate := range codexAccessTokenCandidates(auth) {
+		if candidate.value == "" {
+			continue
+		}
+		identity, err := ExtractFromJWT(candidate.value)
+		if err != nil || identity.ExpiresAt.IsZero() {
+			continue
+		}
+		return identity.ExpiresAt, true
+	}
+	return time.Time{}, false
 }
 
 func stringFromMap(values map[string]interface{}, key string) string {
