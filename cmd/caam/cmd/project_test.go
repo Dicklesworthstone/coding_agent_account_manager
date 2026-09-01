@@ -36,9 +36,11 @@ func TestProjectSetRemoveClear(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	abs, err := filepath.Abs(cwd)
+	// The command keys the association by os.Getwd(), which resolves
+	// symlinks (macOS temp dirs live under /var -> /private/var).
+	abs, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
-		t.Fatalf("Abs() error = %v", err)
+		t.Fatalf("EvalSymlinks() error = %v", err)
 	}
 	if got := data.Associations[abs]["claude"]; got != "work@company.com" {
 		t.Fatalf("associations[%s][claude] = %q, want %q", abs, got, "work@company.com")
@@ -119,7 +121,13 @@ func TestActivate_UsesProjectAssociationWhenProfileOmitted(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(oldWD) })
 
-	if err := projectStore.SetAssociation(cwd, "codex", "work"); err != nil {
+	// Key by the symlink-resolved path, which is what os.Getwd() reports
+	// inside runActivate (macOS temp dirs live under /var -> /private/var).
+	resolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		t.Fatalf("EvalSymlinks() error = %v", err)
+	}
+	if err := projectStore.SetAssociation(resolved, "codex", "work"); err != nil {
 		t.Fatalf("SetAssociation() error = %v", err)
 	}
 

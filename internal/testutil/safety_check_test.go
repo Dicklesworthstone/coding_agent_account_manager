@@ -164,7 +164,7 @@ func TestNoHardcodedAuthPaths(t *testing.T) {
 		`"~/.claude"`,
 		`"~/.codex"`,
 		`"~/.config/gemini"`,
-		`"/home/` + `"`, // Split to avoid matching this file
+		`"/home/` + `"`,    // Split to avoid matching this file
 		`os.UserHomeDir()`, // Only dangerous in certain contexts
 	}
 
@@ -184,7 +184,7 @@ func TestNoHardcodedAuthPaths(t *testing.T) {
 
 	// Files that are allowed to reference these paths (for verification, not writing)
 	allowedFiles := map[string]bool{
-		"internal/testutil/safety_check_test.go": true, // This file
+		"internal/testutil/safety_check_test.go":  true, // This file
 		"internal/provider/claude/claude_test.go": true, // Verifies paths
 		"internal/provider/codex/codex_test.go":   true, // Verifies paths
 		"internal/provider/gemini/gemini_test.go": true, // Verifies paths
