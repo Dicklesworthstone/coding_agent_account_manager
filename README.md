@@ -155,6 +155,19 @@ A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everyt
 
 **Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps only *its own* identity files real and private; everything else symlinks back to your real `~/`. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
 
+**Daily flow.** Day to day this is the whole loop:
+
+```bash
+caam shallow-spawn vadim     # open claude as "vadim" in THIS terminal.
+                             # First time: creates the profile (empty) and the session logs you in.
+caam status                  # which account each tool is on right now
+caam next claude             # rotate the MAIN lane (your real ~/) to the next account
+```
+
+`caam shallow-spawn <name>` with no `-- <cmd>` section runs that profile's own provider CLI (`claude`, `codex`, or `agy`), and creates the profile if it does not exist yet — add `--tool codex|agy` to pick a non-claude layout. Profiles created this way start **empty** on purpose: caam never copies a credential out of the vault on spawn, because two homes sharing one refresh-token family log each other out as soon as Claude rotates the token (issue #19). When you deliberately want a copy, ask for it: `caam shallow-profile create <name> --from-vault <tool>/<profile>`.
+
+**Double-spend rule.** caam refuses to open a shallow `claude` profile that is logged in as the account *already active* in your real `~/.claude.json` — two live sessions would draw down one subscription's quota. Run `claude` directly for that account, or pass `--force`. The check is skipped when either side has no `oauthAccount` recorded (nothing to compare), and for `codex`/`agy`, which keep no comparable account identity on disk.
+
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
 caam backup claude alice@example.com
@@ -202,8 +215,12 @@ Per-provider real (private) files — everything else under the provider's home 
 caam shallow-profile create <name> [--tool claude|codex|agy] [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
+caam shallow-spawn <name>                     # runs the profile's own CLI; creates the profile if new
+caam shallow-spawn <name> --tool codex        # layout for a profile created on first use (default: claude)
+caam shallow-spawn <name> --force             # override the double-spend guard
 caam shallow-spawn <name> -- <cmd> [args...]
 caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
+                                              # strict dry run: never creates a missing profile, never guards
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
 caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `-c model_reasoning_effort=xhigh` (codex has no --effort flag)
 ```
