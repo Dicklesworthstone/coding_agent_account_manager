@@ -426,6 +426,7 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 |---------|-------------|
 | `caam activate <tool> --auto` | Auto-select the best profile using rotation algorithm |
 | `caam next <tool>` | Switch to the next profile in rotation (use `--dry-run` to preview without switching) |
+| `caam quota [claude]` | Show cached usage per Claude profile, read from disk with no network (`--json` supported) |
 | `caam run <tool> [-- args]` | Wrap CLI execution with automatic failover on rate limits |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
@@ -499,6 +500,33 @@ Health scoring combines multiple factors:
 - **Plan type**: Enterprise/Pro plans get slight scoring boosts
 
 The penalty system uses **exponential decay** (20% reduction every 5 minutes) so temporary issues don't permanently mark a profile as unhealthy. After about 30 minutes of no errors, a profile's penalty score returns to near zero.
+
+### Cached Usage: `caam quota`
+
+`caam quota` shows how much of each Claude account's usage windows is spent, **without touching the network**:
+
+```
+PROFILE           EMAIL  PLAN  5H                WEEKLY            FABLE             RESETS           AS OF
+● adriana-gmail   n/a    Pro   █████░░░░░   53%  █░░░░░░░░░   11%  ██░░░░░░░░   19%  Fri Sep 4 08:00  18m ago
+  adriana-syneto  n/a    Pro   ░░░░░░░░░░ ~  0%  ░░░░░░░░░░ ~  4%  ░░░░░░░░░░ ~  3%  Wed Sep 2 20:59  3h ago
+  vadim           n/a    Pro   ░░░░░░░░░░ ~  0%  ███░░░░░░░ ~ 29%  █████░░░░░ ~ 54%  Wed Sep 2 10:00  3h ago
+
+usage as cached by Claude Code; refreshed by that account's own sessions. No network.
+```
+
+Claude Code already caches each account's utilization in that account's own `.claude.json`. `caam quota` reads those files and nothing else. `caam limits`, by contrast, answers the same question by presenting every profile's bearer token from one process — one machine speaking for several accounts at once, which is the shared-credential pattern that gets subscriptions revoked. Reading the cache avoids that entirely.
+
+The trade-off is freshness: a profile's numbers only move when that profile itself runs a session. Every row states its own age, and marks figures taken from a frozen vault snapshot with `~`. The active profile is read from the live `~/.claude.json`, so its numbers are as current as your last turn.
+
+Reading the table:
+
+- `●` marks the active profile; rows tagged `(shallow)` are shallow profiles.
+- **5H** is the rolling 5-hour session window; **WEEKLY** is the all-model weekly cap; the third bar is the weekly cap for the model named in its header.
+- A window whose reset time has already passed reads 0%: it rolled over, and nothing has run against it since.
+- **RESETS** is when the weekly window rolls over; **AS OF** is how stale the snapshot is.
+- `--json` emits the same data per profile, including `source` (`live`, `snapshot`, or `shallow`), `account_uuid`, `fetched_at`, and each window's `percent`, `resets_at`, and `rolled`.
+
+Only Claude caches usage on disk. `caam quota <other-provider>` exits 1 and points you at `caam limits`.
 
 ### Smart Rotation Algorithms
 
