@@ -516,8 +516,8 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	// unparseable later (issue #73). Claude only: the other tools carry their
 	// identity inside the credential file itself.
 	if tool == "claude" {
-		if keys := claudeLiveIdentityKeys(fileSet); len(keys) > 0 {
-			meta.Identity = claudeIdentityLabel(keys)
+		if keys := ClaudeLiveIdentityKeys(fileSet); len(keys) > 0 {
+			meta.Identity = ClaudeIdentityLabel(keys)
 			meta.IdentityKeys = keys
 		}
 	}
@@ -792,7 +792,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	// copied over the live ~/.claude.json (issue #73).
 	var liveClaudeKeys []string
 	if fileSet.Tool == "claude" {
-		liveClaudeKeys = claudeLiveIdentityKeys(fileSet)
+		liveClaudeKeys = ClaudeLiveIdentityKeys(fileSet)
 	}
 
 	restored := 0
@@ -2193,9 +2193,9 @@ func claudeIdentityKeys(root map[string]interface{}) []string {
 	return keys
 }
 
-// claudeIdentityKeysFromFile parses a .claude.json at path and derives its
+// ClaudeIdentityKeysFromFile parses a .claude.json at path and derives its
 // identity keys. Unreadable or unparseable files yield nil.
-func claudeIdentityKeysFromFile(path string) []string {
+func ClaudeIdentityKeysFromFile(path string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -2207,9 +2207,9 @@ func claudeIdentityKeysFromFile(path string) []string {
 	return claudeIdentityKeys(root)
 }
 
-// claudeIdentityLabel picks the human-facing identity out of a key set:
+// ClaudeIdentityLabel picks the human-facing identity out of a key set:
 // email, else account uuid, else the legacy account string.
-func claudeIdentityLabel(keys []string) string {
+func ClaudeIdentityLabel(keys []string) string {
 	for _, prefix := range []string{"email:", "uuid:", "account:"} {
 		for _, key := range keys {
 			if strings.HasPrefix(key, prefix) {
@@ -2220,8 +2220,8 @@ func claudeIdentityLabel(keys []string) string {
 	return ""
 }
 
-// identityKeysIntersect reports whether two key sets share any key.
-func identityKeysIntersect(a, b []string) bool {
+// IdentityKeysIntersect reports whether two key sets share any key.
+func IdentityKeysIntersect(a, b []string) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
@@ -2263,21 +2263,22 @@ func claudeFileSetPath(fileSet AuthFileSet, name string) string {
 	return ""
 }
 
-// claudeLiveIdentityKeys derives the identity of the currently logged-in
-// Claude account from the live ~/.claude.json.
-func claudeLiveIdentityKeys(fileSet AuthFileSet) []string {
+// ClaudeLiveIdentityKeys derives the identity of the currently logged-in
+// Claude account from the live ~/.claude.json named by fileSet (pass
+// ClaudeAuthFiles() to resolve it the way every other caam command does).
+func ClaudeLiveIdentityKeys(fileSet AuthFileSet) []string {
 	settingsPath := claudeFileSetPath(fileSet, claudeSettingsFile)
 	if settingsPath == "" {
 		return nil
 	}
-	return claudeIdentityKeysFromFile(settingsPath)
+	return ClaudeIdentityKeysFromFile(settingsPath)
 }
 
 // claudeProfileIdentityKeys derives a vault profile's identity from its
 // .claude.json snapshot, merged with whatever Backup recorded in meta.json so
 // matching survives a missing or unparseable snapshot.
 func (v *Vault) claudeProfileIdentityKeys(profileDir string) []string {
-	keys := claudeIdentityKeysFromFile(filepath.Join(profileDir, claudeSettingsFile))
+	keys := ClaudeIdentityKeysFromFile(filepath.Join(profileDir, claudeSettingsFile))
 	if metaKeys := profileMetaIdentityKeys(profileDir); len(metaKeys) > 0 {
 		keys = mergeIdentityKeys(keys, metaKeys)
 	}
@@ -2306,7 +2307,7 @@ func profileMetaIdentityKeys(profileDir string) []string {
 // active one. User-named profiles win over system profiles (_backup_* etc.),
 // which can legitimately carry the same account.
 func (v *Vault) claudeActiveProfileByIdentity(fileSet AuthFileSet, profiles []string) string {
-	liveKeys := claudeLiveIdentityKeys(fileSet)
+	liveKeys := ClaudeLiveIdentityKeys(fileSet)
 	if len(liveKeys) == 0 {
 		return ""
 	}
@@ -2314,7 +2315,7 @@ func (v *Vault) claudeActiveProfileByIdentity(fileSet AuthFileSet, profiles []st
 	systemMatch := ""
 	for _, profile := range profiles {
 		profileKeys := v.claudeProfileIdentityKeys(v.ProfilePath(fileSet.Tool, profile))
-		if !identityKeysIntersect(liveKeys, profileKeys) {
+		if !IdentityKeysIntersect(liveKeys, profileKeys) {
 			continue
 		}
 		if !IsSystemProfile(profile) {
@@ -2400,7 +2401,7 @@ func (v *Vault) claudeLiveIsNewer(liveKeys []string, profileDir, livePath, snaps
 	}
 
 	// Only guard when it is unambiguously the SAME account.
-	if !identityKeysIntersect(liveKeys, v.claudeProfileIdentityKeys(profileDir)) {
+	if !IdentityKeysIntersect(liveKeys, v.claudeProfileIdentityKeys(profileDir)) {
 		return false
 	}
 
@@ -2422,7 +2423,7 @@ func (v *Vault) claudeLiveIsNewer(liveKeys []string, profileDir, livePath, snaps
 // (email when known), falling back to JWT claims in .credentials.json for
 // legacy token formats.
 func (v *Vault) claudeProfileIdentity(profileDir string) string {
-	if label := claudeIdentityLabel(v.claudeProfileIdentityKeys(profileDir)); label != "" {
+	if label := ClaudeIdentityLabel(v.claudeProfileIdentityKeys(profileDir)); label != "" {
 		return label
 	}
 
