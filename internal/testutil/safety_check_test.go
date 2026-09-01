@@ -3,8 +3,11 @@ package testutil
 import (
 	"bufio"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -276,6 +279,129 @@ func TestTempDirUsage(t *testing.T) {
 		if !hasTempDir && !hasHarness && !hasHomeOverride {
 			t.Errorf("%s: Creates auth files but doesn't use t.TempDir(), testutil.NewHarness, or override HOME to temp dir", relPath)
 		}
+	}
+}
+
+// TestEveryTestPackageIsolatesHome fails when a package with tests has no
+// TestMain that calls IsolatedMain. TestNoRealHomeWrites scans test sources
+// for dangerous patterns, but the writers that corrupted a developer's
+// ~/.claude.json live in production code the tests call (auth restore, wrap,
+// the CLI commands), which no source scan can see. The runtime guard is the
+// real protection; this test keeps it from eroding as packages are added.
+func TestEveryTestPackageIsolatesHome(t *testing.T) {
+	rootDir := findProjectRoot(t)
+
+	testFiles := map[string][]string{}
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() && (info.Name() == ".git" || info.Name() == "vendor" || info.Name() == "testdata") {
+			return filepath.SkipDir
+		}
+		if strings.HasSuffix(path, "_test.go") {
+			dir := filepath.Dir(path)
+			testFiles[dir] = append(testFiles[dir], path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to walk directory: %v", err)
+	}
+
+	var missing []string
+	for dir, files := range testFiles {
+		guarded := false
+		for _, file := range files {
+			content, err := os.ReadFile(file)
+			if err != nil {
+				t.Errorf("Failed to read %s: %v", file, err)
+				continue
+			}
+			src := string(content)
+			if strings.Contains(src, "func TestMain(") && strings.Contains(src, "IsolatedMain(") {
+				guarded = true
+				break
+			}
+		}
+		if !guarded {
+			rel, _ := filepath.Rel(rootDir, dir)
+			missing = append(missing, rel)
+		}
+	}
+
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Errorf("%d package(s) with tests do not run under an isolated HOME:\n\n  %s\n\n"+
+			"FIX: add a main_test.go whose TestMain calls testutil.IsolatedMain(m) (copy any existing one). "+
+			"Without it, `go test` on a machine with live logins can overwrite real auth files and launch real CLIs.",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+// TestIsolateEnv checks the guard itself: HOME moves to a fresh directory,
+// derived variables are cleared, secrets are dropped, the stubs shadow the
+// real CLIs, and restore puts everything back.
+func TestIsolateEnv(t *testing.T) {
+	t.Setenv("HOME", "/nonexistent/home")
+	t.Setenv("CODEX_HOME", "/nonexistent/codex")
+	t.Setenv("ANTHROPIC_API_KEY", "secret")
+	t.Setenv("XDG_CONFIG_HOME", "/nonexistent/xdg")
+	t.Setenv(isolatedMarker, "")
+	os.Unsetenv(isolatedMarker)
+	origPath := os.Getenv("PATH")
+
+	restore, err := IsolateEnv()
+	if err != nil {
+		t.Fatalf("IsolateEnv() error = %v", err)
+	}
+
+	home := os.Getenv("HOME")
+	if home == "/nonexistent/home" || home == "" {
+		t.Fatalf("HOME = %q, want a fresh temporary directory", home)
+	}
+	if st, err := os.Stat(home); err != nil || !st.IsDir() {
+		t.Errorf("HOME %q is not a directory: %v", home, err)
+	}
+	for _, key := range []string{"CODEX_HOME", "ANTHROPIC_API_KEY", "XDG_CONFIG_HOME"} {
+		if v, ok := os.LookupEnv(key); ok {
+			t.Errorf("%s = %q, want unset", key, v)
+		}
+	}
+	if os.Getenv(isolatedMarker) != "1" {
+		t.Errorf("%s not exported for helper processes", isolatedMarker)
+	}
+	if runtime.GOOS != "windows" {
+		for _, bin := range []string{"claude", "codex", "open"} {
+			path, err := exec.LookPath(bin)
+			if err != nil {
+				t.Errorf("LookPath(%s) error = %v, want a stub", bin, err)
+				continue
+			}
+			if !strings.HasPrefix(path, home) {
+				t.Errorf("LookPath(%s) = %q, want a stub under %q", bin, path, home)
+			}
+			if out, err := exec.Command(path, "--version").CombinedOutput(); err != nil || len(out) != 0 {
+				t.Errorf("stub %s: output %q, err %v; want silent success", bin, out, err)
+			}
+		}
+	}
+
+	restore()
+	if got := os.Getenv("HOME"); got != "/nonexistent/home" {
+		t.Errorf("after restore HOME = %q, want %q", got, "/nonexistent/home")
+	}
+	if got := os.Getenv("ANTHROPIC_API_KEY"); got != "secret" {
+		t.Errorf("after restore ANTHROPIC_API_KEY = %q, want restored", got)
+	}
+	if got := os.Getenv("PATH"); got != origPath {
+		t.Errorf("after restore PATH changed")
+	}
+	if _, ok := os.LookupEnv(isolatedMarker); ok {
+		t.Errorf("after restore %s should be unset again", isolatedMarker)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Errorf("after restore the temporary HOME %q still exists", home)
 	}
 }
 
