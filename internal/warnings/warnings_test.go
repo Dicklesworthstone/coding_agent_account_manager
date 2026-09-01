@@ -59,9 +59,9 @@ func TestFormatDuration(t *testing.T) {
 
 func TestPrint(t *testing.T) {
 	tests := []struct {
-		name     string
-		warnings []Warning
-		noColor  bool
+		name        string
+		warnings    []Warning
+		noColor     bool
 		wantPrinted bool
 	}{
 		{
@@ -445,6 +445,58 @@ func TestCheckerCheckAllExpiredToken(t *testing.T) {
 	}
 	if !foundExpired {
 		t.Error("CheckAll() should return 'Token EXPIRED' for expired token")
+	}
+}
+
+// TestCheckerSkipsSelfRefreshingClaude covers PR #84: Claude Code renews its
+// own access token from the refresh token beside it and caam cannot refresh
+// Claude, so a short TTL on such a credential is not a warning. A Claude
+// credential without a refresh token, and other providers, still warn.
+func TestCheckerSkipsSelfRefreshingClaude(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+	writeProfile := func(tool, name, file string, body map[string]interface{}) {
+		dir := vault.ProfilePath(tool, name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(body)
+		if err := os.WriteFile(filepath.Join(dir, file), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	soon := time.Now().Add(30 * time.Minute)
+
+	writeProfile("claude", "refreshing", ".credentials.json", map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{"accessToken": "a", "refreshToken": "r", "expiresAt": soon.UnixMilli()},
+	})
+	writeProfile("claude", "lapsed", ".credentials.json", map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{"accessToken": "a", "refreshToken": "r", "expiresAt": soon.Add(-2 * 24 * time.Hour).UnixMilli()},
+	})
+	writeProfile("claude", "norefresh", ".credentials.json", map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{"accessToken": "a", "expiresAt": soon.UnixMilli()},
+	})
+	writeProfile("codex", "cx", "auth.json", map[string]interface{}{
+		"access_token": "a", "refresh_token": "r", "expires_at": soon.Unix(),
+	})
+
+	warnings := NewChecker(vault, nil, nil).CheckAll(context.Background())
+
+	got := map[string]bool{}
+	for _, w := range warnings {
+		got[w.Tool+"/"+w.Profile] = true
+	}
+	if got["claude/refreshing"] {
+		t.Error("expiring self-refreshing Claude credential must not warn")
+	}
+	if got["claude/lapsed"] {
+		t.Error("lapsed self-refreshing Claude credential must not warn")
+	}
+	if !got["claude/norefresh"] {
+		t.Error("Claude credential without a refresh token must still warn")
+	}
+	if !got["codex/cx"] {
+		t.Error("expiring Codex credential must still warn")
 	}
 }
 
