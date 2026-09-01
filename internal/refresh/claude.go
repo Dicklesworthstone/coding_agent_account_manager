@@ -31,6 +31,18 @@ var (
 	ClaudeRefreshDisabled = true
 )
 
+// SelfRefreshing reports whether the provider's own CLI renews its OAuth
+// access token in place, from the refresh token stored beside it.
+//
+// Claude Code does: it refreshes on next use, and caam's own Claude refresh is
+// disabled (see ClaudeRefreshDisabled and refreshClaude), so "caam refresh
+// claude <profile>" always fails. For such a provider a short access-token TTL
+// is routine lifecycle rather than something the operator can act on, and
+// health and warnings must not report it as a fault (issue #22).
+func SelfRefreshing(provider string) bool {
+	return provider == "claude" && ClaudeRefreshDisabled
+}
+
 // TokenResponse represents the OAuth token response.
 type TokenResponse struct {
 	AccessToken  string `json:"access_token"`

@@ -15,6 +15,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 // Warning represents a proactive warning to show the user.
@@ -151,7 +152,24 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		return warnings
 	}
 
+	// Prefer the profile's own live credential over the vault snapshot. Vault
+	// copies are frozen at backup/activate time while tools refresh the live
+	// file in place, so a snapshot can report an expiry the tool has already
+	// moved past (PR #82).
+	if live := c.liveProfileExpiry(tool, profileName); live != nil && !live.ExpiresAt.IsZero() {
+		expInfo, err = live, nil
+	}
+
 	if err != nil || expInfo == nil || expInfo.ExpiresAt.IsZero() {
+		return warnings
+	}
+
+	// Claude Code renews its own access token in place from the refresh token
+	// stored beside it, and caam's Claude refresh is disabled, so the ~8h
+	// access-token TTL is routine and "caam refresh claude <profile>" cannot
+	// succeed. Warning here fires on every command and recommends an action
+	// that always fails (issue #22).
+	if refresh.SelfRefreshing(tool) && expInfo.HasRefreshToken {
 		return warnings
 	}
 
@@ -188,6 +206,34 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 	}
 
 	return warnings
+}
+
+// liveProfileExpiry reads the token expiry from a profile's own auth directory,
+// which adopted profiles symlink to the location the tool actually refreshes.
+// Best-effort; returns nil on any failure, leaving the vault snapshot in play.
+func (c *Checker) liveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
+	if c.profiles == nil {
+		return nil
+	}
+	prof, err := c.profiles.Load(tool, profileName)
+	if err != nil {
+		return nil
+	}
+	var info *health.ExpiryInfo
+	switch tool {
+	case "claude":
+		info, err = health.ParseClaudeExpiry(filepath.Join(prof.HomePath(), ".claude"))
+	case "codex":
+		info, err = health.ParseCodexExpiry(filepath.Join(prof.CodexHomePath(), "auth.json"))
+	case "gemini":
+		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
+	default:
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 // formatDuration formats a duration in a human-friendly way.

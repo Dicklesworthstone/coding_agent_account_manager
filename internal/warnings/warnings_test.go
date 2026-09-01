@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 func TestLevelString(t *testing.T) {
@@ -609,5 +610,149 @@ func TestCheckerCustomThresholds(t *testing.T) {
 	}
 	if !foundCritical {
 		t.Error("CheckAll() with custom threshold should return critical warning")
+	}
+}
+
+// writeClaudeCreds writes a Claude credentials file into dir.
+func writeClaudeCreds(t *testing.T, dir string, expiresAt time.Time, refreshToken string) {
+	t.Helper()
+
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatalf("failed to create %s: %v", dir, err)
+	}
+	oauth := map[string]interface{}{
+		"accessToken": "fake-token",
+		"expiresAt":   expiresAt.UnixMilli(),
+	}
+	if refreshToken != "" {
+		oauth["refreshToken"] = refreshToken
+	}
+	credsData, _ := json.Marshal(map[string]interface{}{"claudeAiOauth": oauth})
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), credsData, 0600); err != nil {
+		t.Fatalf("failed to write credentials: %v", err)
+	}
+}
+
+// findWarning returns the warning for tool/profile, or nil.
+func findWarning(warnings []Warning, tool, profileName string) *Warning {
+	for i := range warnings {
+		if warnings[i].Tool == tool && warnings[i].Profile == profileName {
+			return &warnings[i]
+		}
+	}
+	return nil
+}
+
+// TestCheckAllClaudeRefreshableTokenIsSilent covers issue #22: Claude Code
+// renews its own access token from the refresh token stored beside it, and
+// caam's Claude refresh is disabled, so the ~8h access-token TTL must not
+// produce a warning on every command.
+func TestCheckAllClaudeRefreshableTokenIsSilent(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	writeClaudeCreds(t, vault.ProfilePath("claude", "refreshable"), time.Now().Add(30*time.Minute), "refresh-token")
+
+	checker := NewChecker(vault, nil, nil)
+	warns := checker.CheckAll(context.Background())
+
+	if w := findWarning(warns, "claude", "refreshable"); w != nil {
+		t.Errorf("CheckAll() warned about a refreshable Claude token: %+v", *w)
+	}
+}
+
+// TestCheckAllClaudeExpiredRefreshableTokenIsSilent covers the same lifecycle
+// after the access token has lapsed: Claude Code refreshes it on next use, so
+// there is nothing for the operator to do.
+func TestCheckAllClaudeExpiredRefreshableTokenIsSilent(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	writeClaudeCreds(t, vault.ProfilePath("claude", "lapsed"), time.Now().Add(-2*time.Hour), "refresh-token")
+
+	checker := NewChecker(vault, nil, nil)
+	warns := checker.CheckAll(context.Background())
+
+	if w := findWarning(warns, "claude", "lapsed"); w != nil {
+		t.Errorf("CheckAll() warned about an expired but refreshable Claude token: %+v", *w)
+	}
+}
+
+// TestCheckAllClaudeWithoutRefreshTokenStillWarns keeps the existing behavior
+// for a credential that genuinely needs operator action.
+func TestCheckAllClaudeWithoutRefreshTokenStillWarns(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	writeClaudeCreds(t, vault.ProfilePath("claude", "norefresh"), time.Now().Add(-2*time.Hour), "")
+
+	checker := NewChecker(vault, nil, nil)
+	warns := checker.CheckAll(context.Background())
+
+	w := findWarning(warns, "claude", "norefresh")
+	if w == nil {
+		t.Fatal("CheckAll() should warn about an expired Claude token with no refresh token")
+	}
+	if w.Level != LevelCritical || w.Message != "Token EXPIRED" {
+		t.Errorf("warning = %+v, want critical 'Token EXPIRED'", *w)
+	}
+}
+
+// TestCheckAllCodexRefreshableTokenStillWarns pins that the suppression is
+// Claude-specific: caam can refresh Codex, so "caam refresh codex X" remains
+// actionable advice.
+func TestCheckAllCodexRefreshableTokenStillWarns(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	profilePath := vault.ProfilePath("codex", "refreshable")
+	if err := os.MkdirAll(profilePath, 0700); err != nil {
+		t.Fatalf("failed to create profile dir: %v", err)
+	}
+	auth := map[string]interface{}{
+		"access_token":  "fake-token",
+		"refresh_token": "refresh-token",
+		"expires_at":    time.Now().Add(30 * time.Minute).Unix(),
+	}
+	authData, _ := json.Marshal(auth)
+	if err := os.WriteFile(filepath.Join(profilePath, "auth.json"), authData, 0600); err != nil {
+		t.Fatalf("failed to write auth: %v", err)
+	}
+
+	checker := NewChecker(vault, nil, nil)
+	warns := checker.CheckAll(context.Background())
+
+	w := findWarning(warns, "codex", "refreshable")
+	if w == nil {
+		t.Fatal("CheckAll() should still warn about an expiring Codex token")
+	}
+	if w.Action != "caam refresh codex refreshable" {
+		t.Errorf("Action = %q, want %q", w.Action, "caam refresh codex refreshable")
+	}
+}
+
+// TestCheckAllPrefersLiveProfileCredential mirrors PR #82 for warnings: the
+// vault copy is frozen at backup/activate time, so a profile whose own auth
+// directory holds a freshly refreshed token must not be warned about.
+func TestCheckAllPrefersLiveProfileCredential(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+	store := profile.NewStore(filepath.Join(tmpDir, "profiles"))
+
+	// Stale vault snapshot: expired two hours ago, no refresh token.
+	writeClaudeCreds(t, vault.ProfilePath("claude", "live"), time.Now().Add(-2*time.Hour), "")
+
+	prof, err := store.Create("claude", "live", "isolated")
+	if err != nil {
+		t.Fatalf("failed to create profile: %v", err)
+	}
+	// The profile's own credential was refreshed in place and is valid.
+	writeClaudeCreds(t, filepath.Join(prof.HomePath(), ".claude"), time.Now().Add(7*24*time.Hour), "")
+
+	checker := NewChecker(vault, nil, store)
+	warns := checker.CheckAll(context.Background())
+
+	if w := findWarning(warns, "claude", "live"); w != nil {
+		t.Errorf("CheckAll() warned from the stale vault snapshot: %+v", *w)
 	}
 }
