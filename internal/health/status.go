@@ -128,7 +128,18 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	// Override if token is strictly expired or critical errors met
 	if !h.TokenExpiresAt.IsZero() {
 		if h.TokenExpiresAt.Before(now) {
-			status = StatusCritical
+			if h.RateLimited(now) {
+				// An active rate-limit cooldown outranks the recorded expiry:
+				// the account recovers on the reset timer, not via re-login,
+				// and the expiry timestamp may come from a stale vault
+				// snapshot while the live token is still valid. Reporting a
+				// cap as token-expired misdirects the operator (PR #82).
+				if status == StatusCritical && h.ErrorCount1h < config.ErrorCountCritical {
+					status = StatusWarning
+				}
+			} else {
+				status = StatusCritical
+			}
 		} else {
 			ttl := h.TokenExpiresAt.Sub(now)
 			criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
@@ -142,6 +153,12 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 				}
 			}
 		}
+	}
+
+	// An active cap is a real (if temporary) constraint: never report a
+	// rate-limited profile as fully healthy.
+	if h.RateLimited(now) && status == StatusHealthy {
+		status = StatusWarning
 	}
 
 	if h.ErrorCount1h >= config.ErrorCountCritical {

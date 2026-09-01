@@ -448,8 +448,13 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 		System: authfile.IsSystemProfile(profileName),
 	}
 
-	// Get health info
+	// Get health info. For the active profile the live auth location is the
+	// profile's real credential, so its expiry supersedes any stale vault
+	// snapshot (PR #82).
 	ph, id := getProfileHealthWithIdentity(tool, profileName)
+	if pInfo.Active {
+		applyLiveExpiry(tool, ph)
+	}
 	status := health.CalculateStatus(ph)
 
 	pInfo.Health = RobotHealthInfo{
@@ -465,7 +470,9 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 				pInfo.Health.ExpiresIn = robotFormatDuration(remaining)
 			} else {
 				pInfo.Health.ExpiresIn = "expired"
-				pInfo.Health.Reason = "token expired"
+				if !ph.RateLimited(time.Now()) {
+					pInfo.Health.Reason = "token expired"
+				}
 			}
 		}
 
@@ -513,6 +520,13 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) string {
 	// Use thresholds from health.DefaultHealthConfig()
 	cfg := health.DefaultHealthConfig()
+
+	// An active rate-limit cooldown is the operative constraint and must not
+	// be reported as a token problem: the recorded expiry may be a stale
+	// vault snapshot, and the cap clears on its own timer (PR #82).
+	if now := time.Now(); ph.RateLimited(now) {
+		return fmt.Sprintf("rate limited (resets in %s)", robotFormatDuration(ph.RateLimitedUntil.Sub(now)))
+	}
 
 	if status == health.StatusCritical {
 		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {

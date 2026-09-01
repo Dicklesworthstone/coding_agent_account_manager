@@ -301,23 +301,81 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 
-	// If file parsing succeeds and provides an expiry, treat it as authoritative
-	if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+	// Prefer the profile's own live credential over the vault snapshot.
+	// Vault copies are frozen at backup/activate time while tools refresh
+	// the live file in place, so a snapshot expiry can be days stale and
+	// report "Token expired" for a token that is actually valid (PR #82).
+	// Adopted profiles symlink their auth dir to the live location, so this
+	// reads the real, current token; it also keeps TokenExpiresAt from
+	// staying zero, which capped the verdict at 🟡 Warning forever (issue
+	// #60).
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+		ph.TokenExpiresAt = liveExp.ExpiresAt
+	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+		// Fallback: the vault snapshot is the best information we have.
 		ph.TokenExpiresAt = expInfo.ExpiresAt
 	}
 
-	// Fallback: when the vault snapshot yields no usable expiry, derive health
-	// from the profile's own live credential instead of leaving TokenExpiresAt
-	// zero (which caps the verdict at 🟡 Warning forever, even for a perfectly
-	// healthy live token — issue #60). Adopted profiles symlink their auth dir
-	// to the live location, so this reads the real, current token.
-	if ph.TokenExpiresAt.IsZero() {
-		if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-			ph.TokenExpiresAt = liveExp.ExpiresAt
-		}
-	}
-
 	return ph
+}
+
+// liveAuthExpiry parses token expiry from the tool's live (in-use) auth
+// location, e.g. ~/.claude/.credentials.json. Best-effort; returns nil when
+// unavailable.
+func liveAuthExpiry(tool string) *health.ExpiryInfo {
+	var (
+		info *health.ExpiryInfo
+		err  error
+	)
+	switch tool {
+	case "claude":
+		info, err = health.ParseClaudeExpiry("")
+	case "codex":
+		info, err = health.ParseCodexExpiry("")
+	case "gemini":
+		info, err = health.ParseGeminiExpiry("")
+	case "grok":
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return nil
+		}
+		info, err = health.ParseCodexExpiry(filepath.Join(home, ".grok", "auth.json"))
+	default:
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+	return info
+}
+
+// applyLiveExpiry replaces a possibly stale vault-snapshot expiry with the
+// expiry of the live credential. Only call this for the ACTIVE profile: the
+// live auth location belongs to whichever profile is currently activated.
+func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
+	if ph == nil {
+		return
+	}
+	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+		ph.TokenExpiresAt = info.ExpiresAt
+	}
+}
+
+// applyActiveCooldown records an active rate-limit cooldown from limit_events
+// on the health snapshot, so classification reports "rate limited" instead of
+// blaming the token (PR #82). Best-effort: without a DB the field stays zero.
+func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
+	if ph == nil {
+		return
+	}
+	db, err := getDB()
+	if err != nil || db == nil {
+		return
+	}
+	now := time.Now()
+	if ev, err := db.ActiveCooldown(tool, profileName, now); err == nil && ev != nil && ev.CooldownUntil.After(now) {
+		ph.RateLimitedUntil = ev.CooldownUntil
+	}
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
@@ -354,6 +412,7 @@ func getProfileHealthWithIdentity(tool, profileName string) (*health.ProfileHeal
 	ph := buildProfileHealth(tool, profileName)
 	id := getVaultIdentity(tool, profileName)
 	applyIdentityToHealth(tool, profileName, ph, id)
+	applyActiveCooldown(tool, profileName, ph)
 	return ph, id
 }
 
@@ -898,8 +957,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Get health and identity info
+		// Get health and identity info. The active profile IS the live auth,
+		// so its live expiry supersedes any stale vault snapshot (PR #82).
 		ph, id := getProfileHealthWithIdentity(tool, activeProfile)
+		applyLiveExpiry(tool, ph)
 		status := health.CalculateStatus(ph)
 
 		if jsonOutput {
@@ -915,6 +976,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			if !ph.TokenExpiresAt.IsZero() {
 				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+			}
+			if reasons := health.StatusReasons(ph); len(reasons) > 0 {
+				st.Health.Reason = strings.Join(reasons, ", ")
 			}
 			// Get cooldown info
 			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})

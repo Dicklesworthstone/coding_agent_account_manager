@@ -287,3 +287,64 @@ func TestFormatDurationNatural(t *testing.T) {
 		})
 	}
 }
+
+// TestRateLimitCapReporting covers PR #82: an active rate-limit cooldown must
+// surface as "Rate limited", never as "Token expired", and must never produce
+// a re-login recommendation.
+func TestRateLimitCapReporting(t *testing.T) {
+	now := time.Now()
+
+	capped := &ProfileHealth{
+		TokenExpiresAt:   now.Add(-5 * 24 * time.Hour), // stale snapshot expiry
+		ErrorCount1h:     0,
+		RateLimitedUntil: now.Add(16 * time.Minute),
+	}
+
+	t.Run("StatusReasons puts rate limit first and drops token expired", func(t *testing.T) {
+		reasons := StatusReasons(capped)
+		if len(reasons) == 0 {
+			t.Fatal("StatusReasons() returned no reasons for a rate-limited profile")
+		}
+		if !strings.Contains(reasons[0], "Rate limited") {
+			t.Errorf("StatusReasons()[0] = %q, want it to contain %q", reasons[0], "Rate limited")
+		}
+		joined := strings.Join(reasons, ", ")
+		if strings.Contains(joined, "Token expired") {
+			t.Errorf("StatusReasons() = %q, must not contain %q for an active cap", joined, "Token expired")
+		}
+	})
+
+	t.Run("FormatStatusWithReason reports rate limited", func(t *testing.T) {
+		got := FormatStatusWithReason(StatusWarning, capped, FormatOptions{NoColor: true})
+		if !strings.Contains(got, "Rate limited") {
+			t.Errorf("FormatStatusWithReason() = %q, want it to contain %q", got, "Rate limited")
+		}
+		if strings.Contains(got, "Token expired") {
+			t.Errorf("FormatStatusWithReason() = %q, must not contain %q", got, "Token expired")
+		}
+	})
+
+	t.Run("FormatRecommendation says wait, not login", func(t *testing.T) {
+		got := FormatRecommendation("claude", "main", capped)
+		if !strings.Contains(got, "rate limited") {
+			t.Errorf("FormatRecommendation() = %q, want it to mention the rate limit", got)
+		}
+		if strings.Contains(got, "caam login") {
+			t.Errorf("FormatRecommendation() = %q, must not recommend re-login for a cap", got)
+		}
+	})
+
+	t.Run("genuine expiry without cooldown still reports and recommends login", func(t *testing.T) {
+		expired := &ProfileHealth{
+			TokenExpiresAt: now.Add(-1 * time.Hour),
+		}
+		reasons := strings.Join(StatusReasons(expired), ", ")
+		if !strings.Contains(reasons, "Token expired") {
+			t.Errorf("StatusReasons() = %q, want %q", reasons, "Token expired")
+		}
+		rec := FormatRecommendation("claude", "main", expired)
+		if !strings.Contains(rec, "caam login") {
+			t.Errorf("FormatRecommendation() = %q, want a login recommendation", rec)
+		}
+	})
+}

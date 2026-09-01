@@ -99,41 +99,63 @@ func FormatTimeRemaining(expiry time.Time) string {
 	}
 }
 
+// StatusReasons lists the human-readable causes behind a profile's health
+// verdict, most important first.
+//
+// An active rate-limit cooldown is reported first and suppresses the
+// "Token expired" reason: a capped account recovers on the reset timer, and
+// its recorded expiry may come from a stale vault snapshot while the live
+// token is still valid, so blaming the token misdirects the operator toward
+// a re-login that fixes nothing (PR #82).
+func StatusReasons(h *ProfileHealth) []string {
+	if h == nil {
+		return nil
+	}
+
+	var reasons []string
+	now := time.Now()
+	rateLimited := h.RateLimited(now)
+
+	if rateLimited {
+		reasons = append(reasons, fmt.Sprintf("Rate limited (resets in %s)", formatDurationNatural(h.RateLimitedUntil.Sub(now))))
+	}
+
+	// Check token expiry
+	if !h.TokenExpiresAt.IsZero() {
+		ttl := h.TokenExpiresAt.Sub(now)
+		if ttl <= 0 {
+			if !rateLimited {
+				reasons = append(reasons, "Token expired")
+			}
+		} else if ttl < time.Hour {
+			reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
+		}
+	}
+
+	// Check errors
+	if h.ErrorCount1h > 0 {
+		if h.ErrorCount1h == 1 {
+			reasons = append(reasons, "1 recent error")
+		} else {
+			reasons = append(reasons, fmt.Sprintf("%d recent errors", h.ErrorCount1h))
+		}
+	}
+
+	// Check penalty
+	if h.Penalty >= 1.0 {
+		reasons = append(reasons, "High penalty from errors")
+	}
+
+	return reasons
+}
+
 // FormatStatusWithReason returns a detailed status string with explanation.
 // Example: "🟡 Warning - Token expires in 12 minutes"
 func FormatStatusWithReason(status HealthStatus, health *ProfileHealth, opts FormatOptions) string {
 	icon := status.Icon()
 	statusStr := status.String()
 
-	var reasons []string
-
-	if health != nil {
-		// Check token expiry
-		if !health.TokenExpiresAt.IsZero() {
-			ttl := time.Until(health.TokenExpiresAt)
-			if ttl <= 0 {
-				reasons = append(reasons, "Token expired")
-			} else if ttl < 15*time.Minute {
-				reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
-			} else if ttl < time.Hour {
-				reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
-			}
-		}
-
-		// Check errors
-		if health.ErrorCount1h > 0 {
-			if health.ErrorCount1h == 1 {
-				reasons = append(reasons, "1 recent error")
-			} else {
-				reasons = append(reasons, fmt.Sprintf("%d recent errors", health.ErrorCount1h))
-			}
-		}
-
-		// Check penalty
-		if health.Penalty >= 1.0 {
-			reasons = append(reasons, "High penalty from errors")
-		}
-	}
+	reasons := StatusReasons(health)
 
 	var result string
 	if len(reasons) > 0 {
@@ -165,10 +187,17 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 	}
 
 	var recs []string
+	now := time.Now()
 
-	// Check token expiry
-	if !health.TokenExpiresAt.IsZero() {
-		ttl := time.Until(health.TokenExpiresAt)
+	if health.RateLimited(now) {
+		// A usage cap clears on its own timer. Re-authenticating does not
+		// lift it, and a login is disruptive (claude login is machine-wide),
+		// so never steer a rate-limited profile toward "caam login" (PR #82).
+		recs = append(recs, fmt.Sprintf("%s/%s is rate limited - wait %s for the cap to reset (re-login will not clear it)",
+			provider, profile, formatDurationNatural(health.RateLimitedUntil.Sub(now))))
+	} else if !health.TokenExpiresAt.IsZero() {
+		// Check token expiry
+		ttl := health.TokenExpiresAt.Sub(now)
 		if ttl <= 0 {
 			recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
 		} else if ttl < time.Hour {

@@ -39,6 +39,19 @@ type ProfileHealth struct {
 
 	// LastChecked is when health was last verified.
 	LastChecked time.Time `json:"last_checked,omitempty"`
+
+	// RateLimitedUntil is the end of an active rate-limit cooldown, filled in
+	// at report time from the limit_events table. It is never persisted here:
+	// the DB owns cooldown state. When set and in the future, the cap is the
+	// operative constraint and must be reported as "rate limited" rather than
+	// letting a (possibly stale) TokenExpiresAt masquerade as a token-expiry
+	// problem.
+	RateLimitedUntil time.Time `json:"-"`
+}
+
+// RateLimited reports whether an active rate-limit cooldown is in effect.
+func (h *ProfileHealth) RateLimited(now time.Time) bool {
+	return h != nil && !h.RateLimitedUntil.IsZero() && h.RateLimitedUntil.After(now)
 }
 
 // HealthStore holds health data for all profiles.

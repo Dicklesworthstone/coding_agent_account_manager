@@ -109,3 +109,71 @@ func TestHealthStatus_String_Icon(t *testing.T) {
 		}
 	}
 }
+
+// TestCalculateHealthRateLimitCap covers the PR #82 misclassification: an
+// active rate-limit cooldown must be reported as rate-limited (warning), not
+// escalated to critical by a (possibly stale) expired token timestamp.
+func TestCalculateHealthRateLimitCap(t *testing.T) {
+	now := time.Now()
+	config := DefaultHealthConfig()
+
+	tests := []struct {
+		name           string
+		health         *ProfileHealth
+		expectedStatus HealthStatus
+	}{
+		{
+			name: "active cooldown with stale expired token is warning, not critical",
+			health: &ProfileHealth{
+				TokenExpiresAt:   now.Add(-5 * 24 * time.Hour),
+				ErrorCount1h:     0,
+				RateLimitedUntil: now.Add(16 * time.Minute),
+			},
+			expectedStatus: StatusWarning,
+		},
+		{
+			name: "active cooldown with valid token is warning, not healthy",
+			health: &ProfileHealth{
+				TokenExpiresAt:   now.Add(6 * time.Hour),
+				ErrorCount1h:     0,
+				RateLimitedUntil: now.Add(30 * time.Minute),
+			},
+			expectedStatus: StatusWarning,
+		},
+		{
+			name: "lapsed cooldown does not mask a genuinely expired token",
+			health: &ProfileHealth{
+				TokenExpiresAt:   now.Add(-1 * time.Hour),
+				ErrorCount1h:     0,
+				RateLimitedUntil: now.Add(-1 * time.Minute),
+			},
+			expectedStatus: StatusCritical,
+		},
+		{
+			name: "active cooldown does not mask critical error rate",
+			health: &ProfileHealth{
+				TokenExpiresAt:   now.Add(-5 * 24 * time.Hour),
+				ErrorCount1h:     5,
+				RateLimitedUntil: now.Add(16 * time.Minute),
+			},
+			expectedStatus: StatusCritical,
+		},
+		{
+			name: "expired token without cooldown stays critical",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-1 * time.Minute),
+				ErrorCount1h:   0,
+			},
+			expectedStatus: StatusCritical,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _ := CalculateHealth(tt.health, config)
+			if status != tt.expectedStatus {
+				t.Errorf("CalculateHealth() status = %v, want %v", status, tt.expectedStatus)
+			}
+		})
+	}
+}
