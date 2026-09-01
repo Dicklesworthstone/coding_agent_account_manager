@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/spf13/cobra"
@@ -610,5 +611,56 @@ func TestFormatIdentityDisplay_ClaudeEmptyEmail(t *testing.T) {
 				t.Errorf("formatIdentityDisplay() plan = %q, want %q", gotPlan, tc.wantPlan)
 			}
 		})
+	}
+}
+
+// TestGetVaultIdentity_ClaudeEmailFromClaudeJSON covers the status/ls display
+// path for PR #85: a vault Claude profile whose .credentials.json carries no
+// email still reports the one in its .claude.json snapshot, and a profile
+// without that snapshot keeps the "n/a" display.
+func TestGetVaultIdentity_ClaudeEmailFromClaudeJSON(t *testing.T) {
+	prevVault := vault
+	t.Cleanup(func() { vault = prevVault })
+	vault = authfile.NewVault(t.TempDir())
+
+	writeProfile := func(name string, withSettings bool) {
+		dir := vault.ProfilePath("claude", name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max","expiresAt":1788000000000}}`
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(creds), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if withSettings {
+			settings := `{"numStartups":3,"oauthAccount":{"accountUuid":"uuid-work","emailAddress":"work@example.com","organizationName":"Work Org"}}`
+			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(settings), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeProfile("work", true)
+	writeProfile("solo", false)
+
+	id := getVaultIdentity("claude", "work")
+	if id == nil {
+		t.Fatal("getVaultIdentity(work) = nil")
+	}
+	if id.Email != "work@example.com" || id.AccountID != "uuid-work" || id.Organization != "Work Org" {
+		t.Errorf("identity = %+v, want work@example.com / uuid-work / Work Org", id)
+	}
+	if email, _ := formatIdentityDisplay(id); email != "work@example.com" {
+		t.Errorf("display email = %q, want %q", email, "work@example.com")
+	}
+
+	solo := getVaultIdentity("claude", "solo")
+	if solo == nil {
+		t.Fatal("getVaultIdentity(solo) = nil")
+	}
+	if solo.Email != "" {
+		t.Errorf("solo Email = %q, want empty", solo.Email)
+	}
+	if email, _ := formatIdentityDisplay(solo); email != "n/a" {
+		t.Errorf("solo display email = %q, want %q", email, "n/a")
 	}
 }

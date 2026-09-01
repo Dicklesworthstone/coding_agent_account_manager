@@ -543,8 +543,10 @@ func formatIdentityDisplay(id *identity.Identity) (string, string) {
 		return email, plan
 	}
 
-	// For Claude, email/accountId are no longer available in current auth files.
-	// Show "n/a" instead of "unknown" to indicate this is expected, not an error.
+	// For Claude the email comes from the oauthAccount block of the profile's
+	// .claude.json (the credentials file no longer carries it). A profile
+	// snapshotted without that file has no email to show: "n/a" instead of
+	// "unknown" marks that as expected, not an error.
 	// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001, CLAUDE-002)
 	if id.Provider == "claude" && strings.TrimSpace(id.Email) == "" {
 		email = "n/a"
