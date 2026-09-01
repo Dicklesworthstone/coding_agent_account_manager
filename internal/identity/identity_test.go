@@ -319,6 +319,66 @@ func TestFixture_CodexNestedTokens(t *testing.T) {
 	}
 }
 
+// TestExtractFromCodexAuth_ExpiryFromAccessToken: identity claims still come
+// from the id_token, but the expiry must be the access token's, since that is
+// the token Codex actually authenticates with (PR #86).
+func TestExtractFromCodexAuth_ExpiryFromAccessToken(t *testing.T) {
+	idExp := time.Now().Add(-3 * 24 * time.Hour).Truncate(time.Second)
+	accessExp := time.Now().Add(6 * 24 * time.Hour).Truncate(time.Second)
+
+	t.Run("nested layout", func(t *testing.T) {
+		path := writeAuthFile(t, map[string]interface{}{
+			"tokens": map[string]interface{}{
+				"id_token":     buildJWT(t, map[string]interface{}{"email": "id@example.com", "exp": idExp.Unix()}),
+				"access_token": buildJWT(t, map[string]interface{}{"exp": accessExp.Unix()}),
+			},
+		})
+
+		id, err := ExtractFromCodexAuth(path)
+		if err != nil {
+			t.Fatalf("ExtractFromCodexAuth error: %v", err)
+		}
+		if id.Email != "id@example.com" {
+			t.Errorf("Email = %q, want the id_token's email", id.Email)
+		}
+		if !id.ExpiresAt.Equal(accessExp) {
+			t.Errorf("ExpiresAt = %v, want access token exp %v", id.ExpiresAt, accessExp)
+		}
+	})
+
+	t.Run("flat layout", func(t *testing.T) {
+		path := writeAuthFile(t, map[string]interface{}{
+			"id_token":     buildJWT(t, map[string]interface{}{"email": "flat@example.com", "exp": idExp.Unix()}),
+			"access_token": buildJWT(t, map[string]interface{}{"exp": accessExp.Unix()}),
+		})
+
+		id, err := ExtractFromCodexAuth(path)
+		if err != nil {
+			t.Fatalf("ExtractFromCodexAuth error: %v", err)
+		}
+		if !id.ExpiresAt.Equal(accessExp) {
+			t.Errorf("ExpiresAt = %v, want access token exp %v", id.ExpiresAt, accessExp)
+		}
+	})
+
+	t.Run("id token expiry kept when access token has none", func(t *testing.T) {
+		path := writeAuthFile(t, map[string]interface{}{
+			"tokens": map[string]interface{}{
+				"id_token":     buildJWT(t, map[string]interface{}{"email": "id@example.com", "exp": idExp.Unix()}),
+				"access_token": "opaque",
+			},
+		})
+
+		id, err := ExtractFromCodexAuth(path)
+		if err != nil {
+			t.Fatalf("ExtractFromCodexAuth error: %v", err)
+		}
+		if !id.ExpiresAt.Equal(idExp) {
+			t.Errorf("ExpiresAt = %v, want id token exp %v", id.ExpiresAt, idExp)
+		}
+	})
+}
+
 func TestFixture_CodexOpenAINestedClaims(t *testing.T) {
 	// Tests the real-world Codex/OpenAI JWT structure where plan type is
 	// nested under "https://api.openai.com/auth" -> "chatgpt_plan_type".
