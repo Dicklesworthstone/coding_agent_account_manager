@@ -50,6 +50,14 @@ type ProfileHealth struct {
 	// letting a (possibly stale) TokenExpiresAt masquerade as a token-expiry
 	// problem.
 	RateLimitedUntil time.Time `json:"-"`
+
+	// SelfRefreshing marks TokenExpiresAt as the expiry of an access token
+	// the provider's own CLI renews in place (Claude Code, when a refresh
+	// token is present). Set at report time alongside TokenExpiresAt and
+	// never persisted: the token's TTL is then informational only and must
+	// not lower the verdict, list a reason, or recommend a refresh caam
+	// cannot perform (PR #84).
+	SelfRefreshing bool `json:"-"`
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.

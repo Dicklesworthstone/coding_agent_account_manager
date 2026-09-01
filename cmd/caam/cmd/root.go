@@ -310,13 +310,21 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
 	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = liveExp.ExpiresAt
+		applyExpiryInfo(ph, liveExp)
 	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
 		// Fallback: the vault snapshot is the best information we have.
-		ph.TokenExpiresAt = expInfo.ExpiresAt
+		applyExpiryInfo(ph, expInfo)
 	}
 
 	return ph
+}
+
+// applyExpiryInfo records a parsed credential's expiry on the health
+// snapshot, together with whether that credential is self-refreshing (so
+// the TTL is informational rather than a fault, PR #84).
+func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
+	ph.TokenExpiresAt = info.ExpiresAt
+	ph.SelfRefreshing = info.SelfRefreshing
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -357,7 +365,7 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 		return
 	}
 	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = info.ExpiresAt
+		applyExpiryInfo(ph, info)
 	}
 }
 

@@ -145,6 +145,58 @@ func TestCalculateHealth_PlanBonusByTier(t *testing.T) {
 	}
 }
 
+// TestCalculateHealth_SelfRefreshing covers PR #84: a credential the
+// provider's own CLI renews in place must not be downgraded by its short
+// access-token TTL, while errors and rate limits keep working.
+func TestCalculateHealth_SelfRefreshing(t *testing.T) {
+	now := time.Now()
+	config := DefaultHealthConfig()
+
+	tests := []struct {
+		name   string
+		health *ProfileHealth
+		want   HealthStatus
+	}{
+		{
+			name:   "expiring within warning window stays healthy",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute), SelfRefreshing: true},
+			want:   StatusHealthy,
+		},
+		{
+			name:   "inside critical window stays healthy",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(2 * time.Minute), SelfRefreshing: true},
+			want:   StatusHealthy,
+		},
+		{
+			name:   "lapsed token stays healthy",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(-3 * 24 * time.Hour), SelfRefreshing: true},
+			want:   StatusHealthy,
+		},
+		{
+			name:   "rate limit still caps at warning",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute), SelfRefreshing: true, RateLimitedUntil: now.Add(time.Hour)},
+			want:   StatusWarning,
+		},
+		{
+			name:   "critical error count still critical",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute), SelfRefreshing: true, ErrorCount1h: 3},
+			want:   StatusCritical,
+		},
+		{
+			name:   "same TTL without the flag is still warning",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute)},
+			want:   StatusWarning,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := CalculateHealth(tt.health, config); got != tt.want {
+				t.Errorf("CalculateHealth() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHealthStatus_String_Icon(t *testing.T) {
 	tests := []struct {
 		status   HealthStatus

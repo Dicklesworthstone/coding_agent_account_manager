@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -843,6 +844,49 @@ func TestParseExpiryField_AdditionalFormats(t *testing.T) {
 		}
 	})
 }
+
+// TestParseClaudeExpiry_SelfRefreshing: a Claude credential with a refresh
+// token is renewed by Claude Code itself; one without is not (PR #84).
+func TestParseClaudeExpiry_SelfRefreshing(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	exp := time.Now().Add(4 * time.Hour).UnixMilli()
+
+	dir := write(t, `{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":`+itoa(exp)+`}}`)
+	info, err := ParseClaudeExpiry(dir)
+	if err != nil {
+		t.Fatalf("ParseClaudeExpiry() error = %v", err)
+	}
+	if !info.SelfRefreshing || !info.HasRefreshToken {
+		t.Errorf("with refresh token: SelfRefreshing=%v HasRefreshToken=%v, want both true", info.SelfRefreshing, info.HasRefreshToken)
+	}
+
+	dir = write(t, `{"claudeAiOauth":{"accessToken":"a","expiresAt":`+itoa(exp)+`}}`)
+	info, err = ParseClaudeExpiry(dir)
+	if err != nil {
+		t.Fatalf("ParseClaudeExpiry() error = %v", err)
+	}
+	if info.SelfRefreshing {
+		t.Error("without refresh token: SelfRefreshing = true, want false")
+	}
+
+	// Other providers never set the flag.
+	codexPath := writeCodexAuthJSON(t, map[string]any{"access_token": "a", "refresh_token": "r", "expires_at": exp / 1000})
+	cinfo, err := ParseCodexExpiry(codexPath)
+	if err != nil {
+		t.Fatalf("ParseCodexExpiry() error = %v", err)
+	}
+	if cinfo.SelfRefreshing {
+		t.Error("codex: SelfRefreshing = true, want false")
+	}
+}
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // unsignedJWT builds a three-part JWT with the given payload claims. The
 // parsers never validate signatures, so a placeholder signature suffices.

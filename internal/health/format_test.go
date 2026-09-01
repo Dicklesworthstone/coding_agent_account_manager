@@ -164,6 +164,46 @@ func TestFormatStatusWithReason(t *testing.T) {
 	}
 }
 
+// TestSelfRefreshingFormatting covers PR #84: user-facing output must not
+// present the short access-token TTL of a self-refreshing credential as a
+// problem, nor recommend a caam refresh/login that cannot help.
+func TestSelfRefreshingFormatting(t *testing.T) {
+	now := time.Now()
+	expiring := &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute), SelfRefreshing: true}
+	lapsed := &ProfileHealth{TokenExpiresAt: now.Add(-2 * time.Hour), SelfRefreshing: true}
+
+	for name, h := range map[string]*ProfileHealth{"expiring": expiring, "lapsed": lapsed} {
+		if reasons := StatusReasons(h); len(reasons) != 0 {
+			t.Errorf("%s: StatusReasons() = %q, want none", name, reasons)
+		}
+		if rec := FormatRecommendation("claude", "main", h); rec != "" {
+			t.Errorf("%s: FormatRecommendation() = %q, want empty", name, rec)
+		}
+	}
+
+	got := FormatHealthStatus(StatusHealthy, lapsed, FormatOptions{NoColor: true})
+	if strings.Contains(got, "Expired") || !strings.Contains(got, "Auto-refresh") {
+		t.Errorf("FormatHealthStatus(lapsed) = %q, want 🟢 Auto-refresh", got)
+	}
+	got = FormatHealthStatus(StatusHealthy, expiring, FormatOptions{NoColor: true})
+	if !strings.Contains(got, "left") {
+		t.Errorf("FormatHealthStatus(expiring) = %q, want the remaining time", got)
+	}
+
+	// Other signals are still reported.
+	erroring := &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute), SelfRefreshing: true, ErrorCount1h: 4}
+	if reasons := strings.Join(StatusReasons(erroring), ", "); !strings.Contains(reasons, "4 recent errors") {
+		t.Errorf("StatusReasons(erroring) = %q, want the error count", reasons)
+	}
+	if rec := FormatRecommendation("claude", "main", erroring); !strings.Contains(rec, "frequent errors") {
+		t.Errorf("FormatRecommendation(erroring) = %q, want the error advice", rec)
+	}
+	capped := &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), SelfRefreshing: true, RateLimitedUntil: now.Add(30 * time.Minute)}
+	if reasons := strings.Join(StatusReasons(capped), ", "); !strings.Contains(reasons, "Rate limited") {
+		t.Errorf("StatusReasons(capped) = %q, want the rate limit", reasons)
+	}
+}
+
 func TestFormatRecommendation(t *testing.T) {
 	now := time.Now()
 

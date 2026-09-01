@@ -155,6 +155,14 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		return warnings
 	}
 
+	// A self-refreshing credential (Claude Code with a refresh token) renews
+	// its short-lived access token by itself, and the "caam refresh" this
+	// would recommend is unsupported for it. Warning on every invocation
+	// about a TTL that is routine lifecycle is noise (PR #84).
+	if expInfo.SelfRefreshing {
+		return warnings
+	}
+
 	// Check expiry
 	remaining := time.Until(expInfo.ExpiresAt)
 
