@@ -47,6 +47,15 @@ type ProfileHealth struct {
 	// letting a (possibly stale) TokenExpiresAt masquerade as a token-expiry
 	// problem.
 	RateLimitedUntil time.Time `json:"-"`
+
+	// SelfRefreshing marks a credential whose access token is renewed in place
+	// by the provider's own CLI (Claude Code) from a stored refresh token.
+	// caam can neither perform nor needs to perform that refresh, so an
+	// approaching or just-passed access-token expiry is normal lifecycle and
+	// must not downgrade the profile or produce advice the operator cannot act
+	// on (issue #22). Filled in at report time by the caller, which knows the
+	// provider; never persisted.
+	SelfRefreshing bool `json:"-"`
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.

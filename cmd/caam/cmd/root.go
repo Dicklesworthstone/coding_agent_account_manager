@@ -36,6 +36,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	grokprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/grok"
 	opencodeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/opencode"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tui"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/warnings"
@@ -301,6 +302,13 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 
+	// The credential this profile's health is read from. The vault snapshot is
+	// the fallback; the live file below supersedes it when readable.
+	cred := expInfo
+	if err != nil {
+		cred = nil
+	}
+
 	// Prefer the profile's own live credential over the vault snapshot.
 	// Vault copies are frozen at backup/activate time while tools refresh
 	// the live file in place, so a snapshot expiry can be days stale and
@@ -310,10 +318,17 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
 	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = liveExp.ExpiresAt
-	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
-		// Fallback: the vault snapshot is the best information we have.
-		ph.TokenExpiresAt = expInfo.ExpiresAt
+		cred = liveExp
+	}
+
+	if cred != nil && !cred.ExpiresAt.IsZero() {
+		ph.TokenExpiresAt = cred.ExpiresAt
+	}
+	// Claude Code renews its own access token from the refresh token stored
+	// beside it, and caam's Claude refresh is disabled, so the short TTL is
+	// routine lifecycle rather than a fault to report (issue #22).
+	if cred != nil && cred.HasRefreshToken && refresh.SelfRefreshing(tool) {
+		ph.SelfRefreshing = true
 	}
 
 	return ph
@@ -356,8 +371,15 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if ph == nil {
 		return
 	}
-	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+	info := liveAuthExpiry(tool)
+	if info == nil {
+		return
+	}
+	if !info.ExpiresAt.IsZero() {
 		ph.TokenExpiresAt = info.ExpiresAt
+	}
+	if info.HasRefreshToken && refresh.SelfRefreshing(tool) {
+		ph.SelfRefreshing = true
 	}
 }
 

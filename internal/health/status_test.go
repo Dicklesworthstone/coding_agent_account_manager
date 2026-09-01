@@ -177,3 +177,68 @@ func TestCalculateHealthRateLimitCap(t *testing.T) {
 		})
 	}
 }
+
+// TestCalculateHealthSelfRefreshing covers issue #22: a credential the
+// provider's own CLI renews in place (Claude Code) must not be downgraded by
+// its short access-token TTL, while every other signal keeps working.
+func TestCalculateHealthSelfRefreshing(t *testing.T) {
+	now := time.Now()
+	config := DefaultHealthConfig()
+
+	tests := []struct {
+		name           string
+		health         *ProfileHealth
+		expectedStatus HealthStatus
+	}{
+		{
+			name: "access token expiring within the warning window stays healthy",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(20 * time.Minute),
+				SelfRefreshing: true,
+			},
+			expectedStatus: StatusHealthy,
+		},
+		{
+			name: "lapsed access token stays healthy",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-2 * time.Hour),
+				SelfRefreshing: true,
+			},
+			expectedStatus: StatusHealthy,
+		},
+		{
+			name: "same token without self-refresh is critical",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(-2 * time.Hour),
+			},
+			expectedStatus: StatusCritical,
+		},
+		{
+			name: "an active cap still outranks self-refresh",
+			health: &ProfileHealth{
+				TokenExpiresAt:   now.Add(20 * time.Minute),
+				SelfRefreshing:   true,
+				RateLimitedUntil: now.Add(30 * time.Minute),
+			},
+			expectedStatus: StatusWarning,
+		},
+		{
+			name: "errors still escalate a self-refreshing profile",
+			health: &ProfileHealth{
+				TokenExpiresAt: now.Add(20 * time.Minute),
+				SelfRefreshing: true,
+				ErrorCount1h:   5,
+			},
+			expectedStatus: StatusCritical,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, _ := CalculateHealth(tt.health, config)
+			if status != tt.expectedStatus {
+				t.Errorf("CalculateHealth() status = %v, want %v", status, tt.expectedStatus)
+			}
+		})
+	}
+}

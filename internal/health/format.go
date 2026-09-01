@@ -35,7 +35,13 @@ func FormatHealthStatus(status HealthStatus, health *ProfileHealth, opts FormatO
 	} else if !health.TokenExpiresAt.IsZero() {
 		ttl := time.Until(health.TokenExpiresAt)
 		if ttl <= 0 {
-			text = "Expired"
+			if health.SelfRefreshing {
+				// Claude Code renews this token on next use, so it is stale,
+				// not expired; "Expired" would read as a dead account.
+				text = "Refreshable"
+			} else {
+				text = "Expired"
+			}
 		} else {
 			text = FormatTimeRemaining(health.TokenExpiresAt)
 		}
@@ -120,8 +126,10 @@ func StatusReasons(h *ProfileHealth) []string {
 		reasons = append(reasons, fmt.Sprintf("Rate limited (resets in %s)", formatDurationNatural(h.RateLimitedUntil.Sub(now))))
 	}
 
-	// Check token expiry
-	if !h.TokenExpiresAt.IsZero() {
+	// Check token expiry. A self-refreshing credential is skipped: its access
+	// token is renewed in place by the provider's CLI, so its TTL is not a
+	// reason for anything (issue #22).
+	if !h.TokenExpiresAt.IsZero() && !h.SelfRefreshing {
 		ttl := h.TokenExpiresAt.Sub(now)
 		if ttl <= 0 {
 			if !rateLimited {
@@ -195,8 +203,10 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 		// so never steer a rate-limited profile toward "caam login" (PR #82).
 		recs = append(recs, fmt.Sprintf("%s/%s is rate limited - wait %s for the cap to reset (re-login will not clear it)",
 			provider, profile, formatDurationNatural(health.RateLimitedUntil.Sub(now))))
-	} else if !health.TokenExpiresAt.IsZero() {
-		// Check token expiry
+	} else if !health.TokenExpiresAt.IsZero() && !health.SelfRefreshing {
+		// Check token expiry. Nothing to recommend for a self-refreshing
+		// credential: the provider's CLI renews it on next use, "caam refresh
+		// claude X" is unsupported, and a login is disruptive (issue #22).
 		ttl := health.TokenExpiresAt.Sub(now)
 		if ttl <= 0 {
 			recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))

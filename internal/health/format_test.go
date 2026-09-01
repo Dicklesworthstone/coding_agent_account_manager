@@ -348,3 +348,76 @@ func TestRateLimitCapReporting(t *testing.T) {
 		}
 	})
 }
+
+// TestSelfRefreshingFormatting covers issue #22: nothing in the user-facing
+// output may present the short access-token TTL of a self-refreshing
+// credential as a problem, or recommend a caam refresh/login that cannot help.
+func TestSelfRefreshingFormatting(t *testing.T) {
+	now := time.Now()
+
+	t.Run("StatusReasons omits the access-token TTL", func(t *testing.T) {
+		expiring := &ProfileHealth{
+			TokenExpiresAt: now.Add(20 * time.Minute),
+			SelfRefreshing: true,
+		}
+		if reasons := StatusReasons(expiring); len(reasons) != 0 {
+			t.Errorf("StatusReasons() = %q, want none", reasons)
+		}
+
+		lapsed := &ProfileHealth{
+			TokenExpiresAt: now.Add(-2 * time.Hour),
+			SelfRefreshing: true,
+		}
+		if reasons := StatusReasons(lapsed); len(reasons) != 0 {
+			t.Errorf("StatusReasons() = %q, want none", reasons)
+		}
+	})
+
+	t.Run("FormatRecommendation stays silent", func(t *testing.T) {
+		expiring := &ProfileHealth{
+			TokenExpiresAt: now.Add(20 * time.Minute),
+			SelfRefreshing: true,
+		}
+		if got := FormatRecommendation("claude", "main", expiring); got != "" {
+			t.Errorf("FormatRecommendation() = %q, want empty", got)
+		}
+
+		lapsed := &ProfileHealth{
+			TokenExpiresAt: now.Add(-2 * time.Hour),
+			SelfRefreshing: true,
+		}
+		got := FormatRecommendation("claude", "main", lapsed)
+		if got != "" {
+			t.Errorf("FormatRecommendation() = %q, want empty", got)
+		}
+	})
+
+	t.Run("FormatHealthStatus reports a lapsed token as refreshable", func(t *testing.T) {
+		lapsed := &ProfileHealth{
+			TokenExpiresAt: now.Add(-2 * time.Hour),
+			SelfRefreshing: true,
+		}
+		got := FormatHealthStatus(StatusHealthy, lapsed, FormatOptions{NoColor: true})
+		if strings.Contains(got, "Expired") {
+			t.Errorf("FormatHealthStatus() = %q, must not label a self-refreshing token expired", got)
+		}
+		if !strings.Contains(got, "Refreshable") {
+			t.Errorf("FormatHealthStatus() = %q, want it to contain %q", got, "Refreshable")
+		}
+	})
+
+	t.Run("errors on a self-refreshing profile are still reported", func(t *testing.T) {
+		erroring := &ProfileHealth{
+			TokenExpiresAt: now.Add(20 * time.Minute),
+			SelfRefreshing: true,
+			ErrorCount1h:   4,
+		}
+		reasons := strings.Join(StatusReasons(erroring), ", ")
+		if !strings.Contains(reasons, "4 recent errors") {
+			t.Errorf("StatusReasons() = %q, want it to report the errors", reasons)
+		}
+		if !strings.Contains(FormatRecommendation("claude", "main", erroring), "frequent errors") {
+			t.Error("FormatRecommendation() should still flag frequent errors")
+		}
+	})
+}

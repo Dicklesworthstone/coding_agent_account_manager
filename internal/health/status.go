@@ -80,7 +80,11 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	now := time.Now()
 
 	// Factor 1: Token expiry (primary)
-	if h.TokenExpiresAt.IsZero() {
+	if h.SelfRefreshing {
+		// The provider's own CLI renews this access token in place, so its
+		// TTL says nothing about the account (issue #22).
+		score += 1.0
+	} else if h.TokenExpiresAt.IsZero() {
 		// Unknown expiry - neutral
 	} else if h.TokenExpiresAt.Before(now) {
 		score -= 1.0 // Expired
@@ -125,8 +129,10 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		status = StatusWarning
 	}
 
-	// Override if token is strictly expired or critical errors met
-	if !h.TokenExpiresAt.IsZero() {
+	// Override if token is strictly expired or critical errors met.
+	// A self-refreshing credential is exempt: its access-token TTL is renewed
+	// by the provider's CLI, not by anything the operator does.
+	if !h.TokenExpiresAt.IsZero() && !h.SelfRefreshing {
 		if h.TokenExpiresAt.Before(now) {
 			if h.RateLimited(now) {
 				// An active rate-limit cooldown outranks the recorded expiry:
