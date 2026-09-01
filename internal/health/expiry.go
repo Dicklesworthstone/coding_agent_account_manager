@@ -32,6 +32,14 @@ type ExpiryInfo struct {
 	// HasRefreshToken indicates if a refresh token is available.
 	HasRefreshToken bool
 
+	// SelfRefreshing reports that the provider's own CLI renews this access
+	// token in place from the refresh token stored beside it, and that caam
+	// neither can nor should refresh it. Claude Code works this way (see
+	// refresh.ClaudeRefreshDisabled): its access tokens live only a few
+	// hours and are renewed on next use, so a short TTL is routine lifecycle
+	// rather than a fault to warn about (PR #84).
+	SelfRefreshing bool
+
 	// Source describes where the expiry was parsed from.
 	Source string
 }
@@ -54,6 +62,20 @@ type ExpiryInfo struct {
 //	  }
 //	}
 func ParseClaudeExpiry(authDir string) (*ExpiryInfo, error) {
+	info, err := parseClaudeExpiryFiles(authDir)
+	if err != nil {
+		return nil, err
+	}
+	// Claude Code renews its own access token from the refresh token, and
+	// caam's Claude refresh is disabled, so a credential that carries a
+	// refresh token is self-refreshing.
+	info.SelfRefreshing = info.HasRefreshToken
+	return info, nil
+}
+
+// parseClaudeExpiryFiles locates and parses the Claude credential file for
+// authDir ("" means the live locations under HOME / CLAUDE_CONFIG_DIR).
+func parseClaudeExpiryFiles(authDir string) (*ExpiryInfo, error) {
 	homeDir, _ := os.UserHomeDir()
 
 	if authDir == "" {
