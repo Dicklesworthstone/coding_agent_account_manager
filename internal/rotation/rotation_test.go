@@ -2,10 +2,72 @@ package rotation
 
 import (
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
+
+// TestPlanBonus guards PR #87: the rotation bonus follows the shared
+// health.PlanTierOf ranking, so a Max account is rewarded at least as much as
+// a Pro one and an unrecognized spelling earns nothing.
+func TestPlanBonus(t *testing.T) {
+	free, pro, team := planBonus("free"), planBonus("pro"), planBonus("team")
+	max, ultra, enterprise := planBonus("max"), planBonus("ultra"), planBonus("enterprise")
+	if free != 0 {
+		t.Errorf("free bonus = %v, want 0", free)
+	}
+	if pro <= 0 || team != pro {
+		t.Errorf("pro %v / team %v must be equal and positive", pro, team)
+	}
+	if max < pro || ultra < pro {
+		t.Errorf("max %v / ultra %v must be at least pro %v", max, ultra, pro)
+	}
+	if enterprise < max {
+		t.Errorf("enterprise %v must be at least max %v", enterprise, max)
+	}
+	if got := planBonus("claude_pro_2025"); got != 0 {
+		t.Errorf("unrecognized plan bonus = %v, want 0", got)
+	}
+}
+
+// TestSelectSmart_PlanReasonUsesRealTier: the explanation names the actual
+// plan ("Max plan"), not a collapsed spelling.
+func TestSelectSmart_PlanReasonUsesRealTier(t *testing.T) {
+	store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	expiry := time.Now().Add(24 * time.Hour)
+	for name, plan := range map[string]string{"maxacct": "max", "proacct": "pro", "freeacct": "free"} {
+		if err := store.UpdateProfile("claude", name, &health.ProfileHealth{TokenExpiresAt: expiry, PlanType: plan}); err != nil {
+			t.Fatalf("UpdateProfile(%s) error = %v", name, err)
+		}
+	}
+
+	s := NewSelector(AlgorithmSmart, store, nil)
+	result, err := s.Select("claude", []string{"maxacct", "proacct", "freeacct"}, "")
+	if err != nil {
+		t.Fatalf("Select() error = %v", err)
+	}
+
+	reasons := map[string]string{}
+	for _, alt := range result.Alternatives {
+		var texts []string
+		for _, r := range alt.Reasons {
+			texts = append(texts, r.Text)
+		}
+		reasons[alt.Name] = strings.Join(texts, "|")
+	}
+	if !strings.Contains(reasons["maxacct"], "Max plan") {
+		t.Errorf("reasons for maxacct = %q, want %q", reasons["maxacct"], "Max plan")
+	}
+	if !strings.Contains(reasons["proacct"], "Pro plan") {
+		t.Errorf("reasons for proacct = %q, want %q", reasons["proacct"], "Pro plan")
+	}
+	if strings.Contains(reasons["freeacct"], "plan") {
+		t.Errorf("reasons for freeacct = %q, want no plan bonus reason", reasons["freeacct"])
+	}
+}
 
 func TestNewSelector(t *testing.T) {
 	s := NewSelector(AlgorithmSmart, nil, nil)
