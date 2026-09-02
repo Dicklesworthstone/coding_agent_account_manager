@@ -1193,3 +1193,56 @@ func TestPrependShallowLocalBin(t *testing.T) {
 		t.Fatalf("empty PATH: got %q, want %q", got, bin)
 	}
 }
+
+// TestShallowList_ShowsLiveLoginState pins the LOGIN column: it reflects the
+// profile's credential file and identity right now, not the creation-time
+// source, which stays "(none)" for a profile that logged in later.
+func TestShallowList_ShowsLiveLoginState(t *testing.T) {
+	base, _ := shallowEnv(t)
+
+	for _, name := range []string{"fresh", "logged"} {
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", name, "--tool", "claude"); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+	loggedHome := filepath.Join(base, "logged")
+	if err := os.WriteFile(filepath.Join(loggedHome, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"t","refreshToken":"r"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(loggedHome, ".claude.json"), []byte(`{"oauthAccount":{"accountUuid":"u-logged","emailAddress":"logged@example.com"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "list")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(stdout, "LOGIN") || !strings.Contains(stdout, "logged@example.com") || !strings.Contains(stdout, "not logged in") {
+		t.Fatalf("table lacks live login state:\n%s", stdout)
+	}
+
+	stdout, _, err = runCmdCaptured(t, "shallow-profile", "list", "--json")
+	if err != nil {
+		t.Fatalf("list --json: %v", err)
+	}
+	var out struct {
+		Profiles []struct {
+			Name     string `json:"name"`
+			LoggedIn bool   `json:"logged_in"`
+			Identity string `json:"identity"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	got := map[string][2]any{}
+	for _, p := range out.Profiles {
+		got[p.Name] = [2]any{p.LoggedIn, p.Identity}
+	}
+	if got["fresh"] != [2]any{false, ""} {
+		t.Fatalf("fresh: %v", got["fresh"])
+	}
+	if got["logged"] != [2]any{true, "logged@example.com"} {
+		t.Fatalf("logged: %v", got["logged"])
+	}
+}

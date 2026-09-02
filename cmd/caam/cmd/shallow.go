@@ -349,10 +349,46 @@ func init() {
 }
 
 type shallowListItem struct {
-	Name           string    `json:"name"`
-	Path           string    `json:"path"`
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Provider string `json:"provider,omitempty"`
+	// LoggedIn reports whether the profile's private credential file holds a
+	// credential right now; Identity names the account (claude only) from
+	// the profile's own .claude.json. Both are read live, unlike
+	// CredentialFrom, which only records where the credential came from at
+	// creation time and stays "(none)" for a profile that logged in later.
+	LoggedIn       bool      `json:"logged_in"`
+	Identity       string    `json:"identity,omitempty"`
 	CredentialFrom string    `json:"credential_from,omitempty"`
 	CreatedAt      time.Time `json:"created_at,omitempty"`
+}
+
+// shallowLoginState reads a shallow profile's live login state: its provider,
+// whether its private credential file holds a credential, and (claude only)
+// which account that is.
+func shallowLoginState(mgr *shallow.Manager, name, home string) (provider string, loggedIn bool, identity string) {
+	provider, _ = mgr.ResolveProvider(name)
+	credPath, err := mgr.CredentialPath(name)
+	if err != nil {
+		return provider, false, ""
+	}
+	loggedIn = shallowCredentialPresent(credPath)
+	if loggedIn && shallow.NormalizeProvider(provider) == "claude" {
+		identity = authfile.ClaudeIdentityLabel(authfile.ClaudeIdentityKeysFromFile(filepath.Join(home, ".claude.json")))
+	}
+	return provider, loggedIn, identity
+}
+
+// shallowCredentialPresent reports whether path holds a non-empty JSON
+// object: the shape every provider's credential file takes once a login has
+// happened, and what an empty placeholder written at creation lacks.
+func shallowCredentialPresent(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	return json.Unmarshal(data, &obj) == nil && len(obj) > 0
 }
 
 type shallowListOutput struct {
@@ -376,6 +412,7 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 		out := shallowListOutput{BaseDir: mgr.BaseDir(), Count: len(profiles)}
 		for _, p := range profiles {
 			item := shallowListItem{Name: p.Name, Path: p.Path}
+			item.Provider, item.LoggedIn, item.Identity = shallowLoginState(mgr, p.Name, p.Path)
 			if p.Meta != nil {
 				item.CredentialFrom = p.Meta.CredentialFrom
 				item.CreatedAt = p.Meta.CreatedAt
@@ -395,7 +432,7 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Shallow profiles (base: %s)\n", mgr.BaseDir())
-	fmt.Fprintf(cmd.OutOrStdout(), "%-22s  %-32s  %s\n", "NAME", "CREDENTIALS", "CREATED")
+	fmt.Fprintf(cmd.OutOrStdout(), "%-22s  %-32s  %-24s  %s\n", "NAME", "LOGIN", "SOURCE", "CREATED")
 	for _, p := range profiles {
 		credFrom := "(none)"
 		created := "?"
@@ -407,7 +444,15 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 				created = p.Meta.CreatedAt.Local().Format("2006-01-02 15:04")
 			}
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "%-22s  %-32s  %s\n", p.Name, credFrom, created)
+		_, loggedIn, identity := shallowLoginState(mgr, p.Name, p.Path)
+		login := "not logged in"
+		switch {
+		case identity != "":
+			login = identity
+		case loggedIn:
+			login = "logged in"
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%-22s  %-32s  %-24s  %s\n", p.Name, login, credFrom, created)
 	}
 	return nil
 }
@@ -792,12 +837,7 @@ func shallowSpawnDoubleSpend(provider, profileHome string) (label string, confli
 	if shallow.NormalizeProvider(provider) != "claude" {
 		return "", false
 	}
-	cred, err := os.ReadFile(filepath.Join(profileHome, ".claude", ".credentials.json"))
-	if err != nil {
-		return "", false
-	}
-	var credObj map[string]json.RawMessage
-	if json.Unmarshal(cred, &credObj) != nil || len(credObj) == 0 {
+	if !shallowCredentialPresent(filepath.Join(profileHome, ".claude", ".credentials.json")) {
 		return "", false
 	}
 	profileKeys := authfile.ClaudeIdentityKeysFromFile(filepath.Join(profileHome, ".claude.json"))
