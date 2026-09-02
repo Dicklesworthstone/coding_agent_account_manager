@@ -12,27 +12,27 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "next": "16.1.4",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
+    "framer-motion": "^12.43.0",
     "lucide-react": "^0.513.0",
-    "framer-motion": "^12.18.0"
+    "next": "16.3.4",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.1.18",
-    "@types/node": "^20.19.30",
-    "@types/react": "^19.2.9",
-    "@types/react-dom": "^19.2.3",
-    "eslint": "^9.39.2",
-    "eslint-config-next": "16.1.4",
-    "tailwindcss": "^4.1.18",
-    "typescript": "^5.9.3",
-    "@playwright/test": "^1.52.1",
-    "vitest": "^3.2.3",
-    "@testing-library/react": "^16.3.0",
-    "@vitejs/plugin-react": "^4.5.4",
+    "@playwright/test": "^1.62.1",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^20.19.43",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^4.7.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "16.3.4",
     "jsdom": "^26.1.0",
-    "@testing-library/jest-dom": "^6.6.3"
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
   },
   "engines": {
     "node": ">=22.0.0",
