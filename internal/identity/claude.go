@@ -68,19 +68,51 @@ type claudeSettingsIdentity struct {
 	OAuthAccount *claudeOAuthAccount `json:"oauthAccount"`
 }
 
-// claudeSettingsCandidates lists where the .claude.json paired with a
-// credentials file lives: beside it (vault profile snapshots, and
-// CLAUDE_CONFIG_DIR layouts, keep the two side by side), and, when the
-// credentials sit in a ".claude" directory, in that directory's parent
-// (the live ~/.claude/.credentials.json pairs with ~/.claude.json, as does a
-// shallow profile's <home>/.claude/.credentials.json).
+// claudeSettingsCandidates lists, in precedence order, where the .claude.json
+// paired with a credentials file lives. It mirrors how Claude Code itself
+// resolves the file: the credentials always sit in the config directory, and
+// the state file is <config dir>/.claude.json when CLAUDE_CONFIG_DIR is set
+// but ~/.claude.json — one level ABOVE the default ~/.claude config dir — when
+// it is not.
+//
+//   - Credentials in a directory not named ".claude" (a vault snapshot, or an
+//     explicit CLAUDE_CONFIG_DIR): only the sibling .claude.json is paired.
+//   - Credentials in a ".claude" directory (the live ~/.claude, or a shallow
+//     profile's <home>/.claude): the parent's .claude.json is canonical and
+//     is consulted first. A .claude.json inside the directory is only a
+//     fallback — it is what an older tool that exported CLAUDE_CONFIG_DIR=
+//     ~/.claude left behind, and the shallow symlink farm mirrors such a
+//     stray file into every profile's .claude/, where it would otherwise
+//     outrank the profile's own identity (issue #91). The one layout in which
+//     the nested file IS canonical — CLAUDE_CONFIG_DIR currently pointing at
+//     that very directory — puts it first again.
 func claudeSettingsCandidates(credentialsPath string) []string {
 	dir := filepath.Dir(credentialsPath)
-	candidates := []string{filepath.Join(dir, claudeSettingsFile)}
-	if filepath.Base(dir) == ".claude" {
-		candidates = append(candidates, filepath.Join(filepath.Dir(dir), claudeSettingsFile))
+	sibling := filepath.Join(dir, claudeSettingsFile)
+	if filepath.Base(dir) != ".claude" {
+		return []string{sibling}
 	}
-	return candidates
+	parent := filepath.Join(filepath.Dir(dir), claudeSettingsFile)
+	if cfg := os.Getenv("CLAUDE_CONFIG_DIR"); cfg != "" && samePath(cfg, dir) {
+		return []string{sibling, parent}
+	}
+	return []string{parent, sibling}
+}
+
+// samePath reports whether a and b name the same directory, resolving
+// symlinks when possible.
+func samePath(a, b string) bool {
+	return canonicalPath(a) == canonicalPath(b)
+}
+
+func canonicalPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return filepath.Clean(p)
 }
 
 // fillFromClaudeSettings copies the identity fields that are still empty out

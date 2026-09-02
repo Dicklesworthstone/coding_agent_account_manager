@@ -262,14 +262,90 @@ func TestExtractFromClaudeCredentials_IdentityFromParentClaudeJSON(t *testing.T)
 		t.Errorf("identity = %+v, want live@example.com / uuid-live", id)
 	}
 
-	// A .claude.json beside the credentials outranks the parent's.
-	writeClaudeSettings(t, claudeDir, map[string]interface{}{"emailAddress": "beside@example.com"})
+	// A stray .claude.json INSIDE .claude/ (left by an older tool that set
+	// CLAUDE_CONFIG_DIR=~/.claude, and mirrored into every shallow profile by
+	// the symlink farm) must not outrank the canonical parent file (#91).
+	writeClaudeSettings(t, claudeDir, map[string]interface{}{
+		"accountUuid":  "uuid-stale",
+		"emailAddress": "stale@example.com",
+	})
 	id, err = ExtractFromClaudeCredentials(credPath)
 	if err != nil {
 		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
 	}
-	if id.Email != "beside@example.com" {
-		t.Errorf("Email = %q, want the sibling file's %q", id.Email, "beside@example.com")
+	if id.Email != "live@example.com" || id.AccountID != "uuid-live" {
+		t.Errorf("identity = %+v, want the parent ~/.claude.json to win over the stray nested file", id)
+	}
+}
+
+// With no usable parent file the nested .claude.json is still a fallback.
+func TestExtractFromClaudeCredentials_NestedClaudeJSONIsFallback(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"subscriptionType":"pro"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, claudeDir, map[string]interface{}{"emailAddress": "nested@example.com"})
+
+	// No parent file at all.
+	id, err := ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "nested@example.com" {
+		t.Errorf("Email = %q, want nested fallback %q", id.Email, "nested@example.com")
+	}
+
+	// A parent file without an oauthAccount block does not shadow the fallback.
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	id, err = ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "nested@example.com" {
+		t.Errorf("Email = %q, want nested fallback %q", id.Email, "nested@example.com")
+	}
+}
+
+// When CLAUDE_CONFIG_DIR points at the .claude directory itself, Claude Code
+// keeps its state file inside it, so the nested file is canonical again.
+func TestExtractFromClaudeCredentials_ConfigDirPinsNestedClaudeJSON(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, home, map[string]interface{}{"emailAddress": "parent@example.com"})
+	writeClaudeSettings(t, claudeDir, map[string]interface{}{"emailAddress": "configdir@example.com"})
+
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	id, err := ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "configdir@example.com" {
+		t.Errorf("Email = %q, want %q (CLAUDE_CONFIG_DIR names this dir)", id.Email, "configdir@example.com")
+	}
+
+	// A CLAUDE_CONFIG_DIR naming some OTHER directory (a different profile's
+	// config dir, say) does not change the precedence for this one.
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(t.TempDir(), ".claude"))
+	id, err = ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "parent@example.com" {
+		t.Errorf("Email = %q, want parent %q", id.Email, "parent@example.com")
 	}
 }
 
