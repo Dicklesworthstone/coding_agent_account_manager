@@ -853,3 +853,73 @@ func TestShallowCreateVaultWithoutSnapshotMergesOnboarding(t *testing.T) {
 		t.Fatalf("real HOME state fields dropped; staged = %s", staged)
 	}
 }
+
+// TestShallowSpawnSyncsClaudeConfig proves the end-to-end wiring of the
+// shared-configuration refresh (#93): before exec, a claude shallow profile's
+// private .claude.json picks up the allowlisted preference keys from the real
+// ~/.claude.json while keeping its own identity; --no-sync-config and
+// --print-env leave the profile untouched.
+func TestShallowSpawnSyncsClaudeConfig(t *testing.T) {
+	base, realHome := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	profilePath := filepath.Join(base, "alice", ".claude.json")
+	profileState := `{"oauthAccount":{"emailAddress":"alice@example.com"},"theme":"light"}`
+	if err := os.WriteFile(profilePath, []byte(profileState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realState := `{"oauthAccount":{"emailAddress":"real@example.com"},"theme":"dark","editorMode":"vim"}`
+	if err := os.WriteFile(filepath.Join(realHome, ".claude.json"), []byte(realState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origExec := spawnExec
+	spawnExec = func(_ string, _ []string, _ []string) error { return nil }
+	t.Cleanup(func() { spawnExec = origExec })
+
+	readProfile := func() string {
+		t.Helper()
+		raw, err := os.ReadFile(profilePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+
+	// --print-env and --no-sync-config are read-only for the profile file.
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env"); err != nil {
+		t.Fatalf("print-env: %v", err)
+	}
+	if got := readProfile(); got != profileState {
+		t.Fatalf("--print-env mutated the profile: %s", got)
+	}
+	if _, stderr, err := runCmdCaptured(t, "shallow-spawn", "alice", "--no-sync-config", "--", "sh", "-c", "true"); err != nil {
+		t.Fatalf("spawn --no-sync-config: %v (stderr %q)", err, stderr)
+	}
+	if got := readProfile(); got != profileState {
+		t.Fatalf("--no-sync-config mutated the profile: %s", got)
+	}
+
+	_, stderr, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if !strings.Contains(stderr, "refreshed 2 shared Claude settings") {
+		t.Fatalf("expected refresh note on stderr, got %q", stderr)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(readProfile()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["theme"]) != `"dark"` || string(got["editorMode"]) != `"vim"` {
+		t.Fatalf("preferences not refreshed: %s", readProfile())
+	}
+	if !strings.Contains(string(got["oauthAccount"]), "alice@example.com") {
+		t.Fatalf("profile identity clobbered by the real HOME's: %s", got["oauthAccount"])
+	}
+	realRaw, _ := os.ReadFile(filepath.Join(realHome, ".claude.json"))
+	if string(realRaw) != realState {
+		t.Fatal("real ~/.claude.json was modified by shallow-spawn")
+	}
+}

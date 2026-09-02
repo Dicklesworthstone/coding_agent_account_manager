@@ -506,12 +506,20 @@ to run anything else under the profile instead.
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
 profile, so spawned sessions see the same skill library as direct ones.
-Auth/config files stay real and private; nothing is copied or overwritten.
+Auth files stay real and private; nothing else is copied or overwritten.
+
+For claude profiles each spawn additionally refreshes the SHARED preference
+keys of the profile's private .claude.json (theme, editor mode, notification
+channel, user-scope mcpServers, and per-project trust / allowedTools / MCP
+settings) from your real ~/.claude.json: the main lane is the source of
+truth for configuration. The profile's identity (oauthAccount), usage cache
+and session state are never touched. Pass --no-sync-config to skip it.
 
 Examples:
   caam shallow-spawn alice                     # open claude as alice
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
+  caam shallow-spawn alice --no-sync-config   # keep this profile's own theme etc.
   caam shallow-spawn codex-bob --reload-daemon -- codex
   caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
@@ -538,6 +546,7 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
+	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "for claude: do not refresh shared preferences (theme, editor mode, notification channel, user/project MCP servers, project trust and tool approvals) in the profile's .claude.json from your real ~/.claude.json before exec")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
 }
 
@@ -621,6 +630,23 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	} else if len(created) > 0 {
 		fmt.Fprintf(cmd.ErrOrStderr(), "note: linked %d user skill entr%s from your real HOME into shallow profile %q\n",
 			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
+	}
+
+	// Shared-configuration refresh (#93): a claude profile's .claude.json is a
+	// real, private file because it holds the login identity, but it also
+	// carries the operator's preferences and per-project approvals, which
+	// silently diverge from the real HOME after creation. Copy the allowlisted
+	// shared keys from the real ~/.claude.json into the profile before exec so
+	// the main lane stays the source of truth for configuration; identity,
+	// usage caches and session state stay the profile's own. Best-effort: a
+	// failure warns and never blocks the spawn.
+	if noSync, _ := cmd.Flags().GetBool("no-sync-config"); !noSync {
+		if changed, serr := mgr.SyncClaudeConfig(name); serr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh shared Claude configuration in shallow profile %q: %v\n", name, serr)
+		} else if len(changed) > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(), "note: refreshed %d shared Claude setting%s from your real HOME into shallow profile %q (--no-sync-config to skip)\n",
+				len(changed), map[bool]string{true: "", false: "s"}[len(changed) == 1], name)
+		}
 	}
 
 	// Codex daemon caveat (#21, #45): a long-lived `codex app-server`/`mcp-server`

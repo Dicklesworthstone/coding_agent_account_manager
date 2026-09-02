@@ -181,7 +181,7 @@ Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-f
 |------|------------------|-----|
 | `.claude/.credentials.json` | **real file** | The whole point: per-identity OAuth token. |
 | `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
-| `.claude.json` | **real file** | Claude Code rewrites this on every run; a symlink would mutate the user's real settings under the shallow identity. |
+| `.claude.json` | **real file** | Claude Code rewrites this on every run (it holds the login identity); a symlink would mutate the user's real settings under the shallow identity. Seeded from your real `~/.claude.json` minus the account-bound keys (`oauthAccount`, usage/entitlement caches), and the shared preference keys (theme, editor mode, notification channel, user/project `mcpServers`, project trust and `allowedTools`) are refreshed from the real file on every `shallow-spawn` — the main lane is the source of truth for configuration; pass `--no-sync-config` to keep a profile's own values. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
 | `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
 
@@ -207,6 +207,7 @@ caam shallow-spawn <name>                     # open the profile's own provider 
 caam shallow-spawn <name> -- <cmd> [args...]  # or run any other command under the profile
 caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
+caam shallow-spawn <name> --no-sync-config    # claude only: don't refresh shared preferences from ~/.claude.json
 caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `-c model_reasoning_effort=xhigh` (codex has no --effort flag)
 ```
 

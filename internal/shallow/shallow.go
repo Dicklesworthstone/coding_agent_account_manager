@@ -18,8 +18,10 @@
 //	  .credentials.lock            (real file — empty, prevents Claude from
 //	                                touching the symlinked .claude folder above)
 //	  projects/, todos/, ...       (symlinks to ~/.claude/projects, etc.)
-//	.claude.json                   (real file — copy of the user's settings;
-//	                                Claude rewrites this in-place during runtime)
+//	.claude.json                   (real file — the user's settings minus the
+//	                                account-bound keys; Claude rewrites this
+//	                                in-place at runtime; shared preferences are
+//	                                refreshed on spawn — see claude_config.go)
 //	.bashrc, .gitconfig, .ssh, ... (symlinks to ~/.bashrc, etc.)
 //
 // Why some HOME entries must be real:
@@ -605,9 +607,14 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 	return nil
 }
 
-// writeClaudeJSON writes <home>/.claude.json. Prefer an explicit source; fall
-// back to the user's real ~/.claude.json (automatic onboarding); otherwise emit
-// a minimal skeleton. (Claude rewrites this file in place at runtime.)
+// writeClaudeJSON writes <home>/.claude.json. An explicit source (a vault
+// snapshot or --from-claude-json) is copied verbatim — its identity belongs
+// to the credentials it came with. Otherwise the user's real ~/.claude.json
+// is used as the seed (automatic onboarding: preferences, theme, project
+// approvals) with the account-bound keys stripped, so the new profile never
+// reports the real HOME's identity or usage as its own (issue #92; policy in
+// claude_config.go). With no real file either, a minimal skeleton is written.
+// (Claude rewrites this file in place at runtime.)
 func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 	claudeJSONPath := filepath.Join(home, ".claude.json")
 	if opts.SourceClaudeJSON != "" {
@@ -618,8 +625,12 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 	}
 	realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
 	if _, err := os.Stat(realClaudeJSON); err == nil {
-		if cerr := copyFileMode(realClaudeJSON, claudeJSONPath, 0o600); cerr != nil {
-			return fmt.Errorf("seed .claude.json from real HOME: %w", cerr)
+		seed, serr := seedClaudeJSONFromRealHome(realClaudeJSON)
+		if serr != nil {
+			return fmt.Errorf("seed .claude.json from real HOME: %w", serr)
+		}
+		if werr := writeFileAtomic(claudeJSONPath, seed, 0o600); werr != nil {
+			return fmt.Errorf("seed .claude.json from real HOME: %w", werr)
 		}
 		return nil
 	}
