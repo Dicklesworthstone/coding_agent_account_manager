@@ -49,8 +49,8 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We use **Go** with **Make** as the build system in this project.
 
-- **Go version:** 1.24+ (see `go.mod` for minimum)
-- **Toolchain:** `go1.24.4` (pinned in `go.mod`)
+- **Go version:** 1.26+ (see `go.mod` for minimum)
+- **Toolchain:** `go1.26.8` (pinned in `go.mod`)
 - **Build:** `make build` or `go build ./cmd/caam`
 - **Binary name:** `caam`
 - **Dependency versions:** Explicit in `go.mod` for stability
