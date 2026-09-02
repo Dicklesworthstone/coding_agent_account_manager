@@ -143,9 +143,9 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 | Other `$XDG_CONFIG_HOME` entries (`gh`, `atuin`, `uv`, `shopify-*`, ...) | per-entry symlink → real `~/.config` | XDG-based CLIs keep their credentials — without this, `gh` silently logs out and `git push` fails with `could not read Username for 'https://github.com'` (issue #69). |
 | Other `~/.local/share` and `~/.local/state` entries (`com.vercel.cli`, `supabase`, ...) | per-entry symlink → real home | Same: `HOME` redirection silently relocates the XDG data/state dirs. |
 | `~/.local/share/caam` | never passed through | Contains the vault and every profile's credentials. |
-| Claude `~/.claude/skills`, `plugins`, `commands`, `agents` | symlink → real home | User tooling, not account state — shared so sessions inside a profile keep their skills. |
+| Claude `~/.claude/skills`, `plugins`, `commands`, `agents` | symlink → real home, in both `home/.claude` and `$CLAUDE_CONFIG_DIR` (`xdg_config/claude-code`) | User tooling, not account state — shared so sessions inside a profile keep their skills. XDG-aware Claude Code reads them only from `CLAUDE_CONFIG_DIR` (issue #90). |
 
-Passthrough symlinks are refreshed on every `caam exec`, so tools installed after profile creation are picked up automatically.
+Passthrough symlinks (and the Claude asset links) are refreshed on every `caam exec`, so tools installed after profile creation are picked up automatically.
 
 **Use when:** You need two accounts running at the same time in different terminals.
 

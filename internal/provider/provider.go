@@ -67,6 +67,16 @@ type DeviceCodeProvider interface {
 	LoginWithDeviceCode(ctx context.Context, p *profile.Profile) error
 }
 
+// ProfileRefresher is an optional extension for providers whose isolated
+// profile layout mirrors parts of the real home (shared skills, plugins,
+// slash commands, ...). The runner calls RefreshProfile best-effort before
+// every isolated run so profiles created by an older caam, or before the user
+// installed new tooling, are healed in place instead of requiring re-creation.
+// Implementations must be idempotent and must never touch account state.
+type ProfileRefresher interface {
+	RefreshProfile(ctx context.Context, p *profile.Profile) error
+}
+
 // ProfileStatus represents the current authentication state of a profile.
 type ProfileStatus struct {
 	LoggedIn    bool   // Whether the profile has valid auth credentials

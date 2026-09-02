@@ -114,6 +114,36 @@ func claudeXDGCredentialsPathForProfile(prof *profile.Profile) string {
 	return filepath.Join(claudeConfigDirForProfile(prof), ".credentials.json")
 }
 
+// claudeLegacyDirForProfile returns the legacy home/.claude directory, which
+// is where Claude Code builds that ignore CLAUDE_CONFIG_DIR keep everything.
+func claudeLegacyDirForProfile(prof *profile.Profile) string {
+	return filepath.Join(prof.HomePath(), ".claude")
+}
+
+// claudeConfigDirsForProfile returns every directory a Claude Code build may
+// treat as its user config dir inside the profile: the legacy home/.claude
+// and the CLAUDE_CONFIG_DIR the profile env sets (xdg_config/claude-code).
+// Modern builds resolve settings, skills, plugins, commands and agents from
+// CLAUDE_CONFIG_DIR only, so anything caam lays down for the CLI to read has
+// to land in both (issues #70, #90).
+func claudeConfigDirsForProfile(prof *profile.Profile) []string {
+	return []string{
+		claudeLegacyDirForProfile(prof),
+		claudeConfigDirForProfile(prof),
+	}
+}
+
+// claudeSettingsPathsForProfile returns the profile-scoped settings.json
+// locations, one per config dir candidate.
+func claudeSettingsPathsForProfile(prof *profile.Profile) []string {
+	dirs := claudeConfigDirsForProfile(prof)
+	paths := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		paths = append(paths, filepath.Join(dir, "settings.json"))
+	}
+	return paths
+}
+
 // AuthFiles returns the auth file specifications for Claude Code.
 // This is the key method for auth file backup/restore.
 func (p *Provider) AuthFiles() []provider.AuthFileSpec {
@@ -187,12 +217,12 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 	}
 
 	// Share non-account Claude assets (skills, plugins, slash commands, agent
-	// definitions) from the real ~/.claude into the profile's isolated
-	// .claude. Isolation is per-account credentials, not the user's tooling:
-	// without these links a session inside the profile silently loses every
-	// user-level skill and plugin (issue #69 follow-up finding).
-	if err := shareClaudeUserAssets(mgr.RealHome(), claudeDir); err != nil {
-		return fmt.Errorf("share claude user assets: %w", err)
+	// definitions) from the real ~/.claude into the profile. Isolation is
+	// per-account credentials, not the user's tooling: without these links a
+	// session inside the profile silently loses every user-level skill and
+	// plugin (issue #69 follow-up finding).
+	if err := shareClaudeUserAssetsForProfile(mgr.RealHome(), prof); err != nil {
+		return err
 	}
 
 	// If using API key mode, set up the apiKeyHelper configuration
@@ -211,10 +241,43 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 // (apiKeyHelper may be per-profile), and session state stay isolated.
 var sharedClaudeAssetEntries = []string{"skills", "plugins", "commands", "agents"}
 
+// shareClaudeUserAssetsForProfile links the shared assets into every config
+// dir a Claude Code build may read inside the profile. The links used to go
+// only into the legacy home/.claude, which XDG-aware builds never consult
+// because the profile env points CLAUDE_CONFIG_DIR at xdg_config/claude-code;
+// every user skill and plugin was invisible there (issue #90).
+func shareClaudeUserAssetsForProfile(realHome string, prof *profile.Profile) error {
+	for _, dir := range claudeConfigDirsForProfile(prof) {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+		if err := shareClaudeUserAssets(realHome, dir); err != nil {
+			return fmt.Errorf("share claude user assets into %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// RefreshProfile re-syncs the shared, non-account assets of an existing
+// profile with the real home. The runner calls it before every isolated run
+// (provider.ProfileRefresher) so profiles created before the XDG config dir
+// received the links heal in place. It never touches credentials or
+// settings.
+func (p *Provider) RefreshProfile(ctx context.Context, prof *profile.Profile) error {
+	mgr, err := passthrough.NewManager()
+	if err != nil {
+		return fmt.Errorf("create passthrough manager: %w", err)
+	}
+	if prof.HomePath() == mgr.RealHome() {
+		return nil // Global (non-isolated) profile: nothing to mirror.
+	}
+	return shareClaudeUserAssetsForProfile(mgr.RealHome(), prof)
+}
+
 // shareClaudeUserAssets symlinks non-account Claude assets from the real
-// ~/.claude into the profile's .claude directory. An entry that already
-// exists in the profile as a real file/dir is left untouched; existing
-// symlinks are refreshed.
+// ~/.claude into one profile config directory. An entry that already exists
+// in the profile as a real file/dir is left untouched; existing symlinks are
+// refreshed.
 func shareClaudeUserAssets(realHome, profileClaudeDir string) error {
 	realClaude := filepath.Join(realHome, ".claude")
 	for _, name := range sharedClaudeAssetEntries {
@@ -245,8 +308,6 @@ func shareClaudeUserAssets(realHome, profileClaudeDir string) error {
 
 // setupAPIKeyHelper creates the settings.json with apiKeyHelper configuration.
 func (p *Provider) setupAPIKeyHelper(prof *profile.Profile) error {
-	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
-
 	// Create a helper script path
 	helperPath := filepath.Join(prof.BasePath, "api_key_helper.sh")
 
@@ -297,8 +358,12 @@ exit 1
 		return fmt.Errorf("marshal settings: %w", err)
 	}
 
-	if err := atomicWriteFile(settingsPath, data, 0600); err != nil {
-		return fmt.Errorf("write settings: %w", err)
+	// Write it under every config dir candidate: an XDG-aware build reads
+	// settings.json from CLAUDE_CONFIG_DIR, an older one from home/.claude.
+	for _, settingsPath := range claudeSettingsPathsForProfile(prof) {
+		if err := atomicWriteFile(settingsPath, data, 0600); err != nil {
+			return fmt.Errorf("write settings: %w", err)
+		}
 	}
 
 	return nil
@@ -390,8 +455,8 @@ func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
 		claudeXDGCredentialsPathForProfile(prof),
 		filepath.Join(prof.HomePath(), ".claude.json"),
 		filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
-		filepath.Join(prof.HomePath(), ".claude", "settings.json"),
 	}
+	authPaths = append(authPaths, claudeSettingsPathsForProfile(prof)...)
 
 	for _, path := range authPaths {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -437,10 +502,12 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 
 	// API key mode can be configured via settings.json or env var
 	if !status.LoggedIn && provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
-		settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
-		hasKey, err := claudeSettingsHasAPIKey(settingsPath)
-		if err == nil && hasKey {
-			status.LoggedIn = true
+		for _, settingsPath := range claudeSettingsPathsForProfile(prof) {
+			hasKey, err := claudeSettingsHasAPIKey(settingsPath)
+			if err == nil && hasKey {
+				status.LoggedIn = true
+				break
+			}
 		}
 	}
 

@@ -157,6 +157,16 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 				}
 			}
 		}
+
+		// Provider-specific layout refresh (e.g. Claude's shared skills /
+		// plugins links into the config dir the CLI actually reads, issue
+		// #90). Same contract as the passthrough refresh above: heal in
+		// place, never block the run.
+		if refresher, ok := opts.Provider.(provider.ProfileRefresher); ok {
+			if rerr := refresher.RefreshProfile(ctx, opts.Profile); rerr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: refresh %s profile: %v\n", opts.Provider.ID(), rerr)
+			}
+		}
 	}
 
 	// Build command

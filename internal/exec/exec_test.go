@@ -901,3 +901,67 @@ func TestRun_NoFalseTTYDetection(t *testing.T) {
 		t.Errorf("NeedsTTY = true for a non-TTY failure; want false")
 	}
 }
+
+// =============================================================================
+// Profile refresh hook (issue #90)
+// =============================================================================
+
+type refreshingProvider struct {
+	mockProvider
+	refreshed  []*profile.Profile
+	refreshErr error
+}
+
+func (r *refreshingProvider) RefreshProfile(_ context.Context, p *profile.Profile) error {
+	r.refreshed = append(r.refreshed, p)
+	return r.refreshErr
+}
+
+var _ provider.ProfileRefresher = (*refreshingProvider)(nil)
+
+func TestRun_RefreshesProviderProfileBeforeLaunch(t *testing.T) {
+	prof := &profile.Profile{Name: "test", Provider: "test", BasePath: t.TempDir()}
+	mock := &refreshingProvider{mockProvider: mockProvider{
+		id:         "test",
+		defaultBin: "/nonexistent/command/path",
+		envVars:    map[string]string{"HOME": prof.HomePath()},
+	}}
+
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{Profile: prof, Provider: mock, NoLock: true})
+	if err == nil || !strings.Contains(err.Error(), "run command") {
+		t.Fatalf("expected the launch itself to fail, got %v", err)
+	}
+	if len(mock.refreshed) != 1 || mock.refreshed[0] != prof {
+		t.Fatalf("RefreshProfile calls = %v, want exactly one with the run's profile", mock.refreshed)
+	}
+}
+
+func TestRun_RefreshFailureDoesNotBlockLaunch(t *testing.T) {
+	prof := &profile.Profile{Name: "test", Provider: "test", BasePath: t.TempDir()}
+	mock := &refreshingProvider{
+		mockProvider: mockProvider{id: "test", defaultBin: "true", envVars: map[string]string{}},
+		refreshErr:   errors.New("boom"),
+	}
+
+	runner := NewRunner(provider.NewRegistry())
+	if err := runner.Run(context.Background(), RunOptions{Profile: prof, Provider: mock, NoLock: true}); err != nil {
+		t.Fatalf("Run() = %v, want nil: a refresh failure is a warning only", err)
+	}
+	if len(mock.refreshed) != 1 {
+		t.Fatalf("RefreshProfile calls = %d, want 1", len(mock.refreshed))
+	}
+}
+
+func TestRun_GlobalEnvSkipsProfileRefresh(t *testing.T) {
+	prof := &profile.Profile{Name: "test", Provider: "test", BasePath: t.TempDir()}
+	mock := &refreshingProvider{mockProvider: mockProvider{id: "test", defaultBin: "true"}}
+
+	runner := NewRunner(provider.NewRegistry())
+	if err := runner.Run(context.Background(), RunOptions{Profile: prof, Provider: mock, NoLock: true, UseGlobalEnv: true}); err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+	if len(mock.refreshed) != 0 {
+		t.Fatalf("RefreshProfile must not run for a global-env launch, got %d calls", len(mock.refreshed))
+	}
+}
