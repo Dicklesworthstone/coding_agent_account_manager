@@ -506,10 +506,10 @@ The penalty system uses **exponential decay** (20% reduction every 5 minutes) so
 `caam quota` shows how much of each Claude account's usage windows is spent, **without touching the network**:
 
 ```
-PROFILE           EMAIL  PLAN  5H                WEEKLY            FABLE             RESETS           AS OF
-● adriana-gmail   n/a    Pro   █████░░░░░   53%  █░░░░░░░░░   11%  ██░░░░░░░░   19%  Fri Sep 4 08:00  18m ago
-  adriana-syneto  n/a    Pro   ░░░░░░░░░░ ~  0%  ░░░░░░░░░░ ~  4%  ░░░░░░░░░░ ~  3%  Wed Sep 2 20:59  3h ago
-  vadim           n/a    Pro   ░░░░░░░░░░ ~  0%  ███░░░░░░░ ~ 29%  █████░░░░░ ~ 54%  Wed Sep 2 10:00  3h ago
+PROFILE           LANE           EMAIL  PLAN  5H                WEEKLY            FABLE             RESETS           AS OF
+* adriana-gmail   active         n/a    Pro   █████░░░░░   53%  █░░░░░░░░░   11%  ██░░░░░░░░   19%  Fri Sep 4 08:00  18m ago
+  adriana-syneto  vault          n/a    Pro   ░░░░░░░░░░ ~  0%  ░░░░░░░░░░ ~  4%  ░░░░░░░░░░ ~  3%  Wed Sep 2 20:59  3h ago
+  vadim           vault+shallow  n/a    Pro   ░░░░░░░░░░ ~  0%  ███░░░░░░░ ~ 29%  █████░░░░░ ~ 54%  Wed Sep 2 10:00  3h ago
 
 usage as cached by Claude Code; refreshed by that account's own sessions. No network.
 ```
@@ -520,7 +520,7 @@ The trade-off is freshness: a profile's numbers only move when that profile itse
 
 Reading the table:
 
-- `●` marks the active profile; rows tagged `(shallow)` are shallow profiles.
+- One row per **account**. `*` marks the account active in `~/.claude`; **LANE** lists where it is set up: `active`, `vault` (a vault profile not currently active), `shallow` (a shallow profile; `shallow(<name>)` when its name differs). A vault profile and a shallow profile logged into the same account draw down the same windows, so they fold into one row carrying the freshest numbers.
 - **5H** is the rolling 5-hour session window; **WEEKLY** is the all-model weekly cap; the third bar is the weekly cap for the model named in its header.
 - A window whose reset time has already passed reads 0%: it rolled over, and nothing has run against it since.
 - **RESETS** is when the weekly window rolls over; **AS OF** is how stale the snapshot is.

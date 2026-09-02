@@ -56,11 +56,17 @@ const quotaFooter = "usage as cached by Claude Code; refreshed by that account's
 
 // quotaRow is one profile's cached usage, as rendered and as emitted by --json.
 type quotaRow struct {
-	Profile     string               `json:"profile"`
-	Email       string               `json:"email"`
-	Plan        string               `json:"plan"`
-	Source      string               `json:"source"`
-	Active      bool                 `json:"active"`
+	Profile string `json:"profile"`
+	Email   string `json:"email"`
+	Plan    string `json:"plan"`
+	Source  string `json:"source"`
+	Active  bool   `json:"active"`
+	// Lanes lists where this account is set up: "active" (the vault profile
+	// currently switched into ~/.claude), "vault" (a vault profile that is
+	// not active), and "shallow" or "shallow(<name>)" for a shallow profile
+	// (named when its name differs from Profile). One account can be in
+	// several lanes at once; its usage is one number regardless.
+	Lanes       []string             `json:"lanes"`
 	AccountUUID string               `json:"account_uuid"`
 	FetchedAt   *time.Time           `json:"fetched_at"`
 	Windows     []usage.CachedWindow `json:"windows"`
@@ -171,7 +177,128 @@ func collectQuotaRows(scan quotaScan) ([]quotaRow, error) {
 	}
 
 	rows = append(rows, collectShallowQuotaRows(scan)...)
-	return rows, nil
+	return mergeQuotaRows(rows), nil
+}
+
+// mergeQuotaRows folds the rows that belong to one account into one. Usage is
+// a property of the account, not of the place its cache was read from: a
+// vault profile and a shallow profile logged into the same account draw down
+// the same windows, so listing them twice with two different ages reads as
+// two accounts. The merged row keeps the freshest numbers (latest fetch;
+// ties go live > shallow > snapshot), the vault profile's name when there is
+// one, and every lane the account is set up in. Rows without an account uuid
+// cannot be matched and stay as they are.
+func mergeQuotaRows(rows []quotaRow) []quotaRow {
+	var out []quotaRow
+	index := map[string]int{}
+	for _, row := range rows {
+		row.Lanes = quotaLanes(row, row.Profile)
+		if row.AccountUUID == "" {
+			out = append(out, row)
+			continue
+		}
+		i, seen := index[row.AccountUUID]
+		if !seen {
+			index[row.AccountUUID] = len(out)
+			out = append(out, row)
+			continue
+		}
+		out[i] = mergeQuotaPair(out[i], row)
+	}
+	// Lane names are relative to the row's final name, which is only known
+	// once every row of the account has been folded in.
+	for i := range out {
+		out[i].Lanes = quotaNormalizeLanes(out[i].Lanes, out[i].Profile)
+	}
+	return out
+}
+
+// mergeQuotaPair combines two rows known to be the same account.
+func mergeQuotaPair(a, b quotaRow) quotaRow {
+	base, other := a, b
+	if quotaFresher(b, a) {
+		base, other = b, a
+	}
+	merged := base
+	merged.Active = a.Active || b.Active
+	// The vault profile's name is the one `caam activate`/`next` use, so it
+	// names the row whenever the account has one.
+	if base.Source == quotaSourceShallow && other.Source != quotaSourceShallow {
+		merged.Profile = other.Profile
+	}
+	if merged.Email == "" || merged.Email == "n/a" || merged.Email == "unknown" {
+		if other.Email != "" {
+			merged.Email = other.Email
+		}
+	}
+	merged.Lanes = append(append([]string{}, a.Lanes...), b.Lanes...)
+	return merged
+}
+
+// quotaFresher reports whether a's numbers should be preferred over b's.
+func quotaFresher(a, b quotaRow) bool {
+	switch {
+	case a.FetchedAt == nil:
+		return false
+	case b.FetchedAt == nil:
+		return true
+	case !a.FetchedAt.Equal(*b.FetchedAt):
+		return a.FetchedAt.After(*b.FetchedAt)
+	}
+	return quotaSourceRank(a.Source) > quotaSourceRank(b.Source)
+}
+
+func quotaSourceRank(source string) int {
+	switch source {
+	case quotaSourceLive:
+		return 3
+	case quotaSourceShallow:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// quotaLanes describes one unmerged row's lane.
+func quotaLanes(row quotaRow, _ string) []string {
+	switch {
+	case row.Active:
+		return []string{"active"}
+	case row.Source == quotaSourceShallow:
+		// Always carry the shallow profile's name; quotaNormalizeLanes
+		// collapses it to plain "shallow" once the merged row's name is known.
+		return []string{"shallow(" + row.Profile + ")"}
+	default:
+		return []string{"vault"}
+	}
+}
+
+// quotaNormalizeLanes dedupes lanes, orders them active, vault, shallow, and
+// renames shallow lanes relative to the merged row's profile name.
+func quotaNormalizeLanes(lanes []string, profile string) []string {
+	rank := func(l string) int {
+		switch {
+		case l == "active":
+			return 0
+		case l == "vault":
+			return 1
+		default:
+			return 2
+		}
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range lanes {
+		if l == "shallow("+profile+")" {
+			l = "shallow"
+		}
+		if !seen[l] {
+			seen[l] = true
+			out = append(out, l)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return rank(out[i]) < rank(out[j]) })
+	return out
 }
 
 // collectShallowQuotaRows adds a row per Claude shallow profile. Shallow
@@ -281,25 +408,28 @@ func renderQuotaTable(w io.Writer, rows []quotaRow, now time.Time, color bool) e
 	var table bytes.Buffer
 	tw := tabwriter.NewWriter(&table, 0, 0, 2, ' ', 0)
 
-	fmt.Fprintf(tw, "PROFILE\tEMAIL\tPLAN\t5H\tWEEKLY\t%s\tRESETS\tAS OF\n", strings.ToUpper(quotaScopedTitle(rows)))
+	fmt.Fprintf(tw, "PROFILE\tLANE\tEMAIL\tPLAN\t5H\tWEEKLY\t%s\tRESETS\tAS OF\n", strings.ToUpper(quotaScopedTitle(rows)))
 
 	// bars[i] holds the plain bar cells of the i-th data line, in the order
 	// they appear, so they can be colorized after the layout is fixed.
 	bars := make([][]quotaBarCell, len(rows))
 
 	for i, row := range rows {
+		// The active marker is plain ASCII on purpose: glyphs such as "●" are
+		// ambiguous-width and shift the row in some terminals.
 		name := "  " + row.Profile
 		if row.Active {
-			name = "● " + row.Profile
+			name = "* " + row.Profile
 		}
-		if row.Source == quotaSourceShallow {
-			name += " (shallow)"
+		lanes := strings.Join(row.Lanes, "+")
+		if lanes == "" {
+			lanes = "-"
 		}
 
 		if len(row.Windows) == 0 {
 			// A trailing, un-tab-terminated cell sits outside the aligned
 			// columns, so an account with no snapshot cannot stretch the table.
-			fmt.Fprintf(tw, "%s\t%s\t%s\tno usage cache yet (run a session)\n", name, row.Email, row.Plan)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\tno usage cache yet (run a session)\n", name, lanes, row.Email, row.Plan)
 			continue
 		}
 
@@ -315,8 +445,8 @@ func renderQuotaTable(w io.Writer, rows []quotaRow, now time.Time, color bool) e
 			}
 		}
 
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, row.Email, row.Plan, cells[0].Text, cells[1].Text, cells[2].Text,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, lanes, row.Email, row.Plan, cells[0].Text, cells[1].Text, cells[2].Text,
 			quotaResetsCell(row.Windows), quotaAsOfCell(row, now))
 	}
 

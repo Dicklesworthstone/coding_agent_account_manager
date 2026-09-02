@@ -44,6 +44,7 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Plan:        "Pro",
 			Source:      quotaSourceLive,
 			Active:      true,
+			Lanes:       []string{"active"},
 			AccountUUID: "0552fa96-40f9-4b38-a33a-0d5ac585167d",
 			FetchedAt:   &fetched,
 			Windows: []usage.CachedWindow{
@@ -57,6 +58,7 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Email:       "n/a",
 			Plan:        "Pro",
 			Source:      quotaSourceSnapshot,
+			Lanes:       []string{"vault"},
 			AccountUUID: "9fc5c17d-a950-4bd0-b3c6-c1c9e7a9b452",
 			FetchedAt:   &stale,
 			Windows: []usage.CachedWindow{
@@ -70,6 +72,7 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Email:   "unknown",
 			Plan:    "unknown",
 			Source:  quotaSourceShallow,
+			Lanes:   []string{"shallow"},
 			Windows: []usage.CachedWindow{},
 		},
 	}
@@ -89,8 +92,9 @@ func TestQuotaTableRendersEveryRowKind(t *testing.T) {
 	assert.Contains(t, out, "RESETS")
 	assert.Contains(t, out, "AS OF")
 
-	assert.Contains(t, out, "● work", "the active profile is marked")
-	assert.Contains(t, out, "spare (shallow)", "shallow rows are tagged")
+	assert.Contains(t, out, "* work", "the active profile is marked")
+	assert.Contains(t, out, "LANE")
+	assert.Contains(t, out, "shallow", "shallow rows show their lane")
 	assert.Contains(t, out, "no usage cache yet (run a session)")
 
 	assert.Contains(t, out, "█", "percentages render as bars")
@@ -125,7 +129,7 @@ func TestQuotaTableColumnsStayAligned(t *testing.T) {
 
 	var dataLines []string
 	for _, line := range strings.Split(buf.String(), "\n") {
-		if strings.HasPrefix(line, "● work") || strings.HasPrefix(line, "  personal") {
+		if strings.HasPrefix(line, "* work") || strings.HasPrefix(line, "  personal") {
 			dataLines = append(dataLines, line)
 		}
 	}
@@ -160,6 +164,7 @@ func TestQuotaJSONShape(t *testing.T) {
 	assert.Equal(t, "live", live["source"])
 	assert.Equal(t, true, live["active"])
 	assert.Equal(t, "0552fa96-40f9-4b38-a33a-0d5ac585167d", live["account_uuid"])
+	assert.Equal(t, []any{"active"}, live["lanes"])
 	assert.NotNil(t, live["fetched_at"])
 
 	windows, ok := live["windows"].([]any)
@@ -332,4 +337,44 @@ func TestColorizeQuotaLine_IdenticalCellsPaintedIndependently(t *testing.T) {
 	if got != want {
 		t.Fatalf("colorizeQuotaLine() =\n%s\nwant\n%s", got, want)
 	}
+}
+
+// TestMergeQuotaRowsFoldsLanesOfOneAccount pins the account-centric view: a
+// vault profile and a shallow profile logged into the same account are one
+// row, named after the vault profile, carrying the freshest numbers and both
+// lanes. Different accounts, and rows with no uuid, stay separate.
+func TestMergeQuotaRowsFoldsLanesOfOneAccount(t *testing.T) {
+	old := quotaTestNow.Add(-3 * time.Hour)
+	fresh := quotaTestNow.Add(-2 * time.Minute)
+	rows := []quotaRow{
+		{Profile: "vadim", Source: quotaSourceSnapshot, AccountUUID: "u1", FetchedAt: &old,
+			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 29}}},
+		{Profile: "adriana", Source: quotaSourceLive, Active: true, AccountUUID: "u2", FetchedAt: &fresh,
+			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 11}}},
+		{Profile: "vadim", Source: quotaSourceShallow, AccountUUID: "u1", FetchedAt: &fresh,
+			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 31}}},
+		{Profile: "sw-adriana", Source: quotaSourceShallow, AccountUUID: "u2", FetchedAt: &old,
+			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 9}}},
+		{Profile: "blank", Source: quotaSourceSnapshot, Windows: []usage.CachedWindow{}},
+	}
+
+	merged := mergeQuotaRows(rows)
+	require.Len(t, merged, 3)
+
+	vadim := merged[0]
+	assert.Equal(t, "vadim", vadim.Profile)
+	assert.Equal(t, quotaSourceShallow, vadim.Source, "the fresher shallow numbers win")
+	assert.Equal(t, 31, vadim.Windows[0].Percent)
+	assert.Equal(t, []string{"vault", "shallow"}, vadim.Lanes)
+	assert.False(t, vadim.Active)
+
+	adriana := merged[1]
+	assert.Equal(t, "adriana", adriana.Profile, "the vault name names the row even when a shallow lane exists")
+	assert.Equal(t, quotaSourceLive, adriana.Source, "the live numbers are fresher than the shallow snapshot")
+	assert.Equal(t, 11, adriana.Windows[0].Percent)
+	assert.True(t, adriana.Active)
+	assert.Equal(t, []string{"active", "shallow(sw-adriana)"}, adriana.Lanes)
+
+	assert.Equal(t, "blank", merged[2].Profile)
+	assert.Equal(t, []string{"vault"}, merged[2].Lanes)
 }
