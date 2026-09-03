@@ -17,6 +17,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
@@ -902,6 +903,37 @@ func checkLocks(fix bool) []CheckResult {
 	return results
 }
 
+// checkClaudeKeychain reports the state of the macOS login keychain item
+// Claude Code stores its OAuth tokens in. It returns nil off macOS, where
+// there is no keychain and the credentials file is the only source.
+func checkClaudeKeychain() *CheckResult {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	name := "claude keychain"
+	if !keychain.Available() {
+		return &CheckResult{
+			Name:    name,
+			Status:  "warn",
+			Message: "keychain unreachable",
+			Details: "caam cannot read " + keychain.ClaudeService + "; account switching will fall back to ~/.claude/.credentials.json, which Claude Code ignores on macOS",
+		}
+	}
+	if _, ok := keychain.ClaudeCredentials(); !ok {
+		return &CheckResult{
+			Name:    name,
+			Status:  "warn",
+			Message: "no Claude credentials in the login keychain",
+			Details: "run /login inside claude, then 'caam backup claude <name>' to capture the account",
+		}
+	}
+	return &CheckResult{
+		Name:    name,
+		Status:  "pass",
+		Message: "credentials in the login keychain (" + keychain.ClaudeService + "), mirrored for caam",
+	}
+}
+
 func checkAuthFiles() []CheckResult {
 	var results []CheckResult
 
@@ -913,6 +945,10 @@ func checkAuthFiles() []CheckResult {
 			Message: "vault not initialized",
 		})
 		return results
+	}
+
+	if kc := checkClaudeKeychain(); kc != nil {
+		results = append(results, *kc)
 	}
 
 	for tool, getFileSet := range tools {

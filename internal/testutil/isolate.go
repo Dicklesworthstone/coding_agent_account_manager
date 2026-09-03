@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
 // isolatedMarker is exported into the environment by IsolateEnv so that a
@@ -104,11 +106,19 @@ func IsolateEnv() (restore func(), err error) {
 	}
 	remember("PATH")
 	remember("BROWSER")
+	remember(keychain.EnvDisable)
+	remember(keychain.EnvBin)
 	remember(isolatedMarker)
 
 	os.Setenv("HOME", dir)
 	os.Setenv("USERPROFILE", dir)
 	os.Setenv(isolatedMarker, "1")
+	// The macOS keychain is machine-global: an isolated HOME does not contain
+	// it. Leaving the bridge on would let tests read (and rewrite) the
+	// developer's real Claude tokens, so it stays off unless a test opts in by
+	// setting CAAM_KEYCHAIN=1 with CAAM_KEYCHAIN_BIN pointed at a stub.
+	os.Setenv(keychain.EnvDisable, "0")
+	os.Unsetenv(keychain.EnvBin)
 
 	if runtime.GOOS != "windows" {
 		stubDir := filepath.Join(dir, "stub-bin")

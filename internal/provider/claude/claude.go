@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -563,6 +564,10 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get home dir: %w", err)
 	}
+
+	// On macOS the OAuth tokens live in the login keychain, not on disk;
+	// mirror them into the credentials file so the scan below can see them.
+	keychain.MirrorClaudeCredentials(filepath.Join(homeDir, ".claude", ".credentials.json"))
 
 	// Define locations to check
 	locations := []struct {

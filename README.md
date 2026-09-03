@@ -53,7 +53,7 @@ authorize app → wait for redirect → back to terminal
 
 ## The Solution
 
-Each AI CLI stores OAuth tokens in plain files. `caam` backs them up and restores them:
+Each AI CLI stores OAuth tokens in plain files — except Claude Code on macOS, which keeps them in the login keychain. `caam` backs up both and restores them:
 
 ```bash
 caam activate claude bob@gmail.com   # ~50ms, done
@@ -264,13 +264,24 @@ wait
 **Subscription:** Claude Max ($200/month)
 
 **Auth Files:**
-- `~/.claude/.credentials.json` — Claude Code OAuth credentials (primary)
+- macOS login keychain, generic password `Claude Code-credentials` — where Claude Code actually keeps the OAuth tokens on a Mac
+- `~/.claude/.credentials.json` — Claude Code OAuth credentials (primary on Linux; on macOS, caam's mirror of the keychain item)
 - `~/.claude.json` — Session/account state
 - `~/.config/claude-code/auth.json` — Secondary auth data
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
 - `~/Library/Application Support/Claude/config.json` — macOS: Claude Desktop's encrypted OAuth token cache (only its `oauth:tokenCache*` fields are tracked, so recent Claude Code builds can't reassert the previous account after a switch)
 
 **Login Command:** Inside Claude Code, type `/login`
+
+**macOS keychain:** Claude Code does not write `~/.claude/.credentials.json` on macOS. It stores the OAuth tokens as a generic password in the login keychain under the service `Claude Code-credentials`, with your login name as the account, and only falls back to the file when the keychain is unreachable. caam reads and writes that item through `/usr/bin/security`, the same way Claude Code does:
+
+- `caam backup` copies the keychain item into the vault profile, so the snapshot holds real tokens
+- `caam activate` writes the profile's tokens back into the keychain, which is what makes the switch visible to the CLI
+- every read path (`status`, `doctor`, profile detection, expiry checks) mirrors the keychain into `~/.claude/.credentials.json` first, so a Mac login is no longer invisible to caam
+
+The keychain stays authoritative: Claude Code rotates tokens there, and caam rewrites the mirror whenever the two differ. The mirror is a plaintext file with mode `0600`, the same format and permissions caam relies on everywhere else. `caam doctor` reports the keychain item under `claude keychain`. Set `CAAM_KEYCHAIN=0` to switch the bridge off.
+
+The keychain is scoped to `$HOME`. A shallow or isolated profile runs Claude Code with its own `HOME`, finds no keychain item there, and falls back to that profile's `.credentials.json` — which those modes seed from a vault profile. On macOS those snapshots held no credentials before this bridge existed, so the fix is what makes concurrent multi-account Claude sessions possible on a Mac. Plain `caam activate` swaps the one shared keychain item, so outside those modes a single account is live at a time.
 
 **Notes:** Claude Max has a 5-hour rolling usage window. When you hit it, you'll see rate limit messages. Switch accounts to continue.
 

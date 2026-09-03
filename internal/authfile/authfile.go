@@ -403,6 +403,10 @@ func (v *Vault) BackupPath(tool, profile, filename string) string {
 
 // Backup saves the current auth files to the vault.
 func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
+	// macOS keeps Claude's tokens in the keychain; mirror them into the
+	// credentials file first or the snapshot captures no credentials at all.
+	syncClaudeKeychainIn(fileSet)
+
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -770,6 +774,10 @@ func MigrateGeminiVaultDir(dir string) error {
 
 // Restore copies backed-up auth files to their original locations.
 func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
+	// The freshness guards below compare the snapshot against live state, so
+	// the live credentials file has to reflect the keychain before they run.
+	syncClaudeKeychainIn(fileSet)
+
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -905,6 +913,13 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		if !(fileSet.AllowOptionalOnly && !requiredFound && optionalFound) {
 			return fmt.Errorf("required backup not found: %s", missingRequired[0])
 		}
+	}
+
+	// On macOS the restored file is inert until it reaches the keychain, which
+	// is where Claude Code reads from. Fail loudly: a swallowed error here
+	// leaves the previous account live while caam reports a successful switch.
+	if err := syncClaudeKeychainOut(fileSet); err != nil {
+		return err
 	}
 
 	return nil
@@ -1059,6 +1074,8 @@ func (v *Vault) CopyProfile(tool, srcProfile, dstProfile string) error {
 // hashed so that volatile metadata (e.g., changelogLastFetched, numStartups)
 // does not break profile detection.
 func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
+	syncClaudeKeychainIn(fileSet)
+
 	profiles, err := v.List(fileSet.Tool)
 	if err != nil {
 		return "", err
@@ -1155,6 +1172,8 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 // HasAuthFiles checks if the tool currently has auth files present.
 func HasAuthFiles(fileSet AuthFileSet) bool {
+	syncClaudeKeychainIn(fileSet)
+
 	optionalFound := false
 	for _, spec := range fileSet.Files {
 		// The Claude Desktop config only counts as auth when it holds a token
@@ -1193,7 +1212,7 @@ func ClearAuthFiles(fileSet AuthFileSet) error {
 			return fmt.Errorf("remove %s: %w", spec.Path, err)
 		}
 	}
-	return nil
+	return clearClaudeKeychain(fileSet)
 }
 
 // --- Claude Desktop OAuth token cache (macOS) -------------------------------
