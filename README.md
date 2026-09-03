@@ -427,11 +427,21 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 
 ### Smart Profile Management
 
+Claude reports a separate weekly allowance per model (Opus, Fable) alongside the
+5-hour and weekly windows, and an account can exhaust one of those while its
+general windows still read as idle. caam treats a spent per-model allowance as a
+ceiling like any other, so such an account is not offered for work on that
+model. Pass `--model` to `caam limits` or `caam precheck` — or just run
+`caam run claude --precheck -- --model opus …`, which reads the model off the
+passed-through arguments — and only that model's own allowance constrains the
+choice; with no model given, every per-model allowance counts.
+
 | Command | Description |
 |---------|-------------|
 | `caam activate <tool> --auto` | Auto-select the best profile using rotation algorithm |
 | `caam next <tool>` | Switch to the next profile in rotation (use `--dry-run` to preview without switching) |
 | `caam run <tool> [-- args]` | Wrap CLI execution with automatic failover on rate limits |
+| `caam limits <tool> [--model <name>]` | Live rate-limit usage, including each account's per-model allowance |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
 | `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
