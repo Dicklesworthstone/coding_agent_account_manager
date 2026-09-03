@@ -294,7 +294,7 @@ func TestBuildPrecheckResult(t *testing.T) {
 	profiles := []string{"work", "personal"}
 
 	// Build result without usage data or selection
-	result := buildPrecheckResult("claude", profiles, nil, nil, nil, healthStore, nil, "smart")
+	result := buildPrecheckResult("claude", profiles, nil, nil, nil, healthStore, nil, "smart", "")
 
 	assert.Equal(t, "claude", result.Provider)
 	assert.Equal(t, "smart", result.Algorithm)

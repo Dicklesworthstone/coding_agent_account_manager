@@ -52,6 +52,7 @@ func init() {
 	precheckCmd.Flags().Duration("timeout", 30*time.Second, "timeout for API fetches")
 	precheckCmd.Flags().String("algorithm", "", "override rotation algorithm (smart, round_robin, random)")
 	precheckCmd.Flags().String("policy", "", "override rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
+	precheckCmd.Flags().String("model", "", "model the session will use (e.g. opus, fable); only that model's own quota then constrains a profile")
 	rootCmd.AddCommand(precheckCmd)
 }
 
@@ -78,8 +79,24 @@ type ProfileRecommendation struct {
 	HealthStatus    string   `json:"health_status"`
 	TokenExpiry     string   `json:"token_expiry,omitempty"`
 	TimeToDepletion string   `json:"time_to_depletion,omitempty"`
+	ScopedLimit     string   `json:"scoped_limit,omitempty"`
 	Reasons         []string `json:"reasons"`
 	PoolStatus      string   `json:"pool_status"`
+}
+
+// scopedAlertPercent is where a model-scoped quota starts being worth saying
+// out loud, and the point above which it is treated as spent.
+const (
+	scopedAlertPercent    = 80
+	scopedCriticalPercent = 100
+)
+
+// scopedAlertUrgency grades a model-scoped quota alert.
+func scopedAlertUrgency(percent int) string {
+	if percent >= scopedCriticalPercent {
+		return "high"
+	}
+	return "medium"
 }
 
 // CooldownProfile represents a profile in cooldown.
@@ -122,6 +139,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	timeout, _ := cmd.Flags().GetDuration("timeout")
 	algoOverride, _ := cmd.Flags().GetString("algorithm")
 	policyOverride, _ := cmd.Flags().GetString("policy")
+	model, _ := cmd.Flags().GetString("model")
 	policyOverride = strings.ToLower(policyOverride)
 	switch policyOverride {
 	case "", "availability", "drain":
@@ -224,7 +242,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	if len(usageMap) > 0 {
 		rotationUsage := make(map[string]*rotation.UsageInfo)
 		for name, info := range usageMap {
-			rotationUsage[name] = toRotationUsageInfo(name, info)
+			rotationUsage[name] = toRotationUsageInfo(name, info, model)
 		}
 		selector.SetUsageData(rotationUsage)
 	}
@@ -240,7 +258,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build precheck result
-	result := buildPrecheckResult(provider, userProfiles, selectionResult, usageMap, pool, healthStoreInst, db, string(algorithm))
+	result := buildPrecheckResult(provider, userProfiles, selectionResult, usageMap, pool, healthStoreInst, db, string(algorithm), model)
 
 	// Output based on format
 	switch format {
@@ -262,6 +280,7 @@ func buildPrecheckResult(
 	healthStore *health.Storage,
 	db *caamdb.DB,
 	algorithm string,
+	model string,
 ) *PrecheckResult {
 	result := &PrecheckResult{
 		Provider:   provider,
@@ -294,7 +313,22 @@ func buildPrecheckResult(
 		// Get usage data
 		if usageMap != nil {
 			if info, ok := usageMap[profileName]; ok && info != nil {
-				rec.AvailScore = info.AvailabilityScore()
+				rec.AvailScore = info.AvailabilityScoreForModel(model)
+				if scoped := info.ScopedLimit(model); scoped != nil {
+					rec.ScopedLimit = formatScopedLimit(scoped)
+					// A spent per-model quota is invisible in the primary
+					// figure, which is what made exhausted accounts look
+					// available (issue #97).
+					if scoped.UsedPercent >= scopedAlertPercent {
+						result.Alerts = append(result.Alerts, PrecheckAlert{
+							Type:    "scoped_limit",
+							Profile: profileName,
+							Message: fmt.Sprintf("%s quota %d%% used", scopedLabel(scoped), scoped.UsedPercent),
+							Urgency: scopedAlertUrgency(scoped.UsedPercent),
+							Action:  "use another profile for that model, or wait for the quota to reset",
+						})
+					}
+				}
 				if info.PrimaryWindow != nil {
 					rec.UsagePercent = info.PrimaryWindow.UsedPercent
 					totalUsage += rec.UsagePercent

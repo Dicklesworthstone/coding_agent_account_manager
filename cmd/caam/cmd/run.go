@@ -162,7 +162,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
 	if precheck && (tool == "claude" || tool == "codex") {
-		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg); switched && !quiet {
+		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
 			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
@@ -308,7 +308,12 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 // runPrecheck checks current usage levels and switches profile if near limit.
 // Returns true if a switch was performed.
-func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig) bool {
+//
+// model is the model the run will use when it can be read off the passed-through
+// arguments, so a spent per-model quota counts as "near limit" even when the
+// account's general windows are idle (issue #97); "" means unknown, and then
+// every model-scoped quota counts.
+func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
 	// Get current profile's access token
 	vaultDir := authfile.DefaultVaultPath()
 
@@ -344,7 +349,7 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	currentUsage := results[0].Usage
 
 	// Check if near limit
-	if !currentUsage.IsNearLimit(threshold) {
+	if !currentUsage.IsNearLimitForModel(threshold, model) {
 		return false // All good, no switch needed
 	}
 
@@ -369,7 +374,7 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 		if r.Usage == nil {
 			continue
 		}
-		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage)
+		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage, model)
 	}
 
 	// Use rotation selector with usage data

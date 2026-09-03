@@ -5,6 +5,7 @@ package usage
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -21,7 +22,38 @@ type UsageWindow struct {
 
 	// WindowDuration is the window size (if known).
 	WindowDuration time.Duration `json:"window_duration,omitempty"`
+
+	// Label is the human-readable name of what this window limits, as the
+	// provider reports it — a model's display name ("Opus", "Fable") for a
+	// scoped window, empty for the general ones.
+	Label string `json:"label,omitempty"`
+
+	// Kind is the provider's name for the window: for Claude, one of
+	// "session" (5-hour), "weekly_all", or "weekly_scoped".
+	Kind string `json:"kind,omitempty"`
+
+	// Severity is the provider's own assessment: "normal", "warning" or
+	// "critical".
+	Severity string `json:"severity,omitempty"`
+
+	// IsActive reports whether the provider flagged this window as the one
+	// currently binding the account.
+	IsActive bool `json:"is_active,omitempty"`
 }
+
+// Claude reports each rate limit window under one of these kinds.
+const (
+	LimitKindSession      = "session"
+	LimitKindWeeklyAll    = "weekly_all"
+	LimitKindWeeklyScoped = "weekly_scoped"
+)
+
+// Severity values the provider attaches to a limit.
+const (
+	SeverityNormal   = "normal"
+	SeverityWarning  = "warning"
+	SeverityCritical = "critical"
+)
 
 // UsageInfo contains rate limit and usage information for a provider account.
 type UsageInfo struct {
@@ -87,9 +119,36 @@ type Fetcher interface {
 	Fetch(ctx context.Context, accessToken string) (*UsageInfo, error)
 }
 
+// windowUtilization returns a window's utilization as a 0-1 fraction, falling
+// back to UsedPercent for windows that only carry the integer percent.
+func windowUtilization(w *UsageWindow) float64 {
+	if w == nil {
+		return 0
+	}
+	util := w.Utilization
+	if util == 0 && w.UsedPercent > 0 {
+		util = float64(w.UsedPercent) / 100.0
+	}
+	return util
+}
+
 // AvailabilityScore calculates a score for account rotation (0-100).
 // Higher scores indicate more available capacity.
+//
+// Model-scoped limits count against the score at their worst, so an account
+// whose per-model allowance is spent ranks below an equally-idle one whose is
+// not. Use AvailabilityScoreForModel when the model is known.
 func (u *UsageInfo) AvailabilityScore() int {
+	return u.AvailabilityScoreForModel("")
+}
+
+// AvailabilityScoreForModel is AvailabilityScore narrowed to the work actually
+// about to run: only the scoped window for model constrains the score, so an
+// account out of Fable capacity is still ranked as available for Sonnet work.
+//
+// An empty model means "unknown", and every scoped window is then taken into
+// account at its worst.
+func (u *UsageInfo) AvailabilityScoreForModel(model string) int {
 	if u == nil || u.Error != "" {
 		return 0
 	}
@@ -98,31 +157,15 @@ func (u *UsageInfo) AvailabilityScore() int {
 	score := 100.0
 
 	// Primary window is most important (weight: 50%)
-	if u.PrimaryWindow != nil {
-		primaryUtil := u.PrimaryWindow.Utilization
-		if primaryUtil == 0 && u.PrimaryWindow.UsedPercent > 0 {
-			primaryUtil = float64(u.PrimaryWindow.UsedPercent) / 100.0
-		}
-		score -= primaryUtil * 50
-	}
+	score -= windowUtilization(u.PrimaryWindow) * 50
 
 	// Secondary window (weight: 25%)
-	if u.SecondaryWindow != nil {
-		secondaryUtil := u.SecondaryWindow.Utilization
-		if secondaryUtil == 0 && u.SecondaryWindow.UsedPercent > 0 {
-			secondaryUtil = float64(u.SecondaryWindow.UsedPercent) / 100.0
-		}
-		score -= secondaryUtil * 25
-	}
+	score -= windowUtilization(u.SecondaryWindow) * 25
 
-	// Tertiary window for premium model limits (weight: 15%)
-	if u.TertiaryWindow != nil {
-		tertiaryUtil := u.TertiaryWindow.Utilization
-		if tertiaryUtil == 0 && u.TertiaryWindow.UsedPercent > 0 {
-			tertiaryUtil = float64(u.TertiaryWindow.UsedPercent) / 100.0
-		}
-		score -= tertiaryUtil * 15
-	}
+	// Premium-model limits (weight: 15%). The legacy tertiary window and the
+	// scoped windows describe the same kind of constraint, so they share one
+	// weight and the worst of the ones that apply is what counts.
+	score -= u.premiumUtilization(model) * 15
 
 	// Credit availability (weight: 10%)
 	if u.Credits != nil && !u.Credits.Unlimited && !u.Credits.HasCredits {
@@ -135,53 +178,146 @@ func (u *UsageInfo) AvailabilityScore() int {
 	return int(score)
 }
 
+// premiumWindows returns the per-model windows that constrain work on model —
+// the scoped windows plus the legacy tertiary one, which is itself an Opus
+// allowance on the accounts that still report it that way.
+//
+// An empty model means "unknown", and then every one of them applies: an
+// omitted scoped limit must never read as spare capacity (issue #97).
+func (u *UsageInfo) premiumWindows(model string) []*UsageWindow {
+	if u == nil {
+		return nil
+	}
+	var out []*UsageWindow
+	if u.TertiaryWindow != nil && windowAppliesToModel(u.TertiaryWindow, model) {
+		out = append(out, u.TertiaryWindow)
+	}
+	if model != "" {
+		if w := u.scopedWindowForModel(model); w != nil {
+			out = append(out, w)
+		}
+		return out
+	}
+	for _, w := range u.ModelWindows {
+		if w != nil {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// windowAppliesToModel reports whether a labelled window constrains model. An
+// unlabelled window constrains everything, and so does any window when the
+// model is unknown.
+func windowAppliesToModel(w *UsageWindow, model string) bool {
+	if w == nil {
+		return false
+	}
+	if model == "" || w.Label == "" {
+		return true
+	}
+	return modelKeysMatch(NormalizeModelKey(model), NormalizeModelKey(w.Label))
+}
+
+// premiumUtilization returns the worst utilization among the per-model windows
+// that apply to model.
+func (u *UsageInfo) premiumUtilization(model string) float64 {
+	return windowUtilization(u.ScopedLimit(model))
+}
+
+// ScopedLimit returns the per-model window closest to its cap among those that
+// constrain model — every one of them when model is empty — or nil when the
+// account has none. It is what a caller shows when asking "what else could
+// stop this account from running the work?".
+func (u *UsageInfo) ScopedLimit(model string) *UsageWindow {
+	var worst *UsageWindow
+	for _, w := range u.premiumWindows(model) {
+		if worst == nil || windowUtilization(w) > windowUtilization(worst) {
+			worst = w
+		}
+	}
+	return worst
+}
+
+// scopedWindowForModel returns the model-scoped window that applies to model,
+// or nil. Unlike WindowForModel it never falls back to the tertiary window.
+func (u *UsageInfo) scopedWindowForModel(model string) *UsageWindow {
+	if u == nil || len(u.ModelWindows) == 0 || model == "" {
+		return nil
+	}
+	if w, ok := u.ModelWindows[model]; ok {
+		return w
+	}
+	want := NormalizeModelKey(model)
+	for key, w := range u.ModelWindows {
+		if modelKeysMatch(want, NormalizeModelKey(key)) {
+			return w
+		}
+		// A scoped window also carries the provider's display name, which is
+		// what the API keys the limit on ("Fable", "Opus").
+		if w != nil && w.Label != "" && modelKeysMatch(want, NormalizeModelKey(w.Label)) {
+			return w
+		}
+	}
+	return nil
+}
+
+// NormalizeModelKey reduces a model name to a comparable token: lower case,
+// letters and digits only, with a leading "claude" dropped. It lets the model
+// identifier a caller passes ("claude-opus-4-1-20250805") line up with the
+// display name the usage API scopes a limit to ("Opus").
+func NormalizeModelKey(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimPrefix(b.String(), "claude")
+}
+
+// modelKeysMatch reports whether two normalized model keys name the same model
+// family. Containment handles the common shape — a family name inside a full
+// model identifier — and the length floor keeps short fragments from matching
+// everything.
+func modelKeysMatch(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) >= 4 && strings.Contains(b, a) {
+		return true
+	}
+	return len(b) >= 4 && strings.Contains(a, b)
+}
+
 // IsNearLimit returns true if usage is approaching the limit.
 // threshold is the utilization fraction to consider "near" (e.g., 0.8 for 80%).
 func (u *UsageInfo) IsNearLimit(threshold float64) bool {
+	return u.IsNearLimitForModel(threshold, "")
+}
+
+// IsNearLimitForModel is IsNearLimit narrowed to the model about to be used:
+// the general windows always count, but of the model-scoped windows only the
+// one covering model does. An empty model means "unknown", and then every
+// scoped window counts — an omitted scoped limit must never read as capacity
+// (issue #97).
+func (u *UsageInfo) IsNearLimitForModel(threshold float64, model string) bool {
 	if u == nil {
 		return false
 	}
 
-	if u.PrimaryWindow != nil {
-		util := u.PrimaryWindow.Utilization
-		if util == 0 && u.PrimaryWindow.UsedPercent > 0 {
-			util = float64(u.PrimaryWindow.UsedPercent) / 100.0
-		}
-		if util >= threshold {
-			return true
-		}
+	atLimit := func(w *UsageWindow) bool {
+		return w != nil && windowUtilization(w) >= threshold
+	}
+	if atLimit(u.PrimaryWindow) || atLimit(u.SecondaryWindow) {
+		return true
 	}
 
-	if u.SecondaryWindow != nil {
-		util := u.SecondaryWindow.Utilization
-		if util == 0 && u.SecondaryWindow.UsedPercent > 0 {
-			util = float64(u.SecondaryWindow.UsedPercent) / 100.0
-		}
-		if util >= threshold {
-			return true
-		}
-	}
-
-	if u.TertiaryWindow != nil {
-		util := u.TertiaryWindow.Utilization
-		if util == 0 && u.TertiaryWindow.UsedPercent > 0 {
-			util = float64(u.TertiaryWindow.UsedPercent) / 100.0
-		}
-		if util >= threshold {
-			return true
-		}
-	}
-
-	// Check model-specific windows
-	for _, window := range u.ModelWindows {
-		if window == nil {
-			continue
-		}
-		util := window.Utilization
-		if util == 0 && window.UsedPercent > 0 {
-			util = float64(window.UsedPercent) / 100.0
-		}
-		if util >= threshold {
+	for _, w := range u.premiumWindows(model) {
+		if atLimit(w) {
 			return true
 		}
 	}
@@ -282,10 +418,8 @@ func (u *UsageInfo) WindowForModel(model string) *UsageWindow {
 		return nil
 	}
 
-	if u.ModelWindows != nil {
-		if w, ok := u.ModelWindows[model]; ok {
-			return w
-		}
+	if w := u.scopedWindowForModel(model); w != nil {
+		return w
 	}
 
 	// Fall back to tertiary (premium model) window

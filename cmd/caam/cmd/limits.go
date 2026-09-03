@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -34,7 +35,13 @@ Examples:
   caam limits codex               # Show Codex limits only
   caam limits --profile work      # Show limits for a specific profile
   caam limits --format json       # Output as JSON
-  caam limits --best              # Show the best profile for rotation`,
+  caam limits --best              # Show the best profile for rotation
+  caam limits claude --model fable --best   # Best profile for Fable work specifically
+
+Claude reports a separate weekly allowance per model on top of the 5-hour and
+weekly windows. The SCOPED column shows the per-model allowance closest to its
+cap; --model narrows scores and eligibility to the allowance for one model, so
+an account out of Fable capacity is still offered for Sonnet work.`,
 	RunE: runLimits,
 }
 
@@ -46,6 +53,7 @@ func init() {
 	limitsCmd.Flags().Float64("threshold", 0.8, "utilization threshold for rotation (0-1)")
 	limitsCmd.Flags().Bool("recommend", false, "show smart rotation recommendations")
 	limitsCmd.Flags().Bool("forecast", false, "show usage forecasts and optimal switch times")
+	limitsCmd.Flags().String("model", "", "model the work will run on (e.g. opus, fable); scores and eligibility then honor that model's own quota")
 }
 
 func runLimits(cmd *cobra.Command, args []string) error {
@@ -55,6 +63,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	threshold, _ := cmd.Flags().GetFloat64("threshold")
 	showRecommend, _ := cmd.Flags().GetBool("recommend")
 	showForecast, _ := cmd.Flags().GetBool("forecast")
+	model, _ := cmd.Flags().GetString("model")
 
 	// Live limit fetching only has API support for a subset of providers (those
 	// with credential readers + API fetchers). Be explicit about scope: default
@@ -119,19 +128,45 @@ func runLimits(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// A model-scoped quota only binds the model it is scoped to, so ranking
+	// and eligibility re-sort around the model the work will run on when the
+	// caller names one (issue #97).
+	if model != "" {
+		sortResultsForModel(allResults, model)
+	}
+
 	if showBest {
-		return renderBestProfile(out, format, allResults, threshold)
+		return renderBestProfile(out, format, allResults, threshold, model)
 	}
 
 	if showRecommend {
-		return renderRecommendations(out, format, allResults, threshold)
+		return renderRecommendations(out, format, allResults, threshold, model)
 	}
 
 	if showForecast {
 		return renderForecast(out, format, allResults)
 	}
 
-	return renderLimits(out, format, allResults)
+	return renderLimits(out, format, allResults, model)
+}
+
+// sortResultsForModel re-ranks profiles by their availability for one model.
+// MultiProfileFetcher sorts by the model-agnostic score, which counts every
+// scoped quota; with a model in hand only that model's own quota should.
+func sortResultsForModel(results []usage.ProfileUsage, model string) {
+	sort.SliceStable(results, func(i, j int) bool {
+		scoreI, scoreJ := 0, 0
+		if results[i].Usage != nil {
+			scoreI = results[i].Usage.AvailabilityScoreForModel(model)
+		}
+		if results[j].Usage != nil {
+			scoreJ = results[j].Usage.AvailabilityScoreForModel(model)
+		}
+		if scoreI == scoreJ {
+			return results[i].ProfileName < results[j].ProfileName
+		}
+		return scoreI > scoreJ
+	})
 }
 
 // limitsProviders are the providers with live limit/usage API support.
@@ -174,7 +209,7 @@ func getVaultDir() string {
 	return authfile.DefaultVaultPath()
 }
 
-func renderLimits(w io.Writer, format string, results []usage.ProfileUsage) error {
+func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, model string) error {
 	format = strings.ToLower(strings.TrimSpace(format))
 
 	switch format {
@@ -196,20 +231,22 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage) erro
 		fmt.Fprintln(w, "──────────────────────────────────────────────────────────────────────────────────────────")
 
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "PROFILE\tSCORE\tPRIMARY\tSECONDARY\tRESETS IN\tBURN/HR\tDEPLETES\tSTATUS")
+		fmt.Fprintln(tw, "PROFILE\tSCORE\tPRIMARY\tSECONDARY\tSCOPED\tRESETS IN\tBURN/HR\tDEPLETES\tSTATUS")
 
 		for _, r := range results {
 			profileName := fmt.Sprintf("%s/%s", r.Provider, r.ProfileName)
 			score := 0
 			primary := "-"
 			secondary := "-"
+			scoped := "-"
 			resetsIn := "-"
 			status := "unknown"
 			burnRate := "-"
 			depletesIn := "-"
 
 			if r.Usage != nil {
-				score = r.Usage.AvailabilityScore()
+				score = r.Usage.AvailabilityScoreForModel(model)
+				scoped = formatScopedLimit(r.Usage.ScopedLimit(model))
 
 				if r.Usage.Error != "" {
 					status = "error: " + truncate(r.Usage.Error, 20)
@@ -242,8 +279,8 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage) erro
 				}
 			}
 
-			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				profileName, score, primary, secondary, resetsIn, burnRate, depletesIn, status)
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				profileName, score, primary, secondary, scoped, resetsIn, burnRate, depletesIn, status)
 		}
 
 		tw.Flush()
@@ -252,6 +289,24 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage) erro
 	default:
 		return fmt.Errorf("unsupported format: %s", format)
 	}
+}
+
+// formatScopedLimit renders the model-scoped quota closest to its cap, e.g.
+// "Fable 100%". A profile with no per-model quota reports "-".
+func formatScopedLimit(w *usage.UsageWindow) string {
+	if w == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%s %d%%", scopedLabel(w), w.UsedPercent)
+}
+
+// scopedLabel names the model a window is scoped to, for windows the provider
+// reported without a display name.
+func scopedLabel(w *usage.UsageWindow) string {
+	if w == nil || w.Label == "" {
+		return "model quota"
+	}
+	return w.Label
 }
 
 // formatBurnRate formats tokens per hour in a compact way.
@@ -264,11 +319,11 @@ func formatBurnRate(tokensPerHour float64) string {
 	return fmt.Sprintf("%.0f", tokensPerHour)
 }
 
-func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage, threshold float64) error {
+func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
 	// Filter to profiles that are available
 	var available []usage.ProfileUsage
 	for _, r := range results {
-		if r.Usage != nil && r.Usage.Error == "" && !r.Usage.IsNearLimit(threshold) {
+		if r.Usage != nil && r.Usage.Error == "" && !r.Usage.IsNearLimitForModel(threshold, model) {
 			available = append(available, r)
 		}
 	}
@@ -303,7 +358,11 @@ func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage,
 
 		best := available[0]
 		fmt.Fprintf(w, "Best profile: %s/%s (score: %d)\n",
-			best.Provider, best.ProfileName, best.Usage.AvailabilityScore())
+			best.Provider, best.ProfileName, best.Usage.AvailabilityScoreForModel(model))
+
+		if scoped := best.Usage.ScopedLimit(model); scoped != nil {
+			fmt.Fprintf(w, "  Model-scoped window: %s used\n", formatScopedLimit(scoped))
+		}
 
 		if best.Usage.PrimaryWindow != nil {
 			fmt.Fprintf(w, "  Primary window: %d%% used, resets in %s\n",
@@ -372,10 +431,10 @@ type Forecast struct {
 	Recommendation    string `json:"recommendation"`
 }
 
-func renderRecommendations(w io.Writer, format string, results []usage.ProfileUsage, threshold float64) error {
+func renderRecommendations(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
 	format = strings.ToLower(strings.TrimSpace(format))
 
-	recs := generateLimitsRecommendations(results, threshold)
+	recs := generateLimitsRecommendations(results, threshold, model)
 
 	switch format {
 	case "json":
@@ -421,7 +480,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 	}
 }
 
-func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float64) []Recommendation {
+func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float64, model string) []Recommendation {
 	var recs []Recommendation
 
 	// Group by provider
@@ -439,7 +498,7 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 			if p.Usage == nil || p.Usage.Error != "" {
 				continue
 			}
-			if p.Usage.IsNearLimit(threshold) {
+			if p.Usage.IsNearLimitForModel(threshold, model) {
 				nearLimit = append(nearLimit, p)
 			} else {
 				healthy = append(healthy, p)
@@ -469,6 +528,15 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 			if p.Usage.SecondaryWindow != nil && p.Usage.SecondaryWindow.UsedPercent >= thresholdPct {
 				reason += fmt.Sprintf(", secondary at %d%%", p.Usage.SecondaryWindow.UsedPercent)
 			}
+			// Say so when a per-model quota is what makes the profile
+			// unusable: at 0% general usage the primary figure alone reads as
+			// "plenty left" (issue #97).
+			if scoped := p.Usage.ScopedLimit(model); scoped != nil && scoped.UsedPercent >= thresholdPct {
+				reason += fmt.Sprintf(", %s exhausted at %d%%", scopedLabel(scoped), scoped.UsedPercent)
+				if primary < thresholdPct {
+					urgency = "now"
+				}
+			}
 
 			rec := Recommendation{
 				Action:      "Switch from",
@@ -486,7 +554,7 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 			// Find the one with lowest usage
 			best := healthy[0]
 			for _, h := range healthy[1:] {
-				if h.Usage.AvailabilityScore() > best.Usage.AvailabilityScore() {
+				if h.Usage.AvailabilityScoreForModel(model) > best.Usage.AvailabilityScoreForModel(model) {
 					best = h
 				}
 			}
@@ -499,7 +567,7 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 			rec := Recommendation{
 				Action:      "Switch to",
 				Profile:     fmt.Sprintf("%s/%s", provider, best.ProfileName),
-				Reason:      fmt.Sprintf("Has %d%% availability (primary at %d%%)", best.Usage.AvailabilityScore(), bestPrimary),
+				Reason:      fmt.Sprintf("Has %d%% availability (primary at %d%%)", best.Usage.AvailabilityScoreForModel(model), bestPrimary),
 				Urgency:     "none",
 				CurrentLoad: bestPrimary,
 			}

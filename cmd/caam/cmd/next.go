@@ -283,7 +283,9 @@ func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotat
 			continue
 		}
 
-		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage)
+		// `caam next` picks an account without knowing what will run on it,
+		// so every model-scoped quota counts against availability.
+		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage, "")
 	}
 
 	return usageData

@@ -90,9 +90,20 @@ type UsageInfo struct {
 	ProfileName      string
 	PrimaryPercent   int        // Primary window usage (0-100)
 	SecondaryPercent int        // Secondary window usage (0-100)
+	ScopedPercent    int        // Worst applicable model-scoped quota (0-100); 0 when none
+	ScopedLabel      string     // Model that quota is scoped to, e.g. "Fable"
 	AvailScore       int        // Availability score (0-100, higher is better)
 	ResetsAt         *time.Time // Earliest known quota reset time (nil if unknown)
 	Error            string     // Error message if fetch failed
+}
+
+// scopedQuotaLabel names the model a scoped quota belongs to, for providers
+// that report one without a display name.
+func scopedQuotaLabel(u *UsageInfo) string {
+	if u == nil || u.ScopedLabel == "" {
+		return "Model-scoped"
+	}
+	return u.ScopedLabel
 }
 
 // Selector performs profile selection based on configured algorithm.
@@ -251,10 +262,15 @@ func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) 
 
 		switch {
 		case usage != nil && usage.Error == "":
-			// The most constrained window governs headroom.
+			// The most constrained window governs headroom — including a
+			// model-scoped quota, which can be spent while the general
+			// windows still read as idle (issue #97).
 			used := usage.PrimaryPercent
 			if usage.SecondaryPercent > used {
 				used = usage.SecondaryPercent
+			}
+			if usage.ScopedPercent > used {
+				used = usage.ScopedPercent
 			}
 			usedPercents[p] = used
 
@@ -599,6 +615,17 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 					score.Score -= 30 // Extra penalty for high secondary usage
 					score.Reasons = append(score.Reasons, Reason{
 						Text:     fmt.Sprintf("Secondary limit %d%% used (near limit)", usage.SecondaryPercent),
+						Positive: false,
+					})
+				}
+
+				// A spent model-scoped quota makes the profile unusable for
+				// that model even when its general windows are idle, so say so
+				// and rank it down (issue #97).
+				if usage.ScopedPercent >= 80 {
+					score.Score -= 30
+					score.Reasons = append(score.Reasons, Reason{
+						Text:     fmt.Sprintf("%s limit %d%% used (near limit)", scopedQuotaLabel(usage), usage.ScopedPercent),
 						Positive: false,
 					})
 				}
