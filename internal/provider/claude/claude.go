@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -563,6 +564,11 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get home dir: %w", err)
 	}
+
+	// On macOS the OAuth blob lives in the login keychain; ~/.claude/.credentials.json
+	// is its mirror. Refresh it or detection reports "no credentials found"
+	// for a perfectly good login (issue #98).
+	_, _ = keychain.EnsureMirror(filepath.Join(homeDir, ".claude", ".credentials.json"))
 
 	// Define locations to check
 	locations := []struct {

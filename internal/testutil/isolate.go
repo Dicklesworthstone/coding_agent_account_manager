@@ -106,6 +106,15 @@ func IsolateEnv() (restore func(), err error) {
 	remember("BROWSER")
 	remember(isolatedMarker)
 
+	// The macOS login keychain is machine-global state that an isolated HOME
+	// does not contain: with the bridge live, a test that backs up or restores
+	// a Claude profile would read — and overwrite — the developer's real
+	// tokens. Tests that need the bridge opt in via testutil.FakeKeychain.
+	remember("CAAM_KEYCHAIN")
+	remember("CAAM_KEYCHAIN_BIN")
+	os.Unsetenv("CAAM_KEYCHAIN_BIN")
+	os.Setenv("CAAM_KEYCHAIN", "0")
+
 	os.Setenv("HOME", dir)
 	os.Setenv("USERPROFILE", dir)
 	os.Setenv(isolatedMarker, "1")

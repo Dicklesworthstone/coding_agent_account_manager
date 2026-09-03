@@ -17,6 +17,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
@@ -915,6 +916,10 @@ func checkAuthFiles() []CheckResult {
 		return results
 	}
 
+	if result := checkClaudeKeychain(); result != nil {
+		results = append(results, *result)
+	}
+
 	for tool, getFileSet := range tools {
 		fileSet := getFileSet()
 		hasAuth := authfile.HasAuthFiles(fileSet)
@@ -1002,6 +1007,37 @@ func checkAuthFiles() []CheckResult {
 // identityFromJWT returns "email|accountID|org" — this extracts the email,
 // falling back to accountID if email is empty.
 // Plain email strings are returned lowercased as-is.
+// checkClaudeKeychain reports on the macOS login-keychain bridge. On a Mac the
+// live Claude OAuth token is a keychain item, not a file, and a keychain caam
+// cannot read means backup captures a token-less profile and activate is a
+// silent no-op (issue #98). Off darwin, and with the bridge switched off,
+// there is nothing to report.
+func checkClaudeKeychain() *CheckResult {
+	if !keychain.Enabled() {
+		return nil
+	}
+	check := &CheckResult{Name: "claude keychain"}
+	switch _, err := keychain.ReadClaude(); {
+	case err == nil:
+		check.Status = "pass"
+		check.Message = fmt.Sprintf("%q readable in the login keychain", keychain.ClaudeService)
+	case errors.Is(err, keychain.ErrNoKeychain):
+		return nil
+	case errors.Is(err, keychain.ErrNotFound):
+		check.Status = "warn"
+		check.Message = "no Claude item in the login keychain"
+		check.Details = "Claude Code stores its OAuth token there on macOS; log in with 'claude' before 'caam backup claude <profile>'"
+	case errors.Is(err, keychain.ErrDenied):
+		check.Status = "fail"
+		check.Message = "the login keychain refused access"
+		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.claude/.credentials.json"
+	default:
+		check.Status = "fail"
+		check.Message = err.Error()
+	}
+	return check
+}
+
 func normalizeIdentity(id string) string {
 	if id == "" {
 		return ""

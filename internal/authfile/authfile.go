@@ -425,6 +425,14 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
+	// On macOS the live Claude credentials are in the login keychain, not on
+	// disk. Mirror them out before the walk below, or the snapshot captures
+	// settings with no token in them (issue #98). A refused keychain is fatal
+	// here: a token-less profile is worse than a failed backup.
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return err
+	}
+
 	// Create profile directory
 	if err := os.MkdirAll(profileDir, 0700); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
@@ -786,6 +794,14 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
+	// Mirror the login keychain onto disk first: on macOS it, not the file, is
+	// what the freshness guard below must compare the snapshot against, and a
+	// keychain caam cannot read is one it cannot write either — better to stop
+	// than to report a switch that did not happen (issue #98).
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return err
+	}
+
 	// Capture the live Claude identity BEFORE any file is overwritten: the
 	// freshness guard below must compare against the account that is logged
 	// in right now, not against the snapshot's settings once those have been
@@ -905,6 +921,12 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		if !(fileSet.AllowOptionalOnly && !requiredFound && optionalFound) {
 			return fmt.Errorf("required backup not found: %s", missingRequired[0])
 		}
+	}
+
+	// The restored file only becomes the account Claude Code uses once it is
+	// back in the login keychain (issue #98).
+	if err := pushClaudeKeychain(fileSet); err != nil {
+		return err
 	}
 
 	return nil
@@ -1059,6 +1081,11 @@ func (v *Vault) CopyProfile(tool, srcProfile, dstProfile string) error {
 // hashed so that volatile metadata (e.g., changelogLastFetched, numStartups)
 // does not break profile detection.
 func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
+	// Best-effort: on macOS the live token is in the keychain, so without the
+	// mirror the hash comparison below has nothing to compare (issue #98).
+	// A refused keychain leaves detection where it was before the bridge.
+	_ = pullClaudeKeychain(fileSet)
+
 	profiles, err := v.List(fileSet.Tool)
 	if err != nil {
 		return "", err
@@ -1155,6 +1182,11 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 // HasAuthFiles checks if the tool currently has auth files present.
 func HasAuthFiles(fileSet AuthFileSet) bool {
+	// Best-effort mirror: a macOS Claude login lives in the keychain, and
+	// reporting "not logged in" for it would send callers down the login path
+	// (issue #98).
+	_ = pullClaudeKeychain(fileSet)
+
 	optionalFound := false
 	for _, spec := range fileSet.Files {
 		// The Claude Desktop config only counts as auth when it holds a token
@@ -1193,7 +1225,10 @@ func ClearAuthFiles(fileSet AuthFileSet) error {
 			return fmt.Errorf("remove %s: %w", spec.Path, err)
 		}
 	}
-	return nil
+
+	// Removing the mirror is not a logout while the keychain still holds the
+	// token Claude Code prefers (issue #98).
+	return clearClaudeKeychain(fileSet)
 }
 
 // --- Claude Desktop OAuth token cache (macOS) -------------------------------

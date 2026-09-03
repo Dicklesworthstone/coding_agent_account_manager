@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
 // ErrNoExpiry indicates that expiry information could not be determined.
@@ -103,8 +104,11 @@ func parseClaudeExpiryFiles(authDir string) (*ExpiryInfo, error) {
 			}
 		}
 
-		// System state probing - check the actual credentials file location
+		// System state probing - check the actual credentials file location.
+		// On macOS the live token is in the login keychain and this file is
+		// its mirror, so refresh it first or expiry reads as unknown (#98).
 		credentialsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		_, _ = keychain.EnsureMirror(credentialsPath)
 		info, err = parseClaudeCredentialsFile(credentialsPath)
 		if err == nil {
 			info.Source = credentialsPath
