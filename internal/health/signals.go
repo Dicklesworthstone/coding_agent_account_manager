@@ -78,10 +78,13 @@ func CredentialSignals(h *ProfileHealth, config HealthConfig) Signals {
 	expired := h.TokenExpiresAt.Before(now)
 	renewable := h.CredentialRenewable()
 
-	// Refresh scheduling. Claude renews itself and caam's Claude refresh is
-	// disabled, so never claim a refresh is due for it.
+	// Refresh scheduling. Two things make a refresh impossible rather than
+	// merely unnecessary, and neither is a refresh being "due":
+	//   - Claude renews itself and caam's Claude refresh is disabled;
+	//   - a credential with no refresh token has nothing to renew from, and
+	//     needs a login instead (LoginRequired says so below).
 	refreshDue := false
-	if !h.SelfRefreshing {
+	if !h.SelfRefreshing && renewable {
 		warning := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
 		refreshDue = expired || h.TokenExpiresAt.Sub(now) <= warning
 	}

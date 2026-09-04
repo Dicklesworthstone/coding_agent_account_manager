@@ -168,9 +168,16 @@ func TestCredentialSignals(t *testing.T) {
 			refreshDue: ptr(true), launchUsable: ptr(true), loginReq: ptr(false),
 		},
 		{
-			name:       "codex lapsed with nothing to renew",
-			health:     &ProfileHealth{TokenExpiresAt: now.Add(-72 * time.Hour)},
-			refreshDue: ptr(true), launchUsable: ptr(false), loginReq: ptr(true),
+			name:   "codex lapsed with nothing to renew",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(-72 * time.Hour)},
+			// Nothing to refresh FROM: this needs a human, not a scheduler.
+			refreshDue: ptr(false), launchUsable: ptr(false), loginReq: ptr(true),
+		},
+		{
+			name:   "expiring soon with nothing to renew",
+			health: &ProfileHealth{TokenExpiresAt: now.Add(20 * time.Minute)},
+			// Still usable, but no refresh can save it when it lapses.
+			refreshDue: ptr(false), launchUsable: ptr(true), loginReq: ptr(false),
 		},
 		{
 			name: "claude self-refreshing and lapsed",

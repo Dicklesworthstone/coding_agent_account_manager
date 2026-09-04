@@ -664,7 +664,7 @@ signals per profile alongside the composite `status`:
 
 | Field | Meaning |
 |-------|---------|
-| `refresh_due` | caam should renew this credential soon. `false` for a self-refreshing Claude credential, which caam must leave alone. |
+| `refresh_due` | caam should renew this credential soon. `false` for a self-refreshing Claude credential (caam must leave it alone) and for one with no refresh token (there is nothing to renew from — it needs a login, not a scheduler). |
 | `launch_usable` | a new session can start on this account right now — this is what a rotation controller should route on, not warning severity |
 | `login_required` | a human must re-authenticate: the credential has lapsed **and** carries nothing to renew itself with |
 

@@ -205,7 +205,10 @@ func mergeCodexRoot(real, profile *tomlDoc, changed map[string]bool) {
 		}
 		if idx, ok := byKey[e.key]; ok {
 			if !tomlTextEqual(profEntries[idx].text, e.text) {
-				profEntries[idx].text = e.text
+				// The real entry may be the last line of a file with no
+				// trailing newline; entries are concatenated, so an entry in
+				// the middle must always end in one.
+				profEntries[idx].text = ensureTrailingNewline(e.text)
 				changed[e.key] = true
 			}
 			continue

@@ -161,6 +161,8 @@ func runLimits(cmd *cobra.Command, args []string) error {
 			// A strictly healthier copy elsewhere means the default namespace
 			// would produce a verdict a controller must not act on. Refuse.
 			if len(res.Healthier) > 0 {
+				// The message IS the guidance; cobra's usage block would bury it.
+				cmd.SilenceUsage = true
 				return res.AmbiguityError(provider, profileArg)
 			}
 			sourceNotes = append(sourceNotes, res.describe(provider, profileArg))
