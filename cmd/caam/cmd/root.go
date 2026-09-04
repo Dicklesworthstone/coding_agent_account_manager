@@ -325,11 +325,14 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 }
 
 // applyExpiryInfo records a parsed credential's expiry on the health
-// snapshot, together with whether that credential is self-refreshing (so
-// the TTL is informational rather than a fault, PR #84).
+// snapshot, together with whether that credential is self-refreshing (so the
+// TTL is informational rather than a fault, PR #84) and whether it is
+// renewable at all (so a lapsed-but-refreshable Codex/Grok/Gemini token is
+// not reported as an expired account, issue #102).
 func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
 	ph.TokenExpiresAt = info.ExpiresAt
 	ph.SelfRefreshing = info.SelfRefreshing
+	ph.TokenRenewable = info.Renewable
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -865,6 +868,9 @@ type statusHealth struct {
 	ExpiresAt         string `json:"expires_at,omitempty"`
 	ErrorCount        int    `json:"error_count"`
 	CooldownRemaining string `json:"cooldown_remaining,omitempty"`
+
+	// The three-signal credential contract (issue #102); see lsHealth.
+	health.Signals
 }
 
 // statusCmd shows which profile is currently active.
@@ -984,6 +990,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				Health: &statusHealth{
 					Status:     status.String(),
 					ErrorCount: ph.ErrorCount1h,
+					Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 				},
 			}
 			if !ph.TokenExpiresAt.IsZero() {
@@ -1083,6 +1090,12 @@ type lsHealth struct {
 	Status     string `json:"status"`
 	ExpiresAt  string `json:"expires_at,omitempty"`
 	ErrorCount int    `json:"error_count"`
+
+	// The three-signal credential contract (issue #102). Status stays the
+	// human-facing composite verdict; controllers should route on
+	// launch_usable and schedulers on refresh_due. A null field means caam
+	// found no evidence either way and is not guessing.
+	health.Signals
 }
 
 // lsCmd lists all stored profiles.
@@ -1185,6 +1198,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
+						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 					},
 					Identity: id,
 				}
@@ -1278,6 +1292,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Health: lsHealth{
 						Status:     status.String(),
 						ErrorCount: ph.ErrorCount1h,
+						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
 					},
 					Identity: id,
 				}

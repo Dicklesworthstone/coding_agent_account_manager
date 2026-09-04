@@ -37,9 +37,10 @@ func FormatHealthStatus(status HealthStatus, health *ProfileHealth, opts FormatO
 		switch {
 		case ttl > 0:
 			text = FormatTimeRemaining(health.TokenExpiresAt)
-		case health.SelfRefreshing:
-			// The provider's CLI renews this token on next use; "Expired"
-			// would read as a dead account (PR #84).
+		case health.CredentialRenewable():
+			// The credential renews without a human — the provider's CLI does
+			// it on next use, or caam refreshes it from the stored refresh
+			// token. "Expired" would read as a dead account (PR #84, #102).
 			text = "Auto-refresh"
 		default:
 			text = "Expired"
@@ -125,10 +126,12 @@ func StatusReasons(h *ProfileHealth) []string {
 		reasons = append(reasons, fmt.Sprintf("Rate limited (resets in %s)", formatDurationNatural(h.RateLimitedUntil.Sub(now))))
 	}
 
-	// Check token expiry. A self-refreshing credential is skipped: the
-	// provider's CLI renews it in place, so its TTL is not a reason for
-	// anything (PR #84).
-	if !h.TokenExpiresAt.IsZero() && !h.SelfRefreshing {
+	// Check token expiry. A renewable credential is skipped: it is renewed in
+	// place by the provider's CLI or by caam's refresher, so its TTL is not a
+	// reason for the account's verdict (PR #84, issue #102). Refresh
+	// scheduling reads Signals.RefreshDue instead, which stays true for a
+	// renewable-but-lapsed Codex or Grok credential.
+	if !h.TokenExpiresAt.IsZero() && !h.CredentialRenewable() {
 		ttl := h.TokenExpiresAt.Sub(now)
 		if ttl <= 0 {
 			if !rateLimited {
@@ -208,7 +211,14 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 		// refresh" is unsupported for it, and a re-login is disruptive.
 		ttl := health.TokenExpiresAt.Sub(now)
 		if ttl <= 0 {
-			recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
+			// A lapsed access token that still has something to renew itself
+			// with does not need a login; sending the operator through one
+			// would be disruptive and would fix nothing (issue #102).
+			if health.TokenRenewable {
+				recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to renew the lapsed access token (no re-login needed)", provider, profile))
+			} else {
+				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
+			}
 		} else if ttl < time.Hour {
 			recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to refresh expiring token", provider, profile))
 		}

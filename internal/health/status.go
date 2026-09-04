@@ -118,9 +118,11 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	now := time.Now()
 
 	// Factor 1: Token expiry (primary)
-	if h.SelfRefreshing {
-		// The provider's CLI renews this token on next use; its TTL says
-		// nothing about whether the account works (PR #84).
+	if h.CredentialRenewable() {
+		// The credential renews without a human — the provider's CLI does it
+		// on next use, or caam refreshes it from the stored refresh token.
+		// Either way its TTL says nothing about whether the account works
+		// (PR #84, issue #102).
 		score += 1.0
 	} else if h.TokenExpiresAt.IsZero() {
 		// Unknown expiry - neutral
@@ -171,9 +173,13 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	}
 
 	// Override if token is strictly expired or critical errors met. A
-	// self-refreshing credential is exempt: its TTL is renewed by the
-	// provider's CLI, not by anything the operator does.
-	if !h.TokenExpiresAt.IsZero() && !h.SelfRefreshing {
+	// renewable credential is exempt: its TTL is renewed by the provider's
+	// CLI or by caam's refresher, not by anything the operator does. Codex
+	// profiles are the reason this keys on renewability rather than on
+	// SelfRefreshing — three live Codex accounts read "warning" from a
+	// months-old access-token expiry that the CLI renews on next use
+	// (issue #102).
+	if !h.TokenExpiresAt.IsZero() && !h.CredentialRenewable() {
 		if h.TokenExpiresAt.Before(now) {
 			if h.RateLimited(now) {
 				// An active rate-limit cooldown outranks the recorded expiry:

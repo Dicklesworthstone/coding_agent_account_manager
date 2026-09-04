@@ -58,11 +58,31 @@ type ProfileHealth struct {
 	// not lower the verdict, list a reason, or recommend a refresh caam
 	// cannot perform (PR #84).
 	SelfRefreshing bool `json:"-"`
+
+	// TokenRenewable marks TokenExpiresAt as the expiry of an access token
+	// that can be renewed without a human re-authenticating — a refresh token
+	// is stored beside it, or the provider's CLI renews it in place. Set at
+	// report time alongside TokenExpiresAt and never persisted.
+	//
+	// It is the "does this account need a re-login?" half of what
+	// SelfRefreshing used to answer alone. Codex sets it without setting
+	// SelfRefreshing: caam still wants to be told the access token is near
+	// expiry (it has a Codex refresher), but a lapsed-yet-refreshable token
+	// must not be reported as an expired account (issue #102).
+	TokenRenewable bool `json:"-"`
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.
 func (h *ProfileHealth) RateLimited(now time.Time) bool {
 	return h != nil && !h.RateLimitedUntil.IsZero() && h.RateLimitedUntil.After(now)
+}
+
+// CredentialRenewable reports whether the recorded token expiry can be
+// resolved without a human logging in again. It is the predicate the
+// user-facing verdict keys on: a renewable credential's TTL says nothing
+// about whether the account works.
+func (h *ProfileHealth) CredentialRenewable() bool {
+	return h != nil && (h.SelfRefreshing || h.TokenRenewable)
 }
 
 // HealthStore holds health data for all profiles.
