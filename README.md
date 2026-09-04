@@ -190,7 +190,7 @@ Per-provider real (private) files — everything else under the provider's home 
 | Provider | Real / private files | Spawn pins |
 |----------|----------------------|------------|
 | `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | scrubs `CLAUDE_CONFIG_DIR` |
-| `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced) | `CODEX_HOME=<profile>/.codex` |
+| `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced; shared tables refreshed from your real config on every spawn, hook/project/notice state kept private) | `CODEX_HOME=<profile>/.codex` |
 | `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
@@ -203,11 +203,15 @@ Per-provider real (private) files — everything else under the provider's home 
 caam shallow-profile create <name> [--tool claude|codex|agy] [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
+caam shallow-profile sync-config <name>|--all [--json]   # reconcile shared config with your real HOME
 caam shallow-spawn <name>                     # open the profile's own provider CLI (claude / codex / agy) in this terminal
+caam shallow-spawn <name> --create            # first run of a NEW identity: provision an empty profile, then start it
+caam shallow-spawn <name> --create --tool codex   # ...with a codex layout instead of claude
 caam shallow-spawn <name> -- <cmd> [args...]  # or run any other command under the profile
 caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
-caam shallow-spawn <name> --no-sync-config    # claude only: don't refresh shared preferences from ~/.claude.json
+caam shallow-spawn <name> --no-sync-config    # don't refresh shared config from your real HOME before starting
+caam shallow-profile sync-config <name>       # ...or reconcile it on demand (--all for every profile)
 caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `-c model_reasoning_effort=xhigh` (codex has no --effort flag)
 ```
 
@@ -236,6 +240,62 @@ caam shallow-spawn bob     -- claude --print "write tests for internal/shallow" 
 caam shallow-spawn charlie -- claude --print "draft release notes for v0.4.0"       &
 wait
 ```
+
+#### Starting a new identity: `--create`
+
+An unknown name is an **error**, not a new profile. Creating implicitly would
+turn `caam shallow-spawn alise` into a fresh empty identity plus a login prompt
+for the wrong account, with the mistyped profile then lingering on disk. The
+error instead names the closest existing profile and the flag that would have
+created this one:
+
+```
+shallow profile "alise" does not exist; did you mean "alice"?
+  create it and start a session:  caam shallow-spawn alise --create [--tool claude|codex|agy]
+  or set it up explicitly:        caam shallow-profile create alise
+```
+
+`--create` provisions the profile with **empty** credentials and starts the
+session, so the first run of a new identity is a login prompt. Credentials are
+deliberately never copied from the vault here: two homes sharing one
+refresh-token family invalidate each other, so seeding stays an explicit
+`caam shallow-profile create --from-vault <tool>/<profile>` decision.
+`--print-env` remains a strict dry run and never creates anything, and `--tool`
+on a profile that already exists under another provider is an error rather than
+a silent no-op.
+
+#### Keeping shared configuration in sync
+
+A shallow profile's provider configuration is a *real*, private file — it has
+to be, because the provider writes identity and per-home state into it — so it
+diverges from your real HOME the moment you change something there. The most
+common casualty is an MCP server: change a real-home entry from the stdio
+transport to streamable HTTP and every codex profile keeps the old
+`command`/`args` block, after which codex refuses to parse its config at all
+(`url is not supported for stdio in mcp_servers.<name>`).
+
+Every spawn therefore refreshes the shared configuration from your real HOME,
+and `caam shallow-profile sync-config <name> [--all]` does it on demand:
+
+| Provider | Refreshed | Never touched |
+|----------|-----------|---------------|
+| claude (`.claude.json`) | preferences (theme, editor mode, notification channel, auto-updates), user-scope `mcpServers`, per-project trust / `allowedTools` / MCP settings | `oauthAccount`, usage caches, prompt history, per-project session state |
+| codex (`.codex/config.toml`) | root settings (`model`, `model_reasoning_effort`, `personality`, `notify`, …) and whole tables: `[mcp_servers.*]`, `[features]`, `[skills]`, `[hooks]`, `[model_providers.*]` | `[hooks.state.*]` (hook trust), `[projects.*]` (workspace trust), `[notice.*]` (dismissed notices), and `auth.json` |
+
+Two rules keep it safe to run on every spawn:
+
+- **Sections are replaced as a unit, never merged key by key.** For an MCP
+  server that is the whole point: `[mcp_servers.kernel]` and its subtables are
+  dropped and re-inserted together, so a stale `command`/`args` pair cannot
+  survive beside a new `url`.
+- **Nothing is deleted.** A table your profile has and your real HOME does not
+  is left alone; the real side wins only where it has an opinion.
+
+`cli_auth_credentials_store = "file"` is re-enforced on every codex sync, so a
+profile can never be talked into a shared keychain. The edit is a structural
+splice over the raw file rather than a parse-and-rewrite, so comments, key
+order and formatting survive and an untouched region stays byte-identical —
+and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 > **Claude Agent View is disabled by default in shallow sessions (issue #49).** Claude Code's Agent View feature (the `--bg` background-supervisor daemon) runs a **long-lived, cross-session** supervisor process that is **not** bound to the shallow profile's `HOME`. On resume, a shallow `claude` session would reconnect to an already-running supervisor bound to a *different* identity (typically the VM's primary Claude auth), silently bypassing shallow-spawn's per-identity auth isolation and using the wrong account. caam cannot control that daemon's lifecycle, so `caam shallow-spawn <name> -- claude` injects `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` into the child environment by default. This keeps the session foreground and honoring the per-identity `~/.claude/.credentials.json`.
 >
@@ -442,6 +502,8 @@ choice; with no model given, every per-model allowance counts.
 | `caam next <tool>` | Switch to the next profile in rotation (use `--dry-run` to preview without switching) |
 | `caam run <tool> [-- args]` | Wrap CLI execution with automatic failover on rate limits |
 | `caam limits <tool> [--model <name>]` | Live rate-limit usage, including each account's per-model allowance |
+| `caam limits claude --cached` | The same view offline, from the snapshot Claude Code caches on disk (no network, no token presented) |
+| `caam limits <tool> --profile <name> --source vault\|isolated\|shallow` | Read a specific credential namespace |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
 | `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
@@ -449,6 +511,71 @@ choice; with no model given, every per-model allowance counts.
 | `caam project set <tool> <profile>` | Associate current directory with a profile |
 | `caam project show [tool]` | Show resolved associations for current directory (`get` is an alias; `--json` for machine-readable output) |
 | `caam project list` | List all project associations (`--json` supported) |
+
+#### Offline usage: `caam limits --cached`
+
+`caam limits` answers "which account still has headroom" by querying the
+provider. Claude Code also caches the figures it last received in each
+account's own `.claude.json`, and `--cached` reads those files instead: no
+request is made and no token is presented.
+
+```bash
+caam limits claude --cached
+caam limits claude --cached --best        # only accounts caam actually has data for
+caam limits claude --cached --format json
+```
+
+The trade-off is freshness. A profile's snapshot only moves when that profile
+itself runs a session, so an account you are *not* currently using may be hours
+or days stale - or have no snapshot at all. The offline table is explicit about
+both:
+
+- an **AS OF** column per row (the snapshot's own timestamp, or `unknown` when
+  it carries none - never `0s ago`);
+- a profile with nothing cached reads `no cached data`, not `0%`, and is
+  excluded from `--best` and from the recommendations. An account caam knows
+  nothing about is never offered as the one with room;
+- a window whose reset time had already passed when the snapshot was written
+  reads `0% (rolled)`, so a stale zero is not mistaken for a measured one.
+
+In `--format json` these appear as `source: "cache"`, the window-level `rolled`
+flag, and `fetched_at` set to the snapshot's own timestamp rather than the time
+caam read it. Only Claude keeps such a cache; `--cached` on another provider is
+an error rather than an empty table.
+
+#### Credential namespaces: `caam limits --profile ... --source`
+
+One profile name can exist in three unrelated stores at once:
+
+| Namespace | Where | Written by |
+|-----------|-------|------------|
+| `vault` | `<vault>/<provider>/<name>/` | `caam backup` / `caam activate` |
+| `isolated` | the profile's own HOME and XDG config dir | `caam login`, or an in-app `/login` under `caam exec` |
+| `shallow` | `~/orch-homes/<name>/` | signing in inside a `shallow-spawn` session |
+
+`--profile NAME` still reads the vault by default, but it no longer stays quiet
+about it. Claude is the case that made this matter: Claude cannot use
+`caam login`, its supported isolated-profile flow is `caam exec claude <name>`
+plus an in-app `/login`, and that flow never touches the vault - so the one
+provider whose login path cannot refresh the vault copy was being reported
+purely from the vault copy, and a healthy account came back
+`unauthorized: token expired or invalid`.
+
+Now:
+
+- output names the namespace and path actually read, in the table and as
+  `credential_source` in `--format json`;
+- other namespaces holding the same name are listed with their state
+  (`healthy` / `expired` / `unknown`);
+- if an unselected namespace holds a **strictly healthier** credential and you
+  did not choose one, the lookup fails with the exact commands that
+  disambiguate it, rather than emitting a routing verdict drawn from the stale
+  copy. A controller can fail closed on that;
+- `--source vault|isolated|shallow` is the explicit override, and also works
+  without `--profile` to list every profile in one namespace.
+
+Credentials are never copied between namespaces: rotating OAuth credentials
+copied behind your back is how two lanes end up invalidating each other.
 
 **Options for `caam run`:**
 - `--max-retries N` — Maximum retry attempts on rate limit (default: 1)
@@ -514,6 +641,42 @@ Health scoring combines multiple factors:
 - **Plan type**: Enterprise/Pro plans get slight scoring boosts
 
 The penalty system uses **exponential decay** (20% reduction every 5 minutes) so temporary issues don't permanently mark a profile as unhealthy. After about 30 minutes of no errors, a profile's penalty score returns to near zero.
+
+#### Refreshable tokens are not expired accounts
+
+A short-lived access token that can be renewed **without a human** is not an
+unhealthy account, and caam does not report it as one. Every provider's
+credential carries a refresh token or it does not, and that — not the raw
+expiry timestamp — decides the verdict. Codex is the case that forced the
+distinction: its access token routinely sits expired for days while the CLI
+renews it from the refresh token on next use, and three live accounts were
+reading `warning` in `caam ls` from an expiry months in the past.
+
+Two questions used to share one flag, and they have different answers:
+
+| Question | Consumer | Claude | Codex / Grok / Gemini (with a refresh token) |
+|----------|----------|--------|-----------------------------------------------|
+| "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — Claude Code renews itself and caam's Claude refresh is disabled | **yes** — caam has a refresher and runs off this signal |
+| "Must a human log in again?" | `caam ls` status, rotation eligibility | no | **no** |
+
+`caam ls --json` and `caam status --json` therefore carry three additive
+signals per profile alongside the composite `status`:
+
+| Field | Meaning |
+|-------|---------|
+| `refresh_due` | caam should renew this credential soon. `false` for a self-refreshing Claude credential, which caam must leave alone. |
+| `launch_usable` | a new session can start on this account right now — this is what a rotation controller should route on, not warning severity |
+| `login_required` | a human must re-authenticate: the credential has lapsed **and** carries nothing to renew itself with |
+
+Each is `null` when caam has no evidence either way. Unknown stays unknown; it
+is never promoted to healthy or to login-required. An active rate-limit
+cooldown sets `launch_usable` to `false` on its own, since nothing can start
+until the cap clears — but it is not a login problem, so `login_required` stays
+`false`.
+
+A lapsed-but-renewable credential shows as `Auto-refresh` rather than
+`Expired`, and its recommendation is `caam refresh <provider> <profile>`, never
+`caam login` (a login is disruptive and would fix nothing).
 
 ### Smart Rotation Algorithms
 

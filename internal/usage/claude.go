@@ -194,6 +194,7 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 
 	info := &UsageInfo{
 		Provider:  "claude",
+		Source:    SourceAPI,
 		FetchedAt: time.Now(),
 	}
 

@@ -19,6 +19,42 @@ type ProfileUsage struct {
 	ProfileName string     `json:"profile_name"`
 	Usage       *UsageInfo `json:"usage"`
 	AccessToken string     `json:"-"` // Not serialized
+
+	// CredentialSource names which of caam's credential namespaces this row
+	// was actually read from, and what else holds the same profile name.
+	// One name can exist in the vault, in an isolated profile and in a
+	// shallow profile at once, holding different (and differently fresh)
+	// credentials; without this a caller cannot tell which copy produced the
+	// verdict (issue #100). Populated for single-profile lookups.
+	CredentialSource *CredentialSource `json:"credential_source,omitempty"`
+}
+
+// CredentialSource describes the credential namespace a row was read from.
+type CredentialSource struct {
+	// Namespace is "vault", "isolated" or "shallow".
+	Namespace string `json:"namespace"`
+	// Path is the credential file (or, for an offline read, the .claude.json)
+	// that was actually opened.
+	Path string `json:"path"`
+	// State is caam's offline read of that credential: "healthy", "expired",
+	// "unknown", or "missing".
+	State string `json:"state"`
+	// Explicit reports whether the caller named the namespace (--source)
+	// rather than taking the default.
+	Explicit bool `json:"explicit"`
+	// Alternatives lists the other namespaces holding the same profile name.
+	// Credentials are never copied between them implicitly.
+	Alternatives []CredentialAlternative `json:"alternatives,omitempty"`
+}
+
+// CredentialAlternative is one namespace that also holds the profile name.
+type CredentialAlternative struct {
+	Namespace string `json:"namespace"`
+	Path      string `json:"path"`
+	State     string `json:"state"`
+	// Healthier reports that this copy is in a strictly better state than the
+	// one that was read.
+	Healthier bool `json:"healthier"`
 }
 
 // MultiProfileFetcher fetches usage data for multiple profiles concurrently.

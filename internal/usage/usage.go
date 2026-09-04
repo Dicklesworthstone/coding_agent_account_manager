@@ -39,6 +39,13 @@ type UsageWindow struct {
 	// IsActive reports whether the provider flagged this window as the one
 	// currently binding the account.
 	IsActive bool `json:"is_active,omitempty"`
+
+	// Rolled reports that ResetsAt had already passed when these figures were
+	// read, so the window has emptied since they were recorded. Only a cached
+	// (on-disk) snapshot can be stale enough for this; the percentages are
+	// zeroed when it is set, and the flag keeps that zero distinguishable from
+	// a window that is genuinely untouched.
+	Rolled bool `json:"rolled,omitempty"`
 }
 
 // Claude reports each rate limit window under one of these kinds.
@@ -89,7 +96,18 @@ type UsageInfo struct {
 	// Credits contains credit balance info (Codex only).
 	Credits *CreditInfo `json:"credits,omitempty"`
 
-	// FetchedAt is when this usage info was fetched.
+	// AccountID is the provider's own identifier for the account these
+	// figures belong to, when the source reports one.
+	AccountID string `json:"account_id,omitempty"`
+
+	// Source says where the figures came from: SourceAPI (a live request) or
+	// SourceCache (a snapshot read off local disk). Empty means the live API,
+	// for compatibility with rows produced before offline reads existed.
+	Source string `json:"source,omitempty"`
+
+	// FetchedAt is when this usage info was fetched. For SourceCache it is the
+	// snapshot's OWN timestamp — when the provider last refreshed it — not
+	// when caam read the file, so now-FetchedAt is the real staleness.
 	FetchedAt time.Time `json:"fetched_at"`
 
 	// Error contains any error message from fetching.

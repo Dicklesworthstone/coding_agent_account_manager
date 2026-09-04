@@ -3,10 +3,12 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
 
@@ -37,11 +40,37 @@ Examples:
   caam limits --format json       # Output as JSON
   caam limits --best              # Show the best profile for rotation
   caam limits claude --model fable --best   # Best profile for Fable work specifically
+  caam limits claude --cached     # Offline: read the snapshot Claude Code cached on disk
+  caam limits claude --profile work --source isolated   # Read a specific credential store
 
 Claude reports a separate weekly allowance per model on top of the 5-hour and
 weekly windows. The SCOPED column shows the per-model allowance closest to its
 cap; --model narrows scores and eligibility to the allowance for one model, so
-an account out of Fable capacity is still offered for Sonnet work.`,
+an account out of Fable capacity is still offered for Sonnet work.
+
+Credential namespaces (--source)
+--------------------------------
+One profile name can exist in three unrelated stores: the "vault" (the
+backup/activate store), an "isolated" profile (its own HOME and XDG config
+dir, which is where an in-app /login under "caam exec" writes), and a
+"shallow" HOME. --profile reads the vault by default; output now always names
+the namespace and path it read, lists the other namespaces holding the same
+name, and refuses to report a verdict when an unselected namespace holds a
+strictly healthier credential. Pass --source vault|isolated|shallow to choose
+explicitly. Credentials are never copied between namespaces.
+
+Offline mode (--cached)
+-----------------------
+--cached answers the same question without the network and without presenting
+any token: Claude Code caches the usage figures it last received in each
+account's own .claude.json, and --cached reads those files. Only Claude keeps
+such a cache.
+
+The snapshot only moves when that account itself runs a session, so a profile
+you are not currently using can be hours or days stale — or have no cache at
+all. Every row therefore reports its snapshot's age in an AS OF column, and a
+profile with nothing cached is reported as "no cached data" and excluded from
+--best rather than being shown as 0% used.`,
 	RunE: runLimits,
 }
 
@@ -54,6 +83,8 @@ func init() {
 	limitsCmd.Flags().Bool("recommend", false, "show smart rotation recommendations")
 	limitsCmd.Flags().Bool("forecast", false, "show usage forecasts and optimal switch times")
 	limitsCmd.Flags().String("model", "", "model the work will run on (e.g. opus, fable); scores and eligibility then honor that model's own quota")
+	limitsCmd.Flags().String("source", "", "credential namespace to read: vault (default), isolated, or shallow")
+	limitsCmd.Flags().Bool("cached", false, "read the usage snapshot Claude Code cached on disk instead of querying the API (offline, presents no token; claude only)")
 }
 
 func runLimits(cmd *cobra.Command, args []string) error {
@@ -64,6 +95,13 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	showRecommend, _ := cmd.Flags().GetBool("recommend")
 	showForecast, _ := cmd.Flags().GetBool("forecast")
 	model, _ := cmd.Flags().GetString("model")
+	source, _ := cmd.Flags().GetString("source")
+	cached, _ := cmd.Flags().GetBool("cached")
+
+	source = strings.ToLower(strings.TrimSpace(source))
+	if source != "" && !ValidCredNamespace(source) {
+		return fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+	}
 
 	// Live limit fetching only has API support for a subset of providers (those
 	// with credential readers + API fetchers). Be explicit about scope: default
@@ -80,11 +118,24 @@ func runLimits(cmd *cobra.Command, args []string) error {
 		providers = append([]string(nil), limitsProviders...)
 	}
 
+	// Only Claude keeps a usage snapshot on disk, so --cached has nothing to
+	// read for anyone else. Say so instead of silently returning empty rows.
+	if cached {
+		for _, p := range providers {
+			if p != "claude" {
+				return fmt.Errorf("--cached is claude-only: %s keeps no usage snapshot on disk (drop --cached to query its API)", p)
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	vaultDir := getVaultDir()
 	out := cmd.OutOrStdout()
+	lookup := buildCredentialLookup(vaultDir)
+	now := time.Now()
+	var sourceNotes []string
 
 	// Initialize log scanners for burn rate calculation
 	scanner := logs.NewMultiScanner()
@@ -98,34 +149,87 @@ func runLimits(cmd *cobra.Command, args []string) error {
 
 	for _, provider := range providers {
 		if profileArg != "" {
-			// Fetch for specific profile
-			token, err := getProfileToken(vaultDir, provider, profileArg)
+			// A single named profile: resolve WHICH credential namespace the
+			// name means before reading anything (issue #100).
+			res, err := resolveProfileCredential(lookup, provider, profileArg, source)
 			if err != nil {
 				if format != "json" {
 					fmt.Fprintf(out, "%s/%s: %v\n", provider, profileArg, err)
 				}
 				continue
 			}
+			// A strictly healthier copy elsewhere means the default namespace
+			// would produce a verdict a controller must not act on. Refuse.
+			if len(res.Healthier) > 0 {
+				return res.AmbiguityError(provider, profileArg)
+			}
+			sourceNotes = append(sourceNotes, res.describe(provider, profileArg))
 
-			profiles := map[string]string{profileArg: token}
-			results := fetcher.FetchAllProfiles(ctx, provider, profiles)
+			var results []usage.ProfileUsage
+			if cached {
+				results = []usage.ProfileUsage{cachedProfileUsage(provider, profileArg, res.Selected.ClaudeJSON, now)}
+			} else {
+				results = fetcher.FetchAllProfiles(ctx, provider, map[string]string{profileArg: res.Selected.Token})
+			}
+			report := res.report()
+			for i := range results {
+				results[i].CredentialSource = report
+			}
 			allResults = append(allResults, results...)
-		} else {
-			// Fetch for all profiles
-			credentials, err := usage.LoadProfileCredentials(vaultDir, provider)
+			continue
+		}
+
+		if cached || source != "" {
+			// Every profile in one namespace. The default namespace is the
+			// vault, which is what the historical all-profiles path read.
+			ns := source
+			if ns == "" {
+				ns = credNamespaceVault
+			}
+			names, err := namespaceProfileNames(lookup, ns, provider)
 			if err != nil {
 				if format != "json" {
-					fmt.Fprintf(out, "%s: error loading credentials: %v\n", provider, err)
+					fmt.Fprintf(out, "%s: error listing %s profiles: %v\n", provider, ns, err)
 				}
 				continue
 			}
-			if len(credentials) == 0 {
-				continue
+			for _, name := range names {
+				if cached {
+					// An offline read needs no credential at all — that is
+					// the point of it — so do not open one.
+					allResults = append(allResults, cachedProfileUsage(provider, name, lookup.claudeJSONPath(ns, provider, name), now))
+					continue
+				}
+				c := lookup.inspect(ns, provider, name)
+				if !c.Found() {
+					continue
+				}
+				allResults = append(allResults, fetcher.FetchAllProfiles(ctx, provider, map[string]string{name: c.Token})...)
 			}
-
-			results := fetcher.FetchAllProfiles(ctx, provider, credentials)
-			allResults = append(allResults, results...)
+			continue
 		}
+
+		// Fetch for all profiles
+		credentials, err := usage.LoadProfileCredentials(vaultDir, provider)
+		if err != nil {
+			if format != "json" {
+				fmt.Fprintf(out, "%s: error loading credentials: %v\n", provider, err)
+			}
+			continue
+		}
+		if len(credentials) == 0 {
+			continue
+		}
+
+		results := fetcher.FetchAllProfiles(ctx, provider, credentials)
+		allResults = append(allResults, results...)
+	}
+
+	if format != "json" && len(sourceNotes) > 0 {
+		for _, note := range sourceNotes {
+			fmt.Fprintln(out, note)
+		}
+		fmt.Fprintln(out)
 	}
 
 	// A model-scoped quota only binds the model it is scoped to, so ranking
@@ -181,28 +285,67 @@ func isLimitsProvider(p string) bool {
 	return false
 }
 
-func getProfileToken(vaultDir, provider, profileName string) (string, error) {
-	profileDir := filepath.Join(vaultDir, provider, profileName)
-
-	switch provider {
-	case "claude":
-		// Try new location first
-		credPath := filepath.Join(profileDir, ".credentials.json")
-		token, _, err := usage.ReadClaudeCredentials(credPath)
-		if err == nil {
-			return token, nil
-		}
-		// Fall back to old location
-		oldPath := filepath.Join(profileDir, ".claude.json")
-		token, _, err = usage.ReadClaudeCredentials(oldPath)
-		return token, err
-	case "codex":
-		authPath := filepath.Join(profileDir, "auth.json")
-		token, _, err := usage.ReadCodexCredentials(authPath)
-		return token, err
-	default:
-		return "", fmt.Errorf("unsupported provider: %s", provider)
+// buildCredentialLookup wires the three credential namespaces from caam's
+// process globals. It is separate from the resolver itself so tests can build
+// a lookup over temp directories without touching globals.
+func buildCredentialLookup(vaultDir string) credentialLookup {
+	l := credentialLookup{VaultDir: vaultDir, Profiles: profileStore}
+	if home, err := os.UserHomeDir(); err == nil {
+		l.LiveHome = home
 	}
+	if mgr, err := shallow.NewManager("", ""); err == nil {
+		l.Shallow = mgr
+	}
+	l.ActiveName = func(provider string) string {
+		if vault == nil {
+			return ""
+		}
+		get, ok := tools[provider]
+		if !ok {
+			return ""
+		}
+		name, err := vault.ActiveProfile(get())
+		if err != nil {
+			return ""
+		}
+		return name
+	}
+	return l
+}
+
+// cachedProfileUsage builds one row from the usage snapshot Claude Code left
+// in a profile's .claude.json.
+//
+// A profile with no snapshot is a row with an explicit "no cached data" error
+// rather than an all-zero row: zero would read as "this account is idle and
+// the best one to switch to", which is exactly the wrong conclusion, and the
+// error also keeps it out of --best and the recommendations.
+func cachedProfileUsage(provider, name, claudeJSON string, now time.Time) usage.ProfileUsage {
+	row := usage.ProfileUsage{Provider: provider, ProfileName: name}
+	if claudeJSON == "" {
+		row.Usage = &usage.UsageInfo{
+			Provider: provider, ProfileName: name, Source: usage.SourceCache,
+			Error: usage.ErrNoCachedUsage.Error(),
+		}
+		return row
+	}
+	info, err := usage.ReadCachedClaudeUsage(claudeJSON, now)
+	if err != nil {
+		// A file that exists but does not parse is a real problem worth
+		// surfacing; an absent or snapshot-less one is the ordinary state.
+		msg := usage.ErrNoCachedUsage.Error()
+		if !errors.Is(err, usage.ErrNoCachedUsage) {
+			msg = err.Error()
+		}
+		row.Usage = &usage.UsageInfo{
+			Provider: provider, ProfileName: name, Source: usage.SourceCache,
+			Error: msg,
+		}
+		return row
+	}
+	info.ProfileName = name
+	row.Usage = info
+	return row
 }
 
 func getVaultDir() string {
@@ -227,15 +370,35 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 			return nil
 		}
 
-		fmt.Fprintln(w, "Rate Limit Usage")
+		// An AS OF column appears only for offline reads: for a live fetch
+		// every row is seconds old and the column would be noise, while for a
+		// cached read the age IS the caveat.
+		offline := false
+		for _, r := range results {
+			if r.Usage != nil && r.Usage.Source == usage.SourceCache {
+				offline = true
+				break
+			}
+		}
+
+		if offline {
+			fmt.Fprintln(w, "Rate Limit Usage (cached on disk by Claude Code — no network, no token presented)")
+		} else {
+			fmt.Fprintln(w, "Rate Limit Usage")
+		}
 		fmt.Fprintln(w, "──────────────────────────────────────────────────────────────────────────────────────────")
 
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "PROFILE\tSCORE\tPRIMARY\tSECONDARY\tSCOPED\tRESETS IN\tBURN/HR\tDEPLETES\tSTATUS")
+		header := "PROFILE\tSCORE\tPRIMARY\tSECONDARY\tSCOPED\tRESETS IN\tBURN/HR\tDEPLETES\tSTATUS"
+		if offline {
+			header += "\tAS OF"
+		}
+		fmt.Fprintln(tw, header)
 
+		now := time.Now()
 		for _, r := range results {
 			profileName := fmt.Sprintf("%s/%s", r.Provider, r.ProfileName)
-			score := 0
+			score := "-"
 			primary := "-"
 			secondary := "-"
 			scoped := "-"
@@ -245,22 +408,30 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 			depletesIn := "-"
 
 			if r.Usage != nil {
-				score = r.Usage.AvailabilityScoreForModel(model)
-				scoped = formatScopedLimit(r.Usage.ScopedLimit(model))
+				noData := r.Usage.Error == usage.ErrNoCachedUsage.Error()
 
-				if r.Usage.Error != "" {
+				switch {
+				case noData:
+					// Not a failure: this account simply has not refreshed a
+					// snapshot yet. Never render it as 0% used.
+					status = "no cached data"
+				case r.Usage.Error != "":
 					status = "error: " + truncate(r.Usage.Error, 20)
-				} else {
+				default:
 					status = "ok"
 				}
 
-				if r.Usage.PrimaryWindow != nil {
-					primary = fmt.Sprintf("%d%%", r.Usage.PrimaryWindow.UsedPercent)
+				// A row with no data scores nothing. Running the availability
+				// scorer over empty windows would return a perfect 100 and
+				// present an account caam knows nothing about as the idlest
+				// one on the table.
+				if !noData {
+					score = strconv.Itoa(r.Usage.AvailabilityScoreForModel(model))
+					scoped = formatScopedLimit(r.Usage.ScopedLimit(model))
 				}
 
-				if r.Usage.SecondaryWindow != nil {
-					secondary = fmt.Sprintf("%d%%", r.Usage.SecondaryWindow.UsedPercent)
-				}
+				primary = formatWindowPercent(r.Usage.PrimaryWindow)
+				secondary = formatWindowPercent(r.Usage.SecondaryWindow)
 
 				if ttl := r.Usage.TimeUntilReset(); ttl > 0 {
 					resetsIn = formatLimitsDuration(ttl)
@@ -279,16 +450,56 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 				}
 			}
 
-			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				profileName, score, primary, secondary, scoped, resetsIn, burnRate, depletesIn, status)
+			if offline {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					profileName, score, primary, secondary, scoped, resetsIn, burnRate, depletesIn, status,
+					formatCacheAge(r.Usage, now))
+			} else {
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					profileName, score, primary, secondary, scoped, resetsIn, burnRate, depletesIn, status)
+			}
 		}
 
 		tw.Flush()
+		if offline {
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "Figures are as cached by Claude Code and only move when that account itself runs a")
+			fmt.Fprintln(w, "session; \"no cached data\" means the account has none yet, not that it is idle.")
+		}
 		return nil
 
 	default:
 		return fmt.Errorf("unsupported format: %s", format)
 	}
+}
+
+// formatWindowPercent renders a window's utilization. A window that had
+// already rolled over when the figures were read is marked, so an honest 0%
+// from a stale snapshot is not mistaken for a measured one.
+func formatWindowPercent(w *usage.UsageWindow) string {
+	if w == nil {
+		return "-"
+	}
+	if w.Rolled {
+		return "0% (rolled)"
+	}
+	return fmt.Sprintf("%d%%", w.UsedPercent)
+}
+
+// formatCacheAge renders how stale a cached snapshot is. A snapshot with no
+// timestamp of its own reports "unknown" rather than "0s ago".
+func formatCacheAge(u *usage.UsageInfo, now time.Time) string {
+	if u == nil {
+		return "-"
+	}
+	if u.Error == usage.ErrNoCachedUsage.Error() {
+		return "-"
+	}
+	age, ok := u.CacheAge(now)
+	if !ok {
+		return "unknown"
+	}
+	return formatLimitsDuration(age) + " ago"
 }
 
 // formatScopedLimit renders the model-scoped quota closest to its cap, e.g.

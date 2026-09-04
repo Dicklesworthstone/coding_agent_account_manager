@@ -140,6 +140,7 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 
 	info := &UsageInfo{
 		Provider:  "codex",
+		Source:    SourceAPI,
 		FetchedAt: time.Now(),
 	}
 
