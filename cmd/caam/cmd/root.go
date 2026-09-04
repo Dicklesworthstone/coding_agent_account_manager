@@ -299,6 +299,11 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
+	case "grok":
+		// Grok's auth.json is keyed by a dynamic "<issuer>::<client-id>" key,
+		// which the Codex parser cannot read; without its own case every Grok
+		// profile scored as unknown-expiry and stuck at warning (issue #101).
+		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
 	}
 
 	// Prefer the profile's own live credential over the vault snapshot.
@@ -347,7 +352,7 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 		if homeErr != nil {
 			return nil
 		}
-		info, err = health.ParseCodexExpiry(filepath.Join(home, ".grok", "auth.json"))
+		info, err = health.ParseGrokExpiry(filepath.Join(home, ".grok", "auth.json"))
 	default:
 		return nil
 	}
@@ -406,7 +411,7 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	case "gemini":
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":
-		info, err = health.ParseCodexExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
 	default:
 		return nil
 	}
@@ -2030,6 +2035,16 @@ Examples:
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
 			return err
+		}
+
+		// Repair a profile registered without its provider home before handing
+		// off to the tool: otherwise the tool aborts on the missing directory
+		// ("CODEX_HOME points to ..., but that path does not exist") and
+		// `caam profile add` refuses the name, leaving no way forward
+		// (issue #104). This only creates empty directories; existing
+		// credentials are never touched.
+		if err := prof.EnsureLayout(); err != nil {
+			return fmt.Errorf("prepare profile layout: %w", err)
 		}
 
 		ctx := context.Background()

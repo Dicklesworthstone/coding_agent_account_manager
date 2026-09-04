@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -360,6 +361,102 @@ func jwtExpiry(token string) time.Time {
 		return time.Time{}
 	}
 	return id.ExpiresAt
+}
+
+// ParseGrokExpiry extracts token expiry from Grok Build's auth.json.
+//
+// Grok does not use either Codex layout. Its file is a JSON object keyed by a
+// dynamic credential key of the form "<oidc-issuer>::<client-id>", and the
+// entry object holds the token material:
+//
+//	{
+//	  "https://auth.x.ai::<uuid>": {
+//	    "key": "<access token>",
+//	    "auth_mode": "sso",
+//	    "refresh_token": "...",
+//	    "expires_at": "2026-12-31T00:00:00Z"
+//	  }
+//	}
+//
+// Reusing ParseCodexExpiry on this shape found neither an expiry nor a refresh
+// token, so a live, working Grok profile scored as "unknown expiry" and every
+// such profile was reported as a warning forever (issue #101). Top-level keys
+// are treated as opaque and scanned, mirroring identity.ExtractFromGrokAuth;
+// a flat layout is accepted first so this keeps working if a future CLI
+// version flattens the file.
+//
+// The entry with the latest expiry wins, so a file carrying several credential
+// entries reports the one that actually keeps the CLI working.
+//
+// SelfRefreshing is deliberately left unset, matching Codex: whether a
+// refreshable access token should suppress the expiry verdict is a separate,
+// provider-wide question (see the note on ParseClaudeExpiry).
+func ParseGrokExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		authPath = filepath.Join(homeDir, ".grok", "auth.json")
+	}
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+
+	info, err := parseGrokAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	info.Source = authPath
+	return info, nil
+}
+
+// parseGrokAuthJSON extracts expiry info from the contents of a Grok
+// auth.json in either the flat or the dynamic-key layout.
+func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
+	// Flat layout: OAuth fields directly at the top level.
+	if info, err := parseOAuthJSON(data); err == nil {
+		return info, nil
+	}
+
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	// Keys are scanned in sorted order so a tie between two entries with the
+	// same expiry resolves deterministically.
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var best *ExpiryInfo
+	for _, key := range keys {
+		entry, err := parseOAuthJSON(entries[key])
+		if err != nil {
+			continue
+		}
+		if best == nil {
+			best = entry
+			continue
+		}
+		// Prefer the entry that is usable for longest: a later expiry, or a
+		// known expiry over an unknown one.
+		if best.ExpiresAt.IsZero() || entry.ExpiresAt.After(best.ExpiresAt) {
+			best = entry
+		}
+	}
+	if best == nil {
+		return nil, ErrNoExpiry
+	}
+	return best, nil
 }
 
 // ParseGeminiExpiry extracts token expiry from Gemini CLI auth files.

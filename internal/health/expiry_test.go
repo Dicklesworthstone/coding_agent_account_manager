@@ -1052,3 +1052,93 @@ func TestParseCodexExpiry_ChatGPTMode(t *testing.T) {
 		}
 	})
 }
+
+// TestParseGrokExpiry covers issue #101: Grok's auth.json is keyed by a
+// dynamic "<issuer>::<client-id>" key that the Codex parser cannot read, so
+// every live Grok profile reported unknown expiry and stuck at warning.
+// Tokens here are synthetic.
+func TestParseGrokExpiry(t *testing.T) {
+	writeGrok := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("dynamic credential key", func(t *testing.T) {
+		path := writeGrok(t, `{"https://auth.x.ai::00000000-0000-0000-0000-000000000000":`+
+			`{"key":"SYNTHETIC-GROK-TOKEN","auth_mode":"sso","email":"grok@example.com",`+
+			`"refresh_token":"SYNTHETIC-REFRESH","expires_at":"2099-01-01T00:00:00Z"}}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		want := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want %v", info.ExpiresAt, want)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true")
+		}
+		// The reported symptom: with no parseable expiry the profile scored
+		// "unknown", which lands on warning even with zero errors.
+		if got := CalculateStatus(&ProfileHealth{TokenExpiresAt: info.ExpiresAt}); got != StatusHealthy {
+			t.Errorf("CalculateStatus() = %v, want StatusHealthy for a live Grok profile", got)
+		}
+		if got := CalculateStatus(&ProfileHealth{}); got != StatusWarning {
+			t.Errorf("unparsed baseline = %v, want StatusWarning (the pre-fix behaviour)", got)
+		}
+	})
+
+	t.Run("the latest expiry across entries wins", func(t *testing.T) {
+		path := writeGrok(t, `{`+
+			`"https://auth.x.ai::aaaa":{"key":"A","expires_at":"2030-01-01T00:00:00Z"},`+
+			`"https://auth.x.ai::bbbb":{"key":"B","expires_at":"2040-01-01T00:00:00Z"}}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		want := time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want the later entry %v", info.ExpiresAt, want)
+		}
+	})
+
+	t.Run("flat layout still parses", func(t *testing.T) {
+		path := writeGrok(t, `{"access_token":"A","refresh_token":"R","expires_at":"2099-01-01T00:00:00Z"}`)
+		info, err := ParseGrokExpiry(path)
+		if err != nil {
+			t.Fatalf("ParseGrokExpiry() error = %v", err)
+		}
+		if !info.HasRefreshToken {
+			t.Error("HasRefreshToken = false, want true for a flat refresh_token")
+		}
+		want := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+		if !info.ExpiresAt.Equal(want) {
+			t.Errorf("ExpiresAt = %v, want %v", info.ExpiresAt, want)
+		}
+	})
+
+	t.Run("missing file reports ErrNoAuthFile", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if _, err := ParseGrokExpiry(path); !errors.Is(err, ErrNoAuthFile) {
+			t.Errorf("ParseGrokExpiry() error = %v, want ErrNoAuthFile", err)
+		}
+	})
+
+	t.Run("no usable entry reports ErrNoExpiry", func(t *testing.T) {
+		path := writeGrok(t, `{"https://auth.x.ai::aaaa":{"email":"grok@example.com"}}`)
+		if _, err := ParseGrokExpiry(path); !errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseGrokExpiry() error = %v, want ErrNoExpiry", err)
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		path := writeGrok(t, "{not json")
+		if _, err := ParseGrokExpiry(path); err == nil || errors.Is(err, ErrNoExpiry) {
+			t.Errorf("ParseGrokExpiry() error = %v, want a parse error", err)
+		}
+	})
+}

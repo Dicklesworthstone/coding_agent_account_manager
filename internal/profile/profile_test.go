@@ -1619,3 +1619,78 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 		}
 	})
 }
+
+// TestProfileEnsureLayout covers issue #104: a profile whose profile.json
+// exists but whose provider home does not is a dead end — the tool refuses to
+// log in against a missing CODEX_HOME and `profile add` refuses the name.
+func TestProfileEnsureLayout(t *testing.T) {
+	t.Run("create publishes the full layout", func(t *testing.T) {
+		store := NewStore(t.TempDir())
+		prof, err := store.Create("codex", "fresh", "oauth")
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		for _, dir := range []string{prof.HomePath(), prof.XDGConfigPath(), prof.CodexHomePath()} {
+			info, err := os.Stat(dir)
+			if err != nil {
+				t.Fatalf("stat %s: %v", dir, err)
+			}
+			if !info.IsDir() {
+				t.Errorf("%s is not a directory", dir)
+			}
+			if perm := info.Mode().Perm(); perm != 0700 {
+				t.Errorf("%s mode = %o, want 0700", dir, perm)
+			}
+		}
+	})
+
+	t.Run("repairs a metadata-only profile without touching credentials", func(t *testing.T) {
+		store := NewStore(t.TempDir())
+		prof, err := store.Create("codex", "stuck", "oauth")
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		// Seed a credential, then simulate the reported state: only the
+		// pseudo-HOME survives, codex_home is gone.
+		authPath := filepath.Join(prof.HomePath(), "keep.json")
+		if err := os.WriteFile(authPath, []byte(`{"keep":true}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(prof.CodexHomePath()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := prof.EnsureLayout(); err != nil {
+			t.Fatalf("EnsureLayout() error = %v", err)
+		}
+		if info, err := os.Stat(prof.CodexHomePath()); err != nil || !info.IsDir() {
+			t.Fatalf("codex_home not repaired: info=%v err=%v", info, err)
+		}
+		body, err := os.ReadFile(authPath)
+		if err != nil || string(body) != `{"keep":true}` {
+			t.Errorf("existing credential disturbed: %q err=%v", body, err)
+		}
+
+		// Idempotent: a second call changes nothing and still succeeds.
+		if err := prof.EnsureLayout(); err != nil {
+			t.Errorf("second EnsureLayout() error = %v", err)
+		}
+	})
+
+	t.Run("reports a non-directory in the way", func(t *testing.T) {
+		store := NewStore(t.TempDir())
+		prof, err := store.Create("codex", "blocked", "oauth")
+		if err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if err := os.RemoveAll(prof.CodexHomePath()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(prof.CodexHomePath(), []byte("not a dir"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := prof.EnsureLayout(); err == nil {
+			t.Error("EnsureLayout() = nil, want an error when a file blocks the layout")
+		}
+	})
+}

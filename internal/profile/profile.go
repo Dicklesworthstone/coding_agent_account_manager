@@ -103,6 +103,44 @@ func (p *Profile) CodexHomePath() string {
 	return filepath.Join(p.BasePath, "codex_home")
 }
 
+// EnsureLayout creates the profile's directory structure if any of it is
+// missing, with 0700 on every directory.
+//
+// A profile whose profile.json exists but whose provider home does not is a
+// dead end: `caam login` fails inside the tool ("CODEX_HOME points to ..., but
+// that path does not exist") while `caam profile add` refuses because the name
+// is already registered, so neither repairing nor recreating the profile is
+// possible (issue #104). This is called both when a profile is created and as
+// a login preflight, so the layout is repaired in place.
+//
+// It only ever creates empty directories. Existing directories and every file
+// inside them, credentials included, are left untouched, and a path that
+// exists but is not a directory is reported rather than replaced.
+func (p *Profile) EnsureLayout() error {
+	if p == nil || strings.TrimSpace(p.BasePath) == "" {
+		return fmt.Errorf("profile has no base path")
+	}
+	for _, dir := range []string{
+		p.BasePath,
+		p.HomePath(),
+		p.XDGConfigPath(),
+		p.CodexHomePath(),
+	} {
+		switch info, err := os.Stat(dir); {
+		case err == nil && !info.IsDir():
+			return fmt.Errorf("profile path %s exists but is not a directory", dir)
+		case err == nil:
+			continue
+		case !os.IsNotExist(err):
+			return fmt.Errorf("stat %s: %w", dir, err)
+		}
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("create directory %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // LockPath returns the path to the lock file.
 func (p *Profile) LockPath() string {
 	return filepath.Join(p.BasePath, ".lock")
@@ -621,7 +659,15 @@ func (s *Store) Create(provider, name, authMode string) (*Profile, error) {
 		Metadata:  make(map[string]string),
 	}
 
+	// The layout comes first and profile.json last, so a failure part-way
+	// through cannot leave a registered profile with no provider home — the
+	// state that blocks both `caam login` and `caam profile add` (issue #104).
+	if err := profile.EnsureLayout(); err != nil {
+		os.RemoveAll(profilePath)
+		return nil, err
+	}
 	if err := profile.Save(); err != nil {
+		os.RemoveAll(profilePath)
 		return nil, err
 	}
 
