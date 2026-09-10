@@ -40,6 +40,7 @@ Examples:
   caam limits --format json       # Output as JSON
   caam limits --best              # Show the best profile for rotation
   caam limits claude --model fable --best   # Best profile for Fable work specifically
+  caam limits codex --rank earliest-reset-headroom --format json   # Which seat to spend next
   caam limits claude --cached     # Offline: read the snapshot Claude Code cached on disk
   caam limits claude --profile work --source isolated   # Read a specific credential store
 
@@ -70,7 +71,34 @@ The snapshot only moves when that account itself runs a session, so a profile
 you are not currently using can be hours or days stale — or have no cache at
 all. Every row therefore reports its snapshot's age in an AS OF column, and a
 profile with nothing cached is reported as "no cached data" and excluded from
---best rather than being shown as 0% used.`,
+--best rather than being shown as 0% used.
+
+Rank modes (--rank)
+-------------------
+--best answers "which seat is idlest", which is the right question for
+rotating away from a seat you are burning and the wrong one for handing a seat
+to new work: the idlest seat is usually the reserve you meant to keep.
+
+--rank earliest-reset-headroom answers the second question instead. Among
+seats whose included allowance is still under the headroom ceiling it prefers
+the one whose allowance refreshes SOONEST, so quota that is about to be lost
+is spent first and a later-resetting seat is preserved. Seats running on paid
+credits rank last, and a seat whose limits could not be read — or that is
+missing the model-scoped row a named --model needs — is reported ineligible
+with a reason rather than being treated as spare capacity. When nothing is
+selectable the command exits non-zero and says why, because falling through to
+a static pin is the failure this mode exists to prevent.
+
+It sorts on the reset time of the longest allowance a seat reports (its weekly
+cap, not the five-hour window that rolls over by itself), which is the quota
+actually at risk of expiring unused. That differs from "caam precheck --policy
+drain", which ranks on the soonest reset of any window.
+
+--rank availability names the historical --best ordering explicitly.
+
+The ceiling defaults to stealth.rotation.drain_headroom_ceiling (95 if unset)
+and --headroom overrides it for one call. This is a read-only ranking: it
+activates nothing and never touches a running session.`,
 	RunE: runLimits,
 }
 
@@ -85,6 +113,7 @@ func init() {
 	limitsCmd.Flags().String("model", "", "model the work will run on (e.g. opus, fable); scores and eligibility then honor that model's own quota")
 	limitsCmd.Flags().String("source", "", "credential namespace to read: vault (default), isolated, or shallow")
 	limitsCmd.Flags().Bool("cached", false, "read the usage snapshot Claude Code cached on disk instead of querying the API (offline, presents no token; claude only)")
+	addLimitsRankFlags(limitsCmd)
 }
 
 func runLimits(cmd *cobra.Command, args []string) error {
@@ -98,9 +127,38 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	source, _ := cmd.Flags().GetString("source")
 	cached, _ := cmd.Flags().GetBool("cached")
 
+	rankMode, _ := cmd.Flags().GetString("rank")
+	rankMode = strings.TrimSpace(rankMode)
+
 	source = strings.ToLower(strings.TrimSpace(source))
 	if source != "" && !ValidCredNamespace(source) {
 		return fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+	}
+
+	// --best and --rank answer different questions ("which seat is idlest"
+	// versus "which seat should new work spend"). Asking both at once has no
+	// single right answer, so say so instead of silently picking one.
+	if rankMode != "" && showBest {
+		return fmt.Errorf("--rank and --best are alternatives: --best is the idlest-seat answer, --rank ranks seats for new work (use --rank availability for the --best ordering)")
+	}
+
+	// Validate the rank flags before spending a minute on API calls.
+	var rankOpts usage.RankOptions
+	if rankMode != "" {
+		// Ranking asks "which of these interchangeable seats should new work
+		// spend". Seats of different providers are not interchangeable, and a
+		// reset time on a Claude seat says nothing about a Codex one, so a
+		// mixed pool has no meaningful order. Require the provider.
+		if len(args) == 0 {
+			cmd.SilenceUsage = true
+			return fmt.Errorf("--rank needs a provider (%s): seats of different providers are not interchangeable, so ranking them together has no meaning",
+				strings.Join(limitsProviders, " or "))
+		}
+		var err error
+		if rankOpts, err = rankOptionsFromFlags(cmd, strings.ToLower(args[0]), model); err != nil {
+			cmd.SilenceUsage = true
+			return err
+		}
 	}
 
 	// Live limit fetching only has API support for a subset of providers (those
@@ -239,6 +297,10 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	// caller names one (issue #97).
 	if model != "" {
 		sortResultsForModel(allResults, model)
+	}
+
+	if rankMode != "" {
+		return runLimitsRank(cmd, out, format, allResults, rankOpts)
 	}
 
 	if showBest {

@@ -504,6 +504,7 @@ choice; with no model given, every per-model allowance counts.
 | `caam limits <tool> [--model <name>]` | Live rate-limit usage, including each account's per-model allowance |
 | `caam limits claude --cached` | The same view offline, from the snapshot Claude Code caches on disk (no network, no token presented) |
 | `caam limits <tool> --profile <name> --source vault\|isolated\|shallow` | Read a specific credential namespace |
+| `caam limits <tool> --rank earliest-reset-headroom` | Rank seats for **new** work: spend the included quota that refreshes soonest, preserve the rest |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
 | `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
@@ -542,6 +543,101 @@ In `--format json` these appear as `source: "cache"`, the window-level `rolled`
 flag, and `fetched_at` set to the snapshot's own timestamp rather than the time
 caam read it. Only Claude keeps such a cache; `--cached` on another provider is
 an error rather than an empty table.
+
+#### Picking a seat for new work: `caam limits --rank`
+
+`--best` answers *"which seat is idlest"*. That is the right question when you
+are rotating away from a seat you are burning, and the wrong one when you are
+handing a seat to a brand-new session: on a pool of subscription seats the
+idlest one is usually the reserve you meant to keep, while the seat whose
+included allowance expires tomorrow goes unspent.
+
+`--rank earliest-reset-headroom` answers the second question:
+
+```bash
+caam limits codex --rank earliest-reset-headroom --format json
+caam limits claude --rank earliest-reset-headroom --model fable
+caam limits codex --rank earliest-reset-headroom --headroom 80
+```
+
+The ordering is:
+
+1. **Included allowance with headroom**, earliest refresh first — spend quota
+   that is about to be lost, and so preserve the later-resetting seats.
+2. **Paid credits** (included allowance already spent, credits remain) — usable,
+   always last.
+3. **Not eligible**: spent with no credits, limits that could not be read, no
+   future reset time to order by, or a missing model-scoped allowance.
+
+It sorts on the reset time of the **longest** allowance a seat reports — its
+weekly cap, not the five-hour window that rolls over on its own several times a
+day, which is the quota actually at risk of expiring unused. (This is where it
+differs from `--policy drain`, which ranks on the soonest reset of any window.)
+
+An ineligible seat stays in the output with the reason it was passed over, and
+when *nothing* is selectable the command exits non-zero with `selected: null`
+and a populated `error`. That matters for a caller that spawns sessions: the
+failure this mode exists to prevent is falling through to a static pin when the
+live numbers could not be read, so it never answers confidently on missing data.
+
+A named `--model` tightens this further. An account can exhaust its weekly Fable
+or Opus allowance while its general windows still read idle, so that allowance
+counts as the binding window; and if the provider did not report a row for that
+model at all, the seat is `unknown`, not spare capacity. Pass
+`--require-model-window=false` to rank it anyway.
+
+The headroom ceiling defaults to `stealth.rotation.drain_headroom_ceiling`
+(95% used if unset) — the same setting the drain policy uses, because it is the
+same concept — and `--headroom N` overrides it for one call. 95 rather than 100
+because a seat that is 99% spent has enough left to accept a session and not
+enough to finish one.
+
+`--rank availability` names the historical `--best` ordering explicitly.
+`--best` itself is unchanged.
+
+This is a **read**. It ranks; it does not activate anything, swap a credential,
+or touch a running session.
+
+<details>
+<summary>JSON shape</summary>
+
+```json
+{
+  "rank": "earliest-reset-headroom",
+  "provider": "codex",
+  "model": "",
+  "headroom_ceiling_percent": 95,
+  "require_model_window": false,
+  "generated_at": "2026-09-10T12:24:45Z",
+  "selected": { "...": "the top-ranked eligible profile, or null" },
+  "profiles": [
+    {
+      "provider": "codex",
+      "profile": "work",
+      "rank": 1,
+      "eligible": true,
+      "tier": "included_headroom",
+      "reason": "included allowance 34% used (under the 95% ceiling), secondary resets in 20h0m",
+      "used_percent": 34,
+      "binding_window": "secondary",
+      "headroom_percent": 66,
+      "governing_window": "secondary",
+      "resets_at": "2026-09-11T08:00:00Z",
+      "resets_in_seconds": 72000,
+      "availability_score": 74,
+      "has_credits": false,
+      "plan_type": "pro"
+    }
+  ],
+  "error": ""
+}
+```
+
+`tier` is one of `included_headroom`, `paid_credits`, `exhausted`, `unknown`.
+`rank` is 1-based over the eligible profiles and `0` for ineligible ones.
+`error` is non-empty exactly when `selected` is `null`.
+
+</details>
 
 #### Credential namespaces: `caam limits --profile ... --source`
 
@@ -588,6 +684,8 @@ copied behind your back is how two lanes end up invalidating each other.
 
 - `availability` (default) — maximize immediate headroom; this is the existing behavior and remains unchanged unless you opt in to another policy.
 - `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Profiles at/above the ceiling or without a known reset time are held in reserve, ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
+
+Rotation policies decide which profile `caam` *switches the host to*. To rank seats for a new session without switching anything, use [`caam limits --rank`](#picking-a-seat-for-new-work-caam-limits---rank) instead — it is a read, and it ranks on the weekly allowance rather than the soonest window.
 
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile
