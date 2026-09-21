@@ -1,15 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import {
-  Home,
-  Users,
-  Key,
-  Settings,
-  Activity,
-  RefreshCw,
-  type LucideIcon,
-} from "lucide-react";
+import { Activity, Home, Key, type LucideIcon, RefreshCw, Settings, Users } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -60,12 +52,8 @@ export function Sidebar() {
                   transition={{ type: "spring", bounce: 0.2, duration: 0.4 }}
                 />
               )}
-              <Icon
-                className={`relative h-5 w-5 ${isActive ? "text-accent" : "text-muted"}`}
-              />
-              <span
-                className={`relative ${isActive ? "text-accent" : "text-foreground"}`}
-              >
+              <Icon className={`relative h-5 w-5 ${isActive ? "text-accent" : "text-muted"}`} />
+              <span className={`relative ${isActive ? "text-accent" : "text-foreground"}`}>
                 {item.label}
               </span>
             </Link>

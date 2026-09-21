@@ -1,14 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import {
-  Activity,
-  ArrowUpRight,
-  Users,
-  Key,
-  AlertCircle,
-  CheckCircle2,
-} from "lucide-react";
+import { Activity, AlertCircle, ArrowUpRight, CheckCircle2, Key, Users } from "lucide-react";
 import { DashboardLayout } from "@/components";
 
 interface StatCardProps {
@@ -33,11 +26,7 @@ function StatCard({ title, value, change, trend, icon }: StatCardProps) {
           {change && (
             <p
               className={`mt-1 text-sm ${
-                trend === "up"
-                  ? "text-success"
-                  : trend === "down"
-                    ? "text-danger"
-                    : "text-muted"
+                trend === "up" ? "text-success" : trend === "down" ? "text-danger" : "text-muted"
               }`}
             >
               {change}
@@ -91,9 +80,7 @@ export default function DashboardPage() {
         {/* Page Header */}
         <div>
           <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <p className="mt-1 text-muted">
-            Overview of your AI coding assistant accounts
-          </p>
+          <p className="mt-1 text-muted">Overview of your AI coding assistant accounts</p>
         </div>
 
         {/* Stats Grid */}
@@ -142,10 +129,7 @@ export default function DashboardPage() {
             </div>
             <div className="divide-y divide-border">
               {recentActivity.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex items-start gap-3 px-6 py-4"
-                >
+                <div key={item.id} className="flex items-start gap-3 px-6 py-4">
                   {item.type === "success" ? (
                     <CheckCircle2 className="mt-0.5 h-5 w-5 text-success" />
                   ) : item.type === "warning" ? (

@@ -21,14 +21,7 @@ export const metadata: Metadata = {
   },
   description:
     "Coding Agent Account Manager - Control plane for managing AI coding assistant accounts",
-  keywords: [
-    "AI",
-    "coding assistant",
-    "account manager",
-    "Claude",
-    "Codex",
-    "Gemini",
-  ],
+  keywords: ["AI", "coding assistant", "account manager", "Claude", "Codex", "Gemini"],
   authors: [{ name: "CAAM Team" }],
   creator: "CAAM",
   openGraph: {

@@ -1,6 +1,6 @@
 "use client";
 
-import { Bell, Search, Moon, Sun, User } from "lucide-react";
+import { Bell, Moon, Search, Sun, User } from "lucide-react";
 import { useSyncExternalStore } from "react";
 
 // External store for dark mode detection
@@ -22,7 +22,7 @@ export function Header() {
   const isDark = useSyncExternalStore(
     subscribeToDarkMode,
     getDarkModeSnapshot,
-    getDarkModeServerSnapshot
+    getDarkModeServerSnapshot,
   );
 
   return (
