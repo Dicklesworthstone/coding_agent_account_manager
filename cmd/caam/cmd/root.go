@@ -483,12 +483,18 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 		normalizeIdentityPlan(id)
 		return id
 	case "cursor":
+		// Vault copies keep XDG and legacy files under distinct names so they
+		// do not overwrite each other. authInfo in cli-config is a display
+		// label; the access token lives in the auth.json copies.
 		candidates := []string{
+			filepath.Join(vaultPath, "xdg-cli-config.json"),
+			filepath.Join(vaultPath, "xdg-auth.json"),
+			filepath.Join(vaultPath, "cli-config.json"),
 			filepath.Join(vaultPath, "auth.json"),
 			filepath.Join(vaultPath, "settings.json"),
 		}
 		for _, path := range candidates {
-			id, err := identity.ExtractFromGenericAuth(path)
+			id, err := identity.ExtractFromCursorAuth(path)
 			if err != nil {
 				continue
 			}

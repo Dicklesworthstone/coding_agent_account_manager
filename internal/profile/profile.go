@@ -201,10 +201,15 @@ func (p *Profile) LoadIdentity() {
 			filepath.Join(p.HomePath(), ".local", "share", "opencode", "auth.json"),
 		}, identity.ExtractFromGenericAuth)
 	case "cursor":
+		// XDG config is where current Cursor Agent stores the account. The
+		// legacy ~/.cursor tree is still probed. Identity here is a label
+		// only; it is not proof the credential works.
 		id = loadIdentityFromPaths([]string{
+			filepath.Join(p.XDGConfigPath(), "cursor", "cli-config.json"),
+			filepath.Join(p.XDGConfigPath(), "cursor", "auth.json"),
 			filepath.Join(p.HomePath(), ".cursor", "cli-config.json"),
 			filepath.Join(p.HomePath(), ".cursor", "auth.json"),
-		}, identity.ExtractFromGenericAuth)
+		}, identity.ExtractFromCursorAuth)
 	}
 
 	// Prefer freshly extracted live identity; keep any cached value only as a
