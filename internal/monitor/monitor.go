@@ -315,7 +315,16 @@ func (m *Monitor) readAccessToken(provider, name string) (string, error) {
 			return "", fmt.Errorf("grok auth.json not found")
 		}
 		return "grok-home:" + m.vault.ProfilePath(provider, name), nil
-	case "opencode", "cursor":
+	case "cursor":
+		dir := m.vault.ProfilePath(provider, name)
+		for _, fileName := range []string{"xdg-auth.json", "auth.json"} {
+			path := filepath.Join(dir, fileName)
+			if _, err := os.Stat(path); err == nil {
+				return "cursor-root:" + path, nil
+			}
+		}
+		return "", fmt.Errorf("cursor access token not found")
+	case "opencode":
 		return "", fmt.Errorf("usage fetch not yet supported for provider %s", provider)
 	default:
 		return "", fmt.Errorf("usage fetch unsupported for provider %s", provider)

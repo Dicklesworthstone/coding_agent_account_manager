@@ -30,13 +30,14 @@ This command queries the provider's API to get current rate limit utilization,
 which is useful for deciding when to switch accounts. It also parses local logs
 to estimate token burn rate and predict when limits will be hit.
 
-Live limit fetching is available for providers with usage APIs (claude, codex, grok).
+Live limit fetching is available for providers with usage APIs (claude, codex, grok, cursor).
 
 Examples:
-  caam limits                     # Show limits for all supported providers (claude, codex, grok)
+  caam limits                     # Show limits for all supported providers
   caam limits claude              # Show Claude limits only
   caam limits codex               # Show Codex limits only
   caam limits grok                # Show Grok billing for each saved profile
+  caam limits cursor              # Show Cursor limit status for each saved profile
   caam limits --profile work      # Show limits for a specific profile
   caam limits --format json       # Output as JSON
   caam limits --best              # Show the best profile for rotation
@@ -339,7 +340,7 @@ func sortResultsForModel(results []usage.ProfileUsage, model string) {
 }
 
 // limitsProviders are the providers with live limit/usage API support.
-var limitsProviders = []string{"claude", "codex", "grok"}
+var limitsProviders = []string{"claude", "codex", "grok", "cursor"}
 
 func isLimitsProvider(p string) bool {
 	for _, lp := range limitsProviders {

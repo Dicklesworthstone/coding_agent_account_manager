@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func TestLimitsAcceptsGrok(t *testing.T) {
+func TestLimitsAcceptsGrokAndCursor(t *testing.T) {
 	cmd := &cobra.Command{Use: "limits"}
 	cmd.Flags().String("profile", "", "")
 	cmd.Flags().String("format", "json", "")
@@ -26,14 +27,43 @@ func TestLimitsAcceptsGrok(t *testing.T) {
 	cmd.SetOut(&buf)
 	cmd.SetErr(&buf)
 
-	// No saved profiles in the isolated test home. The command must accept
-	// grok instead of rejecting it as unsupported, and it must not crash.
-	err := runLimits(cmd, []string{"grok"})
-	if err != nil {
-		t.Fatalf("grok limits: %v\n%s", err, buf.String())
+	// No saved profiles in the isolated test home. Both providers must be
+	// accepted, and an empty collection must not crash.
+	for _, provider := range []string{"grok", "cursor"} {
+		buf.Reset()
+		err := runLimits(cmd, []string{provider})
+		if err != nil {
+			t.Fatalf("%s limits: %v\n%s", provider, err, buf.String())
+		}
+		if strings.Contains(buf.String(), "not supported") {
+			t.Fatalf("output treated %s as unsupported: %s", provider, buf.String())
+		}
 	}
-	if strings.Contains(buf.String(), "not supported") {
-		t.Fatalf("output treated grok as unsupported: %s", buf.String())
+}
+
+func TestFetchFailuresStayOnTheirOwnProvider(t *testing.T) {
+	// A cursor root with no credential and a grok home with no auth each
+	// produce an error row. Neither call panics or drops the other profile
+	// in the same batch.
+	ctx := context.Background()
+	fetcher := usage.NewMultiProfileFetcher()
+	cursorRows := fetcher.FetchAllProfiles(ctx, "cursor", map[string]string{
+		"one": t.TempDir(),
+		"two": t.TempDir(),
+	})
+	if len(cursorRows) != 2 {
+		t.Fatalf("cursor rows = %d, want 2", len(cursorRows))
+	}
+	for _, row := range cursorRows {
+		if row.Usage == nil || row.Usage.Error == "" || row.Usage.NumericQuotaKnown() {
+			t.Fatalf("cursor row %+v", row.Usage)
+		}
+	}
+	grokRows := fetcher.FetchAllProfiles(ctx, "grok", map[string]string{
+		"g": t.TempDir(),
+	})
+	if len(grokRows) != 1 || grokRows[0].Usage == nil || grokRows[0].Usage.Error == "" {
+		t.Fatalf("grok row %+v", grokRows)
 	}
 }
 

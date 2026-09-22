@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -1383,6 +1385,11 @@ type RobotProfileLimits struct {
 	DepletesIn     string `json:"depletes_in,omitempty"`
 	Error          string `json:"error,omitempty"`
 	Recommendation string `json:"recommendation,omitempty"`
+	// QuotaStatus, LimitStage, and PlanType are set for providers whose live
+	// response is not a single percentage (Grok billing, Cursor limit stage).
+	QuotaStatus string `json:"quota_status,omitempty"`
+	LimitStage  string `json:"limit_stage,omitempty"`
+	PlanType    string `json:"plan_type,omitempty"`
 }
 
 func runRobotLimits(cmd *cobra.Command, args []string) error {
@@ -1410,6 +1417,12 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 			fmt.Sprintf("no profiles found for %s", provider),
 			"",
 			[]string{fmt.Sprintf("caam backup %s <name>", provider)})
+	}
+
+	// Grok and Cursor have live fetchers. Claude and Codex keep the health
+	// proxy this command has always used, so their robot output does not change.
+	if provider == "grok" || provider == "cursor" {
+		return runRobotLiveLimits(cmd, provider, profiles, start)
 	}
 
 	data := RobotLimitsData{
@@ -1460,6 +1473,75 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 	}
 
 	return robotOutput(cmd, output)
+}
+
+// runRobotLiveLimits fills robot limits from the usage fetcher. A profile
+// whose provider call fails becomes a row with an error; it does not abort
+// the rest of the list and it does not invent a percentage.
+func runRobotLiveLimits(cmd *cobra.Command, provider string, profiles []string, start time.Time) error {
+	creds, err := usage.LoadProfileCredentials(vault.BasePath(), provider)
+	if err != nil {
+		return robotError(cmd, "limits", "VAULT_ERROR",
+			"failed to read profile credentials",
+			err.Error(),
+			nil)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	results := usage.NewMultiProfileFetcher().FetchAllProfiles(ctx, provider, creds)
+	byName := make(map[string]usage.ProfileUsage, len(results))
+	for _, row := range results {
+		byName[row.ProfileName] = row
+	}
+
+	data := RobotLimitsData{Provider: provider}
+	for _, name := range profiles {
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		limits := RobotProfileLimits{Name: name}
+		row, ok := byName[name]
+		if !ok || row.Usage == nil {
+			limits.Error = "no credentials"
+			limits.QuotaStatus = usage.QuotaUnavailable
+			limits.Recommendation = "quota unknown"
+			data.Profiles = append(data.Profiles, limits)
+			continue
+		}
+		u := row.Usage
+		limits.QuotaStatus = u.QuotaStatus
+		limits.LimitStage = u.LimitStage
+		limits.PlanType = u.PlanType
+		if u.Error != "" {
+			limits.Error = u.Error
+			limits.Recommendation = "quota unknown"
+		} else if !u.NumericQuotaKnown() {
+			limits.Recommendation = "quota unknown"
+			if u.QuotaNote != "" {
+				limits.Error = u.QuotaNote
+			}
+		} else {
+			limits.AvailScore = u.AvailabilityScore()
+			if u.PrimaryWindow != nil && !u.PrimaryWindow.Unmeasured {
+				limits.PrimaryPct = u.PrimaryWindow.UsedPercent
+			}
+			limits.Recommendation = "ready to use"
+		}
+		if ttl := u.TimeUntilReset(); ttl > 0 {
+			limits.ResetsIn = ttl.Round(time.Minute).String()
+		}
+		data.Profiles = append(data.Profiles, limits)
+	}
+
+	return robotOutput(cmd, RobotOutput{
+		Success: true,
+		Command: "limits",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: time.Since(start).Milliseconds(),
+		},
+	})
 }
 
 // RobotPrecheckData contains session planning data.

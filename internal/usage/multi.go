@@ -62,6 +62,7 @@ type MultiProfileFetcher struct {
 	claudeFetcher *ClaudeFetcher
 	codexFetcher  *CodexFetcher
 	grokFetcher   *GrokFetcher
+	cursorFetcher *CursorFetcher
 	logScanner    logs.Scanner // Optional scanner for burn rate calculation
 }
 
@@ -81,6 +82,7 @@ func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 		claudeFetcher: NewClaudeFetcher(),
 		codexFetcher:  NewCodexFetcher(),
 		grokFetcher:   NewGrokFetcher(),
+		cursorFetcher: NewCursorFetcher(),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -138,6 +140,17 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 					}
 				} else {
 					info, err = m.grokFetcher.Fetch(ctx, token)
+				}
+			case "cursor":
+				if m.cursorFetcher == nil {
+					info = &UsageInfo{
+						Provider:    provider,
+						FetchedAt:   time.Now(),
+						QuotaStatus: QuotaUnavailable,
+						Error:       "cursor fetcher unavailable",
+					}
+				} else {
+					info, err = m.cursorFetcher.Fetch(ctx, token)
 				}
 			default:
 				info = &UsageInfo{
@@ -421,6 +434,8 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 			// value is that directory, not the token.
 			token = "grok-home:" + profileDir
 			readErr = nil
+		case "cursor":
+			token, readErr = cursorVaultLocator(profileDir)
 		}
 
 		if readErr != nil {

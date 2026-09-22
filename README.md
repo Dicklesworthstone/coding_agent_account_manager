@@ -320,6 +320,7 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
+| **Cursor Agent** | `$XDG_CONFIG_HOME/cursor/auth.json` (+ `cli-config.json`); legacy `~/.cursor/` | `cursor-agent login` |
 
 ### Claude Code (Claude Max)
 
@@ -379,9 +380,29 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 **Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). Grok Build tokens expire after 7 days; run `grok login` to refresh — CAAM cannot refresh them.
 
+**Live limits:** `caam limits grok` asks the authenticated `grok agent stdio` process for the `_x.ai/billing` extension under that profile's `GROK_HOME`. It does not send a model prompt. The JSON row includes `plan_type`, `billing` (period start/end, on-demand cents, prepaid balance) and, when the provider sent `creditUsagePercent` or a used/limit pair inside 0–100, a measured `primary_window`. If those numbers are missing, `quota_status` is `degraded`, `quota_note` says why, and any `primary_window` is `unmeasured` (its `used_percent` is not a measurement). A degraded row is excluded from `--best` and from usage-aware rotation.
+
 **Caveats:**
 - **`GROK_DEPLOYMENT_KEY` precedence:** in enterprise/deployment setups this environment variable takes precedence over `auth.json`, so a swapped profile is silently ignored while it is set.
 - **`~/.grok` collision:** the unaffiliated community CLI [`superagent-ai/grok-cli`](https://github.com/superagent-ai/grok-cli) (npm `grok-dev`) also uses `~/.grok/` but stores its state in `grok.db` / `user-settings.json`. CAAM touches only the official Grok Build files (`auth.json`, `config.toml`), so the two CLIs can coexist.
+
+### Cursor Agent
+
+**Auth files (current client):**
+- `$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config/cursor/auth.json`) — access and refresh credentials. This is the login.
+- `$XDG_CONFIG_HOME/cursor/cli-config.json` — settings and `authInfo`. A non-empty `authInfo` is account metadata, not proof the credential works.
+
+**Legacy files** under `~/.cursor/` (`auth.json`, `cli-config.json`, `settings.json`) are still backed up and restored. In the vault the XDG copies are named `xdg-auth.json` and `xdg-cli-config.json` so they do not overwrite the legacy copies.
+
+**Profile isolation:** every Cursor profile sets both `HOME` and `XDG_CONFIG_HOME`. Setting `HOME` alone leaves the CLI on the machine-global account whenever `XDG_CONFIG_HOME` is already set. Active checks run `cursor-agent status --format json` inside that environment (`cursor-agent`, or a binary that is actually the Cursor Agent install). `caam` does not treat `authInfo` as a successful login.
+
+**Login command:** `cursor-agent login`
+
+**Live limits:** `caam limits cursor` calls `DashboardService/GetUsageLimitStatusAndActiveGrants` with the profile's own access token. It does not scrape the website and it does not use team admin spend. JSON may include `limit_stage` (`AUTO_SWITCH`, `SLOW_POOL`, `HARD_BLOCK`), `grants` (only the cents and models the response actually contained), and a measured `primary_window` when a grant has both a total and a remaining amount. A stage or a reset time by itself leaves `quota_status` as `degraded` and does not invent a percentage. Unknown or renamed fields are ignored. HTTP failures and malformed bodies are `quota_status: unavailable` and do not switch accounts.
+
+**Client versions exercised while writing this:**
+- Grok Build `1.0.40` (`eb1a2256660d`). `_x.ai/billing` returned a weekly period (reset 2026-09-28), tier, on-demand cap/used, prepaid balance, and a measured included percentage. No model prompt was sent.
+- Cursor Agent `2026.09.10-fd3934a`. `GetUsageLimitStatusAndActiveGrants` returned spend-limit flags only (no stage, reset, or grants), which is reported as degraded rather than as 0% used.
 
 ---
 
