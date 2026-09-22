@@ -151,16 +151,15 @@ func runNext(cmd *cobra.Command, args []string) error {
 
 	// Fetch usage data if --usage-aware is set
 	var usageData map[string]*rotation.UsageInfo
-	if usageAware && (tool == "claude" || tool == "codex") {
+	if usageAware && isLimitsProvider(tool) {
 		if !quiet {
 			fmt.Printf("Fetching real-time usage data for %d profiles...\n", len(profiles))
 		}
 		usageData = fetchUsageDataForProfiles(tool, profiles)
 	} else if usageAware {
-		// Loud fallback (issue #79): real-time limit fetching is implemented for
-		// claude and codex only. Say so — on stderr, even in quiet mode — instead
-		// of silently ignoring the flag the user asked for.
-		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for claude and codex only); selecting without usage data\n", tool)
+		// Loud fallback (issue #79): say so — on stderr, even in quiet mode —
+		// instead of silently ignoring the flag the user asked for.
+		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for %s); selecting without usage data\n", tool, strings.Join(limitsProviders, ", "))
 	}
 
 	// Select next profile using rotation

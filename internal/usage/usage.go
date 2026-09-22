@@ -46,6 +46,11 @@ type UsageWindow struct {
 	// zeroed when it is set, and the flag keeps that zero distinguishable from
 	// a window that is genuinely untouched.
 	Rolled bool `json:"rolled,omitempty"`
+
+	// Unmeasured means this window carries a reset time or a label but the
+	// provider did not supply a numeric utilization. A zero UsedPercent is
+	// then not a measurement and must not be read as "unused".
+	Unmeasured bool `json:"unmeasured,omitempty"`
 }
 
 // Claude reports each rate limit window under one of these kinds.
@@ -123,6 +128,73 @@ type UsageInfo struct {
 	// DepletionConfidence is how confident the depletion prediction is (0-1).
 	// Based on burn rate data quality and sample size.
 	DepletionConfidence float64 `json:"depletion_confidence,omitempty"`
+
+	// QuotaStatus is "ok" when a numeric utilization was derived from the
+	// provider's figures, "degraded" when the provider responded but did not
+	// include enough to compute one, and "unavailable" when the fetch failed.
+	// Empty means ok, which is what Claude and Codex rows have always been.
+	QuotaStatus string `json:"quota_status,omitempty"`
+
+	// QuotaNote explains a degraded or unavailable read. It is not a percentage.
+	QuotaNote string `json:"quota_note,omitempty"`
+
+	// LimitStage is a provider limit state that is not a percentage (Cursor's
+	// limit-hit stage, for example). Empty when the provider did not report one.
+	LimitStage string `json:"limit_stage,omitempty"`
+
+	// Billing carries provider billing fields that do not fit a rate-limit
+	// window: period bounds, on-demand cents, prepaid balance. Amounts are
+	// omitted when the provider did not send them.
+	Billing *BillingSnapshot `json:"billing,omitempty"`
+
+	// Grants are credit grants the provider returned. A grant is not turned
+	// into a utilization percentage unless both a total and a remaining
+	// amount were present.
+	Grants []GrantSnapshot `json:"grants,omitempty"`
+}
+
+// Quota status values.
+const (
+	QuotaOK          = "ok"
+	QuotaDegraded    = "degraded"
+	QuotaUnavailable = "unavailable"
+)
+
+// BillingSnapshot is the subset of a billing response caam will repeat.
+// Pointer fields are omitted when the provider did not send them, so a zero
+// that was actually reported stays distinguishable from an absent field.
+type BillingSnapshot struct {
+	PeriodType          string `json:"period_type,omitempty"`
+	PeriodStart         string `json:"period_start,omitempty"`
+	PeriodEnd           string `json:"period_end,omitempty"`
+	OnDemandCapCents    *int64 `json:"on_demand_cap_cents,omitempty"`
+	OnDemandUsedCents   *int64 `json:"on_demand_used_cents,omitempty"`
+	PrepaidBalanceCents *int64 `json:"prepaid_balance_cents,omitempty"`
+	Unified             *bool  `json:"unified,omitempty"`
+	OnDemandEnabled     *bool  `json:"on_demand_enabled,omitempty"`
+}
+
+// GrantSnapshot is one credit grant. Cents are the provider's minor units.
+type GrantSnapshot struct {
+	Type           string     `json:"type,omitempty"`
+	TotalCents     *int64     `json:"total_cents,omitempty"`
+	RemainingCents *int64     `json:"remaining_cents,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	Models         []string   `json:"models,omitempty"`
+}
+
+// NumericQuotaKnown reports whether this row has a measured utilization.
+// Claude and Codex rows leave QuotaStatus empty and count as known.
+func (u *UsageInfo) NumericQuotaKnown() bool {
+	if u == nil || u.Error != "" {
+		return false
+	}
+	switch u.QuotaStatus {
+	case QuotaDegraded, QuotaUnavailable:
+		return false
+	default:
+		return true
+	}
 }
 
 // CreditInfo contains credit/balance information (primarily for Codex).
@@ -167,7 +239,7 @@ func (u *UsageInfo) AvailabilityScore() int {
 // An empty model means "unknown", and every scoped window is then taken into
 // account at its worst.
 func (u *UsageInfo) AvailabilityScoreForModel(model string) int {
-	if u == nil || u.Error != "" {
+	if u == nil || u.Error != "" || !u.NumericQuotaKnown() {
 		return 0
 	}
 
@@ -175,10 +247,14 @@ func (u *UsageInfo) AvailabilityScoreForModel(model string) int {
 	score := 100.0
 
 	// Primary window is most important (weight: 50%)
-	score -= windowUtilization(u.PrimaryWindow) * 50
+	if u.PrimaryWindow != nil && !u.PrimaryWindow.Unmeasured {
+		score -= windowUtilization(u.PrimaryWindow) * 50
+	}
 
 	// Secondary window (weight: 25%)
-	score -= windowUtilization(u.SecondaryWindow) * 25
+	if u.SecondaryWindow != nil && !u.SecondaryWindow.Unmeasured {
+		score -= windowUtilization(u.SecondaryWindow) * 25
+	}
 
 	// Premium-model limits (weight: 15%). The legacy tertiary window and the
 	// scoped windows describe the same kind of constraint, so they share one
@@ -328,7 +404,7 @@ func (u *UsageInfo) IsNearLimitForModel(threshold float64, model string) bool {
 	}
 
 	atLimit := func(w *UsageWindow) bool {
-		return w != nil && windowUtilization(w) >= threshold
+		return w != nil && !w.Unmeasured && windowUtilization(w) >= threshold
 	}
 	if atLimit(u.PrimaryWindow) || atLimit(u.SecondaryWindow) {
 		return true
@@ -405,7 +481,7 @@ func (u *UsageInfo) MostConstrainedWindow() *UsageWindow {
 	var highestUtil float64
 
 	checkWindow := func(w *UsageWindow) {
-		if w == nil {
+		if w == nil || w.Unmeasured {
 			return
 		}
 		util := w.Utilization
