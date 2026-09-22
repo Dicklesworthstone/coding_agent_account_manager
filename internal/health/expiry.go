@@ -494,6 +494,75 @@ func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
 	return best, nil
 }
 
+// ParseCursorExpiry extracts token expiry from a Cursor Agent auth.json.
+//
+// The current client stores the session at $XDG_CONFIG_HOME/cursor/auth.json
+// (default ~/.config/cursor/auth.json) as camelCase accessToken/refreshToken
+// JWTs and does not write an expires_at field. The access token's exp claim
+// is the expiry. A refresh token means the CLI renews the session itself, so
+// the credential is renewable and a working login is not reported as an
+// unknown-expiry warning.
+//
+// An empty authPath searches the XDG location, then the legacy ~/.cursor tree.
+func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		authPath = defaultCursorAuthPath()
+	}
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+	info, err := parseCursorAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	info.Renewable = info.HasRefreshToken
+	info.Source = authPath
+	return info, nil
+}
+
+func defaultCursorAuthPath() string {
+	home, _ := os.UserHomeDir()
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = filepath.Join(home, ".config")
+	}
+	candidates := []string{
+		filepath.Join(xdg, "cursor", "auth.json"),
+		filepath.Join(home, ".cursor", "auth.json"),
+	}
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return candidates[0]
+}
+
+func parseCursorAuthJSON(data []byte) (*ExpiryInfo, error) {
+	var oauth oauthJSON
+	if err := json.Unmarshal(data, &oauth); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+	info := &ExpiryInfo{
+		HasRefreshToken: oauth.RefreshToken != "" || oauth.RefreshTokenCamel != "",
+	}
+	token := oauth.AccessToken
+	if token == "" {
+		token = oauth.AccessTokenCamel
+	}
+	if exp := jwtExpiry(token); !exp.IsZero() {
+		info.ExpiresAt = exp
+	}
+	if info.ExpiresAt.IsZero() && !info.HasRefreshToken {
+		return nil, ErrNoExpiry
+	}
+	return info, nil
+}
+
 // ParseGeminiExpiry extracts token expiry from Gemini CLI auth files.
 //
 // Gemini CLI stores auth in:

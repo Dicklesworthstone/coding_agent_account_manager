@@ -1194,6 +1194,13 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 				continue
 			}
 		}
+		// A file that explicitly is not a credential (Cursor cli-config.json
+		// holds editor settings plus authInfo) must not decide which profile
+		// is active. Those files drift while the access token stays put, and
+		// hashing them hides a logged-in account.
+		if spec.AuthPresent != nil && !spec.AuthPresent(spec.Path) {
+			continue
+		}
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}

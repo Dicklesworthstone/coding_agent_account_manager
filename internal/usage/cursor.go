@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,7 +17,12 @@ import (
 	"time"
 )
 
-const cursorUsagePath = "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants"
+const (
+	cursorService         = "/aiserver.v1.DashboardService/"
+	cursorUsagePath       = cursorService + "GetUsageLimitStatusAndActiveGrants"
+	cursorPeriodUsagePath = cursorService + "GetCurrentPeriodUsage"
+	cursorPlanInfoPath    = cursorService + "GetPlanInfo"
+)
 
 // CursorFetcher calls Cursor's authenticated DashboardService RPC for
 // GetUsageLimitStatusAndActiveGrants. It reads the access token from the
@@ -66,25 +72,67 @@ func (f *CursorFetcher) Fetch(ctx context.Context, locator string) (*UsageInfo, 
 		return info, nil
 	}
 
-	body, status, err := f.postUsage(ctx, token)
-	if err != nil {
-		info.Error = err.Error()
-		info.QuotaNote = info.Error
-		return info, nil
+	// Included remaining/limit lives on GetCurrentPeriodUsage. The limit-status
+	// call carries stage and grants, which are empty on an account that has
+	// not hit a limit, so it cannot be the only read.
+	periodBody, periodCode, periodErr := f.post(ctx, token, cursorPeriodUsagePath)
+	statusBody, statusCode, statusErr := f.post(ctx, token, cursorUsagePath)
+	planBody, planCode, _ := f.post(ctx, token, cursorPlanInfoPath)
+
+	var period, status *UsageInfo
+	if periodErr == nil && periodCode >= 200 && periodCode < 300 {
+		period = parseCursorPeriod(periodBody, now)
 	}
-	if status < 200 || status >= 300 {
-		info.Error = fmt.Sprintf("cursor usage HTTP %d", status)
-		info.QuotaNote = info.Error
-		return info, nil
+	if statusErr == nil && statusCode >= 200 && statusCode < 300 {
+		status = parseCursorUsage(statusBody, now)
 	}
-	parsed := parseCursorUsage(body, now)
+
+	switch {
+	case period != nil && period.QuotaStatus == QuotaOK:
+		info = period
+		if status != nil {
+			if status.LimitStage != "" {
+				info.LimitStage = status.LimitStage
+			}
+			info.Grants = append(info.Grants, status.Grants...)
+		}
+	case status != nil && status.QuotaStatus == QuotaOK:
+		info = status
+	case period != nil && period.QuotaStatus == QuotaDegraded:
+		info = period
+		if status != nil && status.LimitStage != "" {
+			info.LimitStage = status.LimitStage
+		}
+	case status != nil && status.Error == "":
+		info = status
+	default:
+		msg := "cursor usage request failed"
+		switch {
+		case periodErr != nil:
+			msg = periodErr.Error()
+		case periodCode >= 300:
+			msg = fmt.Sprintf("cursor usage HTTP %d", periodCode)
+		case statusErr != nil:
+			msg = statusErr.Error()
+		case statusCode >= 300:
+			msg = fmt.Sprintf("cursor usage HTTP %d", statusCode)
+		}
+		info.Error = msg
+		info.QuotaNote = msg
+		info.QuotaStatus = QuotaUnavailable
+	}
+	if planCode >= 200 && planCode < 300 {
+		if name := parseCursorPlanName(planBody); name != "" {
+			info.PlanType = name
+		}
+	}
 	if email := cursorAccountEmail(root, authPath); email != "" {
-		parsed.AccountID = email
+		info.AccountID = email
 	}
-	return parsed, nil
+	return info, nil
 }
 
-func (f *CursorFetcher) postUsage(ctx context.Context, token string) ([]byte, int, error) {
+func (f *CursorFetcher) post(ctx context.Context, token, path string) ([]byte, int, error) {
 	base := strings.TrimRight(f.BaseURL, "/")
 	if base == "" {
 		base = strings.TrimRight(os.Getenv("CURSOR_API_ENDPOINT"), "/")
@@ -92,7 +140,7 @@ func (f *CursorFetcher) postUsage(ctx context.Context, token string) ([]byte, in
 	if base == "" {
 		base = "https://api2.cursor.sh"
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+cursorUsagePath, strings.NewReader("{}"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, strings.NewReader("{}"))
 	if err != nil {
 		return nil, 0, fmt.Errorf("cursor usage request could not be built")
 	}
@@ -247,6 +295,105 @@ func emailFromCursorConfig(path string) string {
 		return ""
 	}
 	return email
+}
+
+// parseCursorPeriod reads GetCurrentPeriodUsage. included_spend / limit is
+// the included-usage percentage the CLI prints ("You've used N%"). A reset
+// alone, or a percent field with no spend and no limit, is not a measurement.
+func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
+	info := &UsageInfo{
+		Provider:    "cursor",
+		FetchedAt:   now,
+		Source:      SourceAPI,
+		QuotaStatus: QuotaDegraded,
+		QuotaNote:   "cursor period usage did not include an included spend and limit",
+	}
+	if now.IsZero() {
+		info.FetchedAt = time.Now()
+	}
+	if !json.Valid(raw) {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "cursor period usage was not valid JSON"
+		info.QuotaNote = info.Error
+		return info
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "cursor period usage was not a JSON object"
+		info.QuotaNote = info.Error
+		return info
+	}
+	var reset time.Time
+	if ms, ok := jsonInt(firstPresent(root, "billingCycleEnd", "billing_cycle_end")); ok && ms > 0 {
+		reset = time.UnixMilli(ms).UTC()
+	}
+	usageRaw, ok := firstRaw(root, "planUsage", "plan_usage")
+	if !ok {
+		if !reset.IsZero() {
+			info.PrimaryWindow = &UsageWindow{ResetsAt: reset, Kind: "included", Label: "included", Unmeasured: true}
+		}
+		return info
+	}
+	var plan map[string]json.RawMessage
+	if err := json.Unmarshal(usageRaw, &plan); err != nil || plan == nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "cursor plan usage was not a JSON object"
+		info.QuotaNote = info.Error
+		return info
+	}
+	limit, limitOK := jsonInt(firstPresent(plan, "limit"))
+	included, includedOK := jsonInt(firstPresent(plan, "includedSpend", "included_spend"))
+	remaining, remainingOK := jsonInt(firstPresent(plan, "remaining"))
+	var used int64
+	switch {
+	case limitOK && limit > 0 && includedOK && included >= 0 && included <= limit:
+		used = included
+	case limitOK && limit > 0 && remainingOK && remaining >= 0 && remaining <= limit:
+		used = limit - remaining
+	default:
+		if !reset.IsZero() {
+			info.PrimaryWindow = &UsageWindow{ResetsAt: reset, Kind: "included", Label: "included", Unmeasured: true}
+		}
+		return info
+	}
+	pct := float64(used) / float64(limit) * 100
+	info.PrimaryWindow = &UsageWindow{
+		Utilization: pct / 100,
+		UsedPercent: int(math.Round(pct)),
+		ResetsAt:    reset,
+		Kind:        "included",
+		Label:       "included",
+	}
+	if start, ok := jsonInt(firstPresent(root, "billingCycleStart", "billing_cycle_start")); ok && start > 0 && !reset.IsZero() {
+		info.PrimaryWindow.WindowDuration = reset.Sub(time.UnixMilli(start))
+	}
+	info.QuotaStatus = QuotaOK
+	info.QuotaNote = ""
+	info.Error = ""
+	return info
+}
+
+// parseCursorPlanName reads GetPlanInfo's plan name. Empty when the field is
+// missing. The name is a short label such as "Ultra", not a secret.
+func parseCursorPlanName(raw []byte) string {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return ""
+	}
+	infoRaw, ok := firstRaw(root, "planInfo", "plan_info")
+	if !ok {
+		return ""
+	}
+	var info map[string]json.RawMessage
+	if err := json.Unmarshal(infoRaw, &info); err != nil {
+		return ""
+	}
+	name := firstString(info, "planName", "plan_name")
+	if name == "" || len(name) > 40 {
+		return ""
+	}
+	return name
 }
 
 // parseCursorUsage normalizes a GetUsageLimitStatusAndActiveGrants JSON body.

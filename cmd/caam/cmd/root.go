@@ -304,6 +304,15 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		// which the Codex parser cannot read; without its own case every Grok
 		// profile scored as unknown-expiry and stuck at warning (issue #101).
 		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "cursor":
+		// Cursor's session JWT has no expires_at field. Without this case a
+		// logged-in profile stays at unknown expiry and ls shows Warning.
+		for _, name := range []string{"xdg-auth.json", "auth.json"} {
+			expInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, name))
+			if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+				break
+			}
+		}
 	}
 
 	// Prefer the profile's own live credential over the vault snapshot.
@@ -356,6 +365,8 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 			return nil
 		}
 		info, err = health.ParseGrokExpiry(filepath.Join(home, ".grok", "auth.json"))
+	case "cursor":
+		info, err = health.ParseCursorExpiry("")
 	default:
 		return nil
 	}
@@ -415,6 +426,11 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+	case "cursor":
+		info, err = health.ParseCursorExpiry(filepath.Join(prof.XDGConfigPath(), "cursor", "auth.json"))
+		if err != nil || info == nil || info.ExpiresAt.IsZero() {
+			info, err = health.ParseCursorExpiry(filepath.Join(prof.HomePath(), ".cursor", "auth.json"))
+		}
 	default:
 		return nil
 	}
@@ -770,16 +786,26 @@ var backupCmd = &cobra.Command{
 	Long: `Saves the current auth files for a tool to the vault with the given profile name.
 
 Use this after logging in to an account through the tool's normal login flow:
-  1. Run: codex login (or claude with /login, or gemini)
-  2. Run: caam backup codex my-gptpro-account-1
+  1. Log in with the tool: codex login, claude (/login), gemini, grok login, or cursor-agent login
+  2. Run: caam backup <tool> <profile-name>
 
 The auth files are copied to $CAAM_HOME/data/vault/<tool>/<profile>/ (if CAAM_HOME is set)
 or ~/.local/share/caam/vault/<tool>/<profile>/
+
+Where each tool keeps the login that backup reads:
+  - codex:   ~/.codex/auth.json ($CODEX_HOME)
+  - claude:  ~/.claude/.credentials.json and ~/.claude.json
+  - gemini:  ~/.gemini/settings.json
+  - grok:    ~/.grok/auth.json ($GROK_HOME)
+  - cursor:  $XDG_CONFIG_HOME/cursor/auth.json (default ~/.config/cursor/auth.json);
+             legacy ~/.cursor/ is included when it is present
 
 Examples:
   caam backup codex work-account
   caam backup claude personal-max
   caam backup gemini team-ultra
+  caam backup grok work
+  caam backup cursor personal
   caam backup codex work --json`,
 	Args: cobra.ExactArgs(2),
 	RunE: runBackup,

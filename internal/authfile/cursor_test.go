@@ -58,6 +58,43 @@ func TestCursorAuthFiles_UsesXDGAndDoesNotTreatMetadataAsLogin(t *testing.T) {
 	}
 }
 
+func TestCursorActiveProfileIgnoresDriftedSettings(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(home, "xdg")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if err := os.MkdirAll(filepath.Join(xdg, "cursor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	auth := []byte(`{"accessToken":"synthetic-cursor-token","refreshToken":"synthetic-cursor-refresh"}`)
+	if err := os.WriteFile(filepath.Join(xdg, "cursor", "auth.json"), auth, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Settings that will drift after the backup. They must not hide the login.
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "cli-config.json"), []byte(`{"version":1,"model":"a"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	vault := NewVault(t.TempDir())
+	fs := CursorAuthFiles()
+	if err := vault.Backup(fs, "personal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".cursor", "cli-config.json"), []byte(`{"version":1,"model":"changed"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	active, err := vault.ActiveProfile(CursorAuthFiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != "personal" {
+		t.Fatalf("active = %q, want personal", active)
+	}
+}
+
 func TestCursorBackupRestoreKeepsXDGAndLegacyApart(t *testing.T) {
 	home := t.TempDir()
 	xdg := filepath.Join(home, "xdg")

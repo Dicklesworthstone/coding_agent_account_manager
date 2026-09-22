@@ -13,6 +13,43 @@ import (
 
 // Fixtures are synthetic. No real Cursor token, auth id, or account.
 
+func TestParseCursorPeriod_IncludedSpend(t *testing.T) {
+	// Shape returned by DashboardService/GetCurrentPeriodUsage for an Ultra
+	// account: spend and limit are cents, cycle bounds are unix milliseconds
+	// encoded as strings. 368/40000 is the "1%" the CLI displays.
+	raw := []byte(`{
+		"billingCycleStart": "1789406506000",
+		"billingCycleEnd": "1791998506000",
+		"planUsage": {
+			"totalSpend": 368,
+			"includedSpend": 368,
+			"remaining": 39632,
+			"limit": 40000,
+			"totalPercentUsed": 0.1187
+		},
+		"displayMessage": "You've used 1% of your included usage"
+	}`)
+	info := parseCursorPeriod(raw, time.Unix(1_700_000_000, 0).UTC())
+	if info.QuotaStatus != QuotaOK || !info.NumericQuotaKnown() {
+		t.Fatalf("status %q note %q", info.QuotaStatus, info.QuotaNote)
+	}
+	if info.PrimaryWindow == nil || info.PrimaryWindow.Unmeasured || info.PrimaryWindow.UsedPercent != 1 {
+		t.Fatalf("window %+v", info.PrimaryWindow)
+	}
+	if info.PrimaryWindow.ResetsAt.UnixMilli() != 1791998506000 {
+		t.Fatalf("reset %s", info.PrimaryWindow.ResetsAt)
+	}
+}
+
+func TestParseCursorPlanName(t *testing.T) {
+	if got := parseCursorPlanName([]byte(`{"planInfo":{"planName":"Ultra","includedAmountCents":40000}}`)); got != "Ultra" {
+		t.Fatalf("plan %q", got)
+	}
+	if got := parseCursorPlanName([]byte(`{}`)); got != "" {
+		t.Fatalf("empty plan %q", got)
+	}
+}
+
 func TestParseCursorUsage_GrantsAndReset(t *testing.T) {
 	raw := []byte(`{
 		"usageLimitPolicyStatus": {
@@ -113,6 +150,15 @@ func TestCursorFetch_TwoProfilesAndNoGlobalLeak(t *testing.T) {
 
 	seen := map[string]int{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == cursorPeriodUsagePath {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"billingCycleEnd":"1791998506000","planUsage":{"includedSpend":8000,"limit":40000,"remaining":32000}}`))
+			return
+		}
+		if r.URL.Path == cursorPlanInfoPath {
+			_, _ = w.Write([]byte(`{"planInfo":{"planName":"Ultra"}}`))
+			return
+		}
 		if r.URL.Path != cursorUsagePath {
 			http.NotFound(w, r)
 			return
@@ -169,13 +215,16 @@ func TestCursorFetch_TwoProfilesAndNoGlobalLeak(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.QuotaStatus != QuotaDegraded || got.NumericQuotaKnown() {
+		if got.QuotaStatus != QuotaOK || !got.NumericQuotaKnown() {
 			t.Fatalf("%s status %+v", tc.name, got)
+		}
+		if got.PlanType != "Ultra" {
+			t.Fatalf("%s plan %q", tc.name, got.PlanType)
 		}
 		if got.LimitStage != tc.stage {
 			t.Fatalf("%s stage %q", tc.name, got.LimitStage)
 		}
-		if got.PrimaryWindow == nil || got.PrimaryWindow.ResetsAt.UnixMilli() != tc.reset || !got.PrimaryWindow.Unmeasured {
+		if got.PrimaryWindow == nil || got.PrimaryWindow.Unmeasured || got.PrimaryWindow.UsedPercent != 20 {
 			t.Fatalf("%s window %+v", tc.name, got.PrimaryWindow)
 		}
 		if got.AccountID != tc.name+"@example.com" {
