@@ -189,9 +189,11 @@ Per-provider real (private) files — everything else under the provider's home 
 
 | Provider | Real / private files | Spawn pins |
 |----------|----------------------|------------|
-| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | scrubs `CLAUDE_CONFIG_DIR` |
+| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | (none; `$HOME/.claude` is the config dir) |
 | `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced; shared tables refreshed from your real config on every spawn, hook/project/notice state kept private) | `CODEX_HOME=<profile>/.codex` |
 | `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
+
+Every shallow spawn, whatever its provider, scrubs every inherited provider-home override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_HOME`) plus `CAAM_HOME`/`XDG_DATA_HOME` before applying its own pins, so a shallow session started from inside another shallow session cannot inherit the outer profile's identity (issue #106).
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 

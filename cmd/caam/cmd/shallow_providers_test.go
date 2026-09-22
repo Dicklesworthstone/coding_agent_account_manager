@@ -398,3 +398,76 @@ func TestShallowSpawnCodex(t *testing.T) {
 		}
 	})
 }
+
+// TestShallowSpawnScrubsForeignProviderHomes: a shallow session of ANY
+// provider must drop every inherited provider-home override (issue #106). A
+// claude shallow spawn launched from inside a codex shallow session used to
+// carry the outer CODEX_HOME into nested tools (ccusage, codex, a nested
+// shallow-spawn), letting them read the outer profile's state. The session's
+// own provider still gets its variable re-pinned inside the shallow HOME.
+func TestShallowSpawnScrubsForeignProviderHomes(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+		"--from-vault", "codex/bob", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stageVaultFile(t, "agy", "carol", "antigravity-oauth-token", "T")
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "agy-carol",
+		"--from-vault", "agy/carol", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate being launched from inside another shallow session (or any
+	// leaky parent shell) that exported every provider home.
+	leaks := map[string]string{
+		"CLAUDE_CONFIG_DIR": "/outer/profile/.claude",
+		"CODEX_HOME":        "/outer/profile/.codex",
+		"GEMINI_HOME":       "/outer/profile/.gemini",
+	}
+	for k, v := range leaks {
+		t.Setenv(k, v)
+	}
+
+	var gotEnv []string
+	orig := spawnExec
+	spawnExec = func(_ string, _ []string, env []string) error { gotEnv = env; return nil }
+	t.Cleanup(func() { spawnExec = orig })
+
+	cases := []struct {
+		profile string
+		pinned  map[string]string
+	}{
+		{"alice", nil},
+		{"codex-bob", map[string]string{"CODEX_HOME": filepath.Join(base, "codex-bob", ".codex")}},
+		{"agy-carol", map[string]string{"GEMINI_HOME": filepath.Join(base, "agy-carol", ".gemini")}},
+	}
+	for _, tc := range cases {
+		gotEnv = nil
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", tc.profile, "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("%s: spawn: %v", tc.profile, err)
+		}
+		env := make(map[string]string, len(gotEnv))
+		for _, e := range gotEnv {
+			if i := strings.IndexByte(e, '='); i > 0 {
+				env[e[:i]] = e[i+1:]
+			}
+		}
+		for k, leaked := range leaks {
+			want, pinned := tc.pinned[k]
+			got, present := env[k]
+			switch {
+			case pinned && got != want:
+				t.Errorf("%s: %s = %q, want pinned %q", tc.profile, k, got, want)
+			case !pinned && present:
+				t.Errorf("%s: foreign %s=%q leaked into the shallow session (parent had %q)", tc.profile, k, got, leaked)
+			}
+		}
+		if env["HOME"] != filepath.Join(base, tc.profile) {
+			t.Errorf("%s: HOME = %q", tc.profile, env["HOME"])
+		}
+	}
+}

@@ -223,6 +223,12 @@ func childUnder(dir, rel string) string {
 // providers, which have no Agent View feature.
 //
 // SpawnEnv is a pure function so the env-isolation policy is unit-testable.
+// providerHomeEnv lists every variable a supported provider CLI honors as an
+// override of its config/credential directory. All of them are scrubbed from a
+// shallow session's environment regardless of the session's own provider; the
+// session's provider re-pins its own variable inside the shallow HOME.
+var providerHomeEnv = []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_HOME"}
+
 func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet bool) (set map[string]string, scrub []string) {
 	set = map[string]string{
 		"HOME":            home,
@@ -236,11 +242,18 @@ func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet b
 	// caam resolves its vault under the shallow HOME, where the caam data subtree
 	// is deliberately withheld, so the spawned process sees no other identities.
 	scrub = []string{"CAAM_HOME", "XDG_DATA_HOME"}
+	// Every provider-home override is scrubbed for EVERY provider (issue #106).
+	// A shallow session is itself a parent shell for whatever it spawns: a
+	// claude shallow spawn launched from inside a codex shallow session would
+	// otherwise inherit the outer CODEX_HOME, so nested tools (ccusage, a
+	// nested `caam shallow-spawn`, codex itself) read the outer profile's
+	// state. Likewise a stale CLAUDE_CONFIG_DIR from a parent shell would pin
+	// auth.json outside the shallow HOME, re-sharing the user's real identity.
+	// The provider's own home is re-pinned below via `set`, which is applied
+	// after the scrub, so pinning always wins over scrubbing.
+	scrub = append(scrub, providerHomeEnv...)
 	switch NormalizeProvider(provider) {
 	case "claude":
-		// A stale CLAUDE_CONFIG_DIR from a parent shell would pin auth.json
-		// outside the shallow HOME, re-sharing the user's real identity.
-		scrub = append(scrub, "CLAUDE_CONFIG_DIR")
 		// Agent View / background supervisor (issue #49): Claude Code's Agent
 		// View feature runs a long-lived, cross-session background supervisor
 		// daemon that is NOT bound to the shallow profile's HOME. On resume a

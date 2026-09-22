@@ -1024,11 +1024,14 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		}
 		envMap[e[:idx]] = e[idx+1:]
 	}
-	for k, v := range set {
-		envMap[k] = v
-	}
+	// Scrub BEFORE applying the overrides: the scrub list now covers every
+	// provider-home variable (issue #106), including the one this provider
+	// re-pins inside the shallow HOME, so the pin must be applied last.
 	for _, k := range scrub {
 		delete(envMap, k)
+	}
+	for k, v := range set {
+		envMap[k] = v
 	}
 	envSlice := make([]string, 0, len(envMap))
 	for k, v := range envMap {
