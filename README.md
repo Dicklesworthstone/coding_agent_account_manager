@@ -398,7 +398,7 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 **Login command:** `cursor-agent login`
 
-**Live limits:** `caam limits cursor` calls the authenticated DashboardService. Included usage comes from `GetCurrentPeriodUsage` (`includedSpend` / `limit`, plus the billing-cycle reset). `GetPlanInfo` supplies the plan name. `GetUsageLimitStatusAndActiveGrants` supplies the limit stage and any credit grants. It does not scrape the website and it does not use team admin spend. A stage or a reset with no spend and no limit leaves `quota_status` as `degraded` and does not invent a percentage. HTTP failures and malformed bodies are `quota_status: unavailable` and do not switch accounts.
+**Live limits:** `caam limits cursor` calls the authenticated DashboardService. Included usage for Cursor's own models comes from `GetCurrentPeriodUsage` (`includedSpend` / `limit`). Named third-party models are a second monthly pool on the same reset (`apiPercentUsed`), reported as the secondary window labeled "other models". `GetPlanInfo` supplies the plan name. `GetUsageLimitStatusAndActiveGrants` supplies the limit stage and any credit grants. It does not scrape the website and it does not use team admin spend. A stage or a reset with no spend and no limit leaves `quota_status` as `degraded` and does not invent a percentage. HTTP failures and malformed bodies are `quota_status: unavailable` and do not switch accounts.
 
 **Client versions exercised while writing this:**
 - Grok Build `1.0.40` (`eb1a2256660d`). `_x.ai/billing` returned a weekly period (reset 2026-09-28), tier, on-demand cap/used, prepaid balance, and a measured included percentage. No model prompt was sent.

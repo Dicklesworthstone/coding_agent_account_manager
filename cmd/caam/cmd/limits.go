@@ -552,6 +552,9 @@ func formatWindowPercent(w *usage.UsageWindow) string {
 	if w.Rolled {
 		return "0% (rolled)"
 	}
+	if w.Label != "" {
+		return fmt.Sprintf("%s %d%%", w.Label, w.UsedPercent)
+	}
 	return fmt.Sprintf("%d%%", w.UsedPercent)
 }
 

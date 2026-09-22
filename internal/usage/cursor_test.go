@@ -25,6 +25,8 @@ func TestParseCursorPeriod_IncludedSpend(t *testing.T) {
 			"includedSpend": 368,
 			"remaining": 39632,
 			"limit": 40000,
+			"apiPercentUsed": 3.61,
+			"autoPercentUsed": 0.0023,
 			"totalPercentUsed": 0.1187
 		},
 		"displayMessage": "You've used 1% of your included usage"
@@ -38,6 +40,23 @@ func TestParseCursorPeriod_IncludedSpend(t *testing.T) {
 	}
 	if info.PrimaryWindow.ResetsAt.UnixMilli() != 1791998506000 {
 		t.Fatalf("reset %s", info.PrimaryWindow.ResetsAt)
+	}
+	if info.SecondaryWindow == nil || info.SecondaryWindow.Unmeasured || info.SecondaryWindow.UsedPercent != 4 {
+		t.Fatalf("other-models window %+v", info.SecondaryWindow)
+	}
+	if info.SecondaryWindow.Label != "other models" || info.SecondaryWindow.Kind != "api" {
+		t.Fatalf("secondary label/kind = %q %q", info.SecondaryWindow.Label, info.SecondaryWindow.Kind)
+	}
+	if !info.SecondaryWindow.ResetsAt.Equal(info.PrimaryWindow.ResetsAt) {
+		t.Fatal("other-models reset differs from the included pool")
+	}
+}
+
+func TestParseCursorPeriod_APIPercentOutOfRangeIsIgnored(t *testing.T) {
+	raw := []byte(`{"billingCycleEnd":"1791998506000","planUsage":{"includedSpend":0,"limit":100,"apiPercentUsed":150}}`)
+	info := parseCursorPeriod(raw, time.Now())
+	if info.QuotaStatus != QuotaOK || info.SecondaryWindow != nil {
+		t.Fatalf("status %q secondary %+v", info.QuotaStatus, info.SecondaryWindow)
 	}
 }
 

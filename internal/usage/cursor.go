@@ -363,10 +363,24 @@ func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
 		UsedPercent: int(math.Round(pct)),
 		ResetsAt:    reset,
 		Kind:        "included",
-		Label:       "included",
+		Label:       "cursor models",
 	}
 	if start, ok := jsonInt(firstPresent(root, "billingCycleStart", "billing_cycle_start")); ok && start > 0 && !reset.IsZero() {
 		info.PrimaryWindow.WindowDuration = reset.Sub(time.UnixMilli(start))
+	}
+	// apiPercentUsed is the separate monthly allowance for named models
+	// (the CLI calls it "included API usage"). Cursor's own models draw on
+	// the included pool above. Both windows share the billing-cycle reset.
+	// The value is a 0-100 percent; anything outside that is ignored.
+	if api, ok := jsonFloat(firstPresent(plan, "apiPercentUsed", "api_percent_used")); ok && api >= 0 && api <= 100 {
+		info.SecondaryWindow = &UsageWindow{
+			Utilization:    api / 100,
+			UsedPercent:    int(math.Round(api)),
+			ResetsAt:       reset,
+			WindowDuration: info.PrimaryWindow.WindowDuration,
+			Kind:           "api",
+			Label:          "other models",
+		}
 	}
 	info.QuotaStatus = QuotaOK
 	info.QuotaNote = ""
