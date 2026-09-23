@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -292,24 +293,78 @@ func OpenCodeAuthFiles() AuthFileSet {
 	}
 }
 
-// CursorAuthFiles returns the auth files for Cursor CLI.
-// Cursor stores config in ~/.cursor/ directory.
+// CursorPaths holds the locations the Cursor Agent CLI (cursor-agent) uses
+// for its config and its file-backed credentials.
+type CursorPaths struct {
+	// ConfigDir holds cli-config.json (settings plus authInfo metadata).
+	ConfigDir string
+	// AuthFile is the file-backed credential store (accessToken,
+	// refreshToken, apiKey). On macOS the CLI prefers the login keychain and
+	// only falls back to this file.
+	AuthFile string
+}
+
+// ResolveCursorPaths mirrors cursor-agent's own path resolution for a given
+// home directory, target OS and environment lookup:
+//
+//   - config dir: $CURSOR_CONFIG_DIR, else $XDG_CONFIG_HOME/cursor, else
+//     <home>/.cursor (all platforms; blank values are ignored)
+//   - credentials: Linux and other Unix $XDG_CONFIG_HOME/cursor/auth.json
+//     (default <home>/.config/cursor/auth.json); macOS <home>/.cursor/auth.json;
+//     Windows %APPDATA%\Cursor\auth.json.
+//
+// Before this was resolved, caam backed up <home>/.cursor/auth.json on Linux,
+// a file current cursor-agent releases never read there, so switching did not
+// change the live login.
+func ResolveCursorPaths(home, goos string, getenv func(string) string) CursorPaths {
+	var p CursorPaths
+	switch {
+	case strings.TrimSpace(getenv("CURSOR_CONFIG_DIR")) != "":
+		p.ConfigDir = getenv("CURSOR_CONFIG_DIR")
+	case strings.TrimSpace(getenv("XDG_CONFIG_HOME")) != "":
+		p.ConfigDir = filepath.Join(getenv("XDG_CONFIG_HOME"), "cursor")
+	default:
+		p.ConfigDir = filepath.Join(home, ".cursor")
+	}
+
+	switch goos {
+	case "windows":
+		appData := getenv("APPDATA")
+		if appData == "" {
+			appData = filepath.Join(home, "AppData", "Roaming")
+		}
+		p.AuthFile = filepath.Join(appData, "Cursor", "auth.json")
+	case "darwin":
+		p.AuthFile = filepath.Join(home, ".cursor", "auth.json")
+	default:
+		configHome := getenv("XDG_CONFIG_HOME")
+		if configHome == "" {
+			configHome = filepath.Join(home, ".config")
+		}
+		p.AuthFile = filepath.Join(configHome, "cursor", "auth.json")
+	}
+	return p
+}
+
+// CursorAuthFiles returns the auth files for Cursor CLI, resolved the way
+// cursor-agent resolves them for the current user (see ResolveCursorPaths).
 func CursorAuthFiles() AuthFileSet {
 	homeDir, _ := os.UserHomeDir()
+	paths := ResolveCursorPaths(homeDir, runtime.GOOS, os.Getenv)
 
 	return AuthFileSet{
 		Tool: "cursor",
 		Files: []AuthFileSpec{
 			{
 				Tool:        "cursor",
-				Path:        filepath.Join(homeDir, ".cursor", "cli-config.json"),
+				Path:        filepath.Join(paths.ConfigDir, "cli-config.json"),
 				Description: "Cursor CLI auth (authInfo)",
 				Required:    false,
 			},
 			{
 				Tool:        "cursor",
-				Path:        filepath.Join(homeDir, ".cursor", "auth.json"),
-				Description: "Cursor CLI auth credentials (legacy)",
+				Path:        paths.AuthFile,
+				Description: "Cursor CLI auth credentials",
 				Required:    false,
 			},
 			{

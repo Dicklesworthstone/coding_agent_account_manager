@@ -10,10 +10,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/spf13/cobra"
 )
 
@@ -176,8 +179,14 @@ func getTracePaths(agent string, noProjects bool, extraPaths []string) ([]string
 		paths = []string{filepath.Join(dataHome, "opencode")}
 
 	case "cursor":
-		paths = []string{
-			filepath.Join(homeDir, ".cursor"),
+		// cursor-agent splits config and file-backed credentials across
+		// ~/.cursor and $XDG_CONFIG_HOME/cursor depending on platform and env.
+		cp := authfile.ResolveCursorPaths(homeDir, runtime.GOOS, os.Getenv)
+		paths = []string{filepath.Join(homeDir, ".cursor")}
+		for _, dir := range []string{cp.ConfigDir, filepath.Dir(cp.AuthFile)} {
+			if !slices.Contains(paths, dir) {
+				paths = append(paths, dir)
+			}
 		}
 
 	default:

@@ -310,3 +310,23 @@ func TestCreateFileInfo(t *testing.T) {
 		t.Error("createFileInfo() ModTime is empty")
 	}
 }
+
+// Cursor's config honors XDG_CONFIG_HOME, so a trace of a cursor login must
+// watch that directory as well as ~/.cursor.
+func TestGetTracePathsCursorIncludesXDGConfig(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("CURSOR_CONFIG_DIR", "")
+
+	paths, err := getTracePaths("cursor", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(xdg, "cursor")
+	for _, p := range paths {
+		if p == want {
+			return
+		}
+	}
+	t.Fatalf("cursor trace paths %v do not include %s", paths, want)
+}

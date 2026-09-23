@@ -204,6 +204,8 @@ func (p *Profile) LoadIdentity() {
 		id = loadIdentityFromPaths([]string{
 			filepath.Join(p.HomePath(), ".cursor", "cli-config.json"),
 			filepath.Join(p.HomePath(), ".cursor", "auth.json"),
+			// Linux cursor-agent keeps file-backed credentials under XDG config.
+			filepath.Join(p.HomePath(), ".config", "cursor", "auth.json"),
 		}, identity.ExtractFromGenericAuth)
 	}
 

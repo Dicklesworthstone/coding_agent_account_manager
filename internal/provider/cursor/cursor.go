@@ -1,9 +1,13 @@
 // Package cursor implements the provider adapter for Cursor CLI.
 //
 // Authentication mechanics:
-// - Cursor stores config in ~/.cursor/ directory.
-// - Auth files may include auth.json and settings.json within ~/.cursor/.
-// - Binary name: cursor
+//   - cli-config.json (authInfo metadata) lives in $CURSOR_CONFIG_DIR, else
+//     $XDG_CONFIG_HOME/cursor, else ~/.cursor.
+//   - File-backed credentials (auth.json) live in $XDG_CONFIG_HOME/cursor on
+//     Linux (default ~/.config/cursor), ~/.cursor on macOS (where the login
+//     keychain is preferred) and %APPDATA%\Cursor on Windows.
+//     See authfile.ResolveCursorPaths.
+//   - Binary name: cursor
 //
 // Auth file swapping (PRIMARY use case):
 // - Backup auth files after logging in with each account
@@ -17,8 +21,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
@@ -54,36 +60,62 @@ func (p *Provider) SupportedAuthModes() []provider.AuthMode {
 	}
 }
 
-// cursorHome returns the Cursor home directory.
-func cursorHome() string {
+// goos is the platform whose Cursor path layout is used. Tests override it.
+var goos = runtime.GOOS
+
+// userPaths returns the Cursor paths for the current user's real home.
+func userPaths() authfile.CursorPaths {
 	homeDir, _ := os.UserHomeDir()
-	return filepath.Join(homeDir, ".cursor")
+	return authfile.ResolveCursorPaths(homeDir, goos, os.Getenv)
 }
 
-// AuthFiles returns the auth file specifications for Cursor.
-//
-// cursor-agent now stores credentials in ~/.cursor/cli-config.json under the
-// "authInfo" key; older versions used ~/.cursor/auth.json. Both are kept so
-// account switching works across cursor-agent versions.
-func (p *Provider) AuthFiles() []provider.AuthFileSpec {
-	home := cursorHome()
-	return []provider.AuthFileSpec{
-		{
-			Path:        filepath.Join(home, "cli-config.json"),
-			Description: "Cursor CLI auth (authInfo)",
-			Required:    false,
-		},
-		{
-			Path:        filepath.Join(home, "auth.json"),
-			Description: "Cursor CLI auth credentials (legacy)",
-			Required:    false,
-		},
-		{
-			Path:        filepath.Join(home, "settings.json"),
-			Description: "Cursor CLI settings",
-			Required:    false,
-		},
+// profileEnv pins every variable cursor-agent uses to locate its config and
+// credentials, so an XDG_CONFIG_HOME or CURSOR_CONFIG_DIR inherited from the
+// caller cannot point a profile at the machine-global login. The pinned
+// values equal cursor-agent's defaults for that HOME, so existing profile
+// layouts keep working.
+func profileEnv(prof *profile.Profile) map[string]string {
+	home := prof.HomePath()
+	env := map[string]string{
+		"HOME":              home,
+		"XDG_CONFIG_HOME":   filepath.Join(home, ".config"),
+		"CURSOR_CONFIG_DIR": filepath.Join(home, ".cursor"),
 	}
+	if goos == "windows" {
+		// Windows credentials live under %APPDATA%, which HOME does not move.
+		env["APPDATA"] = filepath.Join(home, "AppData", "Roaming")
+	}
+	return env
+}
+
+// profilePaths returns the Cursor paths cursor-agent uses inside a profile.
+func profilePaths(prof *profile.Profile) authfile.CursorPaths {
+	env := profileEnv(prof)
+	lookup := func(k string) string {
+		return env[k]
+	}
+	return authfile.ResolveCursorPaths(prof.HomePath(), goos, lookup)
+}
+
+// legacyAuthPath is where older caam versions and older cursor-agent
+// releases kept auth.json inside a profile.
+func legacyAuthPath(prof *profile.Profile) string {
+	return filepath.Join(prof.HomePath(), ".cursor", "auth.json")
+}
+
+// AuthFiles returns the auth file specifications for Cursor, resolved the
+// way cursor-agent resolves them (see authfile.ResolveCursorPaths).
+func (p *Provider) AuthFiles() []provider.AuthFileSpec {
+	set := authfile.CursorAuthFiles()
+	specs := make([]provider.AuthFileSpec, 0, len(set.Files))
+	for _, f := range set.Files {
+		specs = append(specs, provider.AuthFileSpec{
+			Path:        f.Path,
+			Description: f.Description,
+			Required:    f.Required,
+		})
+	}
+	return specs
 }
 
 // hasAuthInfo reports whether the file at path is a Cursor cli-config.json that
@@ -121,16 +153,16 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 
 // Env returns the environment variables for running Cursor in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
-	env := map[string]string{
-		"HOME": prof.HomePath(),
-	}
-	return env, nil
+	return profileEnv(prof), nil
 }
 
 // Login initiates the authentication flow.
 func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
 	cmd := exec.CommandContext(ctx, "cursor")
-	cmd.Env = append(os.Environ(), "HOME="+prof.HomePath())
+	cmd.Env = os.Environ()
+	for k, v := range profileEnv(prof) {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -143,12 +175,26 @@ func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
 
 // Logout clears authentication credentials.
 func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
-	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
-	authPath := filepath.Join(cursorDir, "auth.json")
-	if err := os.Remove(authPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove auth.json: %w", err)
+	for _, authPath := range uniquePaths(profilePaths(prof).AuthFile, legacyAuthPath(prof)) {
+		if err := os.Remove(authPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", authPath, err)
+		}
 	}
 	return nil
+}
+
+// uniquePaths returns the non-empty paths in order without duplicates.
+func uniquePaths(paths ...string) []string {
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
 }
 
 // Status checks the current authentication state.
@@ -157,19 +203,20 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 		HasLockFile: prof.IsLocked(),
 	}
 
-	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
+	paths := profilePaths(prof)
 
 	// Primary: cli-config.json with a non-empty authInfo object.
-	cliConfigPath := filepath.Join(cursorDir, "cli-config.json")
-	if hasAuthInfo(cliConfigPath) {
+	if hasAuthInfo(filepath.Join(paths.ConfigDir, "cli-config.json")) {
 		status.LoggedIn = true
 		return status, nil
 	}
 
-	// Legacy: presence of auth.json.
-	authPath := filepath.Join(cursorDir, "auth.json")
-	if _, err := os.Stat(authPath); err == nil {
-		status.LoggedIn = true
+	// File-backed credentials: the platform location, then the legacy one.
+	for _, authPath := range uniquePaths(paths.AuthFile, legacyAuthPath(prof)) {
+		if _, err := os.Stat(authPath); err == nil {
+			status.LoggedIn = true
+			break
+		}
 	}
 
 	return status, nil
@@ -191,11 +238,11 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		Locations: []provider.AuthLocation{},
 	}
 
-	home := cursorHome()
+	paths := userPaths()
 
 	// Primary: cli-config.json. "Logged in" requires a non-empty authInfo
 	// object (the file also holds non-secret permission/config data).
-	cliConfigPath := filepath.Join(home, "cli-config.json")
+	cliConfigPath := filepath.Join(paths.ConfigDir, "cli-config.json")
 	cliLoc := provider.AuthLocation{
 		Path:        cliConfigPath,
 		Description: "Cursor CLI auth (authInfo)",
@@ -221,11 +268,11 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		detection.Primary = &locCopy
 	}
 
-	// Legacy: auth.json (presence + valid JSON).
-	authPath := filepath.Join(home, "auth.json")
+	// File-backed credentials: auth.json (presence + valid JSON).
+	authPath := paths.AuthFile
 	authLoc := provider.AuthLocation{
 		Path:        authPath,
-		Description: "Cursor CLI auth credentials (legacy)",
+		Description: "Cursor CLI auth credentials",
 	}
 	if info, err := os.Stat(authPath); err != nil {
 		if !os.IsNotExist(err) {
@@ -267,13 +314,18 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 		return nil, fmt.Errorf("source path is a directory, not a file")
 	}
 
-	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
-	if err := os.MkdirAll(cursorDir, 0700); err != nil {
-		return nil, fmt.Errorf("create cursor dir: %w", err)
-	}
-
+	// Place each file where cursor-agent reads it inside the profile.
+	paths := profilePaths(prof)
 	basename := filepath.Base(sourcePath)
-	targetPath := filepath.Join(cursorDir, basename)
+	var targetPath string
+	switch basename {
+	case "auth.json":
+		targetPath = paths.AuthFile
+	case "cli-config.json":
+		targetPath = filepath.Join(paths.ConfigDir, basename)
+	default:
+		targetPath = filepath.Join(prof.HomePath(), ".cursor", basename)
+	}
 	if err := copyFile(sourcePath, targetPath); err != nil {
 		return nil, fmt.Errorf("copy %s: %w", basename, err)
 	}
@@ -290,17 +342,19 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 		CheckedAt: time.Now(),
 	}
 
-	cursorDir := filepath.Join(prof.HomePath(), ".cursor")
+	paths := profilePaths(prof)
 
 	// Primary: cli-config.json must contain a non-empty authInfo object.
-	cliConfigPath := filepath.Join(cursorDir, "cli-config.json")
-	if hasAuthInfo(cliConfigPath) {
+	if hasAuthInfo(filepath.Join(paths.ConfigDir, "cli-config.json")) {
 		result.Valid = true
 		return result, nil
 	}
 
-	// Legacy: auth.json with valid JSON.
-	authPath := filepath.Join(cursorDir, "auth.json")
+	// File-backed credentials: the platform location, else the legacy one.
+	authPath := paths.AuthFile
+	if _, err := os.Stat(authPath); os.IsNotExist(err) {
+		authPath = legacyAuthPath(prof)
+	}
 	if _, err := os.Stat(authPath); os.IsNotExist(err) {
 		result.Valid = false
 		result.Error = "no Cursor auth found (cli-config.json authInfo empty/missing and auth.json not found)"
