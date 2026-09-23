@@ -141,6 +141,13 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 			}
 		case "codex":
 			return []string{filepath.Join(dir, "auth.json")}
+		case "grok":
+			return []string{filepath.Join(dir, "auth.json")}
+		case "cursor":
+			return []string{
+				filepath.Join(dir, "xdg-auth.json"),
+				filepath.Join(dir, "auth.json"),
+			}
 		}
 	case credNamespaceIsolated:
 		if l.Profiles == nil {
@@ -160,6 +167,13 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 			}
 		case "codex":
 			return []string{filepath.Join(prof.CodexHomePath(), "auth.json")}
+		case "grok":
+			return []string{filepath.Join(prof.HomePath(), ".grok", "auth.json")}
+		case "cursor":
+			return []string{
+				filepath.Join(prof.XDGConfigPath(), "cursor", "auth.json"),
+				filepath.Join(prof.HomePath(), ".cursor", "auth.json"),
+			}
 		}
 	case credNamespaceShallow:
 		if l.Shallow == nil {
@@ -233,6 +247,20 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 			token, _, err = usage.ReadClaudeCredentials(path)
 		case "codex":
 			token, _, err = usage.ReadCodexCredentials(path)
+		case "grok":
+			if _, statErr := os.Stat(path); statErr != nil {
+				err = statErr
+				break
+			}
+			token = "grok-home:" + filepath.Dir(path)
+		case "cursor":
+			if _, statErr := os.Stat(path); statErr != nil {
+				err = statErr
+				break
+			}
+			// The file itself is the credential root. Fetch will not look
+			// outside this path, so a global Cursor login cannot leak in.
+			token = "cursor-root:" + path
 		default:
 			return out
 		}

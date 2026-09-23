@@ -32,11 +32,31 @@ type AuthFileSpec struct {
 	// Path is the absolute path to the auth file.
 	Path string
 
+	// Name is the filename used inside the vault. Empty means filepath.Base(Path).
+	// Set it when two live files share a basename and must not overwrite each
+	// other (Cursor keeps an XDG tree and a legacy ~/.cursor tree).
+	Name string
+
 	// Description is a human-readable description.
 	Description string
 
 	// Required indicates if this file must exist for auth to work.
 	Required bool
+
+	// AuthPresent reports whether this file counts as a usable credential.
+	// Nil means the file existing is enough. Backup still copies a file that
+	// exists even when AuthPresent returns false — a settings file travels
+	// with the account, but it is not itself a login.
+	AuthPresent func(path string) bool
+}
+
+// vaultFileName is the basename used for this spec inside a profile directory.
+func vaultFileName(spec AuthFileSpec) string {
+	name := strings.TrimSpace(spec.Name)
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return filepath.Base(spec.Path)
+	}
+	return name
 }
 
 // AuthFileSet is a collection of auth files that together represent
@@ -292,35 +312,104 @@ func OpenCodeAuthFiles() AuthFileSet {
 	}
 }
 
-// CursorAuthFiles returns the auth files for Cursor CLI.
-// Cursor stores config in ~/.cursor/ directory.
+// CursorAuthFiles returns the auth files for Cursor Agent.
+//
+// Current Cursor Agent builds keep the live credential under
+// $XDG_CONFIG_HOME/cursor/ (default ~/.config/cursor/), not under ~/.cursor.
+// Changing HOME alone does not select an account when XDG_CONFIG_HOME still
+// points at the machine-global config. The legacy ~/.cursor tree is still
+// backed up so older installs round-trip.
+//
+// auth.json (access/refresh credentials) is what counts as a login.
+// cli-config.json also holds authInfo and editor settings; a non-empty
+// authInfo object is not by itself a usable credential, so it is copied when
+// present but does not satisfy HasAuthFiles.
 func CursorAuthFiles() AuthFileSet {
 	homeDir, _ := os.UserHomeDir()
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = filepath.Join(homeDir, ".config")
+	}
 
 	return AuthFileSet{
 		Tool: "cursor",
 		Files: []AuthFileSpec{
 			{
 				Tool:        "cursor",
-				Path:        filepath.Join(homeDir, ".cursor", "cli-config.json"),
-				Description: "Cursor CLI auth (authInfo)",
+				Path:        filepath.Join(xdg, "cursor", "auth.json"),
+				Name:        "xdg-auth.json",
+				Description: "Cursor Agent credentials (XDG config)",
 				Required:    false,
+				AuthPresent: cursorAuthFileHasAccessToken,
+			},
+			{
+				Tool:        "cursor",
+				Path:        filepath.Join(xdg, "cursor", "cli-config.json"),
+				Name:        "xdg-cli-config.json",
+				Description: "Cursor Agent config and account metadata (XDG config)",
+				Required:    false,
+				AuthPresent: neverAuth,
 			},
 			{
 				Tool:        "cursor",
 				Path:        filepath.Join(homeDir, ".cursor", "auth.json"),
-				Description: "Cursor CLI auth credentials (legacy)",
+				Name:        "auth.json",
+				Description: "Cursor CLI auth credentials (legacy ~/.cursor)",
 				Required:    false,
+				AuthPresent: cursorAuthFileHasAccessToken,
+			},
+			{
+				Tool:        "cursor",
+				Path:        filepath.Join(homeDir, ".cursor", "cli-config.json"),
+				Name:        "cli-config.json",
+				Description: "Cursor CLI config (legacy ~/.cursor)",
+				Required:    false,
+				AuthPresent: neverAuth,
 			},
 			{
 				Tool:        "cursor",
 				Path:        filepath.Join(homeDir, ".cursor", "settings.json"),
-				Description: "Cursor CLI settings",
+				Name:        "settings.json",
+				Description: "Cursor CLI settings (legacy ~/.cursor)",
 				Required:    false,
+				AuthPresent: neverAuth,
 			},
 		},
 		AllowOptionalOnly: true,
 	}
+}
+
+// neverAuth marks a file that is backed up with the account but is not a
+// credential. cli-config.json's authInfo is identity metadata, not proof the
+// access token for that profile is present or usable.
+func neverAuth(string) bool { return false }
+
+// cursorAuthFileHasAccessToken reports whether a Cursor auth.json holds a
+// non-empty access token. The file is the credential; account metadata in
+// cli-config.json is not.
+func cursorAuthFileHasAccessToken(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return false
+	}
+	for _, key := range []string{"accessToken", "access_token"} {
+		raw, ok := parsed[key]
+		if !ok {
+			continue
+		}
+		var token string
+		if err := json.Unmarshal(raw, &token); err != nil {
+			continue
+		}
+		if strings.TrimSpace(token) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // GetAuthFileSet returns the AuthFileSet for the given provider name.
@@ -471,8 +560,8 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 			continue // Skip optional files that don't exist
 		}
 
-		// Copy file to vault
-		filename := filepath.Base(spec.Path)
+		// Copy file to vault. Name disambiguates two live files that share a basename.
+		filename := vaultFileName(spec)
 		destPath := filepath.Join(profileDir, filename)
 
 		if err := copyFile(spec.Path, destPath); err != nil {
@@ -816,7 +905,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	optionalFound := false
 	var missingRequired []string
 	for _, spec := range fileSet.Files {
-		filename := filepath.Base(spec.Path)
+		filename := vaultFileName(spec)
 		srcPath := filepath.Join(profileDir, filename)
 
 		// Check if backup exists
@@ -1105,6 +1194,13 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 				continue
 			}
 		}
+		// A file that explicitly is not a credential (Cursor cli-config.json
+		// holds editor settings plus authInfo) must not decide which profile
+		// is active. Those files drift while the access token stays put, and
+		// hashing them hides a logged-in account.
+		if spec.AuthPresent != nil && !spec.AuthPresent(spec.Path) {
+			continue
+		}
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}
@@ -1112,7 +1208,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		if err != nil {
 			continue
 		}
-		base := filepath.Base(spec.Path)
+		base := vaultFileName(spec)
 		if spec.Required {
 			requiredFound = true
 			currentHashes[base] = hash
@@ -1197,12 +1293,17 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 			}
 			continue
 		}
-		if _, err := os.Stat(spec.Path); err == nil {
-			if spec.Required {
-				return true
+		if spec.AuthPresent != nil {
+			if !spec.AuthPresent(spec.Path) {
+				continue
 			}
-			optionalFound = true
+		} else if _, err := os.Stat(spec.Path); err != nil {
+			continue
 		}
+		if spec.Required {
+			return true
+		}
+		optionalFound = true
 	}
 	if fileSet.AllowOptionalOnly && optionalFound {
 		return true

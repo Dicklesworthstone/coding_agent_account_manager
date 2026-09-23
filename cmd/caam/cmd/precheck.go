@@ -211,7 +211,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	var usageResults []usage.ProfileUsage
 	var usageMap map[string]*usage.UsageInfo
 
-	if !noFetch && (provider == "claude" || provider == "codex") {
+	if !noFetch && isLimitsProvider(provider) {
 		credentials, err := usage.LoadProfileCredentials(authfile.DefaultVaultPath(), provider)
 		if err == nil && len(credentials) > 0 {
 			fetchCtx, cancel := context.WithTimeout(ctx, timeout)

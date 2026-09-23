@@ -61,6 +61,8 @@ type CredentialAlternative struct {
 type MultiProfileFetcher struct {
 	claudeFetcher *ClaudeFetcher
 	codexFetcher  *CodexFetcher
+	grokFetcher   *GrokFetcher
+	cursorFetcher *CursorFetcher
 	logScanner    logs.Scanner // Optional scanner for burn rate calculation
 }
 
@@ -79,6 +81,8 @@ func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 	m := &MultiProfileFetcher{
 		claudeFetcher: NewClaudeFetcher(),
 		codexFetcher:  NewCodexFetcher(),
+		grokFetcher:   NewGrokFetcher(),
+		cursorFetcher: NewCursorFetcher(),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -125,6 +129,28 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 					}
 				} else {
 					info, err = m.codexFetcher.Fetch(ctx, token)
+				}
+			case "grok":
+				if m.grokFetcher == nil {
+					info = &UsageInfo{
+						Provider:    provider,
+						FetchedAt:   time.Now(),
+						QuotaStatus: QuotaUnavailable,
+						Error:       "grok fetcher unavailable",
+					}
+				} else {
+					info, err = m.grokFetcher.Fetch(ctx, token)
+				}
+			case "cursor":
+				if m.cursorFetcher == nil {
+					info = &UsageInfo{
+						Provider:    provider,
+						FetchedAt:   time.Now(),
+						QuotaStatus: QuotaUnavailable,
+						Error:       "cursor fetcher unavailable",
+					}
+				} else {
+					info, err = m.cursorFetcher.Fetch(ctx, token)
 				}
 			default:
 				info = &UsageInfo{
@@ -398,6 +424,18 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 		case "codex":
 			authPath := filepath.Join(profileDir, "auth.json")
 			token, _, readErr = ReadCodexCredentials(authPath)
+		case "grok":
+			authPath := filepath.Join(profileDir, "auth.json")
+			if _, statErr := os.Stat(authPath); statErr != nil {
+				readErr = statErr
+				break
+			}
+			// The fetcher reads auth.json itself under GROK_HOME. The map
+			// value is that directory, not the token.
+			token = "grok-home:" + profileDir
+			readErr = nil
+		case "cursor":
+			token, readErr = cursorVaultLocator(profileDir)
 		}
 
 		if readErr != nil {

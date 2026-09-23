@@ -161,15 +161,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Precheck: switch profile if near limit before running
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
-	if precheck && (tool == "claude" || tool == "codex") {
+	if precheck && isLimitsProvider(tool) {
 		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
 			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
 		// Loud fallback (issue #79): usage prechecking needs real-time limit
-		// support, which exists for claude and codex only. Say so — on stderr,
-		// even in quiet mode — instead of silently ignoring the flag.
-		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for claude and codex only); running without a usage precheck\n", tool)
+		// support. Say so — on stderr, even in quiet mode — instead of
+		// silently ignoring the flag.
+		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for %s); running without a usage precheck\n", tool, strings.Join(limitsProviders, ", "))
 	}
 
 	// Initialize AuthPool (if enabled in config)

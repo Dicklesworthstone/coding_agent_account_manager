@@ -308,6 +308,14 @@ func classify(row ProfileUsage, model string, ceiling int, requireModelWindow bo
 
 	used, window, ok := bindingUsage(u, model)
 	if !ok {
+		if u.QuotaStatus == QuotaDegraded || u.QuotaStatus == QuotaUnavailable {
+			note := u.QuotaNote
+			if note == "" {
+				note = "the provider did not include a numeric utilization"
+			}
+			out.Reason = note + "; refusing to treat that as spare capacity"
+			return out
+		}
 		out.Reason = "the provider reported no rate limit window for this profile"
 		return out
 	}
@@ -385,7 +393,7 @@ func bindingUsage(u *UsageInfo, model string) (int, string, bool) {
 	name := ""
 	found := false
 	for _, c := range candidates {
-		if c.w == nil {
+		if c.w == nil || c.w.Unmeasured {
 			continue
 		}
 		if !found || c.w.UsedPercent > used {

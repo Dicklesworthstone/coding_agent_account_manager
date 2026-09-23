@@ -28,13 +28,27 @@ func toRotationUsageInfo(name string, u *usage.UsageInfo, model string) *rotatio
 		Error:       u.Error,
 	}
 
-	if u.PrimaryWindow != nil {
+	// A response that did not include a numeric utilization must not enter
+	// rotation as 0% used ("plenty available") or as a perfect score. The
+	// selector already treats a non-empty Error as "usage unavailable" and
+	// does not switch on it.
+	if !u.NumericQuotaKnown() && info.Error == "" {
+		if u.QuotaNote != "" {
+			info.Error = u.QuotaNote
+		} else {
+			info.Error = "numeric quota unavailable"
+		}
+		info.AvailScore = 0
+		return info
+	}
+
+	if u.PrimaryWindow != nil && !u.PrimaryWindow.Unmeasured {
 		info.PrimaryPercent = u.PrimaryWindow.UsedPercent
 	}
-	if u.SecondaryWindow != nil {
+	if u.SecondaryWindow != nil && !u.SecondaryWindow.Unmeasured {
 		info.SecondaryPercent = u.SecondaryWindow.UsedPercent
 	}
-	if scoped := u.ScopedLimit(model); scoped != nil {
+	if scoped := u.ScopedLimit(model); scoped != nil && !scoped.Unmeasured {
 		info.ScopedPercent = scoped.UsedPercent
 		info.ScopedLabel = scoped.Label
 	}

@@ -24,7 +24,7 @@ func (r *BriefRenderer) Render(state *MonitorState) string {
 		}
 	}
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	providers := []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	parts := make([]string, 0, len(providers))
 	for _, prov := range providers {
 		p := byProvider[prov]
@@ -32,6 +32,10 @@ func (r *BriefRenderer) Render(state *MonitorState) string {
 			continue
 		}
 		percent := usagePercent(p.Usage)
+		if percent < 0 {
+			parts = append(parts, prov+":?")
+			continue
+		}
 		trend := "-"
 		switch {
 		case percent >= 80:

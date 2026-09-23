@@ -30,12 +30,14 @@ This command queries the provider's API to get current rate limit utilization,
 which is useful for deciding when to switch accounts. It also parses local logs
 to estimate token burn rate and predict when limits will be hit.
 
-Live limit fetching is available for providers with usage APIs (claude, codex).
+Live limit fetching is available for providers with usage APIs (claude, codex, grok, cursor).
 
 Examples:
-  caam limits                     # Show limits for all supported providers (claude, codex)
+  caam limits                     # Show limits for all supported providers
   caam limits claude              # Show Claude limits only
   caam limits codex               # Show Codex limits only
+  caam limits grok                # Show Grok billing for each saved profile
+  caam limits cursor              # Show Cursor limit status for each saved profile
   caam limits --profile work      # Show limits for a specific profile
   caam limits --format json       # Output as JSON
   caam limits --best              # Show the best profile for rotation
@@ -338,7 +340,7 @@ func sortResultsForModel(results []usage.ProfileUsage, model string) {
 }
 
 // limitsProviders are the providers with live limit/usage API support.
-var limitsProviders = []string{"claude", "codex"}
+var limitsProviders = []string{"claude", "codex", "grok", "cursor"}
 
 func isLimitsProvider(p string) bool {
 	for _, lp := range limitsProviders {
@@ -481,15 +483,18 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 					status = "no cached data"
 				case r.Usage.Error != "":
 					status = "error: " + truncate(r.Usage.Error, 20)
+				case r.Usage.QuotaStatus == usage.QuotaDegraded:
+					status = "degraded"
+				case r.Usage.QuotaStatus == usage.QuotaUnavailable:
+					status = "unavailable"
 				default:
 					status = "ok"
 				}
 
-				// A row with no data scores nothing. Running the availability
-				// scorer over empty windows would return a perfect 100 and
-				// present an account caam knows nothing about as the idlest
-				// one on the table.
-				if !noData {
+				// A row with no numeric quota scores nothing. Running the
+				// availability scorer over an unmeasured window would return
+				// a perfect 100 and present that account as the idlest one.
+				if !noData && r.Usage.NumericQuotaKnown() {
 					score = strconv.Itoa(r.Usage.AvailabilityScoreForModel(model))
 					scoped = formatScopedLimit(r.Usage.ScopedLimit(model))
 				}
@@ -541,11 +546,14 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 // already rolled over when the figures were read is marked, so an honest 0%
 // from a stale snapshot is not mistaken for a measured one.
 func formatWindowPercent(w *usage.UsageWindow) string {
-	if w == nil {
+	if w == nil || w.Unmeasured {
 		return "-"
 	}
 	if w.Rolled {
 		return "0% (rolled)"
+	}
+	if w.Label != "" {
+		return fmt.Sprintf("%s %d%%", w.Label, w.UsedPercent)
 	}
 	return fmt.Sprintf("%d%%", w.UsedPercent)
 }
@@ -595,17 +603,21 @@ func formatBurnRate(tokensPerHour float64) string {
 }
 
 func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
-	// Filter to profiles that are available
+	// Filter to profiles that are available. A degraded or unavailable row is
+	// not available: its percentage was not measured, so it is not the best
+	// seat and it is not a reason to switch.
 	var available []usage.ProfileUsage
 	for _, r := range results {
-		if r.Usage != nil && r.Usage.Error == "" && !r.Usage.IsNearLimitForModel(threshold, model) {
+		if r.Usage != nil && r.Usage.NumericQuotaKnown() && !r.Usage.IsNearLimitForModel(threshold, model) {
 			available = append(available, r)
 		}
 	}
 
 	if len(available) == 0 {
-		// Fall back to best score even if above threshold
-		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.Error == "" {
+		// Fall back to best score even if above threshold. Still require a
+		// measured quota — falling through to an unmeasured row would switch
+		// onto an account whose remaining allowance is unknown.
+		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.NumericQuotaKnown() {
 			available = results[:1]
 		}
 	}

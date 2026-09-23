@@ -35,7 +35,7 @@ var secretEnv = []string{
 // login or spawn path can neither start a real CLI (which rewrites its own
 // config and begins an OAuth flow) nor open a browser window.
 var stubbedBinaries = []string{
-	"claude", "codex", "gemini", "agy", "grok", "opencode", "cursor", "npx",
+	"claude", "codex", "gemini", "agy", "grok", "opencode", "cursor", "cursor-agent", "npx",
 	"open", "xdg-open", "sensible-browser", "x-www-browser",
 }
 
