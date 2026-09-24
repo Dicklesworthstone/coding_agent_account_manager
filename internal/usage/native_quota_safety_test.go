@@ -260,7 +260,7 @@ func TestGrokStagesOnlyCredentialsAndIsolatesConfig(t *testing.T) {
 		t.Error("billing stage inherited arbitrary client configuration")
 	}
 	st, err := os.Stat(filepath.Join(stage, "auth.json"))
-	if err != nil || st.Mode().Perm() != 0600 {
+	if err != nil || (runtime.GOOS != "windows" && st.Mode().Perm() != 0600) {
 		t.Fatalf("staged credential permissions: %v, %v", st, err)
 	}
 	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "GROK_DEPLOYMENT_KEY", "XAI_API_KEY"} {

@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -141,6 +142,10 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 			}
 		case "codex":
 			return []string{filepath.Join(dir, "auth.json")}
+		case "grok":
+			return []string{filepath.Join(dir, "auth.json")}
+		case "cursor":
+			return []string{filepath.Join(dir, "auth.json")}
 		}
 	case credNamespaceIsolated:
 		if l.Profiles == nil {
@@ -160,6 +165,14 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 			}
 		case "codex":
 			return []string{filepath.Join(prof.CodexHomePath(), "auth.json")}
+		case "grok":
+			return []string{filepath.Join(prof.HomePath(), ".grok", "auth.json")}
+		case "cursor":
+			// The provider pins environment roots to this HOME's defaults.
+			// Use the same platform resolver, never the caller's environment
+			// or a stale alternate credential tree.
+			paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(string) string { return "" })
+			return []string{paths.AuthFile}
 		}
 	case credNamespaceShallow:
 		if l.Shallow == nil {
@@ -233,6 +246,8 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 			token, _, err = usage.ReadClaudeCredentials(path)
 		case "codex":
 			token, _, err = usage.ReadCodexCredentials(path)
+		case "grok", "cursor":
+			token, err = usage.NativeCredentialLocator(provider, path)
 		default:
 			return out
 		}

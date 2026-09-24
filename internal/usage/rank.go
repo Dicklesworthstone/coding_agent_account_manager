@@ -305,9 +305,28 @@ func classify(row ProfileUsage, model string, ceiling int, requireModelWindow bo
 		out.Reason = "limits could not be read: " + u.Error
 		return out
 	}
+	// A degraded row can retain a valid primary window for display while a
+	// different pool or limit stage makes the account unsafe to route to.
+	// Check the whole row before deriving headroom or considering credits.
+	if !u.NumericQuotaKnown() {
+		out.Reason = u.QuotaNote
+		if out.Reason == "" {
+			out.Reason = "numeric quota unavailable"
+		}
+		out.Reason += "; refusing to treat that as spare capacity"
+		return out
+	}
 
 	used, window, ok := bindingUsage(u, model)
 	if !ok {
+		if u.QuotaStatus == QuotaDegraded || u.QuotaStatus == QuotaUnavailable {
+			note := u.QuotaNote
+			if note == "" {
+				note = "the provider did not include a numeric utilization"
+			}
+			out.Reason = note + "; refusing to treat that as spare capacity"
+			return out
+		}
 		out.Reason = "the provider reported no rate limit window for this profile"
 		return out
 	}
@@ -385,7 +404,7 @@ func bindingUsage(u *UsageInfo, model string) (int, string, bool) {
 	name := ""
 	found := false
 	for _, c := range candidates {
-		if c.w == nil {
+		if c.w == nil || c.w.Unmeasured {
 			continue
 		}
 		if !found || c.w.UsedPercent > used {

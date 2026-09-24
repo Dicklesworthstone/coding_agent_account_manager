@@ -61,6 +61,8 @@ type CredentialAlternative struct {
 type MultiProfileFetcher struct {
 	claudeFetcher *ClaudeFetcher
 	codexFetcher  *CodexFetcher
+	grokFetcher   *GrokFetcher
+	cursorFetcher *CursorFetcher
 	logScanner    logs.Scanner // Optional scanner for burn rate calculation
 }
 
@@ -79,6 +81,8 @@ func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 	m := &MultiProfileFetcher{
 		claudeFetcher: NewClaudeFetcher(),
 		codexFetcher:  NewCodexFetcher(),
+		grokFetcher:   NewGrokFetcher(),
+		cursorFetcher: NewCursorFetcher(),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -126,6 +130,28 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 				} else {
 					info, err = m.codexFetcher.Fetch(ctx, token)
 				}
+			case "grok":
+				if m.grokFetcher == nil {
+					info = &UsageInfo{
+						Provider:    provider,
+						FetchedAt:   time.Now(),
+						QuotaStatus: QuotaUnavailable,
+						Error:       "grok fetcher unavailable",
+					}
+				} else {
+					info, err = m.grokFetcher.Fetch(ctx, token)
+				}
+			case "cursor":
+				if m.cursorFetcher == nil {
+					info = &UsageInfo{
+						Provider:    provider,
+						FetchedAt:   time.Now(),
+						QuotaStatus: QuotaUnavailable,
+						Error:       "cursor fetcher unavailable",
+					}
+				} else {
+					info, err = m.cursorFetcher.Fetch(ctx, token)
+				}
 			default:
 				info = &UsageInfo{
 					Provider:  provider,
@@ -146,6 +172,16 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 				}
 			} else if err != nil && info.Error == "" {
 				info.Error = err.Error()
+			}
+			// Older consumers (including recommendations and forecasts) use
+			// Error as their eligibility check. Keep the precise native status
+			// and display metadata, but do not let an incomplete row appear
+			// healthy to those consumers.
+			if (provider == "grok" || provider == "cursor") && !info.NumericQuotaKnown() && info.Error == "" {
+				info.Error = info.QuotaNote
+				if info.Error == "" {
+					info.Error = "numeric quota unavailable"
+				}
 			}
 
 			if info != nil {
@@ -239,10 +275,16 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 // GetBestProfile returns the profile with the highest availability score.
 func (m *MultiProfileFetcher) GetBestProfile(ctx context.Context, provider string, profiles map[string]string) *ProfileUsage {
 	results := m.FetchAllProfiles(ctx, provider, profiles)
-	if len(results) == 0 {
-		return nil
+	for i := range results {
+		if provider == "grok" || provider == "cursor" {
+			u := results[i].Usage
+			if !u.NumericQuotaKnown() || u.IsNearLimit(1) {
+				continue
+			}
+		}
+		return &results[i]
 	}
-	return &results[0]
+	return nil
 }
 
 // GetProfilesAboveThreshold returns profiles with usage below the threshold.
@@ -252,6 +294,9 @@ func (m *MultiProfileFetcher) GetProfilesAboveThreshold(ctx context.Context, pro
 	available := make([]ProfileUsage, 0)
 
 	for _, p := range results {
+		if (provider == "grok" || provider == "cursor") && !p.Usage.NumericQuotaKnown() {
+			continue
+		}
 		if p.Usage != nil && !p.Usage.IsNearLimit(threshold) {
 			available = append(available, p)
 		}
@@ -398,6 +443,9 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 		case "codex":
 			authPath := filepath.Join(profileDir, "auth.json")
 			token, _, readErr = ReadCodexCredentials(authPath)
+		case "grok", "cursor":
+			authPath := filepath.Join(profileDir, "auth.json")
+			token, readErr = NativeCredentialLocator(provider, authPath)
 		}
 
 		if readErr != nil {

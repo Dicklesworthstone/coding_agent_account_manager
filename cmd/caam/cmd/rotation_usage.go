@@ -28,13 +28,26 @@ func toRotationUsageInfo(name string, u *usage.UsageInfo, model string) *rotatio
 		Error:       u.Error,
 	}
 
-	if u.PrimaryWindow != nil {
+	// Mark incomplete measurements before converting their zero-valued fields.
+	// NativeQuotaCandidates excludes these errors before native usage-aware
+	// selection; a generic scoring penalty would not be a sufficient guard.
+	if !u.NumericQuotaKnown() && info.Error == "" {
+		if u.QuotaNote != "" {
+			info.Error = u.QuotaNote
+		} else {
+			info.Error = "numeric quota unavailable"
+		}
+		info.AvailScore = 0
+		return info
+	}
+
+	if u.PrimaryWindow != nil && !u.PrimaryWindow.Unmeasured {
 		info.PrimaryPercent = u.PrimaryWindow.UsedPercent
 	}
-	if u.SecondaryWindow != nil {
+	if u.SecondaryWindow != nil && !u.SecondaryWindow.Unmeasured {
 		info.SecondaryPercent = u.SecondaryWindow.UsedPercent
 	}
-	if scoped := u.ScopedLimit(model); scoped != nil {
+	if scoped := u.ScopedLimit(model); scoped != nil && !scoped.Unmeasured {
 		info.ScopedPercent = scoped.UsedPercent
 		info.ScopedLabel = scoped.Label
 	}

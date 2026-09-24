@@ -74,6 +74,18 @@ func usageUnavailable(info *usage.UsageInfo) string {
 	if info == nil {
 		return "no usage data"
 	}
+	// Native rows can retain a display window even when another quota is
+	// unknown, or fail before a fetcher has assigned QuotaStatus.
+	if nativeQuotaUnknown(info) || info.QuotaStatus == usage.QuotaDegraded || info.QuotaStatus == usage.QuotaUnavailable {
+		note := info.QuotaNote
+		if note == "" {
+			note = info.Error
+		}
+		if note == "" {
+			note = "numeric quota unavailable"
+		}
+		return "no usage: " + shortUsageError(note)
+	}
 	// Real data present (a usage window, or a credit balance) -> show the number.
 	if info.MostConstrainedWindow() != nil || info.Credits != nil {
 		return ""
@@ -107,9 +119,18 @@ func shortUsageError(err string) string {
 	return err
 }
 
+func nativeQuotaUnknown(info *usage.UsageInfo) bool {
+	return (info.Provider == "grok" || info.Provider == "cursor") && !info.NumericQuotaKnown()
+}
+
 func usagePercent(info *usage.UsageInfo) float64 {
 	if info == nil {
 		return 0
+	}
+	// Negative means "not a measurement". Callers must not print it as 0%.
+	// Preserve the historical plain-error path for Claude/Codex.
+	if nativeQuotaUnknown(info) || info.QuotaStatus == usage.QuotaDegraded || info.QuotaStatus == usage.QuotaUnavailable {
+		return -1
 	}
 	window := info.MostConstrainedWindow()
 	if window == nil {

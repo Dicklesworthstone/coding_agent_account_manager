@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -88,7 +89,8 @@ func runNext(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
 
-	if len(profiles) == 1 {
+	// Native usage-aware selection must validate even a sole candidate.
+	if len(profiles) == 1 && !(usageAware && (tool == "grok" || tool == "cursor")) {
 		if currentProfile == profiles[0] {
 			fmt.Printf("Only one profile available for %s (%s), already active\n", tool, profiles[0])
 			return nil
@@ -151,16 +153,15 @@ func runNext(cmd *cobra.Command, args []string) error {
 
 	// Fetch usage data if --usage-aware is set
 	var usageData map[string]*rotation.UsageInfo
-	if usageAware && (tool == "claude" || tool == "codex") {
+	if usageAware && isLimitsProvider(tool) {
 		if !quiet {
 			fmt.Printf("Fetching real-time usage data for %d profiles...\n", len(profiles))
 		}
 		usageData = fetchUsageDataForProfiles(tool, profiles)
 	} else if usageAware {
-		// Loud fallback (issue #79): real-time limit fetching is implemented for
-		// claude and codex only. Say so — on stderr, even in quiet mode — instead
-		// of silently ignoring the flag the user asked for.
-		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for claude and codex only); selecting without usage data\n", tool)
+		// Loud fallback (issue #79): say so — on stderr, even in quiet mode —
+		// instead of silently ignoring the flag the user asked for.
+		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for %s); selecting without usage data\n", tool, strings.Join(limitsProviders, ", "))
 	}
 
 	// Select next profile using rotation
@@ -266,8 +267,19 @@ func pluralize(n int) string {
 // fetchUsageDataForProfiles fetches real-time usage data for all profiles.
 func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotation.UsageInfo {
 	vaultDir := authfile.DefaultVaultPath()
-	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
+	var credentials map[string]string
+	var err error
+	if tool == "grok" || tool == "cursor" {
+		credentials = nativeRotationCredentials(tool, profiles)
+	} else {
+		credentials, err = usage.LoadProfileCredentials(vaultDir, tool)
+	}
 	if err != nil || len(credentials) == 0 {
+		if tool == "grok" || tool == "cursor" {
+			// Non-nil means usage was requested but no account was measured.
+			// A nil map would silently opt out of fail-closed selection.
+			return map[string]*rotation.UsageInfo{}
+		}
 		return nil
 	}
 
@@ -291,10 +303,38 @@ func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotat
 	return usageData
 }
 
+// Native quota reads must use the same vault and candidate set that will be
+// activated, not an identically named profile in the default vault.
+func nativeRotationCredentials(tool string, profiles []string) map[string]string {
+	v := vault
+	if v == nil {
+		v = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	credentials := make(map[string]string)
+	for _, name := range profiles {
+		if authfile.IsSystemProfile(name) {
+			continue
+		}
+		path := filepath.Join(v.ProfilePath(tool, name), "auth.json")
+		if locator, err := usage.NativeCredentialLocator(tool, path); err == nil {
+			credentials[name] = locator
+		}
+	}
+	return credentials
+}
+
 // selectProfileWithRotationAndUsage selects a profile using rotation with optional usage data.
 func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo) (*rotation.Result, error) {
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
+	}
+	// Apply eligibility before every algorithm, including the single-profile
+	// shortcut and runNext's forced round-robin retry. Scoring penalties alone
+	// do not stop an unknown account from being selected.
+	var err error
+	profiles, err = rotation.NativeQuotaCandidates(tool, profiles, usageData)
+	if err != nil {
+		return nil, err
 	}
 
 	primePlanTypes(tool, profiles)
