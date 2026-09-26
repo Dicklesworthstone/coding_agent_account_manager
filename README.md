@@ -376,11 +376,11 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 - `~/.grok/auth.json` — login credential written by `grok login` (required)
 - `~/.grok/config.toml` — CLI configuration (optional, travels with the account)
 
-**Login Command:** `grok login` (browser OIDC via xAI accounts)
+**Login Command:** `grok login`, or `grok login --device-auth` on a machine without a browser.
 
-**Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). Grok Build tokens expire after 7 days; run `grok login` to refresh — CAAM cannot refresh them.
+**Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). A new login, including device-auth, replaces that credential and the previous refresh token stops working. CAAM does not refresh Grok tokens itself.
 
-**Live limits:** `caam limits grok` asks the authenticated `grok agent stdio` process for the `_x.ai/billing` extension under that profile's `GROK_HOME`. It does not send a model prompt. The JSON row includes `plan_type`, `billing` (period start/end, on-demand cents, prepaid balance) and, when the provider sent `creditUsagePercent` or a used/limit pair inside 0–100, a measured `primary_window`. If those numbers are missing, `quota_status` is `degraded`, `quota_note` says why, and any `primary_window` is `unmeasured` (its `used_percent` is not a measurement). A degraded row is excluded from `--best` and from usage-aware rotation.
+**Live limits:** `caam limits grok` asks the authenticated `grok agent stdio` process for the `_x.ai/billing` extension. It does not send a model prompt. The vault copy is the credential it starts from. When `$GROK_HOME` (default `~/.grok`) holds a newer login for the same account — the session `grok login --device-auth` just wrote — billing uses that live file. An older snapshot is rejected by the CLI, which then waits on a browser login that this command does not complete. The JSON row includes `plan_type`, `billing` (period start/end, on-demand cents, prepaid balance) and, when the provider sent `creditUsagePercent` or a used/limit pair inside 0–100, a measured `primary_window`. If those numbers are missing, `quota_status` is `degraded`, `quota_note` says why, and any `primary_window` is `unmeasured` (its `used_percent` is not a measurement). A degraded row is excluded from `--best` and from usage-aware rotation.
 
 **Caveats:**
 - **`GROK_DEPLOYMENT_KEY` precedence:** in enterprise/deployment setups this environment variable takes precedence over `auth.json`, so a swapped profile is silently ignored while it is set.

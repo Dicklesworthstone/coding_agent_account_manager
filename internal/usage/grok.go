@@ -49,6 +49,11 @@ func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, e
 	if st, err := os.Stat(home); err == nil && !st.IsDir() {
 		home = filepath.Dir(home)
 	}
+	// A device-auth (or any later) login lands in the live GROK_HOME and
+	// invalidates the refresh token frozen in the vault. Billing has to
+	// follow that live file; the snapshot makes the CLI abandon cached_token
+	// and block on a browser login.
+	home = preferFresherLiveGrokHome(home)
 	authPath := filepath.Join(home, "auth.json")
 	if _, err := os.Stat(authPath); err != nil {
 		info.Error = "grok auth.json not found for this profile"
@@ -154,6 +159,9 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, srcHome string) (json.Ra
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("grok billing response was not readable")
 		}
+		if method == "authenticate" {
+			return nil, fmt.Errorf("grok did not accept the saved credential")
+		}
 		return nil, fmt.Errorf("grok closed before %s completed", method)
 	}
 
@@ -194,6 +202,104 @@ func stageGrokHome(src string) (string, error) {
 	return stage, nil
 }
 
+// preferFresherLiveGrokHome returns the machine's current Grok login when it
+// is the same account as requested and its access token expires later.
+// `grok login` and `grok login --device-auth` both write that login to
+// $GROK_HOME (default ~/.grok). An older vault copy of the same account still
+// has a refresh token the CLI will try, fail, and then replace with a
+// browser login that stdio cannot finish.
+func preferFresherLiveGrokHome(requested string) string {
+	live := liveGrokConfigHome()
+	if live == "" || sameDir(live, requested) {
+		return requested
+	}
+	if _, err := os.Stat(filepath.Join(live, "auth.json")); err != nil {
+		return requested
+	}
+	if !sameGrokAccount(requested, live) {
+		return requested
+	}
+	liveExp := grokAuthExpiry(filepath.Join(live, "auth.json"))
+	if liveExp.IsZero() {
+		return requested
+	}
+	reqExp := grokAuthExpiry(filepath.Join(requested, "auth.json"))
+	if !liveExp.After(reqExp) {
+		return requested
+	}
+	return live
+}
+
+func liveGrokConfigHome() string {
+	if home := strings.TrimSpace(os.Getenv("GROK_HOME")); home != "" {
+		return home
+	}
+	dir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, ".grok")
+}
+
+func sameDir(a, b string) bool {
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return aa == bb
+}
+
+func sameGrokAccount(a, b string) bool {
+	ae := strings.ToLower(grokAccountEmail(filepath.Join(a, "auth.json")))
+	be := strings.ToLower(grokAccountEmail(filepath.Join(b, "auth.json")))
+	return ae != "" && ae == be
+}
+
+// grokAuthExpiry returns the latest expires_at in a Grok auth.json.
+// A missing or unparseable value is the zero time.
+func grokAuthExpiry(path string) time.Time {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}
+	}
+	var root any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return time.Time{}
+	}
+	return findExpiry(root)
+}
+
+func findExpiry(v any) time.Time {
+	switch t := v.(type) {
+	case map[string]any:
+		var best time.Time
+		if s, ok := t["expires_at"].(string); ok {
+			best = parseProviderTime(s)
+		}
+		for k, child := range t {
+			switch strings.ToLower(k) {
+			case "key", "token", "access_token", "refresh_token", "id_token", "secret":
+				continue
+			}
+			if ts := findExpiry(child); ts.After(best) {
+				best = ts
+			}
+		}
+		return best
+	case []any:
+		var best time.Time
+		for _, child := range t {
+			if ts := findExpiry(child); ts.After(best) {
+				best = ts
+			}
+		}
+		return best
+	default:
+		return time.Time{}
+	}
+}
+
 func copyCredentialFile(src, dst string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -203,8 +309,12 @@ func copyCredentialFile(src, dst string) error {
 }
 
 func grokChildEnv(home string) []string {
+	// DISPLAY / WAYLAND_DISPLAY / BROWSER are dropped so a rejected credential
+	// cannot open a browser. Grok skips the opener when neither a display nor
+	// BROWSER is set. Limits never completes an interactive login.
 	drop := map[string]struct{}{
 		"HOME": {}, "GROK_HOME": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {},
+		"DISPLAY": {}, "WAYLAND_DISPLAY": {}, "BROWSER": {},
 	}
 	out := make([]string, 0, 32)
 	for _, kv := range os.Environ() {

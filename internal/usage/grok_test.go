@@ -226,6 +226,109 @@ done
 	}
 }
 
+func TestGrokFetch_UsesNewerLiveLoginForSameAccount(t *testing.T) {
+	vault := t.TempDir()
+	live := t.TempDir()
+	writeLabeledGrokAuth(t, vault, "grok-tester@example.com", "2020-01-01T00:00:00Z", "vault-stale")
+	writeLabeledGrokAuth(t, live, "grok-tester@example.com", "2099-01-01T00:00:00Z", "live-fresh")
+	t.Setenv("GROK_HOME", live)
+
+	log := filepath.Join(t.TempDir(), "methods")
+	installGrokBillingStub(t, log)
+
+	info, err := NewGrokFetcher().Fetch(context.Background(), "grok-home:"+vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.QuotaStatus != QuotaOK || info.AccountID != "grok-tester@example.com" {
+		t.Fatalf("%+v", info)
+	}
+	methods, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(methods), "label:live-fresh") {
+		t.Fatalf("billing used the stale vault credential:\n%s", methods)
+	}
+	if strings.Contains(string(methods), "label:vault-stale") {
+		t.Fatal("stale vault auth was staged")
+	}
+}
+
+func TestGrokFetch_KeepsOtherAccountAndNewerSnapshot(t *testing.T) {
+	vault := t.TempDir()
+	live := t.TempDir()
+	writeLabeledGrokAuth(t, vault, "vault-user@example.com", "2020-01-01T00:00:00Z", "vault-other")
+	writeLabeledGrokAuth(t, live, "live-user@example.com", "2099-01-01T00:00:00Z", "live-other")
+	t.Setenv("GROK_HOME", live)
+	log := filepath.Join(t.TempDir(), "methods")
+	installGrokBillingStub(t, log)
+
+	if _, err := NewGrokFetcher().Fetch(context.Background(), vault); err != nil {
+		t.Fatal(err)
+	}
+	methods, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(methods), "label:vault-other") {
+		t.Fatalf("different live account replaced the vault credential:\n%s", methods)
+	}
+
+	newer := t.TempDir()
+	writeLabeledGrokAuth(t, newer, "grok-tester@example.com", "2099-06-01T00:00:00Z", "snapshot-newer")
+	writeLabeledGrokAuth(t, live, "grok-tester@example.com", "2099-01-01T00:00:00Z", "live-older")
+	log2 := filepath.Join(t.TempDir(), "methods")
+	t.Setenv("CAAM_GROK_METHODS", log2)
+	if _, err := NewGrokFetcher().Fetch(context.Background(), newer); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(log2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "label:snapshot-newer") {
+		t.Fatalf("older live login replaced a newer snapshot:\n%s", got)
+	}
+}
+
+func writeLabeledGrokAuth(t *testing.T, dir, email, expires, label string) {
+	t.Helper()
+	body := `{"https://auth.example/synthetic":{"key":"SYNTHETIC-NOT-A-TOKEN","email":"` + email + `","expires_at":"` + expires + `","label":"` + label + `"}}`
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func installGrokBillingStub(t *testing.T, log string) {
+	t.Helper()
+	bin := t.TempDir()
+	script := `#!/bin/sh
+log="$CAAM_GROK_METHODS"
+label=$(sed -n 's/.*"label"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$GROK_HOME/auth.json" | head -n 1)
+printf 'label:%s\n' "$label" >> "$log"
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  printf '%s\n' "$method" >> "$log"
+  case "$method" in
+    _x.ai/billing)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"config":{"creditUsagePercent":10,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-06-01T00:00:00Z","end":"2026-06-08T00:00:00Z"}},"subscription_tier":"Synthetic"}}\n' "$id"
+      exit 0
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic-session"}}\n' "$id"
+      ;;
+  esac
+done
+`
+	if err := os.WriteFile(filepath.Join(bin, "grok"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_GROK_METHODS", log)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestGrokFetch_CLIFailureIsUnavailable(t *testing.T) {
 	home := t.TempDir()
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"email":"a@example.com"}`), 0600); err != nil {
