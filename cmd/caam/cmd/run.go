@@ -44,6 +44,9 @@ Use --precheck for proactive switching:
   When enabled, caam checks real-time usage levels BEFORE running and
   automatically switches to a healthier profile if current usage is near
   the limit. This prevents rate limit errors before they happen.
+  Supported for claude, codex, grok and cursor. Grok and Cursor only switch
+  to an account whose quota was actually measured; when the current
+  account's quota cannot be measured, caam says so and does not switch.
 
 Examples:
   caam run claude -- "explain this code"
@@ -161,15 +164,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Precheck: switch profile if near limit before running
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
-	if precheck && (tool == "claude" || tool == "codex") {
+	if precheck && isLimitsProvider(tool) {
 		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
 			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
 		// Loud fallback (issue #79): usage prechecking needs real-time limit
-		// support, which exists for claude and codex only. Say so — on stderr,
-		// even in quiet mode — instead of silently ignoring the flag.
-		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for claude and codex only); running without a usage precheck\n", tool)
+		// support. Say so — on stderr, even in quiet mode — instead of
+		// silently ignoring the flag.
+		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for %s); running without a usage precheck\n", tool, strings.Join(limitsProviders, ", "))
 	}
 
 	// Initialize AuthPool (if enabled in config)
@@ -324,32 +327,56 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 		return false // No active profile
 	}
 
+	// Grok and Cursor quota reads are fail-closed (docs/native-quotas.md):
+	// an unmeasured row is not capacity, and a reported limit stage is
+	// exhaustion even without a percentage. Their credentials are read from
+	// the same vault the switch will restore from.
+	native := tool == "grok" || tool == "cursor"
+	if native && vault != nil {
+		vaultDir = vault.BasePath()
+	}
+
 	// Load credentials for current profile
 	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
-	if err != nil || len(credentials) == 0 {
-		return false
-	}
-
 	token, ok := credentials[currentProfile]
-	if !ok {
+	if err != nil || !ok {
+		if native {
+			fmt.Fprintf(os.Stderr, "caam: precheck found no readable %s credential for %s; running without switching\n", tool, currentProfile)
+		}
 		return false
 	}
 
-	// Fetch current usage
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Fetch current usage. A Grok billing read starts the grok CLI, which
+	// its own reader bounds at 25s; keep that within reach.
+	timeout := 15 * time.Second
+	if native {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	fetcher := usage.NewMultiProfileFetcher()
 	results := fetcher.FetchAllProfiles(ctx, tool, map[string]string{currentProfile: token})
 
 	if len(results) == 0 || results[0].Usage == nil {
+		if native {
+			fmt.Fprintf(os.Stderr, "caam: precheck could not read %s/%s quota; running without switching\n", tool, currentProfile)
+		}
 		return false
 	}
 
 	currentUsage := results[0].Usage
 
-	// Check if near limit
-	if !currentUsage.IsNearLimitForModel(threshold, model) {
+	nearLimit, measured := precheckNearLimit(tool, currentUsage, threshold, model)
+	if !measured {
+		// Unknown is neither "near limit" nor "fine". Keep the current
+		// account (the historical behaviour) but say so, rather than letting
+		// the flag look like it checked something.
+		fmt.Fprintf(os.Stderr, "caam: precheck could not measure %s/%s quota (status %s); running without switching\n",
+			tool, currentProfile, nativeQuotaStatus(currentUsage))
+		return false
+	}
+	if !nearLimit {
 		return false // All good, no switch needed
 	}
 
@@ -365,16 +392,45 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 		return false
 	}
 
-	// Fetch usage for all profiles
-	allResults := fetcher.FetchAllProfiles(ctx, tool, allCredentials)
+	// Fetch usage for all profiles, on a fresh deadline: the read above may
+	// have used most of the first one.
+	allCtx, allCancel := context.WithTimeout(context.Background(), timeout)
+	defer allCancel()
+	allResults := fetcher.FetchAllProfiles(allCtx, tool, allCredentials)
 
 	// Convert to rotation.UsageInfo format
 	usageData := make(map[string]*rotation.UsageInfo)
+	rawUsage := make(map[string]*usage.UsageInfo)
 	for _, r := range allResults {
 		if r.Usage == nil {
 			continue
 		}
 		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage, model)
+		rawUsage[r.ProfileName] = r.Usage
+	}
+
+	// A native switch may only land on another account whose quota was
+	// measured, is not spent, and is itself below the precheck threshold;
+	// the selector's scoring alone would still pick an unknown one. If
+	// nothing qualifies, stay put and say so.
+	candidates := allProfiles
+	if native {
+		eligible, _ := rotation.NativeQuotaCandidates(tool, allProfiles, usageData)
+		candidates = make([]string, 0, len(eligible))
+		for _, name := range eligible {
+			if name == currentProfile {
+				continue
+			}
+			if near, measured := precheckNearLimit(tool, rawUsage[name], threshold, model); near || !measured {
+				continue
+			}
+			candidates = append(candidates, name)
+		}
+		if len(candidates) == 0 {
+			fmt.Fprintf(os.Stderr, "caam: %s/%s is near its quota limit, but no other %s profile has measured available quota; not switching\n",
+				tool, currentProfile, tool)
+			return false
+		}
 	}
 
 	// Use rotation selector with usage data
@@ -382,7 +438,7 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	applyRotationPolicy(selector, spmCfg, "")
 	selector.SetUsageData(usageData)
 
-	result, err := selector.Select(tool, allProfiles, currentProfile)
+	result, err := selector.Select(tool, candidates, currentProfile)
 	if err != nil || result.Selected == currentProfile {
 		return false // Couldn't find better alternative
 	}
@@ -398,4 +454,35 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	}
 
 	return true
+}
+
+// precheckNearLimit decides whether the account about to run is near its
+// limit. measured is false only for a Grok or Cursor row whose quota could
+// not be measured: those readers are fail-closed, so such a row is neither
+// near the limit nor known to be fine. A reported Grok/Cursor limit stage is
+// exhaustion even without a percentage. Claude and Codex keep the historical
+// percentage-only rule.
+func precheckNearLimit(tool string, u *usage.UsageInfo, threshold float64, model string) (nearLimit, measured bool) {
+	if u.IsNearLimitForModel(threshold, model) {
+		return true, true
+	}
+	if tool != "grok" && tool != "cursor" {
+		return false, true
+	}
+	if u.LimitStage != "" {
+		return true, true
+	}
+	if !u.NumericQuotaKnown() {
+		return false, false
+	}
+	return false, true
+}
+
+// nativeQuotaStatus names a native quota row's state for a notice without
+// repeating provider error text, which can carry credential material.
+func nativeQuotaStatus(u *usage.UsageInfo) string {
+	if u == nil || u.QuotaStatus == "" {
+		return usage.QuotaUnavailable
+	}
+	return u.QuotaStatus
 }

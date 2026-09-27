@@ -10,6 +10,7 @@ caam limits grok --profile work --source vault
 caam limits cursor --profile work --source isolated --format json
 caam limits cursor --rank earliest-reset-headroom --format json
 caam next cursor --usage-aware --dry-run
+caam run grok --precheck -- "review this diff"
 caam monitor
 ```
 
@@ -64,9 +65,19 @@ fails, selection fails before activation instead of falling back to an
 unmeasured account. Selection without `--usage-aware` and legacy Claude/Codex
 fallback behavior are unchanged.
 
-This integration does not add native support to `precheck` or `run --precheck`,
-and does not replace main's Cursor login, expiry, refresh, or path handling.
-Those PR changes require separate reconciliation with the newer provider code.
+`caam run grok|cursor --precheck` reads the active account's quota from the
+same vault it would switch within. A reported limit stage, or a measured
+window at the threshold, counts as near the limit. The switch target must be
+another account that passes the same measured-and-unspent eligibility check
+that `next --usage-aware` uses and is itself below the threshold. If no other
+account qualifies, the run proceeds on the current account with a stderr
+notice. When the current account's quota cannot be measured, the
+precheck prints a notice and does not switch. It never treats unknown quota as
+capacity.
+
+The `caam precheck` session planner still fetches live usage for Claude and
+Codex only. This integration does not replace main's Cursor login, expiry,
+refresh, or path handling.
 
 ## Validation
 
