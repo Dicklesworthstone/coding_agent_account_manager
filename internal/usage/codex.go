@@ -97,6 +97,10 @@ func (b *codexBalance) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ErrorUnauthorized is the UsageInfo.Error a usage fetch reports when the
+// provider answered 401 or 403 for the access token.
+const ErrorUnauthorized = "unauthorized: token expired or invalid"
+
 // CodexFetchOptions provides optional parameters for fetching.
 type CodexFetchOptions struct {
 	AccountID string // ChatGPT-Account-Id header
@@ -148,9 +152,11 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	case http.StatusOK:
 		// Success - parse response
 	case http.StatusUnauthorized, http.StatusForbidden:
-		info.Error = "unauthorized: token expired or invalid"
+		info.HTTPStatus = resp.StatusCode
+		info.Error = ErrorUnauthorized
 		return info, fmt.Errorf("unauthorized: status %d", resp.StatusCode)
 	default:
+		info.HTTPStatus = resp.StatusCode
 		info.Error = fmt.Sprintf("API error: status %d", resp.StatusCode)
 		return info, fmt.Errorf("API error: status %d", resp.StatusCode)
 	}

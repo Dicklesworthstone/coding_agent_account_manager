@@ -32,6 +32,11 @@ func FormatHealthStatus(status HealthStatus, health *ProfileHealth, opts FormatO
 	var text string
 	if health == nil {
 		text = "Unknown"
+	} else if health.ProviderRejected() {
+		// The provider refused this credential (issue #108). Its expiry
+		// would read as a working account ("9d left"), so say what the
+		// operator actually has to do.
+		text = "Login required"
 	} else if !health.TokenExpiresAt.IsZero() {
 		ttl := time.Until(health.TokenExpiresAt)
 		switch {
@@ -121,6 +126,14 @@ func StatusReasons(h *ProfileHealth) []string {
 	var reasons []string
 	now := time.Now()
 	rateLimited := h.RateLimited(now)
+
+	if h.ProviderRejected() {
+		reason := "Provider rejected credential"
+		if h.ProviderRejection != "" {
+			reason += " (" + h.ProviderRejection + ")"
+		}
+		reasons = append(reasons, reason+"; log in again")
+	}
 
 	if rateLimited {
 		reasons = append(reasons, fmt.Sprintf("Rate limited (resets in %s)", formatDurationNatural(h.RateLimitedUntil.Sub(now))))

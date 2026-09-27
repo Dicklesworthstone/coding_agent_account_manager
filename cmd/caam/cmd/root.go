@@ -333,6 +333,7 @@ func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
 	ph.TokenExpiresAt = info.ExpiresAt
 	ph.SelfRefreshing = info.SelfRefreshing
 	ph.TokenRenewable = info.Renewable
+	ph.CredentialFingerprint = info.Fingerprint
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -871,6 +872,9 @@ type statusHealth struct {
 
 	// The three-signal credential contract (issue #102); see lsHealth.
 	health.Signals
+
+	// Provider verification (issue #108); see lsHealth.
+	health.VerificationInfo
 }
 
 // statusCmd shows which profile is currently active.
@@ -988,9 +992,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				ActiveProfile: activeProfile,
 				Identity:      id,
 				Health: &statusHealth{
-					Status:     status.String(),
-					ErrorCount: ph.ErrorCount1h,
-					Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
+					Status:           status.String(),
+					ErrorCount:       ph.ErrorCount1h,
+					Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+					VerificationInfo: health.VerificationFor(ph),
 				},
 			}
 			if !ph.TokenExpiresAt.IsZero() {
@@ -1096,6 +1101,11 @@ type lsHealth struct {
 	// launch_usable and schedulers on refresh_due. A null field means caam
 	// found no evidence either way and is not guessing.
 	health.Signals
+
+	// Provider verification (issue #108): whether the provider itself has
+	// answered for the credential now on disk, when it last accepted it, and
+	// any outstanding rejection. Expiry alone is not a liveness claim.
+	health.VerificationInfo
 }
 
 // lsCmd lists all stored profiles.
@@ -1196,9 +1206,10 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
 					Health: lsHealth{
-						Status:     status.String(),
-						ErrorCount: ph.ErrorCount1h,
-						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						Status:           status.String(),
+						ErrorCount:       ph.ErrorCount1h,
+						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						VerificationInfo: health.VerificationFor(ph),
 					},
 					Identity: id,
 				}
@@ -1290,9 +1301,10 @@ func runLs(cmd *cobra.Command, args []string) error {
 					Active: p == activeProfile,
 					System: authfile.IsSystemProfile(p),
 					Health: lsHealth{
-						Status:     status.String(),
-						ErrorCount: ph.ErrorCount1h,
-						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						Status:           status.String(),
+						ErrorCount:       ph.ErrorCount1h,
+						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						VerificationInfo: health.VerificationFor(ph),
 					},
 					Identity: id,
 				}

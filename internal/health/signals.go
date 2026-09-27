@@ -66,6 +66,17 @@ func CredentialSignals(h *ProfileHealth, config HealthConfig) Signals {
 	now := time.Now()
 	rateLimited := h.RateLimited(now)
 
+	// The provider refused this very credential (issue #108). That outranks
+	// anything the file says: a revoked refresh token is still present, and
+	// the access token beside it may still be days from expiry. Nothing caam
+	// can refresh will fix it; a human has to log in again.
+	if h.ProviderRejected() {
+		out.RefreshDue = boolPtr(false)
+		out.LoginRequired = boolPtr(true)
+		out.LaunchUsable = boolPtr(false)
+		return out
+	}
+
 	if h.TokenExpiresAt.IsZero() {
 		// No expiry evidence. A cooldown is still hard evidence that nothing
 		// can launch right now; everything else stays unknown.

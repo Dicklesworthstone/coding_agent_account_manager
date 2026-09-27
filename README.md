@@ -731,7 +731,7 @@ Each profile displays a health indicator showing its current state at a glance:
 |------|--------|---------|
 | 🟢 | Healthy | Token valid for >1 hour, no recent errors |
 | 🟡 | Warning | Token expiring within 1 hour, or minor issues |
-| 🔴 | Critical | Token expired, or repeated errors in the last hour |
+| 🔴 | Critical | Token expired, the provider rejected the credential, or repeated errors in the last hour |
 | ⚪ | Unknown | No health data available yet |
 
 Health scoring combines multiple factors:
@@ -777,6 +777,39 @@ until the cap clears — but it is not a login problem, so `login_required` stay
 A lapsed-but-renewable credential shows as `Auto-refresh` rather than
 `Expired`, and its recommendation is `caam refresh <provider> <profile>`, never
 `caam login` (a login is disruptive and would fix nothing).
+
+#### Provider verification
+
+The signals above come from the credential file: its expiry and whether a
+refresh token sits beside it. A file cannot show that the provider has
+**revoked** the credential. A revoked Codex refresh token is still present,
+and the access token minted beside it can be days from expiry, so on disk it
+looks the same as a working credential. Only the provider can tell them apart.
+
+caam therefore records what the provider says whenever it contacts the
+provider for a Codex profile: a caam refresh (`caam refresh`, the refresh
+daemon, activation), the live `/v1/me` probe in `caam doctor`, and a live
+`caam limits codex` read. A refusal (a refresh rejected as revoked, reused or
+expired, or a 401 for an unexpired access token) marks that credential
+`login_required: true` and `launch_usable: false`, and `caam ls` shows
+🔴 `Login required` in place of the expiry. The rejection is tied to that
+specific credential, so logging in again clears it, and so does a later
+successful provider check. Rate limiting, 5xx answers, a bare 403 (which an
+edge proxy can send) and network failures tell caam nothing about the
+credential and are not recorded. Rotation scoring reads the stored record, so
+after logging in again outside caam a profile can rank lower there until the
+next provider check succeeds.
+
+`ls --json` and `status --json` rows also carry:
+
+| Field | Meaning |
+|-------|---------|
+| `verification` | `provider` when the provider has answered for the credential now on disk, `passive` when the verdict comes from the file alone |
+| `last_verified_at` | when the provider last accepted this credential (RFC 3339), omitted if it never has |
+| `provider_rejected_at`, `provider_rejection` | an outstanding rejection of this credential and its short reason code (for example `refresh_token_invalidated`) |
+
+`expires_at` is unchanged. It reports when the access token expires and does
+not claim that the account is live.
 
 ### Smart Rotation Algorithms
 

@@ -67,6 +67,11 @@ type ExpiryInfo struct {
 	// credential is renewable by construction.
 	Renewable bool
 
+	// Fingerprint identifies the credential that was parsed (see
+	// CodexCredentialFingerprint). Empty for providers that do not record
+	// provider verification.
+	Fingerprint string
+
 	// Source describes where the expiry was parsed from.
 	Source string
 }
@@ -321,6 +326,7 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 	// and rotation that a lapsed access token here does not mean the account
 	// needs a human (issue #102).
 	info.Renewable = info.HasRefreshToken
+	info.Fingerprint = CodexCredentialFingerprint(data)
 
 	info.Source = authPath
 	return info, nil

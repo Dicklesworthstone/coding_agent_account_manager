@@ -218,5 +218,15 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		status = StatusCritical
 	}
 
+	// A provider rejection of this credential is definitive: the account
+	// cannot be used until someone logs in again, however healthy the file
+	// looks (issue #108).
+	if h.ProviderRejected() {
+		status = StatusCritical
+		if score > -1.0 {
+			score = -1.0
+		}
+	}
+
 	return status, score
 }

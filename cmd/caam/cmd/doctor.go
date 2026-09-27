@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -1173,11 +1175,34 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	fingerprint := health.CodexCredentialFingerprint(data)
 	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
+		// Only a definitive refusal (401) is recorded (issue #108). Rate
+		// limiting, 5xx and transport failures say nothing about the
+		// credential, and a 403 can come from an edge proxy.
+		var verifyErr *refresh.TokenVerifyError
+		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized {
+			recordProbeVerdict(tool, profileName, false, fmt.Sprintf("access_token_rejected_http_%d", verifyErr.StatusCode), fingerprint)
+		}
 		return classifyCodexProbeError(tool, profileName, err)
 	}
 
+	recordProbeVerdict(tool, profileName, true, "", fingerprint)
 	return nil // Token is valid
+}
+
+// recordProbeVerdict stores a live probe's answer in health metadata so
+// ls/status reflect it (issue #108). Best-effort.
+func recordProbeVerdict(tool, profileName string, accepted bool, reason, fingerprint string) {
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage("")
+	}
+	_ = store.RecordProviderVerification(tool, profileName, health.ProviderVerification{
+		Accepted:    accepted,
+		Reason:      reason,
+		Fingerprint: fingerprint,
+	})
 }
 
 // classifyCodexProbeError maps a VerifyCodexToken failure onto a doctor check.

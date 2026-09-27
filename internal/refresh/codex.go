@@ -69,6 +69,12 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 		if resp.StatusCode == http.StatusUnauthorized && IsRefreshTokenReused(string(body)) {
 			return nil, ErrRefreshTokenReused
 		}
+		// A definitive refusal of the refresh token (revoked, expired,
+		// invalid) gets a structured error without the raw body, so callers
+		// can record that the account needs a new login (issue #108).
+		if code, rejected := classifyRefreshRejection(resp.StatusCode, body); rejected {
+			return nil, &RefreshRejectedError{Provider: "codex", StatusCode: resp.StatusCode, Code: code}
+		}
 		return nil, fmt.Errorf("codex refresh error %d: %s", resp.StatusCode, string(body))
 	}
 

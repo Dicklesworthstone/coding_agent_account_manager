@@ -202,7 +202,7 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 	case http.StatusOK:
 		// Success - parse response
 	case http.StatusUnauthorized, http.StatusForbidden:
-		info.Error = "unauthorized: token expired or invalid"
+		info.Error = ErrorUnauthorized
 		return info, fmt.Errorf("unauthorized: status %d", resp.StatusCode)
 	default:
 		info.Error = fmt.Sprintf("API error: status %d", resp.StatusCode)

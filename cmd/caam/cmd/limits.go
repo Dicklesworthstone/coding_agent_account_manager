@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
@@ -284,6 +287,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 		}
 
 		results := fetcher.FetchAllProfiles(ctx, provider, credentials)
+		recordCodexUsageVerdicts(vaultDir, provider, results)
 		allResults = append(allResults, results...)
 	}
 
@@ -950,4 +954,48 @@ func generateForecasts(results []usage.ProfileUsage) []Forecast {
 	}
 
 	return forecasts
+}
+
+// recordCodexUsageVerdicts stores what the provider said about each vault
+// Codex credential during a live usage read, so ls/status reflect it (issue
+// #108). An answered usage request is an acceptance. A 401 is recorded as a
+// rejection only while the access token is unexpired by its own claim: an
+// expired access token beside a working refresh token is routine, and the
+// 401 then says nothing about the account. Anything else (403, which an edge
+// proxy can send, network, 5xx, decode errors) is not a verdict and records
+// nothing. Best-effort.
+func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.ProfileUsage) {
+	if provider != "codex" || len(results) == 0 {
+		return
+	}
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage("")
+	}
+	now := time.Now()
+	for _, r := range results {
+		if r.Usage == nil || r.ProfileName == "" {
+			continue
+		}
+		authPath := filepath.Join(vaultDir, provider, r.ProfileName, "auth.json")
+		data, err := os.ReadFile(authPath)
+		if err != nil {
+			continue
+		}
+		fingerprint := health.CodexCredentialFingerprint(data)
+		switch {
+		case r.Usage.Error == "":
+			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{
+				Accepted: true, Fingerprint: fingerprint, At: r.Usage.FetchedAt,
+			})
+		case r.Usage.Error == usage.ErrorUnauthorized && r.Usage.HTTPStatus == http.StatusUnauthorized:
+			info, perr := health.ParseCodexExpiry(authPath)
+			if perr != nil || info.ExpiresAt.IsZero() || !info.ExpiresAt.After(now) {
+				continue
+			}
+			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{
+				Reason: "access_token_rejected", Fingerprint: fingerprint, At: r.Usage.FetchedAt,
+			})
+		}
+	}
 }

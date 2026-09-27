@@ -40,8 +40,29 @@ type ProfileHealth struct {
 	// paid spelling, so "max" stays "max" in storage and output.
 	PlanType string `json:"plan_type,omitempty"`
 
-	// LastChecked is when health was last verified.
+	// LastChecked is when the stored expiry was last written. It records a
+	// local file read, not a provider check; see LastVerifiedAt for that.
 	LastChecked time.Time `json:"last_checked,omitempty"`
+
+	// LastVerifiedAt is when the provider last accepted this profile's
+	// credential (issue #108), and VerifiedFingerprint identifies the
+	// credential it accepted.
+	LastVerifiedAt      time.Time `json:"last_verified_at,omitempty"`
+	VerifiedFingerprint string    `json:"verified_fingerprint,omitempty"`
+
+	// ProviderRejectedAt is when the provider last rejected this profile's
+	// credential (a 401/403, or a refresh refused as revoked, reused or
+	// expired). ProviderRejection is a short non-secret reason code and
+	// RejectedFingerprint identifies the rejected credential, so a new login
+	// clears the rejection by replacing the credential (issue #108).
+	ProviderRejectedAt  time.Time `json:"provider_rejected_at,omitempty"`
+	ProviderRejection   string    `json:"provider_rejection,omitempty"`
+	RejectedFingerprint string    `json:"rejected_fingerprint,omitempty"`
+
+	// CredentialFingerprint identifies the credential currently on disk for
+	// this profile. Set at report time alongside TokenExpiresAt and never
+	// persisted; ProviderRejected compares it with RejectedFingerprint.
+	CredentialFingerprint string `json:"-"`
 
 	// RateLimitedUntil is the end of an active rate-limit cooldown, filled in
 	// at report time from the limit_events table. It is never persisted here:

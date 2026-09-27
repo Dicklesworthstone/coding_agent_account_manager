@@ -57,6 +57,15 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 
 	vaultPath := vault.ProfilePath(provider, profile)
 
+	// Fingerprint the credential being refreshed, so a provider verdict on
+	// it is recorded against this credential and not a later login.
+	var fingerprint string
+	if provider == "codex" {
+		if data, readErr := os.ReadFile(filepath.Join(vaultPath, "auth.json")); readErr == nil {
+			fingerprint = health.CodexCredentialFingerprint(data)
+		}
+	}
+
 	var err error
 	switch provider {
 	case "claude":
@@ -73,11 +82,31 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	}
 
 	if err != nil {
+		// A refusal by the token endpoint is the provider saying this
+		// credential is dead. Record it so ls/status stop calling the
+		// profile healthy (issue #108).
+		var rejected *RefreshRejectedError
+		switch {
+		case errors.Is(err, ErrRefreshTokenReused):
+			recordProviderVerdict(store, provider, profile, false, "refresh_token_reused", fingerprint)
+		case errors.As(err, &rejected):
+			recordProviderVerdict(store, provider, profile, false, rejected.Reason(), fingerprint)
+		}
 		// Wrap refresh_token_reused with profile context for actionable error messages.
 		if errors.Is(err, ErrRefreshTokenReused) {
 			return &RefreshTokenReusedError{Provider: provider, Profile: profile}
 		}
 		return err
+	}
+
+	if provider == "codex" {
+		// The provider just accepted the refresh token and minted a new
+		// credential; record that against the credential now in the vault.
+		newFingerprint := fingerprint
+		if data, readErr := os.ReadFile(filepath.Join(vaultPath, "auth.json")); readErr == nil {
+			newFingerprint = health.CodexCredentialFingerprint(data)
+		}
+		recordProviderVerdict(store, provider, profile, true, "", newFingerprint)
 	}
 
 	// If the profile was active, restore the updated files to the active location
@@ -95,6 +124,19 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	}
 
 	return nil
+}
+
+// recordProviderVerdict stores a provider's answer about a profile's
+// credential. Best-effort: health metadata must never fail a refresh.
+func recordProviderVerdict(store *health.Storage, provider, profile string, accepted bool, reason, fingerprint string) {
+	if store == nil {
+		return
+	}
+	_ = store.RecordProviderVerification(provider, profile, health.ProviderVerification{
+		Accepted:    accepted,
+		Reason:      reason,
+		Fingerprint: fingerprint,
+	})
 }
 
 func refreshClaude(ctx context.Context, vaultPath string) error {

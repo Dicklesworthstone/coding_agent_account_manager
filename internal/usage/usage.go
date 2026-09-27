@@ -76,6 +76,11 @@ type UsageInfo struct {
 	// ProfileName is the CAAM profile name (if known).
 	ProfileName string `json:"profile_name,omitempty"`
 
+	// HTTPStatus is the provider's HTTP status for a failed usage request,
+	// when there was one. Not serialized; it lets callers tell a credential
+	// rejection (401) from a 403 an edge proxy may send.
+	HTTPStatus int `json:"-"`
+
 	// PlanType describes the subscription tier (e.g., "max", "pro", "plus").
 	PlanType string `json:"plan_type,omitempty"`
 
