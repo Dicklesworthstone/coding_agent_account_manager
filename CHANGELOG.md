@@ -8,6 +8,38 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [0.1.19] - 2026-09-28
+
+Everything on `main` since 0.1.18.
+
+### Added
+
+- **Grok and Cursor quotas.** `caam limits`, `caam monitor`, `caam next --usage-aware` and now `caam run grok|cursor --precheck` read Grok and Cursor quotas from the providers themselves. Quota data that is missing, malformed or contradictory is treated as unknown, and an account with unknown quota is never picked as if it had room (#79, PR #107).
+- **Model-aware ranking.** `caam limits --model` and `caam precheck --model` rank and gate accounts by the quota of the model the work will run on, so an account that is out of one model's allowance but fine on another is no longer treated as spent (#97).
+- **Reset-aware seat choice.** An opt-in drain policy spends the quota that resets soonest first instead of leaving it unused, and `--best` for new work picks the seat with the earliest reset that still has headroom. The default ranking is unchanged (#81).
+- **Clearer health signals.** `caam ls` reports `refresh_due`, `launch_usable` and `login_required` separately, so a Codex account with a lapsed access token but a working refresh token reads as usable and due for refresh, not broken (#102).
+- `caam limits` names which credential copy it read and can use an offline Claude cache (#100).
+- `caam shallow-spawn` runs the profile's own provider CLI when no command is given.
+- `caam status` and `caam ls` show the Claude account email from the paired `.claude.json`.
+
+### Fixed
+
+- **A revoked credential no longer reads healthy.** When a provider refuses a credential, caam records it and `caam ls`/`caam status` show the account as needing a login, even if the file on disk still looks valid. A new login or a successful refresh clears it. Doctor and `limits` checks, which only use the access token, no longer clear a refused refresh token, and they no longer mark an account as rejected just because a stored access token has expired (#108).
+- On macOS, `caam backup` and `caam activate` read and write Claude Code's login from the macOS keychain, where Claude Code actually keeps it. Before, a Mac backup could save a profile with no token in it.
+- Cursor config and credential files are found where current cursor-agent puts them (`$CURSOR_CONFIG_DIR`, `$XDG_CONFIG_HOME/cursor`), not only in `~/.cursor`.
+- Grok token expiry is read correctly, and a profile missing its provider home is repaired instead of failing (#101).
+- `caam exec claude` shares user skills, plugins, commands and agents into the profile's Claude config dir (#90).
+- Shallow sessions clear every provider's home override, so a session started inside another provider's shallow session does not read the outer profile's state. Codex `config.toml` in shallow homes is kept in sync with the real one without overwriting profile settings (#103). A seeded `.claude.json` no longer carries the real account's identity.
+- `caam status` reports a rate-limit cap as rate-limited instead of "token expired", and no longer tells you to log in again.
+- Claude credentials that refresh themselves no longer trigger expiry warnings; a credential with nothing to renew from is never marked refresh-due.
+- Subscription plan tiers (Pro, Max, Ultra) are scored the same way everywhere.
+
+### Security
+
+- `golang.org/x/crypto` updated to v0.56.0 (seven SSH advisories on the sync and deploy paths), plus `x/net`, `x/text` and `goldmark` updates; builds use Go 1.26.8.
+
+---
+
 ## [0.1.18] - 2026-08-31
 
 ### Security — release verification moved to minisign (resolves #77)
