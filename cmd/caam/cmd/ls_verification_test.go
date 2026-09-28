@@ -301,3 +301,52 @@ func TestRobotReasonForProviderRejection(t *testing.T) {
 		t.Errorf("recommendation = %q, want %q", rec, "log in again")
 	}
 }
+
+// GH #108's exact scenario: the provider refused the refresh token, yet the
+// freshly minted access token beside it keeps working for days. A doctor
+// probe or a `caam limits` read only exercises that access token, so its
+// acceptance must not clear the refresh-token rejection (review of b3ff27e);
+// otherwise the dead account reads healthy until the access token lapses and
+// then stays that way. A new login still clears it.
+func TestAccessTokenAcceptanceKeepsRefreshTokenRejection(t *testing.T) {
+	vaultDir, store := setupCodexVerificationVault(t)
+	revoked := writeCodexVaultAuth(t, vaultDir, "work", "rt-revoked", time.Now().Add(9*24*time.Hour))
+	if err := store.RecordProviderVerification("codex", "work", health.ProviderVerification{
+		Reason: "refresh_token_invalidated", Fingerprint: health.CodexCredentialFingerprint(revoked),
+		At: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	oldURL := refresh.CodexVerifyURL
+	refresh.CodexVerifyURL = server.URL
+	defer func() { refresh.CodexVerifyURL = oldURL }()
+
+	if res := probeVaultToken("codex", "work"); res != nil {
+		t.Fatalf("200 probe: %+v, want no finding", res)
+	}
+	recordCodexUsageVerdicts(vaultDir, "codex", []usage.ProfileUsage{
+		{ProfileName: "work", Usage: &usage.UsageInfo{FetchedAt: time.Now()}},
+	})
+	h, _ := store.GetProfile("codex", "work")
+	if !h.ProviderRejected() || h.ProviderRejection != "refresh_token_invalidated" {
+		t.Fatalf("access-token acceptance cleared a refresh-token rejection: %+v", h)
+	}
+	if rows := runLsJSONForTest(t, "codex"); rows["work"].Health.LoginRequired == nil || !*rows["work"].Health.LoginRequired {
+		t.Errorf("ls: revoked credential not login_required: %+v", rows["work"].Health)
+	}
+
+	// A new login mints a different credential; its acceptance clears it.
+	writeCodexVaultAuth(t, vaultDir, "work", "rt-new-login", time.Now().Add(9*24*time.Hour))
+	if res := probeVaultToken("codex", "work"); res != nil {
+		t.Fatalf("200 probe after login: %+v", res)
+	}
+	h, _ = store.GetProfile("codex", "work")
+	if h.ProviderRejected() || !h.ProviderRejectedAt.IsZero() || h.LastVerifiedAt.IsZero() {
+		t.Errorf("acceptance of a new login did not clear the rejection: %+v", h)
+	}
+}

@@ -306,3 +306,43 @@ func TestAccessTokenRejectionIsEvidence(t *testing.T) {
 		}
 	}
 }
+
+// An acceptance that only proves the access token works must not clear a
+// refresh-token rejection of the same credential, but does clear an
+// access-token rejection, and a full (refresh) acceptance clears either
+// (review of b3ff27e, GH #108).
+func TestAccessTokenOnlyAcceptance(t *testing.T) {
+	cases := []struct {
+		name        string
+		reason      string
+		accept      ProviderVerification
+		wantCleared bool
+	}{
+		{"refresh rejection, access acceptance", "refresh_token_invalidated", ProviderVerification{Accepted: true, AccessTokenOnly: true, Fingerprint: "fp"}, false},
+		{"refresh rejection, unknown-fingerprint access acceptance", "invalid_grant", ProviderVerification{Accepted: true, AccessTokenOnly: true}, false},
+		{"refresh rejection, access acceptance of new login", "refresh_token_invalidated", ProviderVerification{Accepted: true, AccessTokenOnly: true, Fingerprint: "fp2"}, true},
+		{"refresh rejection, refresh acceptance", "refresh_token_reused", ProviderVerification{Accepted: true, Fingerprint: "fp"}, true},
+		{"access rejection, access acceptance", "access_token_rejected_http_401", ProviderVerification{Accepted: true, AccessTokenOnly: true, Fingerprint: "fp"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			if err := s.RecordProviderVerification("codex", "work", ProviderVerification{
+				Reason: tc.reason, Fingerprint: "fp", At: time.Now().Add(-time.Minute),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RecordProviderVerification("codex", "work", tc.accept); err != nil {
+				t.Fatal(err)
+			}
+			h, _ := s.GetProfile("codex", "work")
+			h.CredentialFingerprint = "fp"
+			if tc.accept.Fingerprint != "" {
+				h.CredentialFingerprint = tc.accept.Fingerprint
+			}
+			if got := !h.ProviderRejected(); got != tc.wantCleared {
+				t.Errorf("rejection cleared = %v, want %v: %+v", got, tc.wantCleared, h)
+			}
+		})
+	}
+}

@@ -794,7 +794,9 @@ expired, or a 401 for an unexpired access token) marks that credential
 `login_required: true` and `launch_usable: false`, and `caam ls` shows
 🔴 `Login required` in place of the expiry. The rejection is tied to that
 specific credential, so logging in again clears it, and so does a later
-successful provider check. Rate limiting, 5xx answers, a bare 403 (which an
+successful refresh. A successful `doctor` probe or `limits` read clears a 401
+rejection, but not a refused refresh token: the access token keeps working
+after a revocation until it expires. Rate limiting, 5xx answers, a bare 403 (which an
 edge proxy can send) and network failures tell caam nothing about the
 credential and are not recorded. Rotation scoring reads the stored record, so
 after logging in again outside caam a profile can rank lower there until the

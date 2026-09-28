@@ -1208,16 +1208,19 @@ func codexAccessTokenLive(authPath string) bool {
 }
 
 // recordProbeVerdict stores a live probe's answer in health metadata so
-// ls/status reflect it (issue #108). Best-effort.
+// ls/status reflect it (issue #108). The probe only exercises the access
+// token, so its acceptance cannot clear a refresh-token rejection.
+// Best-effort.
 func recordProbeVerdict(tool, profileName string, accepted bool, reason, fingerprint string) {
 	store := healthStore
 	if store == nil {
 		store = health.NewStorage("")
 	}
 	_ = store.RecordProviderVerification(tool, profileName, health.ProviderVerification{
-		Accepted:    accepted,
-		Reason:      reason,
-		Fingerprint: fingerprint,
+		Accepted:        accepted,
+		Reason:          reason,
+		Fingerprint:     fingerprint,
+		AccessTokenOnly: accepted,
 	})
 }
 

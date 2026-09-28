@@ -48,12 +48,20 @@ type ProviderVerification struct {
 	Fingerprint string
 	// At is when the provider answered. Zero means now.
 	At time.Time
+	// AccessTokenOnly marks an acceptance that proves only that the access
+	// token works (the doctor /v1/me probe, a usage read), not the refresh
+	// token. It does not clear a refresh-token rejection of the same
+	// credential: after a revocation the access token keeps working until
+	// it expires, and then the account needs a new login.
+	AccessTokenOnly bool
 }
 
 // ProviderRejected reports whether the provider's most recent answer for the
 // credential this snapshot describes was a rejection.
 //
-// A rejection stops applying once a later provider check succeeds, or once
+// A rejection stops applying once a later provider check succeeds (for a
+// refused refresh token, only a successful refresh counts; see
+// ProviderVerification.AccessTokenOnly), or once
 // the credential on disk is a different one than the rejected credential (the
 // operator logged in again). When the current credential cannot be
 // fingerprinted the rejection keeps applying: an unreadable credential is no
@@ -96,7 +104,8 @@ func (h *ProfileHealth) VerificationKind() string {
 }
 
 // RecordProviderVerification stores the result of a provider round trip for
-// a profile. An acceptance clears any earlier rejection; a rejection keeps
+// a profile. An acceptance clears an earlier rejection (except as noted in
+// the function body); a rejection keeps
 // the last acceptance time so both remain visible.
 func (s *Storage) RecordProviderVerification(provider, name string, v ProviderVerification) error {
 	if s == nil {
@@ -134,8 +143,17 @@ func (s *Storage) RecordProviderVerification(provider, name string, v ProviderVe
 		// in between. An acceptance of the same credential that predates
 		// the stored rejection must not erase it, and must not move the
 		// last acceptance backwards.
-		staleForRejection := !h.ProviderRejectedAt.IsZero() && at.Before(h.ProviderRejectedAt) &&
-			(v.Fingerprint == "" || h.RejectedFingerprint == "" || v.Fingerprint == h.RejectedFingerprint)
+		//
+		// An access-token-only acceptance of the credential whose refresh
+		// token the provider refused says nothing about that refusal: the
+		// access token outlives the revocation, then nothing can renew it.
+		// It is not recorded at all, since a newer acceptance would stop
+		// the rejection from applying.
+		sameCredential := v.Fingerprint == "" || h.RejectedFingerprint == "" || v.Fingerprint == h.RejectedFingerprint
+		if v.AccessTokenOnly && sameCredential && !h.ProviderRejectedAt.IsZero() && isRefreshTokenRejection(h.ProviderRejection) {
+			return nil
+		}
+		staleForRejection := !h.ProviderRejectedAt.IsZero() && at.Before(h.ProviderRejectedAt) && sameCredential
 		if at.After(h.LastVerifiedAt) {
 			h.LastVerifiedAt = at
 			h.VerifiedFingerprint = v.Fingerprint
@@ -152,6 +170,13 @@ func (s *Storage) RecordProviderVerification(provider, name string, v ProviderVe
 	}
 
 	return s.saveLocked(store)
+}
+
+// isRefreshTokenRejection reports whether a stored rejection reason came from
+// the token endpoint refusing the refresh token, as opposed to a 401 for an
+// access token (recorded as "access_token_rejected..." by doctor and limits).
+func isRefreshTokenRejection(reason string) bool {
+	return !strings.HasPrefix(reason, "access_token_")
 }
 
 // accessTokenRejectionSkew is how far in the future an access token's own

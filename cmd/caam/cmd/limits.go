@@ -986,6 +986,7 @@ func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.Profile
 		case r.Usage.Error == "":
 			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{
 				Accepted: true, Fingerprint: fingerprint, At: r.Usage.FetchedAt,
+				AccessTokenOnly: true,
 			})
 		case r.Usage.Error == usage.ErrorUnauthorized && r.Usage.HTTPStatus == http.StatusUnauthorized:
 			if !codexAccessTokenLive(authPath) {
