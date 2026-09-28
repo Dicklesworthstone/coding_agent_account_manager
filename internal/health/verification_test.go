@@ -205,3 +205,104 @@ func TestCodexCredentialFingerprint(t *testing.T) {
 		t.Errorf("ParseCodexExpiry fingerprint = %q, want %q", info.Fingerprint, a)
 	}
 }
+
+// Readers that work from stored health alone (rotation, TUI, monitor, API,
+// precheck) never ran applyExpiryInfo, so CredentialFingerprint stayed empty
+// and a rejection kept applying forever after the operator logged in again
+// (review of c742360, GH #108). The store binds the vault credential's
+// fingerprint so a new login clears the rejection there too.
+func TestStoredRejectionClearsAfterNewLoginForStoreOnlyReaders(t *testing.T) {
+	root := t.TempDir()
+	s := NewStorage(filepath.Join(root, "health.json"))
+	authDir := filepath.Join(root, "vault", "codex", "work")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeAuth := func(rt string) []byte {
+		data := []byte(`{"tokens":{"access_token":"at","refresh_token":"` + rt + `"}}`)
+		if err := os.WriteFile(filepath.Join(authDir, "auth.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	old := writeAuth("rt-revoked")
+	if err := s.RecordProviderVerification("codex", "work", ProviderVerification{
+		Reason: "refresh_token_invalidated", Fingerprint: CodexCredentialFingerprint(old),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := s.GetProfile("codex", "work")
+	if err != nil || h == nil {
+		t.Fatalf("GetProfile: %v %v", h, err)
+	}
+	if !h.ProviderRejected() || CalculateStatus(h) != StatusCritical {
+		t.Fatalf("rejection of the credential still in the vault must apply: %+v", h)
+	}
+
+	writeAuth("rt-new-login")
+	h, _ = s.GetProfile("codex", "work")
+	if h.ProviderRejected() {
+		t.Errorf("GetProfile: rejection still applies after a new login: %+v", h)
+	}
+	all, err := s.ListProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all["codex/work"].ProviderRejected() {
+		t.Errorf("ListProfiles: rejection still applies after a new login: %+v", all["codex/work"])
+	}
+}
+
+// A usage read stamps its acceptance with the fetch time but records it after
+// every profile was read; a rejection recorded in between by the refresh
+// daemon must survive that older acceptance.
+func TestOlderAcceptanceDoesNotEraseNewerRejection(t *testing.T) {
+	s := NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	t0 := time.Now().Add(-time.Minute)
+	if err := s.RecordProviderVerification("codex", "work", ProviderVerification{
+		Reason: "refresh_token_invalidated", Fingerprint: "fp", At: t0.Add(30 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordProviderVerification("codex", "work", ProviderVerification{
+		Accepted: true, Fingerprint: "fp", At: t0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := s.GetProfile("codex", "work")
+	h.CredentialFingerprint = "fp"
+	if !h.ProviderRejected() {
+		t.Fatalf("older acceptance erased a newer rejection: %+v", h)
+	}
+
+	// An acceptance of a different (newer) credential still clears it.
+	if err := s.RecordProviderVerification("codex", "work", ProviderVerification{
+		Accepted: true, Fingerprint: "fp2", At: t0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h, _ = s.GetProfile("codex", "work")
+	if !h.ProviderRejectedAt.IsZero() {
+		t.Errorf("acceptance of a new credential did not clear the rejection: %+v", h)
+	}
+}
+
+func TestAccessTokenRejectionIsEvidence(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		exp  time.Time
+		want bool
+	}{
+		{"unknown expiry", time.Time{}, false},
+		{"expired", now.Add(-time.Hour), false},
+		{"inside clock-skew margin", now.Add(2 * time.Minute), false},
+		{"days left", now.Add(9 * 24 * time.Hour), true},
+	}
+	for _, tc := range cases {
+		if got := AccessTokenRejectionIsEvidence(tc.exp, now); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

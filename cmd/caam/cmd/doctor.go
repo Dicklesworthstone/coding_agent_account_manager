@@ -1179,9 +1179,14 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
 		// Only a definitive refusal (401) is recorded (issue #108). Rate
 		// limiting, 5xx and transport failures say nothing about the
-		// credential, and a 403 can come from an edge proxy.
+		// credential, and a 403 can come from an edge proxy. A 401 counts
+		// only while the access token is unexpired by its own claim: a
+		// vault copy routinely holds a lapsed access token beside a
+		// working refresh token, and that 401 says nothing about the
+		// account.
 		var verifyErr *refresh.TokenVerifyError
-		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized {
+		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized &&
+			codexAccessTokenLive(authPath) {
 			recordProbeVerdict(tool, profileName, false, fmt.Sprintf("access_token_rejected_http_%d", verifyErr.StatusCode), fingerprint)
 		}
 		return classifyCodexProbeError(tool, profileName, err)
@@ -1189,6 +1194,17 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 
 	recordProbeVerdict(tool, profileName, true, "", fingerprint)
 	return nil // Token is valid
+}
+
+// codexAccessTokenLive reports whether the Codex credential at authPath has
+// an access token that is comfortably unexpired, so a 401 for it is evidence
+// against the account (issue #108).
+func codexAccessTokenLive(authPath string) bool {
+	info, err := health.ParseCodexExpiry(authPath)
+	if err != nil || info == nil {
+		return false
+	}
+	return health.AccessTokenRejectionIsEvidence(info.ExpiresAt, time.Now())
 }
 
 // recordProbeVerdict stores a live probe's answer in health metadata so

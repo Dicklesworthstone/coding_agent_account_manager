@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -257,7 +258,9 @@ func (s *Storage) GetProfile(provider, name string) (*ProfileHealth, error) {
 	}
 
 	key := profileKey(provider, name)
-	return store.Profiles[key], nil
+	h := store.Profiles[key]
+	s.bindCredentialFingerprint(provider, name, h)
+	return h, nil
 }
 
 // UpdateProfile updates or creates health data for a profile.
@@ -487,6 +490,9 @@ func (s *Storage) ListProfiles() (map[string]*ProfileHealth, error) {
 	for k, v := range store.Profiles {
 		// Deep copy the ProfileHealth struct
 		copy := *v
+		if provider, name, ok := strings.Cut(k, "/"); ok {
+			s.bindCredentialFingerprint(provider, name, &copy)
+		}
 		result[k] = &copy
 	}
 	return result, nil

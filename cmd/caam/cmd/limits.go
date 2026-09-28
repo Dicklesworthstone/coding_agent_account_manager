@@ -972,7 +972,6 @@ func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.Profile
 	if store == nil {
 		store = health.NewStorage("")
 	}
-	now := time.Now()
 	for _, r := range results {
 		if r.Usage == nil || r.ProfileName == "" {
 			continue
@@ -989,8 +988,7 @@ func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.Profile
 				Accepted: true, Fingerprint: fingerprint, At: r.Usage.FetchedAt,
 			})
 		case r.Usage.Error == usage.ErrorUnauthorized && r.Usage.HTTPStatus == http.StatusUnauthorized:
-			info, perr := health.ParseCodexExpiry(authPath)
-			if perr != nil || info.ExpiresAt.IsZero() || !info.ExpiresAt.After(now) {
+			if !codexAccessTokenLive(authPath) {
 				continue
 			}
 			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{

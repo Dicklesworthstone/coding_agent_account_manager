@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -250,5 +251,53 @@ func TestProbeVaultTokenRecordsVerdict(t *testing.T) {
 	after, _ := store.GetProfile("codex", "work")
 	if !after.LastVerifiedAt.Equal(before.LastVerifiedAt) || !after.ProviderRejectedAt.IsZero() {
 		t.Errorf("a 5xx changed the record: before %+v after %+v", before, after)
+	}
+}
+
+// A vault copy routinely holds a lapsed access token beside a working refresh
+// token. doctor's /v1/me probe answers 401 for it, and that must not mark the
+// account "Login required" (review of c742360, GH #108): nothing clears such a
+// false rejection until a refresh or probe succeeds, and the refresh daemon
+// never refreshes an already-expired token.
+func TestProbeVaultToken401ForExpiredAccessTokenRecordsNothing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	oldURL := refresh.CodexVerifyURL
+	refresh.CodexVerifyURL = server.URL
+	defer func() { refresh.CodexVerifyURL = oldURL }()
+
+	for name, exp := range map[string]time.Duration{
+		"expired":    -2 * time.Hour,
+		"clock-skew": 2 * time.Minute,
+	} {
+		vaultDir, store := setupCodexVerificationVault(t)
+		writeCodexVaultAuth(t, vaultDir, "work", "rt-work", time.Now().Add(exp))
+		_ = probeVaultToken("codex", "work")
+		if h, _ := store.GetProfile("codex", "work"); h != nil && !h.ProviderRejectedAt.IsZero() {
+			t.Errorf("%s access token: 401 recorded as a provider rejection: %+v", name, h)
+		}
+	}
+}
+
+// Robot output for a provider-rejected profile named no reason and told
+// agents to "investigate errors" (review of c742360, GH #108).
+func TestRobotReasonForProviderRejection(t *testing.T) {
+	ph := &health.ProfileHealth{
+		TokenExpiresAt:        time.Now().Add(9 * 24 * time.Hour),
+		TokenRenewable:        true,
+		CredentialFingerprint: "fp",
+		ProviderRejectedAt:    time.Now().Add(-time.Minute),
+		ProviderRejection:     "refresh_token_expired",
+		RejectedFingerprint:   "fp",
+	}
+	reason := getHealthReason(ph, health.CalculateStatus(ph))
+	if !strings.Contains(reason, "refresh_token_expired") || !strings.Contains(reason, "login required") {
+		t.Fatalf("reason = %q", reason)
+	}
+	rec := generateRecommendation(RobotProfileInfo{Health: RobotHealthInfo{Status: "critical", Reason: reason}})
+	if rec != "log in again" {
+		t.Errorf("recommendation = %q, want %q", rec, "log in again")
 	}
 }

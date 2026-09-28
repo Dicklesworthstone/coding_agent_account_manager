@@ -529,6 +529,15 @@ func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) strin
 	}
 
 	if status == health.StatusCritical {
+		// The provider refused this credential (issue #108); its expiry
+		// may still look days away, so say what actually has to happen.
+		if ph.ProviderRejected() {
+			reason := "provider rejected credential"
+			if ph.ProviderRejection != "" {
+				reason += " (" + ph.ProviderRejection + ")"
+			}
+			return reason + "; login required"
+		}
 		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
 			return "token expired"
 		}
@@ -552,6 +561,9 @@ func generateRecommendation(p RobotProfileInfo) string {
 		return fmt.Sprintf("wait for cooldown (%s remaining)", p.Cooldown.RemainingStr)
 	}
 	if p.Health.Status == "critical" {
+		if strings.Contains(p.Health.Reason, "login required") {
+			return "log in again"
+		}
 		if strings.Contains(p.Health.Reason, "expired") {
 			return "refresh token required"
 		}

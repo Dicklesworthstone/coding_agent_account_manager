@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -125,11 +128,23 @@ func (s *Storage) RecordProviderVerification(provider, name string, v ProviderVe
 		at = time.Now()
 	}
 	if v.Accepted {
-		h.LastVerifiedAt = at
-		h.VerifiedFingerprint = v.Fingerprint
-		h.ProviderRejectedAt = time.Time{}
-		h.ProviderRejection = ""
-		h.RejectedFingerprint = ""
+		// Verdicts can land out of order: a `caam limits` read stamps its
+		// answer with the fetch time but records it after every profile
+		// has been read, while the refresh daemon may record a rejection
+		// in between. An acceptance of the same credential that predates
+		// the stored rejection must not erase it, and must not move the
+		// last acceptance backwards.
+		staleForRejection := !h.ProviderRejectedAt.IsZero() && at.Before(h.ProviderRejectedAt) &&
+			(v.Fingerprint == "" || h.RejectedFingerprint == "" || v.Fingerprint == h.RejectedFingerprint)
+		if at.After(h.LastVerifiedAt) {
+			h.LastVerifiedAt = at
+			h.VerifiedFingerprint = v.Fingerprint
+		}
+		if !staleForRejection {
+			h.ProviderRejectedAt = time.Time{}
+			h.ProviderRejection = ""
+			h.RejectedFingerprint = ""
+		}
 	} else {
 		h.ProviderRejectedAt = at
 		h.ProviderRejection = sanitizeRejectionReason(v.Reason)
@@ -137,6 +152,46 @@ func (s *Storage) RecordProviderVerification(provider, name string, v ProviderVe
 	}
 
 	return s.saveLocked(store)
+}
+
+// accessTokenRejectionSkew is how far in the future an access token's own
+// expiry must be before a 401 for it counts as the provider rejecting the
+// account. A token at (or, with the local clock behind, past) its expiry is
+// routinely refused while its refresh token works fine.
+const accessTokenRejectionSkew = 5 * time.Minute
+
+// AccessTokenRejectionIsEvidence reports whether a 401 for an access token
+// that expires at expiresAt says the account itself was rejected. It does
+// only while the token is comfortably unexpired by its own claim: an expired
+// (or unknown-expiry) access token beside a working refresh token is routine,
+// and a 401 for it would mark a good account as needing a login.
+func AccessTokenRejectionIsEvidence(expiresAt, now time.Time) bool {
+	return !expiresAt.IsZero() && expiresAt.After(now.Add(accessTokenRejectionSkew))
+}
+
+// bindCredentialFingerprint fills in CredentialFingerprint for a stored
+// Codex profile that carries a provider verdict, from the vault copy of its
+// credential (the vault sits beside health.json in caam's data directory).
+// Without it every reader that works from stored health alone (rotation,
+// the TUI, monitor, API, precheck) would keep treating a rejection as
+// current after the operator logged in again, because an unknown current
+// credential keeps a rejection applying. Callers that know better (ls and
+// status prefer the live credential) overwrite it. Best-effort.
+func (s *Storage) bindCredentialFingerprint(provider, name string, h *ProfileHealth) {
+	if s == nil || h == nil || provider != "codex" || h.CredentialFingerprint != "" {
+		return
+	}
+	if h.RejectedFingerprint == "" && h.VerifiedFingerprint == "" {
+		return
+	}
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(s.path), "vault", provider, name, "auth.json"))
+	if err != nil {
+		return
+	}
+	h.CredentialFingerprint = CodexCredentialFingerprint(data)
 }
 
 // sanitizeRejectionReason keeps a rejection reason to a short code made of
