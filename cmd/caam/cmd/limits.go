@@ -282,6 +282,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 			}
 			continue
 		}
+		sourceNotes = append(sourceNotes, nativeProfilesWithoutCredentialNotes(vaultDir, provider, credentials)...)
 		if len(credentials) == 0 {
 			continue
 		}
@@ -418,6 +419,63 @@ func cachedProfileUsage(provider, name, claudeJSON string, now time.Time) usage.
 	return row
 }
 
+// nativeProfilesWithoutCredentialNotes names the saved grok/cursor profiles
+// that LoadProfileCredentials skipped because the vault copy has no usable
+// auth.json. A backup taken by an older caam can hold only cli-config.json;
+// without this note such a profile vanishes from the table and the command
+// reports "No profiles found" (GH #109).
+func nativeProfilesWithoutCredentialNotes(vaultDir, provider string, loaded map[string]string) []string {
+	if provider != "grok" && provider != "cursor" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(vaultDir, provider))
+	if err != nil {
+		return nil
+	}
+	var notes []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || strings.HasPrefix(name, ".") || authfile.IsSystemProfile(name) {
+			continue
+		}
+		if _, ok := loaded[name]; ok {
+			continue
+		}
+		notes = append(notes, fmt.Sprintf(
+			"%s/%s: skipped, the saved profile has no auth.json with an access token (re-run `caam backup %s %s` while logged in to that account)",
+			provider, name, provider, name))
+	}
+	return notes
+}
+
+// cursorTeamPoolNotes describes the team on-demand pool for cursor rows that
+// report one. The pool is shared by the whole team, so it can run out while
+// the member's own included usage and on-demand figures still look fine.
+func cursorTeamPoolNotes(results []usage.ProfileUsage) []string {
+	var notes []string
+	for _, r := range results {
+		if r.Provider != "cursor" || r.Usage == nil || r.Usage.Billing == nil {
+			continue
+		}
+		b := r.Usage.Billing
+		if b.TeamPoolCapCents == nil || *b.TeamPoolCapCents <= 0 {
+			continue
+		}
+		dollars := func(c int64) string { return fmt.Sprintf("$%d.%02d", c/100, c%100) }
+		used := "unknown"
+		if b.TeamPoolUsedCents != nil {
+			used = dollars(*b.TeamPoolUsedCents)
+		}
+		remaining := ""
+		if b.TeamPoolRemainingCents != nil {
+			remaining = fmt.Sprintf(", %s left", dollars(*b.TeamPoolRemainingCents))
+		}
+		notes = append(notes, fmt.Sprintf("cursor/%s: team on-demand pool %s of %s used%s",
+			r.ProfileName, used, dollars(*b.TeamPoolCapCents), remaining))
+	}
+	return notes
+}
+
 func getVaultDir() string {
 	return authfile.DefaultVaultPath()
 }
@@ -534,6 +592,12 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 		}
 
 		tw.Flush()
+		if notes := cursorTeamPoolNotes(results); len(notes) > 0 {
+			fmt.Fprintln(w)
+			for _, note := range notes {
+				fmt.Fprintln(w, note)
+			}
+		}
 		if offline {
 			fmt.Fprintln(w)
 			fmt.Fprintln(w, "Figures are as cached by Claude Code and only move when that account itself runs a")

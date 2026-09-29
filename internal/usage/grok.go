@@ -402,7 +402,9 @@ func emptyBilling(b *BillingSnapshot) *BillingSnapshot {
 	}
 	if b.PeriodType == "" && b.PeriodStart == "" && b.PeriodEnd == "" &&
 		b.OnDemandCapCents == nil && b.OnDemandUsedCents == nil &&
-		b.PrepaidBalanceCents == nil && b.Unified == nil && b.OnDemandEnabled == nil {
+		b.PrepaidBalanceCents == nil && b.Unified == nil && b.OnDemandEnabled == nil &&
+		b.LimitType == "" && b.TeamPoolCapCents == nil && b.TeamPoolUsedCents == nil &&
+		b.TeamPoolRemainingCents == nil {
 		return nil
 	}
 	return b

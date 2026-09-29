@@ -3,6 +3,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,5 +92,45 @@ func TestDegradedGrokIsNotTheBestProfile(t *testing.T) {
 	}
 	if strings.TrimSpace(buf.String()) != "null" {
 		t.Fatalf("best = %s, want null (unknown quota must not win)", buf.String())
+	}
+}
+
+func TestNativeProfilesWithoutCredentialNotes(t *testing.T) {
+	vault := t.TempDir()
+	for _, dir := range []string{"cursor/good", "cursor/stale", "cursor/_original", "cursor/.hidden", "claude/nocreds"} {
+		if err := os.MkdirAll(filepath.Join(vault, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An older caam backup: cli-config.json only, no auth.json.
+	if err := os.WriteFile(filepath.Join(vault, "cursor/stale/cli-config.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	notes := nativeProfilesWithoutCredentialNotes(vault, "cursor", map[string]string{"good": "cursor-root:x"})
+	if len(notes) != 1 || !strings.HasPrefix(notes[0], "cursor/stale: skipped") || !strings.Contains(notes[0], "caam backup cursor stale") {
+		t.Fatalf("notes = %q", notes)
+	}
+	if got := nativeProfilesWithoutCredentialNotes(vault, "claude", nil); got != nil {
+		t.Fatalf("claude profiles must not be annotated: %q", got)
+	}
+	if got := nativeProfilesWithoutCredentialNotes(filepath.Join(vault, "missing"), "cursor", nil); got != nil {
+		t.Fatalf("missing vault produced notes: %q", got)
+	}
+}
+
+func TestCursorTeamPoolNotes(t *testing.T) {
+	cents := func(n int64) *int64 { return &n }
+	rows := []usage.ProfileUsage{
+		{Provider: "cursor", ProfileName: "team", Usage: &usage.UsageInfo{Billing: &usage.BillingSnapshot{
+			TeamPoolCapCents: cents(100000), TeamPoolUsedCents: cents(91272), TeamPoolRemainingCents: cents(8728),
+		}}},
+		{Provider: "cursor", ProfileName: "solo", Usage: &usage.UsageInfo{Billing: &usage.BillingSnapshot{OnDemandUsedCents: cents(5)}}},
+		{Provider: "cursor", ProfileName: "nil"},
+		{Provider: "grok", ProfileName: "g", Usage: &usage.UsageInfo{Billing: &usage.BillingSnapshot{TeamPoolCapCents: cents(1)}}},
+	}
+	notes := cursorTeamPoolNotes(rows)
+	want := "cursor/team: team on-demand pool $912.72 of $1000.00 used, $87.28 left"
+	if len(notes) != 1 || notes[0] != want {
+		t.Fatalf("notes = %q, want [%q]", notes, want)
 	}
 }

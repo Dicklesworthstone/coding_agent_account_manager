@@ -117,6 +117,12 @@ func (f *CursorFetcher) Fetch(ctx context.Context, locator string) (*UsageInfo, 
 			info.PrimaryWindow = status.PrimaryWindow
 		}
 	}
+	// On-demand spend (the member's own and a team's shared pool) is billing
+	// metadata for the caller to read. It never changes the included-usage
+	// measurement or the routing verdict above.
+	if period != nil {
+		info.Billing = parseCursorSpendLimit(periodBody)
+	}
 	if planCode >= 200 && planCode < 300 {
 		if name := parseCursorPlanName(planBody); name != "" {
 			info.PlanType = name
@@ -369,6 +375,49 @@ func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
 	info.QuotaNote = ""
 	info.Error = ""
 	return info
+}
+
+// parseCursorSpendLimit reads GetCurrentPeriodUsage's billing period and
+// spendLimitUsage, the on-demand figures `cursor-agent` shows under /usage.
+// Amounts are cents. Proto JSON omits zero-valued fields, so an absent amount
+// stays nil rather than being reported as a measured zero. Nil when the body
+// carries none of these fields.
+func parseCursorSpendLimit(raw []byte) *BillingSnapshot {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		return nil
+	}
+	bill := &BillingSnapshot{}
+	cycleTime := func(keys ...string) string {
+		if ms, ok := jsonInt(firstPresent(root, keys...)); ok && ms > 0 {
+			return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+		}
+		return ""
+	}
+	bill.PeriodStart = cycleTime("billingCycleStart", "billing_cycle_start")
+	bill.PeriodEnd = cycleTime("billingCycleEnd", "billing_cycle_end")
+
+	if spendRaw, ok := firstRaw(root, "spendLimitUsage", "spend_limit_usage"); ok {
+		var spend map[string]json.RawMessage
+		if json.Unmarshal(spendRaw, &spend) == nil && spend != nil {
+			cents := func(keys ...string) *int64 {
+				n, ok := jsonInt(firstPresent(spend, keys...))
+				if !ok || n < 0 {
+					return nil
+				}
+				return &n
+			}
+			bill.OnDemandCapCents = cents("individualLimit", "individual_limit")
+			bill.OnDemandUsedCents = cents("individualUsed", "individual_used")
+			bill.TeamPoolCapCents = cents("pooledLimit", "pooled_limit")
+			bill.TeamPoolUsedCents = cents("pooledUsed", "pooled_used")
+			bill.TeamPoolRemainingCents = cents("pooledRemaining", "pooled_remaining")
+			if lt := firstString(spend, "limitType", "limit_type"); len(lt) <= 20 {
+				bill.LimitType = lt
+			}
+		}
+	}
+	return emptyBilling(bill)
 }
 
 // parseCursorPlanName reads GetPlanInfo's plan name. Empty when the field is

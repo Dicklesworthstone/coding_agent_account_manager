@@ -178,6 +178,14 @@ type BillingSnapshot struct {
 	PrepaidBalanceCents *int64 `json:"prepaid_balance_cents,omitempty"`
 	Unified             *bool  `json:"unified,omitempty"`
 	OnDemandEnabled     *bool  `json:"on_demand_enabled,omitempty"`
+	// LimitType is who owns the on-demand limit, as the provider names it
+	// (Cursor sends "team" when a team admin sets it).
+	LimitType string `json:"limit_type,omitempty"`
+	// TeamPool* is a team's shared on-demand pool (Cursor Team plans). It can
+	// run low while the member's own figures above still look fine.
+	TeamPoolCapCents       *int64 `json:"team_pool_cap_cents,omitempty"`
+	TeamPoolUsedCents      *int64 `json:"team_pool_used_cents,omitempty"`
+	TeamPoolRemainingCents *int64 `json:"team_pool_remaining_cents,omitempty"`
 }
 
 // GrantSnapshot is one credit grant. Cents are the provider's minor units.
