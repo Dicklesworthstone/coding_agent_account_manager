@@ -8,6 +8,16 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [0.1.20] - 2026-09-29
+
+### Added
+
+- **Cursor team pool.** On a Cursor Team plan, `caam limits cursor` now prints a line under the table showing how much of the team's shared on-demand pool is used and how much is left. That pool can run out while your own figures still look fine. The JSON output carries the pool numbers under `billing`. Account ranking and the included-usage figure are unchanged (#109).
+
+### Fixed
+
+- `caam limits grok|cursor` no longer skips a saved profile without a word when the profile has no `auth.json` (backups made by older caam versions only saved `cli-config.json`, so the command printed "No profiles found"). Each skipped profile is now named, with a note to re-run `caam backup` for it (#109).
+
 ## [0.1.19] - 2026-09-28
 
 Everything on `main` since 0.1.18.
