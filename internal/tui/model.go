@@ -2527,12 +2527,13 @@ func (m Model) mainView() string {
 		} else {
 			profilesPanelView = m.renderProfileList()
 		}
+		profilesPanelView = clampBox(profilesPanelView, m.width, layout.ProfilesHeight)
 
 		var detailPanelView string
 		if m.detailPanel != nil && layout.ShowDetail {
 			m.syncDetailPanel()
 			m.detailPanel.SetSize(m.width, layout.DetailHeight)
-			detailPanelView = m.detailPanel.View()
+			detailPanelView = clampBox(m.detailPanel.View(), m.width, layout.DetailHeight)
 		}
 
 		if detailPanelView != "" {
@@ -2546,7 +2547,7 @@ func (m Model) mainView() string {
 		// Sync and render provider panel
 		m.providerPanel.SetActiveProvider(m.activeProvider)
 		m.providerPanel.SetSize(layout.ProviderWidth, contentHeight)
-		providerPanelView := m.providerPanel.View()
+		providerPanelView := clampBox(m.providerPanel.View(), layout.ProviderWidth, contentHeight)
 
 		// Sync and render profiles panel (center panel)
 		var profilesPanelView string
@@ -2556,13 +2557,14 @@ func (m Model) mainView() string {
 		} else {
 			profilesPanelView = m.renderProfileList()
 		}
+		profilesPanelView = clampBox(profilesPanelView, layout.ProfilesWidth, contentHeight)
 
 		// Sync and render detail panel (right panel)
 		var detailPanelView string
 		if m.detailPanel != nil {
 			m.syncDetailPanel()
 			m.detailPanel.SetSize(layout.DetailWidth, contentHeight)
-			detailPanelView = m.detailPanel.View()
+			detailPanelView = clampBox(m.detailPanel.View(), layout.DetailWidth, contentHeight)
 		}
 
 		// Create panels side by side
@@ -2597,18 +2599,62 @@ func (m Model) mainView() string {
 		)
 	}
 
-	// Add status bar at bottom
-	availableHeight := m.height - lipgloss.Height(content) - 2
-	if availableHeight > 0 {
-		content = lipgloss.JoinVertical(
-			lipgloss.Left,
-			content,
-			lipgloss.NewStyle().Height(availableHeight).Render(""),
-			status,
-		)
+	// Status bar pinned to the bottom row(s). The content above it is cut to
+	// the rows that remain, so a tall panel can never push the status bar
+	// off-screen (it used to be dropped whenever the content overflowed).
+	statusHeight := lipgloss.Height(status)
+	if m.height <= statusHeight {
+		return fitLines(status, m.width, m.height)
 	}
+	return fitLines(content, m.width, m.height-statusHeight) + "\n" + fitLines(status, m.width, statusHeight)
+}
 
-	return content
+// fitLines cuts s to at most width cells per line and height lines, padding
+// short output with blank lines so the result is exactly height lines.
+func fitLines(s string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if width > 0 {
+		for i, ln := range lines {
+			if ansi.StringWidth(ln) > width {
+				lines[i] = ansi.Truncate(ln, width, "")
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// clampBox fits a bordered panel into width x height. A panel taller than
+// height keeps its first height-1 lines and its last (bottom border) line, so
+// it is cut inside the box rather than losing its frame.
+func clampBox(box string, width, height int) string {
+	if height <= 0 {
+		return box
+	}
+	lines := strings.Split(box, "\n")
+	if len(lines) > height {
+		if height >= 2 {
+			lines = append(lines[:height-1:height-1], lines[len(lines)-1])
+		} else {
+			lines = lines[:height]
+		}
+	}
+	if width > 0 {
+		for i, ln := range lines {
+			if ansi.StringWidth(ln) > width {
+				lines[i] = ansi.Truncate(ln, width, "")
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) isCompactLayout() bool {

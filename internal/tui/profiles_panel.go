@@ -515,6 +515,20 @@ func (p *ProfilesPanel) View() string {
 		rows = append(rows, style.Render(rowStr))
 	}
 
+	// Show only the rows that fit the panel's height (title, column header
+	// and border take the rest), scrolled so the selection stays visible.
+	if p.height > 0 {
+		chrome := lipgloss.Height(title) + lipgloss.Height(header) + 2
+		fit := max(p.height-chrome, 1)
+		if len(rows) > fit {
+			start := 0
+			if p.selected >= fit {
+				start = min(p.selected-fit+1, len(rows)-fit)
+			}
+			rows = rows[start : start+fit]
+		}
+	}
+
 	// Combine header and rows
 	content := lipgloss.JoinVertical(lipgloss.Left, append([]string{header}, rows...)...)
 
