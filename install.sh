@@ -28,9 +28,8 @@ readonly REPO_NAME="coding_agent_account_manager"
 readonly BIN_NAME="caam"
 
 # Exit codes for CI/automation
+# (0 covers both "installed" and "already up to date".)
 readonly EXIT_SUCCESS=0
-readonly EXIT_UP_TO_DATE=0
-readonly EXIT_UPDATED=0
 readonly EXIT_ERROR=1
 readonly EXIT_DEPS_MISSING=2
 readonly EXIT_VERIFY_FAILED=3
@@ -46,6 +45,10 @@ DRY_RUN=false
 SHOW_HELP=false
 
 TMP_DIRS=()
+
+# Set when a release asset was selected but could not be downloaded, so a
+# failed source-build fallback exits with EXIT_DOWNLOAD_FAILED.
+BINARY_DOWNLOAD_FAILED=false
 
 # ==============================================================================
 # Argument Parsing
@@ -175,7 +178,7 @@ success() {
 warn() {
     local msg="$1"
     if [ "$HAS_GUM" = true ]; then
-        gum style --foreground 214 "==> WARNING: $msg"
+        gum style --foreground 214 "==> WARNING: $msg" >&2
     elif [ "$USE_COLOR" = true ]; then
         printf "\033[1;33m==>\033[0m WARNING: %s\n" "$msg" >&2
     else
@@ -186,7 +189,7 @@ warn() {
 error() {
     local msg="$1"
     if [ "$HAS_GUM" = true ]; then
-        gum style --foreground 196 "==> ERROR: $msg"
+        gum style --foreground 196 "==> ERROR: $msg" >&2
     elif [ "$USE_COLOR" = true ]; then
         printf "\033[1;31m==>\033[0m ERROR: %s\n" "$msg" >&2
     else
@@ -485,14 +488,7 @@ get_release() {
 
     # For beta channel, extract first release from array
     if [ "$INSTALL_CHANNEL" = "beta" ] && [ -z "$version" ]; then
-        echo "$response" | ensure_python && "$PYTHON_CMD" -c "
-import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list) and len(data) > 0:
-    print(json.dumps(data[0]))
-else:
-    sys.exit(1)
-"
+        printf '%s' "$response" | first_release_json
     else
         echo "$response"
     fi
@@ -540,29 +536,60 @@ ensure_install_dir() {
 }
 
 PYTHON_CMD=""
+JSON_TOOL=""
 
-ensure_python() {
-    if [ -n "$PYTHON_CMD" ]; then
+# ensure_json_tool picks the parser for GitHub/go.dev release metadata:
+# python3 (or a python that is Python 3) first, jq otherwise. Either one is
+# enough; the jq paths below mirror the Python ones exactly.
+ensure_json_tool() {
+    if [ -n "$JSON_TOOL" ]; then
         return 0
     fi
 
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python3)"
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+            PYTHON_CMD="$(command -v "$candidate")"
+            JSON_TOOL="python"
+            return 0
+        fi
+    done
+
+    if command -v jq >/dev/null 2>&1; then
+        JSON_TOOL="jq"
         return 0
     fi
 
-    if command -v python >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python)"
-        return 0
-    fi
-
-    print_error "Python 3 is required to parse GitHub release metadata."
-    print_error "Please install python3 (e.g., 'xcode-select --install' on macOS) or install jq."
+    print_error "python3 or jq is required to parse GitHub release metadata."
+    print_error "Install either one (e.g. 'brew install jq', 'sudo apt install jq', or 'xcode-select --install' for python3) and re-run."
     return 1
 }
 
+# first_release_json reads a GitHub releases array on stdin and prints its
+# first element as JSON. Fails when the input is not a non-empty array.
+first_release_json() {
+    ensure_json_tool || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        jq -ce 'if type == "array" and length > 0 then .[0] else empty end'
+        return
+    fi
+
+    "$PYTHON_CMD" -c "
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list) and len(data) > 0:
+    print(json.dumps(data[0]))
+else:
+    sys.exit(1)
+"
+}
+
+# fetch_latest_go_pkg prints the latest stable Go version on line 1 and the
+# macOS .pkg URL for this machine's architecture on line 2.
 fetch_latest_go_pkg() {
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local arch
     arch="$(uname -m)"
@@ -571,6 +598,22 @@ fetch_latest_go_pkg() {
         x86_64|amd64) arch="amd64" ;;
         *) print_error "Unsupported macOS architecture for Go install: $arch"; return 1 ;;
     esac
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local releases
+        releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
+            print_error "Failed to fetch Go releases from go.dev"
+            return 1
+        }
+        printf '%s' "$releases" | jq -re --arg arch "$arch" '
+            (map(select(.stable == true)) | .[0]) as $rel
+            | if $rel == null then empty else
+                ([($rel.files // [])[]
+                  | select(.os == "darwin" and .arch == $arch and ((.filename // "") | endswith(".pkg")))][0]) as $pkg
+                | if $pkg == null then empty else ($rel.version // ""), ($pkg.url // "") end
+              end'
+        return
+    fi
 
     "$PYTHON_CMD" - "$arch" <<'PY'
 import json
@@ -613,9 +656,10 @@ PY
 }
 
 install_go_from_pkg() {
-    local version url tmpdir pkg_path
+    local version="" url="" tmpdir pkg_path
 
-    read -r version url < <(fetch_latest_go_pkg) || return 1
+    # fetch_latest_go_pkg prints version and URL on separate lines.
+    { read -r version; read -r url; } < <(fetch_latest_go_pkg) || true
 
     if [ -z "$version" ] || [ -z "$url" ]; then
         return 1
@@ -644,8 +688,9 @@ install_go_from_pkg() {
 }
 
 version_ge() {
-    local IFS=.
-    local i ver1=($1) ver2=($2)
+    local i ver1 ver2
+    IFS=. read -r -a ver1 <<< "$1"
+    IFS=. read -r -a ver2 <<< "$2"
     for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
         local v1=${ver1[i]:-0}
         local v2=${ver2[i]:-0}
@@ -655,12 +700,37 @@ version_ge() {
     return 0
 }
 
+# select_release_asset reads one release object on stdin and prints three
+# lines: tag name, download URL, asset name. Fails when no asset matches.
 select_release_asset() {
     local platform="$1"
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local release_json
     release_json=$(cat) || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local ext=".tar.gz" parsed
+        case "$platform" in
+            windows_*) ext=".zip" ;;
+        esac
+        parsed=$(printf '%s' "$release_json" | jq -r --arg platform "$platform" --arg ext "$ext" '
+            [(.assets // [])[]
+             | {name: (.name // ""), url: (.browser_download_url // "")}
+             | select(.url != "" and (.name | endswith($ext)))] as $candidates
+            | ([$candidates[] | select(.name | contains($platform))][0]
+               // [$candidates[] | select(.name | gsub("_"; "") | contains($platform | gsub("_"; "")))][0]
+               // {name: "", url: ""}) as $pick
+            | (.tag_name // ""), $pick.url, $pick.name') || {
+            print_error "Failed to parse release JSON"
+            return 1
+        }
+        local tag="" url="" name=""
+        { read -r tag; read -r url; read -r name; } <<< "$parsed" || true
+        printf '%s\n%s\n%s\n' "$tag" "$url" "$name"
+        [ -n "$url" ]
+        return
+    fi
 
     CAAM_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$platform" "$BIN_NAME" <<'PY'
 import json
@@ -720,12 +790,29 @@ if __name__ == "__main__":
 PY
 }
 
+# select_named_asset reads one release object on stdin and prints the
+# download URL of the asset named exactly $1. Fails when there is none.
 select_named_asset() {
     local asset_name="$1"
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local release_json
     release_json=$(cat) || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local url
+        url=$(printf '%s' "$release_json" | jq -r --arg target "$asset_name" '
+            [(.assets // [])[]
+             | select((.name // "") == $target)
+             | (.browser_download_url // "")
+             | select(. != "")][0] // ""') || {
+            print_error "Failed to parse release JSON"
+            return 1
+        }
+        printf '%s\n' "$url"
+        [ -n "$url" ]
+        return
+    fi
 
     CAAM_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$asset_name" <<'PY'
 import json
@@ -1045,6 +1132,13 @@ try_binary_install() {
 
     info "Checking for pre-built binary..."
 
+    # Release metadata is parsed with python3 or jq; without either we cannot
+    # pick (or verify) a release asset.
+    if ! ensure_json_tool; then
+        warn "Skipping the pre-built binary: neither python3 nor jq is installed."
+        return 1
+    fi
+
     local release_json
     if [ -n "$INSTALL_VERSION" ]; then
         release_json=$(get_release "$INSTALL_VERSION") || {
@@ -1111,12 +1205,14 @@ try_binary_install() {
     if [ "$HAS_GUM" = true ]; then
         if ! spin "Downloading $asset_name" download_file "$download_url" "$archive_path" "false"; then
             error "Download failed from: $download_url"
+            BINARY_DOWNLOAD_FAILED=true
             error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
             return 1
         fi
     else
         if ! download_file "$download_url" "$archive_path" "false"; then
             error "Download failed from: $download_url"
+            BINARY_DOWNLOAD_FAILED=true
             error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
             return 1
         fi
@@ -1406,6 +1502,9 @@ main() {
 
     if ! try_go_install; then
         rollback_on_failure
+        if [ "$BINARY_DOWNLOAD_FAILED" = true ]; then
+            die "Failed to install $BIN_NAME: the release download failed and the source build fallback did not succeed" $EXIT_DOWNLOAD_FAILED
+        fi
         die "Failed to install $BIN_NAME" $EXIT_BUILD_FAILED
     fi
 
