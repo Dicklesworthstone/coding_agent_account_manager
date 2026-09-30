@@ -133,7 +133,14 @@ Advanced: Profile isolation for simultaneous sessions:
 
 Run 'caam' without arguments to launch the interactive TUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// If called with no subcommand, launch TUI
+		// If called with no subcommand, launch the TUI, unless it is
+		// disabled or there is no terminal to draw it on. Then print the
+		// plain status table instead of starting a full-screen program
+		// that would hang a pipe or CI job.
+		if reason := tuiUnavailableReason(); reason != "" {
+			fmt.Fprintf(cmd.ErrOrStderr(), "caam: not starting the interactive TUI (%s); showing 'caam status'. Run 'caam --help' for all commands.\n", reason)
+			return runStatus(statusCmd, nil)
+		}
 		return tui.Run()
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -258,6 +265,20 @@ func showTokenWarnings(ctx context.Context) {
 
 	// Print to stderr so it doesn't interfere with command output
 	warnings.PrintToStderr(warns, false)
+}
+
+// tuiUnavailableReason says why bare 'caam' must not start the TUI, or
+// returns "" when it can. The TUI needs a terminal on stdin and stdout, and
+// can be turned off with NO_TUI/CAAM_NO_TUI or tui.no_tui in config.yaml.
+func tuiUnavailableReason() string {
+	cfg, err := config.LoadSPMConfig()
+	if err == nil && cfg.TUI.NoTUI {
+		return "disabled by NO_TUI/CAAM_NO_TUI or tui.no_tui in config.yaml"
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !isTerminal() {
+		return "stdin or stdout is not a terminal"
+	}
+	return ""
 }
 
 // isTerminal returns true if stdout is a terminal.

@@ -1421,3 +1421,23 @@ func TestNewConfigSectionLoadAndSave(t *testing.T) {
 		t.Errorf("Loaded Subscriptions[gemini] = %+v, want monthly_cost 275", sub)
 	}
 }
+
+// Environment overrides must apply even when there is no config.yaml, so
+// NO_TUI / CAAM_* settings work on a fresh install.
+func TestLoadSPMConfigEnvOverridesWithoutFile(t *testing.T) {
+	t.Setenv("CAAM_HOME", t.TempDir())
+	t.Setenv("CAAM_NO_TUI", "")
+	t.Setenv("NO_TUI", "1")
+	t.Setenv("CAAM_HEALTH_REFRESH_THRESHOLD", "15m")
+
+	cfg, err := LoadSPMConfig()
+	if err != nil {
+		t.Fatalf("LoadSPMConfig() error = %v", err)
+	}
+	if !cfg.TUI.NoTUI {
+		t.Error("NO_TUI=1 without a config file: TUI.NoTUI = false, want true")
+	}
+	if cfg.Health.RefreshThreshold.Duration() != 15*time.Minute {
+		t.Errorf("RefreshThreshold = %v, want 15m", cfg.Health.RefreshThreshold)
+	}
+}

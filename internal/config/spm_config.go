@@ -487,7 +487,14 @@ func LoadSPMConfig() (*SPMConfig, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultSPMConfig(), nil
+			// No config file: defaults, but environment overrides
+			// (NO_TUI, CAAM_TUI_*, ...) still apply.
+			config := DefaultSPMConfig()
+			config.ApplyEnvOverrides()
+			if err := config.Validate(); err != nil {
+				return nil, fmt.Errorf("invalid SPM config: %w", err)
+			}
+			return config, nil
 		}
 		return nil, fmt.Errorf("read SPM config: %w", err)
 	}
