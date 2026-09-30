@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -80,6 +82,16 @@ func runRename(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("destination profile %s/%s already exists; choose a different name or delete it with 'caam delete %s %s'", tool, newName, tool, newName)
 	}
 
+	// The copy takes only the profile's top-level files. With --delete-old,
+	// refuse up front when the source holds anything else: deleting it
+	// afterwards would lose that data.
+	if deleteOld {
+		if uncopied := uncopiedProfileEntries(vault.ProfilePath(tool, oldName)); len(uncopied) > 0 {
+			return fmt.Errorf("not renaming %s/%s with --delete-old: it contains %s, which rename does not copy; run without --delete-old to copy its files and keep the original",
+				tool, oldName, strings.Join(uncopied, ", "))
+		}
+	}
+
 	// Copy the profile
 	if err := vault.CopyProfile(tool, oldName, newName); err != nil {
 		return fmt.Errorf("copy profile: %w", err)
@@ -122,9 +134,10 @@ func runRename(cmd *cobra.Command, args []string) error {
 	// Delete old profile if requested (with confirmation)
 	if deleteOld {
 		if !skipConfirm {
-			fmt.Printf("Delete old profile %s/%s? This cannot be undone. [y/N]: ", tool, oldName)
+			// Prompt on stderr so --json output on stdout stays parseable.
+			fmt.Fprintf(cmd.ErrOrStderr(), "Delete old profile %s/%s? This cannot be undone. [y/N]: ", tool, oldName)
 			var response string
-			fmt.Scanln(&response)
+			_, _ = fmt.Fscanln(cmd.InOrStdin(), &response)
 			if response != "y" && response != "Y" {
 				if jsonOutput {
 					result["deleted"] = false
@@ -169,4 +182,20 @@ func runRename(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  caam activate %s %s\n", tool, newName)
 
 	return nil
+}
+
+// uncopiedProfileEntries lists the entries in a vault profile directory that
+// Vault.CopyProfile does not copy (it copies top-level files only).
+func uncopiedProfileEntries(profileDir string) []string {
+	entries, err := os.ReadDir(profileDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name()+"/")
+		}
+	}
+	return out
 }
