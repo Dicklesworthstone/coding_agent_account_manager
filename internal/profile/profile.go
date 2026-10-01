@@ -697,7 +697,7 @@ func (s *Store) Load(provider, name string) (*Profile, error) {
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("profile %s/%s not found", provider, name)
+			return nil, fmt.Errorf("profile %s/%s %w", provider, name, ErrNotFound)
 		}
 		return nil, fmt.Errorf("read profile: %w", err)
 	}
@@ -715,6 +715,10 @@ func (s *Store) Load(provider, name string) (*Profile, error) {
 	profile.LoadIdentity()
 	return &profile, nil
 }
+
+// ErrNotFound is returned (wrapped) by Store.Load when no isolated profile
+// with that name exists.
+var ErrNotFound = errors.New("not found")
 
 // Delete removes a profile and all its data.
 func (s *Store) Delete(provider, name string) error {

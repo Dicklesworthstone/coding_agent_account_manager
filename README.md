@@ -434,7 +434,7 @@ carol@gmail.com
 | `caam backup <tool> <email>` | Save current auth files to vault |
 | `caam activate <tool> <email>` | Restore auth files from vault (instant switch!) |
 | `caam status [tool]` | Show which profile is currently active |
-| `caam ls [tool]` | List all saved profiles in vault |
+| `caam ls [tool]` | List all saved profiles in vault. TYPE is `vault` or `vault+iso` (an isolated profile of the same name exists, so `caam exec` works too); isolated-only profiles are listed after the table. `--json` adds `type`, `isolated` and `isolated_only` |
 | `caam delete <tool> <email>` | Remove a saved profile |
 | `caam paths [tool]` | Show auth file locations for each tool |
 | `caam clear <tool>` | Remove auth files (logout state) |

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1101,15 +1102,39 @@ func runStatus(cmd *cobra.Command, args []string) error {
 type lsOutput struct {
 	Profiles []lsProfile `json:"profiles"`
 	Count    int         `json:"count"`
+
+	// IsolatedOnly lists isolated profiles (caam profile add) that have no
+	// vault profile of the same name, so they are not rows above. They run
+	// with caam exec, not caam activate (issue #110).
+	IsolatedOnly []lsIsolatedProfile `json:"isolated_only,omitempty"`
 }
 
+// Profile types. A vault profile is a saved set of auth files that caam
+// activate swaps into place; an isolated profile is a separate home directory
+// that caam exec runs a tool inside. One name can be both.
+const (
+	profileTypeVault    = "vault"
+	profileTypeIsolated = "isolated"
+)
+
 type lsProfile struct {
-	Tool     string             `json:"tool"`
-	Name     string             `json:"name"`
+	Tool string `json:"tool"`
+	Name string `json:"name"`
+	// Type is always "vault": every row is a vault profile.
+	Type string `json:"type"`
+	// Isolated reports that an isolated profile with the same name also
+	// exists, so caam exec <tool> <name> works too.
+	Isolated bool               `json:"isolated"`
 	Active   bool               `json:"active"`
 	System   bool               `json:"system"`
 	Health   lsHealth           `json:"health"`
 	Identity *identity.Identity `json:"identity,omitempty"`
+}
+
+type lsIsolatedProfile struct {
+	Tool string `json:"tool"`
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type lsHealth struct {
@@ -1135,6 +1160,12 @@ var lsCmd = &cobra.Command{
 	Aliases: []string{"list"},
 	Short:   "List saved profiles",
 	Long: `Lists all profiles stored in the vault with health status.
+
+The TYPE column says how a profile can be used. "vault" profiles are switched
+in place with 'caam activate'. "vault+iso" means an isolated profile of the
+same name also exists, so 'caam exec' works for it too. Isolated profiles with
+no vault counterpart are listed after the table; 'caam profile ls' shows them
+in detail.
 
 Examples:
   caam ls              # List all profiles
@@ -1176,6 +1207,10 @@ func runLs(cmd *cobra.Command, args []string) error {
 	// Collect profiles for JSON output
 	var output lsOutput
 
+	// Every row is a vault profile; note which also exist as isolated
+	// profiles, and collect the isolated ones with no vault row (issue #110).
+	isolated := isolatedProfileNames()
+
 	if len(args) > 0 {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
@@ -1186,6 +1221,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		output.IsolatedOnly = isolatedOnlyProfiles(isolated, map[string][]string{tool: profiles}, tool, hasTag)
 
 		// Filter by tag if specified
 		if tagFilter != "" {
@@ -1205,11 +1241,12 @@ func runLs(cmd *cobra.Command, args []string) error {
 				return encodeLsJSON(cmd, output)
 			}
 			fmt.Printf("No profiles saved for %s\n", tool)
+			printIsolatedOnly(output.IsolatedOnly)
 			return nil
 		}
 
 		if !jsonOutput {
-			fmt.Printf("%-22s  %-24s  %-10s  %s\n", "PROFILE", "EMAIL", "PLAN", "STATUS")
+			fmt.Printf("%-22s  %-9s  %-24s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", "PLAN", "STATUS")
 		}
 
 		// Check which is active
@@ -1222,10 +1259,12 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 			if jsonOutput {
 				lp := lsProfile{
-					Tool:   tool,
-					Name:   p,
-					Active: p == activeProfile,
-					System: authfile.IsSystemProfile(p),
+					Tool:     tool,
+					Name:     p,
+					Type:     profileTypeVault,
+					Isolated: isolated[tool][p],
+					Active:   p == activeProfile,
+					System:   authfile.IsSystemProfile(p),
 					Health: lsHealth{
 						Status:           status.String(),
 						ErrorCount:       ph.ErrorCount1h,
@@ -1251,7 +1290,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("%s%-20s  %-24s  %-10s  %s\n", marker, displayName, email, plan, healthStr)
+				fmt.Printf("%s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
 			}
 		}
 
@@ -1259,6 +1298,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 			output.Count = len(output.Profiles)
 			return encodeLsJSON(cmd, output)
 		}
+		printIsolatedOnly(output.IsolatedOnly)
 		return nil
 	}
 
@@ -1267,6 +1307,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	output.IsolatedOnly = isolatedOnlyProfiles(isolated, allProfiles, "", hasTag)
 
 	// Filter by tag if specified
 	if tagFilter != "" {
@@ -1299,6 +1340,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 			fmt.Println("  1. Login using the tool's command (codex login, /login in claude)")
 			fmt.Println("  2. Run: caam backup <tool> <profile-name>")
 		}
+		printIsolatedOnly(output.IsolatedOnly)
 		return nil
 	}
 
@@ -1308,7 +1350,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		if !jsonOutput {
 			fmt.Printf("%s:\n", tool)
-			fmt.Printf("  %-20s  %-24s  %-10s  %s\n", "PROFILE", "EMAIL", "PLAN", "STATUS")
+			fmt.Printf("  %-22s  %-9s  %-24s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", "PLAN", "STATUS")
 		}
 
 		for _, p := range profiles {
@@ -1317,10 +1359,12 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 			if jsonOutput {
 				lp := lsProfile{
-					Tool:   tool,
-					Name:   p,
-					Active: p == activeProfile,
-					System: authfile.IsSystemProfile(p),
+					Tool:     tool,
+					Name:     p,
+					Type:     profileTypeVault,
+					Isolated: isolated[tool][p],
+					Active:   p == activeProfile,
+					System:   authfile.IsSystemProfile(p),
 					Health: lsHealth{
 						Status:           status.String(),
 						ErrorCount:       ph.ErrorCount1h,
@@ -1346,7 +1390,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("  %s%-20s  %-24s  %-10s  %s\n", marker, displayName, email, plan, healthStr)
+				fmt.Printf("  %s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
 			}
 		}
 	}
@@ -1356,7 +1400,84 @@ func runLs(cmd *cobra.Command, args []string) error {
 		return encodeLsJSON(cmd, output)
 	}
 
+	printIsolatedOnly(output.IsolatedOnly)
 	return nil
+}
+
+// isolatedProfileNames returns the isolated profiles in the profile store,
+// keyed by tool then name. Nil when there is no profile store.
+func isolatedProfileNames() map[string]map[string]bool {
+	if profileStore == nil {
+		return nil
+	}
+	all, err := profileStore.ListAll()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]map[string]bool, len(all))
+	for tool, profs := range all {
+		for _, p := range profs {
+			if p == nil || p.Name == "" {
+				continue
+			}
+			if out[tool] == nil {
+				out[tool] = make(map[string]bool)
+			}
+			out[tool][p.Name] = true
+		}
+	}
+	return out
+}
+
+// isolatedOnlyProfiles returns the isolated profiles that have no vault
+// profile of the same name, sorted by tool then name. vaultProfiles is the
+// unfiltered vault listing. onlyTool, when set, restricts the result to that
+// tool; keep applies the --tag filter.
+func isolatedOnlyProfiles(isolated map[string]map[string]bool, vaultProfiles map[string][]string, onlyTool string, keep func(tool, name string) bool) []lsIsolatedProfile {
+	var out []lsIsolatedProfile
+	for tool, names := range isolated {
+		if onlyTool != "" && tool != onlyTool {
+			continue
+		}
+		inVault := make(map[string]bool, len(vaultProfiles[tool]))
+		for _, p := range vaultProfiles[tool] {
+			inVault[p] = true
+		}
+		for name := range names {
+			if inVault[name] || !keep(tool, name) {
+				continue
+			}
+			out = append(out, lsIsolatedProfile{Tool: tool, Name: name, Type: profileTypeIsolated})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Tool != out[j].Tool {
+			return out[i].Tool < out[j].Tool
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// lsTypeLabel is the TYPE column of caam ls.
+func lsTypeLabel(alsoIsolated bool) string {
+	if alsoIsolated {
+		return "vault+iso"
+	}
+	return profileTypeVault
+}
+
+// printIsolatedOnly prints the isolated profiles that are not vault rows, so
+// caam ls shows every profile and which command runs it.
+func printIsolatedOnly(profiles []lsIsolatedProfile) {
+	if len(profiles) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Isolated profiles (run with 'caam exec <tool> <profile>'; details: caam profile ls):")
+	for _, p := range profiles {
+		fmt.Printf("  %s/%s\n", p.Tool, p.Name)
+	}
 }
 
 func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
@@ -2082,7 +2203,10 @@ Examples:
 
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
-			return err
+			// A missing profile is not a syntax error; the usage block
+			// would bury the explanation.
+			cmd.SilenceUsage = true
+			return isolatedProfileLoadError(tool, name, err)
 		}
 
 		// Repair a profile registered without its provider home before handing
@@ -2169,7 +2293,10 @@ Examples:
 
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
-			return err
+			// A missing profile is not a syntax error; the usage block
+			// would bury the explanation.
+			cmd.SilenceUsage = true
+			return isolatedProfileLoadError(tool, name, err)
 		}
 
 		ctx := context.Background()
@@ -2207,6 +2334,31 @@ Examples:
 		}
 		return runErr
 	},
+}
+
+// isolatedProfileLoadError explains a failed isolated-profile lookup for
+// commands that only run isolated profiles (exec, login). The common case is
+// a name that exists only in the vault: caam ls lists it, so "not found" reads
+// as a bug (issue #110). Other load errors pass through unchanged.
+func isolatedProfileLoadError(tool, name string, err error) error {
+	if !errors.Is(err, profile.ErrNotFound) {
+		return err
+	}
+	if vault != nil {
+		if names, listErr := vault.List(tool); listErr == nil && slices.Contains(names, name) {
+			// Claude Code's login cannot be driven by caam login; its
+			// isolated profiles log in with /login inside caam exec.
+			loginStep := fmt.Sprintf("caam login %s %s", tool, name)
+			if tool == "claude" {
+				loginStep = fmt.Sprintf("caam exec %s %s, then /login in the session", tool, name)
+			}
+			return fmt.Errorf("%s/%s is a vault profile, not an isolated profile; caam exec and caam login only use isolated profiles.\n"+
+				"  To use it, switch to it and run %s as usual:  caam activate %s %s\n"+
+				"  To run it in parallel, create an isolated profile and log in:  caam profile add %s %s, then %s",
+				tool, name, tool, tool, name, tool, name, loginStep)
+		}
+	}
+	return fmt.Errorf("%w; run 'caam profile ls %s' to see isolated profiles", err, tool)
 }
 
 // nonInteractiveExecExample returns an example `caam exec` invocation that runs
