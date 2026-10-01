@@ -8,6 +8,15 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [0.1.21] - 2026-09-30
+
+### Fixed
+
+- **`install.sh` works with only `jq`.** The installer said "install python3 or jq", but reading the release list only worked with Python, so a machine with just `jq` fell back to building from source, without signature verification. Both tools now work and are tested to give the same answer. Also fixed in the installer: `--channel=beta` fed the release list to the wrong place, and styled warnings could leak into captured values.
+- **Bare `caam` no longer hangs in pipes or CI.** `NO_TUI`, `CAAM_NO_TUI` and `tui.no_tui` were documented but ignored. When the TUI is turned off, or when there is no terminal, `caam` now prints the `caam status` table instead, with a one-line note on stderr. `CAAM_*` environment overrides now also apply on a fresh install with no `config.yaml`.
+- **The TUI fits the terminal.** The profiles and detail panels ignored their size, so at 80x24 the main view drew 61 rows and 92 columns and the status bar disappeared. The profile list now scrolls to keep the selection visible, every panel is cut to its box, and the status bar stays on the last row.
+- **`caam rename --delete-old` cannot lose data.** Rename copies only a profile's top-level files, so deleting the old profile could remove subdirectories that were never copied. It now refuses up front and names those entries. Its confirmation prompt goes to stderr, so `--json` output stays parseable, and `caam alias --remove` on an unknown alias points at `caam alias --list` (the command it suggested before does not exist).
+
 ## [0.1.20] - 2026-09-29
 
 ### Added
