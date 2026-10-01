@@ -8,6 +8,12 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [0.1.22] - 2026-10-01
+
+### Fixed
+
+- **The macOS Go `.pkg` fallback in `install.sh` works, and the download is checked before it is installed.** When neither a release binary nor Homebrew was usable, the installer was meant to install Go from the official `.pkg` and build from source. It read the download URL from a `url` field that go.dev's release list does not have, so the URL was always empty and that path never ran. The URL is now built from the file name (`https://go.dev/dl/<filename>`), and the `.pkg` must match the SHA-256 that go.dev lists before `sudo installer` runs. A mismatch stops the install. The python3 and jq readers give the same result.
+
 ## [0.1.21] - 2026-09-30
 
 ### Fixed
