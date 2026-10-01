@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // Codex API constants.
@@ -128,14 +130,16 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	req.Header.Set("User-Agent", CodexUserAgent)
 	req.Header.Set("Accept", "application/json")
 
-	if opts != nil && opts.AccountID != "" {
-		req.Header.Set("ChatGPT-Account-Id", opts.AccountID)
+	accountID := codexAccountID(accessToken, opts)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return &UsageInfo{
 			Provider:  "codex",
+			AccountID: accountID,
 			FetchedAt: time.Now(),
 			Error:     fmt.Sprintf("request failed: %v", err),
 		}, err
@@ -144,6 +148,7 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 
 	info := &UsageInfo{
 		Provider:  "codex",
+		AccountID: accountID,
 		Source:    SourceAPI,
 		FetchedAt: time.Now(),
 	}
@@ -203,6 +208,31 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	}
 
 	return info, nil
+}
+
+// codexAccountID picks the ChatGPT account a usage read is scoped to. The
+// Codex CLI always sends ChatGPT-Account-Id with its rate-limit request; when
+// the header is missing, /wham/usage can answer for a different scope than
+// the one Codex shows (GH #111). An explicit id wins; otherwise the id comes
+// from the access token's chatgpt_account_id claim, which is where Codex
+// itself derives tokens.account_id at login. An opaque token with no explicit
+// id sends no header.
+func codexAccountID(accessToken string, opts *CodexFetchOptions) string {
+	id := ""
+	if opts != nil {
+		id = strings.TrimSpace(opts.AccountID)
+	}
+	if id == "" {
+		id = identity.ChatGPTAccountID(accessToken)
+	}
+	// A header value with control characters would make the request itself
+	// fail; an unusable id is the same as no id.
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return id
 }
 
 // resolveUsageURL determines the correct usage API URL.

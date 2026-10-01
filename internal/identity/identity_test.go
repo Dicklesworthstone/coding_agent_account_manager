@@ -407,3 +407,41 @@ func TestFixture_CodexNoTokens(t *testing.T) {
 		t.Error("expected error for fixture without tokens")
 	}
 }
+
+func TestChatGPTAccountID(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{
+			name: "nested account claim",
+			token: buildJWT(t, map[string]interface{}{
+				"https://api.openai.com/auth": map[string]interface{}{
+					"chatgpt_account_id": " acct-123 ",
+					"chatgpt_user_id":    "user-1",
+					"user_id":            "user-1",
+				},
+			}),
+			want: "acct-123",
+		},
+		{
+			name: "user id is not an account id",
+			token: buildJWT(t, map[string]interface{}{
+				"https://api.openai.com/auth": map[string]interface{}{"user_id": "user-1"},
+				"account_id":                  "top-level-is-not-the-chatgpt-claim",
+			}),
+			want: "",
+		},
+		{name: "namespace not an object", token: buildJWT(t, map[string]interface{}{"https://api.openai.com/auth": "x"}), want: ""},
+		{name: "opaque token", token: "sk-opaque", want: ""},
+		{name: "empty", token: "", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ChatGPTAccountID(tc.token); got != tc.want {
+				t.Errorf("ChatGPTAccountID() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

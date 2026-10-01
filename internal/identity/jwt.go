@@ -43,6 +43,27 @@ func ExtractFromJWT(token string) (*Identity, error) {
 	return identity, nil
 }
 
+// ChatGPTAccountID returns the ChatGPT account (workspace) id that an OpenAI
+// token was issued for, read from the chatgpt_account_id claim under
+// "https://api.openai.com/auth". It returns "" when the token is not a JWT or
+// carries no such claim.
+//
+// This is the value the Codex CLI stores as tokens.account_id and sends as
+// the ChatGPT-Account-Id header. The same namespace also carries user_id and
+// chatgpt_user_id; those identify the person, not the account, and are never
+// substituted here.
+func ChatGPTAccountID(token string) string {
+	claims, err := parseJWTClaims(strings.TrimSpace(token))
+	if err != nil {
+		return ""
+	}
+	nested, ok := claims["https://api.openai.com/auth"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return valueAsString(nested["chatgpt_account_id"])
+}
+
 func parseJWTClaims(token string) (map[string]interface{}, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
