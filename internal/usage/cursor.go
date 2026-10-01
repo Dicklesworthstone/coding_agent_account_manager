@@ -280,9 +280,14 @@ func emailFromCursorConfig(path string) string {
 	return email
 }
 
-// parseCursorPeriod reads GetCurrentPeriodUsage. included_spend / limit is
-// the included-usage percentage the CLI prints ("You've used N%"). A reset
-// alone, or a percent field with no spend and no limit, is not a measurement.
+// parseCursorPeriod reads GetCurrentPeriodUsage. The "cursor models" window
+// is autoPercentUsed, the figure cursor-agent's /usage prints as "Auto". It is
+// not includedSpend / limit: includedSpend stops at limit once the included
+// dollars are spent while Cursor keeps serving its own models from bonus
+// credit, so that ratio reads 100% on seats Cursor reports far lower (GH
+// #112). includedSpend / limit (or limit - remaining) is used only when the
+// response has no autoPercentUsed. A reset alone, or a percent field with no
+// spend and no limit, is not a measurement.
 func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
 	info := &UsageInfo{
 		Provider:    "cursor",
@@ -325,25 +330,41 @@ func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
 		info.QuotaNote = info.Error
 		return info
 	}
-	limit, limitOK := jsonInt(firstPresent(plan, "limit"))
-	included, includedOK := jsonInt(firstPresent(plan, "includedSpend", "included_spend"))
-	remaining, remainingOK := jsonInt(firstPresent(plan, "remaining"))
-	includedPresent := hasJSONField(plan, "includedSpend", "included_spend")
-	remainingPresent := hasJSONField(plan, "remaining")
-	var used int64
+	var pct float64
+	auto, autoOK := jsonFloat(firstPresent(plan, "autoPercentUsed", "auto_percent_used"))
 	switch {
-	case limitOK && limit > 0 && includedPresent && includedOK && included >= 0 && included <= limit &&
-		(!remainingPresent || (remainingOK && remaining == limit-included)):
-		used = included
-	case limitOK && limit > 0 && !includedPresent && remainingOK && remaining >= 0 && remaining <= limit:
-		used = limit - remaining
-	default:
+	case autoOK && auto >= 0 && auto <= 100:
+		pct = auto
+	case hasJSONField(plan, "autoPercentUsed", "auto_percent_used"):
+		// Cursor reported a figure for its own models that is not a
+		// percentage. Falling back to spend / limit would show the very
+		// number this field exists to correct, so the row is unmeasured.
+		info.QuotaNote = "cursor model utilization was invalid; automatic selection is disabled"
 		if !reset.IsZero() {
-			info.PrimaryWindow = &UsageWindow{ResetsAt: reset, Kind: "included", Label: "included", Unmeasured: true}
+			info.PrimaryWindow = &UsageWindow{ResetsAt: reset, Kind: "included", Label: "cursor models", Unmeasured: true}
 		}
 		return info
+	default:
+		limit, limitOK := jsonInt(firstPresent(plan, "limit"))
+		included, includedOK := jsonInt(firstPresent(plan, "includedSpend", "included_spend"))
+		remaining, remainingOK := jsonInt(firstPresent(plan, "remaining"))
+		includedPresent := hasJSONField(plan, "includedSpend", "included_spend")
+		remainingPresent := hasJSONField(plan, "remaining")
+		var used int64
+		switch {
+		case limitOK && limit > 0 && includedPresent && includedOK && included >= 0 && included <= limit &&
+			(!remainingPresent || (remainingOK && remaining == limit-included)):
+			used = included
+		case limitOK && limit > 0 && !includedPresent && remainingOK && remaining >= 0 && remaining <= limit:
+			used = limit - remaining
+		default:
+			if !reset.IsZero() {
+				info.PrimaryWindow = &UsageWindow{ResetsAt: reset, Kind: "included", Label: "included", Unmeasured: true}
+			}
+			return info
+		}
+		pct = float64(used) / float64(limit) * 100
 	}
-	pct := float64(used) / float64(limit) * 100
 	info.PrimaryWindow = &UsageWindow{
 		Utilization: pct / 100,
 		UsedPercent: int(math.Round(pct)),
@@ -355,8 +376,8 @@ func parseCursorPeriod(raw []byte, now time.Time) *UsageInfo {
 		info.PrimaryWindow.WindowDuration = reset.Sub(time.UnixMilli(start))
 	}
 	// apiPercentUsed is the separate monthly allowance for named models
-	// (the CLI calls it "included API usage"). Cursor's own models draw on
-	// the included pool above. Both windows share the billing-cycle reset.
+	// (cursor-agent's /usage prints it as "API"). Cursor's own models are
+	// the "Auto" window above. Both windows share the billing-cycle reset.
 	// An invalid reported value makes the row ineligible for routing.
 	if api, ok := jsonFloat(firstPresent(plan, "apiPercentUsed", "api_percent_used")); ok && api >= 0 && api <= 100 {
 		info.SecondaryWindow = &UsageWindow{
