@@ -1,10 +1,15 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1580,5 +1585,59 @@ func TestDaemon_getProfileHealth_ParseGeminiExpiry(t *testing.T) {
 	ph := d.getProfileHealth("gemini", "test@example.com")
 	if ph != nil {
 		t.Error("getProfileHealth should return nil for invalid gemini auth file")
+	}
+}
+
+func TestCursorSessionDaemonWarnsOnceWithoutRefresh(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	path := vault.ProfilePath("cursor", "session")
+	if err := os.MkdirAll(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(exp time.Time, apiKey bool) {
+		payload, _ := json.Marshal(map[string]interface{}{"exp": exp.Unix()})
+		data := map[string]interface{}{"accessToken": "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"}
+		if apiKey {
+			data["apiKey"] = "synthetic-key"
+		}
+		b, _ := json.Marshal(data)
+		if err := os.WriteFile(filepath.Join(path, "auth.json"), b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var logs bytes.Buffer
+	d := &Daemon{vault: vault, config: DefaultConfig(), logger: log.New(&logs, "", 0), ctx: context.Background()}
+	expiry := time.Now().Add(5 * 24 * time.Hour)
+	d.healthStore = health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	if err := d.healthStore.UpdateProfile("cursor", "session", &health.ProfileHealth{TokenExpiresAt: time.Now().Add(30 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	write(expiry, false)
+	parsed := d.getProfileHealth("cursor", "session")
+	if parsed == nil || parsed.TokenExpiresAt.Unix() != expiry.Unix() || parsed.TokenRenewable || parsed.ReloginWarningLead != 7*24*time.Hour {
+		t.Fatalf("stale store bypassed session semantics: %+v", parsed)
+	}
+	d.checkProfile("cursor", "session")
+	d.checkProfile("cursor", "session")
+	d.warnCursorSession("active", parsed)
+	if strings.Count(logs.String(), "log in again") != 1 {
+		t.Fatalf("logs=%s", logs.String())
+	}
+	// Two logins can have the same exp: deduplicate by credential, not date.
+	other := *parsed
+	other.CredentialFingerprint = "another-synthetic-login"
+	d.warnCursorSession("other", &other)
+	if strings.Count(logs.String(), "log in again") != 2 {
+		t.Fatalf("distinct login with same expiry not warned: %s", logs.String())
+	}
+	write(expiry.Add(time.Hour), false)
+	d.checkProfile("cursor", "session")
+	if strings.Count(logs.String(), "log in again") != 3 {
+		t.Fatalf("new login not warned: %s", logs.String())
+	}
+	write(time.Now().Add(-time.Hour), true)
+	d.checkProfile("cursor", "session")
+	if strings.Count(logs.String(), "log in again") != 3 || d.stats.RefreshErrors != 0 || d.stats.RefreshCount != 0 {
+		t.Fatalf("API-backed token attempted refresh or warned: %s %+v", logs.String(), d.stats)
 	}
 }

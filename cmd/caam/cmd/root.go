@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -326,6 +327,8 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		// which the Codex parser cannot read; without its own case every Grok
 		// profile scored as unknown-expiry and stuck at warning (issue #101).
 		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "cursor":
+		expInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
 	}
 
 	// Prefer the profile's own live credential over the vault snapshot.
@@ -336,9 +339,9 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// reads the real, current token; it also keeps TokenExpiresAt from
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
-	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (tool == "cursor" || !liveExp.ExpiresAt.IsZero()) {
 		applyExpiryInfo(ph, liveExp)
-	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+	} else if err == nil && expInfo != nil && (tool == "cursor" || !expInfo.ExpiresAt.IsZero()) {
 		// Fallback: the vault snapshot is the best information we have.
 		applyExpiryInfo(ph, expInfo)
 	}
@@ -355,6 +358,7 @@ func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
 	ph.TokenExpiresAt = info.ExpiresAt
 	ph.SelfRefreshing = info.SelfRefreshing
 	ph.TokenRenewable = info.Renewable
+	ph.ReloginWarningLead = info.ReloginWarningLead
 	ph.CredentialFingerprint = info.Fingerprint
 }
 
@@ -373,6 +377,8 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 		info, err = health.ParseCodexExpiry("")
 	case "gemini":
 		info, err = health.ParseGeminiExpiry("")
+	case "cursor":
+		info, err = health.ParseCursorExpiry("")
 	case "grok":
 		home, homeErr := os.UserHomeDir()
 		if homeErr != nil {
@@ -395,7 +401,7 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if ph == nil {
 		return
 	}
-	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+	if info := liveAuthExpiry(tool); info != nil && (tool == "cursor" || !info.ExpiresAt.IsZero()) {
 		applyExpiryInfo(ph, info)
 	}
 }
@@ -438,6 +444,14 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+	case "cursor":
+		paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(key string) string {
+			if key == "XDG_CONFIG_HOME" {
+				return prof.XDGConfigPath()
+			}
+			return ""
+		})
+		info, err = health.ParseCursorExpiry(paths.AuthFile)
 	default:
 		return nil
 	}
@@ -1255,6 +1269,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
+			if tool == "cursor" && p == activeProfile {
+				applyLiveExpiry(tool, ph)
+			}
 			status := health.CalculateStatus(ph)
 
 			if jsonOutput {
@@ -1355,6 +1372,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
+			if tool == "cursor" && p == activeProfile {
+				applyLiveExpiry(tool, ph)
+			}
 			status := health.CalculateStatus(ph)
 
 			if jsonOutput {

@@ -957,6 +957,19 @@ func checkAuthFiles() []CheckResult {
 					continue
 				}
 				ph := buildProfileHealth(tool, profileName)
+				if tool == "cursor" {
+					if active, err := vault.ActiveProfile(fileSet); err == nil && active == profileName {
+						applyLiveExpiry(tool, ph)
+					}
+					if ph != nil && ph.CredentialRenewable() {
+						results = append(results, CheckResult{
+							Name:   fmt.Sprintf("%s/%s token", tool, profileName),
+							Status: "ok", Message: "API-key-backed credentials can renew",
+							Details: "Cursor renews the access token using the saved API key",
+						})
+						continue
+					}
+				}
 				name := fmt.Sprintf("%s/%s token", tool, profileName)
 				if ph == nil || ph.TokenExpiresAt.IsZero() {
 					// Cannot determine expiry: probe the token with a live API
@@ -966,21 +979,35 @@ func checkAuthFiles() []CheckResult {
 					}
 					continue
 				}
-				if ph.TokenExpiresAt.Before(time.Now()) {
+				warningLead := 15 * time.Minute
+				if ph.ReloginWarningLead > warningLead {
+					warningLead = ph.ReloginWarningLead
+				}
+				if !ph.TokenExpiresAt.After(time.Now()) {
 					results = append(results, CheckResult{
 						Name:    name,
 						Status:  "fail",
 						Message: "token expired",
 						Details: fmt.Sprintf("Expired at %s; re-login with 'caam login %s %s'", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),
 					})
-				} else if time.Until(ph.TokenExpiresAt) < 15*time.Minute {
+				} else if time.Until(ph.TokenExpiresAt) <= warningLead {
+					details := fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName)
+					if ph.ReloginWarningLead > 0 {
+						details = fmt.Sprintf("Session cannot renew; log in again: 'caam login %s %s'", tool, profileName)
+					}
 					results = append(results, CheckResult{
 						Name:    name,
 						Status:  "warn",
 						Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
-						Details: fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName),
+						Details: details,
 					})
 				} else {
+					if tool == "cursor" {
+						results = append(results, CheckResult{
+							Name: name, Status: "ok", Message: "session token valid",
+							Details: fmt.Sprintf("Expires at %s; session cannot renew", ph.TokenExpiresAt.Format(time.RFC3339)),
+						})
+					}
 					// Token not expired and not expiring soon -- still probe Codex
 					// tokens with a live API call to catch refresh_token_reused state
 					// where the access token appears valid by expiry but the refresh

@@ -65,8 +65,8 @@ type ExpiryInfo struct {
 	//     it as expired made healthy profiles look dead in `caam ls` and had
 	//     controllers route around working accounts.
 	//
-	// Every provider sets it from HasRefreshToken; a self-refreshing
-	// credential is renewable by construction.
+	// Most providers set it from HasRefreshToken. Cursor requires a stored
+	// API key instead; its session refreshToken cannot renew the login.
 	Renewable bool
 
 	// ReloginWarningLead widens the warning window for credentials that

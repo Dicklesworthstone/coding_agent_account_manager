@@ -3,6 +3,7 @@ package authpool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -553,4 +554,23 @@ func TestNewMonitor_NilPoolPanics(t *testing.T) {
 	}()
 
 	NewMonitor(nil, NewMockRefresher(), DefaultMonitorConfig())
+}
+
+func TestMonitorDoesNotRefreshCursor(t *testing.T) {
+	pool := NewAuthPool()
+	refresher := NewMockRefresher()
+	monitor := NewMonitor(pool, refresher, DefaultMonitorConfig())
+	for _, status := range []PoolStatus{PoolStatusReady, PoolStatusExpired, PoolStatusError} {
+		profile := fmt.Sprint(status)
+		pool.AddProfile("cursor", profile)
+		pool.SetStatus("cursor", profile, status)
+		pool.UpdateTokenExpiry("cursor", profile, time.Now().Add(-time.Hour))
+	}
+	monitor.checkAndRefresh(context.Background())
+	monitor.triggerRefresh(context.Background(), "cursor", "direct", PoolStatusExpired)
+	// Join any accidentally scheduled asynchronous refresh.
+	monitor.refreshWg.Wait()
+	if refresher.CallCount() != 0 {
+		t.Fatalf("Cursor refresh attempted: %v", refresher.Calls())
+	}
 }

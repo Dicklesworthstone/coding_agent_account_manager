@@ -81,9 +81,10 @@ type Daemon struct {
 	configChanged chan struct{} // Signal to reload config in runLoop
 	wg            sync.WaitGroup
 
-	mu      sync.Mutex
-	running bool
-	stats   Stats
+	mu              sync.Mutex
+	running         bool
+	stats           Stats
+	reloginWarnings map[string]string
 
 	configMu sync.RWMutex // Protects config access during runtime reloads
 }
@@ -461,6 +462,8 @@ func (d *Daemon) runLoop() {
 	// Do an initial check immediately
 	if !shouldUsePoolRefresh() {
 		d.checkAndRefresh()
+	} else {
+		d.checkCursorSessions()
 	}
 	d.checkAndBackup()
 
@@ -490,6 +493,8 @@ func (d *Daemon) runLoop() {
 			// Check each iteration in case pool monitor state changed
 			if !shouldUsePoolRefresh() {
 				d.checkAndRefresh()
+			} else {
+				d.checkCursorSessions()
 			}
 			d.checkAndBackup()
 		}
@@ -635,6 +640,7 @@ func (d *Daemon) checkAndRefresh() {
 	}
 
 	wg.Wait()
+	d.checkLiveCursorSession()
 
 	d.mu.Lock()
 	d.stats.ProfilesChecked += totalChecked
@@ -650,6 +656,11 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	// Get health data for this profile
 	ph := d.getProfileHealth(provider, profile)
 	if ph == nil {
+		return
+	}
+
+	if provider == "cursor" {
+		d.warnCursorSession(profile, ph)
 		return
 	}
 
@@ -694,7 +705,7 @@ func (d *Daemon) checkProfile(provider, profile string) {
 // getProfileHealth returns the health data for a profile.
 func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealth {
 	// First try the health store
-	if d.healthStore != nil {
+	if provider != "cursor" && d.healthStore != nil {
 		ph, err := d.healthStore.GetProfile(provider, profile)
 		if err == nil && ph != nil && !ph.TokenExpiresAt.IsZero() {
 			return ph
@@ -715,7 +726,9 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor", "grok":
+	case "cursor":
+		expiryInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "opencode", "grok":
 		// No token expiry parsing for these providers yet
 		return nil
 	}
@@ -725,7 +738,11 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	}
 
 	return &health.ProfileHealth{
-		TokenExpiresAt: expiryInfo.ExpiresAt,
+		TokenExpiresAt:        expiryInfo.ExpiresAt,
+		SelfRefreshing:        expiryInfo.SelfRefreshing,
+		TokenRenewable:        expiryInfo.Renewable,
+		ReloginWarningLead:    expiryInfo.ReloginWarningLead,
+		CredentialFingerprint: expiryInfo.Fingerprint,
 	}
 }
 
@@ -849,4 +866,64 @@ func StopDaemonByPID(pid int) error {
 	}
 
 	return nil
+}
+
+// warnCursorSession warns once for each login's expiry, without attempting
+// the unsupported refresh of a browser session.
+func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth) {
+	if ph.CredentialRenewable() || ph.TokenExpiresAt.IsZero() {
+		return
+	}
+	lead := ph.ReloginWarningLead
+	if lead <= 0 {
+		lead = 7 * 24 * time.Hour
+	}
+	if time.Until(ph.TokenExpiresAt) > lead {
+		return
+	}
+	fingerprint := ph.TokenExpiresAt.UTC().Format(time.RFC3339Nano)
+	if ph.CredentialFingerprint != "" {
+		fingerprint = ph.CredentialFingerprint
+	}
+	key := fingerprint
+	d.mu.Lock()
+	if d.reloginWarnings == nil {
+		d.reloginWarnings = make(map[string]string)
+	}
+	if d.reloginWarnings[key] == fingerprint {
+		d.mu.Unlock()
+		return
+	}
+	d.reloginWarnings[key] = fingerprint
+	d.mu.Unlock()
+	d.logger.Printf("cursor/%s: session expires %s; log in again: caam login cursor %s", profile, ph.TokenExpiresAt.Format(time.RFC3339), profile)
+}
+
+func (d *Daemon) checkCursorSessions() {
+	d.checkLiveCursorSession()
+	profiles, err := d.vault.List("cursor")
+	if err != nil {
+		return
+	}
+	for _, profile := range profiles {
+		d.checkProfile("cursor", profile)
+	}
+}
+
+func (d *Daemon) checkLiveCursorSession() {
+	info, err := health.ParseCursorExpiry("")
+	if err != nil || info == nil {
+		return
+	}
+	profile, _ := d.vault.ActiveProfile(authfile.CursorAuthFiles())
+	if profile == "" {
+		profile = "active"
+	}
+	d.warnCursorSession(profile, &health.ProfileHealth{
+		TokenExpiresAt:        info.ExpiresAt,
+		SelfRefreshing:        info.SelfRefreshing,
+		TokenRenewable:        info.Renewable,
+		ReloginWarningLead:    info.ReloginWarningLead,
+		CredentialFingerprint: info.Fingerprint,
+	})
 }

@@ -18,15 +18,17 @@ import (
 
 // VerifyProfileResult represents the verification result for a single profile.
 type VerifyProfileResult struct {
-	Provider    string     `json:"provider"`
-	Profile     string     `json:"profile"`
-	Status      string     `json:"status"` // "healthy", "warning", "critical", "unknown"
-	TokenExpiry *time.Time `json:"token_expiry,omitempty"`
-	ExpiresIn   string     `json:"expires_in,omitempty"`
-	ErrorCount  int        `json:"error_count,omitempty"`
-	Penalty     float64    `json:"penalty,omitempty"`
-	Issues      []string   `json:"issues,omitempty"`
-	Score       float64    `json:"score"`
+	Provider           string        `json:"provider"`
+	Profile            string        `json:"profile"`
+	Status             string        `json:"status"` // "healthy", "warning", "critical", "unknown"
+	TokenExpiry        *time.Time    `json:"token_expiry,omitempty"`
+	ExpiresIn          string        `json:"expires_in,omitempty"`
+	ErrorCount         int           `json:"error_count,omitempty"`
+	Penalty            float64       `json:"penalty,omitempty"`
+	Issues             []string      `json:"issues,omitempty"`
+	Score              float64       `json:"score"`
+	ReloginWarningLead time.Duration `json:"relogin_warning_lead,omitempty"`
+	health.Signals
 }
 
 // VerifyOutput represents the complete verification output.
@@ -235,10 +237,19 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 		result.Issues = append(result.Issues, "Could not retrieve health data")
 		return result
 	}
+	if provider == "cursor" {
+		if fileSetFn := tools[provider]; fileSetFn != nil {
+			if active, err := vault.ActiveProfile(fileSetFn()); err == nil && active == profileName {
+				applyLiveExpiry(provider, ph)
+			}
+		}
+	}
 
 	// Calculate health status
 	status, score := health.CalculateHealth(ph, health.DefaultHealthConfig())
 	result.Score = score
+	result.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
+	result.ReloginWarningLead = ph.ReloginWarningLead
 
 	// Convert status to string
 	switch status {
@@ -260,7 +271,9 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 			result.ExpiresIn = formatTimeRemaining(remaining)
 		} else {
 			result.ExpiresIn = "expired"
-			result.Issues = append(result.Issues, fmt.Sprintf("Token expired %s ago", formatTimeRemaining(-remaining)))
+			if provider != "cursor" || !ph.CredentialRenewable() {
+				result.Issues = append(result.Issues, fmt.Sprintf("Token expired %s ago", formatTimeRemaining(-remaining)))
+			}
 		}
 	} else {
 		result.Issues = append(result.Issues, "No token expiry information found")
@@ -279,10 +292,18 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 	}
 
 	// Warning for expiring soon
-	if !ph.TokenExpiresAt.IsZero() {
+	if !ph.TokenExpiresAt.IsZero() && (provider != "cursor" || !ph.CredentialRenewable()) {
 		remaining := time.Until(ph.TokenExpiresAt)
-		if remaining > 0 && remaining < time.Hour {
-			result.Issues = append(result.Issues, "Token expiring soon (within 1 hour)")
+		lead := time.Hour
+		if ph.ReloginWarningLead > lead {
+			lead = ph.ReloginWarningLead
+		}
+		if remaining > 0 && remaining <= lead {
+			if ph.ReloginWarningLead > 0 {
+				result.Issues = append(result.Issues, "Session expiring soon; log in again (session cannot renew)")
+			} else {
+				result.Issues = append(result.Issues, "Token expiring soon (within 1 hour)")
+			}
 		}
 	}
 
@@ -319,6 +340,13 @@ func generateRecommendations(output *VerifyOutput) []string {
 	expiringSoonByProvider := make(map[string][]string)
 
 	for _, p := range output.Profiles {
+		if p.Provider == "cursor" && p.ReloginWarningLead == 0 {
+			continue
+		}
+		if p.ReloginWarningLead > 0 && p.TokenExpiry != nil && time.Until(*p.TokenExpiry) <= p.ReloginWarningLead {
+			recs = append(recs, fmt.Sprintf("Run 'caam login %s %s' to log in again; session cannot renew", p.Provider, p.Profile))
+			continue
+		}
 		if p.ExpiresIn == "expired" {
 			expiredByProvider[p.Provider] = append(expiredByProvider[p.Provider], p.Profile)
 		} else if p.TokenExpiry != nil && time.Until(*p.TokenExpiry) < time.Hour {

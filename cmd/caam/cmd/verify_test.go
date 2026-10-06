@@ -206,6 +206,18 @@ func TestGenerateRecommendations(t *testing.T) {
 	}
 }
 
+func TestCursorSessionVerifyRecommendation(t *testing.T) {
+	expires := time.Now().Add(12 * time.Hour)
+	output := &VerifyOutput{Profiles: []VerifyProfileResult{{
+		Provider: "cursor", Profile: "session", TokenExpiry: &expires,
+		ReloginWarningLead: 24 * time.Hour,
+	}}}
+	recs := generateRecommendations(output)
+	if len(recs) != 1 || !strings.Contains(recs[0], "caam login cursor session") || strings.Contains(recs[0], "refresh") {
+		t.Fatalf("non-renewable session recommendation = %v", recs)
+	}
+}
+
 func TestPrintVerifyOutput(t *testing.T) {
 	now := time.Now()
 	expiry := now.Add(time.Hour)

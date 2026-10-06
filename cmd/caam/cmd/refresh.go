@@ -322,8 +322,10 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		return health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor", "grok":
-		// No token expiry parsing for opencode/cursor/grok yet
+	case "cursor":
+		return health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "opencode", "grok":
+		// These providers do not support CAAM refresh.
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("refresh not supported for tool: %s", tool)

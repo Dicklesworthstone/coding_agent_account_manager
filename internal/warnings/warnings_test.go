@@ -3,6 +3,7 @@ package warnings
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -661,5 +662,71 @@ func TestCheckerCustomThresholds(t *testing.T) {
 	}
 	if !foundCritical {
 		t.Error("CheckAll() with custom threshold should return critical warning")
+	}
+}
+
+func TestCursorSessionWarnings(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	checker := NewChecker(vault, nil, nil)
+	jwt := func(exp time.Time) string {
+		b, _ := json.Marshal(map[string]interface{}{"exp": exp.Unix()})
+		return "e30." + base64.RawURLEncoding.EncodeToString(b) + ".signature"
+	}
+	for _, tc := range []struct {
+		name      string
+		remaining time.Duration
+		apiKey    bool
+		count     int
+	}{
+		{"long-lead", 6 * 24 * time.Hour, false, 1},
+		{"outside-lead", 8 * 24 * time.Hour, false, 0},
+		{"expired", -time.Hour, false, 1},
+		{"api-key", time.Minute, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := vault.ProfilePath("cursor", tc.name)
+			if err := os.MkdirAll(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			data := map[string]interface{}{"accessToken": jwt(time.Now().Add(tc.remaining))}
+			if tc.apiKey {
+				data["apiKey"] = "synthetic-api-key"
+			}
+			b, _ := json.Marshal(data)
+			if err := os.WriteFile(filepath.Join(path, "auth.json"), b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			warnings := checker.checkVaultProfile(context.Background(), "cursor", tc.name)
+			if len(warnings) != tc.count {
+				t.Fatalf("warnings=%v, want %d", warnings, tc.count)
+			}
+			if len(warnings) > 0 && warnings[0].Action != "caam login cursor "+tc.name {
+				t.Fatalf("action=%q", warnings[0].Action)
+			}
+		})
+	}
+}
+
+func TestCursorActiveWarningWithoutSavedProfile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	files := authfile.CursorAuthFiles()
+	for _, spec := range files.Files {
+		if filepath.Base(spec.Path) != "auth.json" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(spec.Path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		payload, _ := json.Marshal(map[string]interface{}{"exp": time.Now().Add(3 * 24 * time.Hour).Unix()})
+		data, _ := json.Marshal(map[string]interface{}{"accessToken": "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"})
+		if err := os.WriteFile(spec.Path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checker := NewChecker(authfile.NewVault(t.TempDir()), nil, nil)
+	warnings := checker.CheckActive(context.Background())
+	if len(warnings) != 1 || warnings[0].Tool != "cursor" {
+		t.Fatalf("warnings=%v", warnings)
 	}
 }

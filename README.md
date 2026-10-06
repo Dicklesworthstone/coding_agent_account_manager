@@ -369,6 +369,24 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 **Notes:** For CAAM, Gemini Ultra behaves like Claude Max and GPT Pro: OAuth tokens are stored locally and can be swapped instantly.
 
+### Cursor Agent
+
+CAAM reads the access JWT expiry from Cursor's `auth.json`: on Linux,
+`$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config/cursor/auth.json`);
+on macOS, `~/.cursor/auth.json`; on Windows, `%APPDATA%\Cursor\auth.json`.
+Browser/session logins cannot auto-refresh, even when `refreshToken` is
+present. CAAM warns seven days before expiry and recommends
+`caam login cursor <profile>`; an expired session requires a new login.
+Active profile matching uses `auth.json` when present, so changing models
+or settings does not lose the active marker.
+
+A stored `apiKey` lets cursor-agent re-mint its access token automatically;
+that token's deadline does not require a relogin. For unattended runs,
+`CURSOR_API_KEY` can supply the key without saving it in a config file, and
+`AGENT_CLI_CREDENTIAL_STORE=memory` keeps minted tokens off disk. CAAM's
+saved-profile health uses only that profile's stored key, never an ambient
+environment key belonging to a different account.
+
 ### Grok Build (xAI)
 
 **Auth Files:**

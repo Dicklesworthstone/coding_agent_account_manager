@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,160 @@ type lsVerificationRow struct {
 		ProviderRejection  string `json:"provider_rejection"`
 		ProviderRejectedAt string `json:"provider_rejected_at"`
 	} `json:"health"`
+}
+
+func TestCursorSessionRobotReloginRecommendations(t *testing.T) {
+	for _, tc := range []struct {
+		remaining time.Duration
+		status    health.HealthStatus
+	}{
+		{12 * time.Hour, health.StatusWarning},
+		{10 * time.Minute, health.StatusCritical},
+		{-time.Minute, health.StatusCritical},
+	} {
+		ph := &health.ProfileHealth{TokenExpiresAt: time.Now().Add(tc.remaining), ReloginWarningLead: 24 * time.Hour}
+		reason := getHealthReason(ph, tc.status)
+		rec := generateRecommendation(RobotProfileInfo{Health: RobotHealthInfo{Status: tc.status.String(), Reason: reason}})
+		if !strings.Contains(reason, "login required") || !strings.Contains(rec, "log in again") || strings.Contains(rec, "refresh") {
+			t.Fatalf("remaining %v: reason=%q recommendation=%q", tc.remaining, reason, rec)
+		}
+	}
+}
+
+func TestCursorStatusKeepsActiveLoginAfterConfigChange(t *testing.T) {
+	setupCodexVerificationVault(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	t.Setenv("CURSOR_CONFIG_DIR", "")
+	tools["cursor"] = authfile.CursorAuthFiles
+	set := authfile.CursorAuthFiles()
+	exp := time.Now().Add(6 * 24 * time.Hour).Truncate(time.Second)
+	payload, err := json.Marshal(map[string]any{"exp": exp.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+	for _, spec := range set.Files {
+		if err := os.MkdirAll(filepath.Dir(spec.Path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte(`{"model":"before"}`)
+		if filepath.Base(spec.Path) == "auth.json" {
+			data, err = json.Marshal(map[string]string{"accessToken": token, "refreshToken": token})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(spec.Path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := vault.Backup(set, "work"); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range set.Files {
+		if filepath.Base(spec.Path) != "auth.json" {
+			if err := os.WriteFile(spec.Path, []byte(`{"model":"after"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("json", true, "")
+	cmd.Flags().Bool("no-color", true, "")
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	if err := runStatus(cmd, []string{"cursor"}); err != nil {
+		t.Fatal(err)
+	}
+	var out statusOutput
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("status output %q: %v", buf.String(), err)
+	}
+	if len(out.Tools) != 1 {
+		t.Fatalf("status = %+v", out)
+	}
+	st := out.Tools[0]
+	if st.ActiveProfile != "work" || st.Health == nil || st.Health.Status != "warning" || !strings.Contains(st.Health.Reason, "log in again") {
+		t.Fatalf("status lost active login/expiry: %+v", st)
+	}
+	if st.Health.LoginRequired == nil || *st.Health.LoginRequired || st.Health.RefreshDue == nil || *st.Health.RefreshDue {
+		t.Fatalf("valid session signals = %+v", st.Health.Signals)
+	}
+}
+
+func TestCursorVaultExpiryPropagation(t *testing.T) {
+	vaultDir, _ := setupCodexVerificationVault(t)
+	tools["cursor"] = func() authfile.AuthFileSet { return authfile.AuthFileSet{Tool: "cursor"} }
+	expires := time.Now().Add(3 * 24 * time.Hour).Truncate(time.Second)
+	payload, err := json.Marshal(map[string]any{"exp": expires.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
+	for _, tc := range []struct {
+		name   string
+		apiKey string
+		want   health.HealthStatus
+	}{
+		{"session", "", health.StatusWarning},
+		{"api", "synthetic-api-key", health.StatusHealthy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(vaultDir, "cursor", tc.name)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(map[string]string{"accessToken": token, "refreshToken": token, "apiKey": tc.apiKey})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "auth.json"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			ph := buildProfileHealth("cursor", tc.name)
+			if !ph.TokenExpiresAt.Equal(expires) || ph.TokenRenewable != (tc.apiKey != "") || health.CalculateStatus(ph) != tc.want {
+				t.Fatalf("Cursor health = %+v, want %s renewable=%t", ph, tc.want.String(), tc.apiKey != "")
+			}
+			verified := verifyProfile("cursor", tc.name)
+			if should, _, err := shouldRefreshProfile("cursor", tc.name, 7*24*time.Hour, true); err != nil || should {
+				t.Fatalf("Cursor must not use CAAM refresh: should=%t error=%v", should, err)
+			}
+			if verified.Status != tc.want.String() || verified.TokenExpiry == nil || !verified.TokenExpiry.Equal(expires) {
+				t.Fatalf("Cursor verify = %+v", verified)
+			}
+			rows := runLsJSONForTest(t, "cursor")
+			listedExpiry, parseErr := time.Parse(time.RFC3339, rows[tc.name].Health.ExpiresAt)
+			if rows[tc.name].Health.Status != tc.want.String() || parseErr != nil || !listedExpiry.Equal(expires) {
+				t.Fatalf("Cursor ls = %+v", rows[tc.name])
+			}
+			for _, compact := range []bool{false, true} {
+				robot := buildProfileInfo("cursor", tc.name, "", nil, compact)
+				if robot.Health.Status != tc.want.String() || robot.Health.Renewable != (tc.apiKey != "") {
+					t.Fatalf("Cursor robot compact=%t = %+v", compact, robot)
+				}
+				if tc.apiKey == "" && !strings.Contains(generateRecommendation(robot), "log in again") {
+					t.Fatalf("Cursor robot compact=%t lost session relogin recommendation: %+v", compact, robot)
+				}
+			}
+			found := false
+			for _, check := range checkAuthFiles() {
+				if check.Name == "cursor/"+tc.name+" token" {
+					found = true
+					if tc.apiKey == "" && (check.Status != "warn" || !strings.Contains(check.Details, "caam login cursor session")) {
+						t.Fatalf("Cursor session doctor = %+v", check)
+					}
+					if tc.apiKey != "" && (check.Status != "ok" || !strings.Contains(check.Message, "can renew")) {
+						t.Fatalf("Cursor API doctor = %+v", check)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("doctor omitted Cursor token check")
+			}
+		})
+	}
 }
 
 func runLsJSONForTest(t *testing.T, tool string) map[string]lsVerificationRow {

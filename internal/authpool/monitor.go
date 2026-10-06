@@ -53,7 +53,7 @@ type Monitor struct {
 	// State
 	mu        sync.Mutex
 	running   bool
-	stopping  bool      // Set when Stop() is called, prevents new refreshes
+	stopping  bool // Set when Stop() is called, prevents new refreshes
 	stopCh    chan struct{}
 	stopOnce  sync.Once // Ensures stopCh is only closed once
 	refreshWg sync.WaitGroup
@@ -165,6 +165,11 @@ func (m *Monitor) checkAndRefresh(ctx context.Context) {
 	profiles := m.pool.GetProfilesNeedingRefresh("")
 
 	for _, profile := range profiles {
+		// Cursor sessions require a login; API-backed credentials renew through Cursor.
+		// Neither supports the CAAM refresh adapter. The daemon emits session warnings.
+		if profile.Provider == "cursor" {
+			continue
+		}
 		// Skip if already refreshing
 		if profile.Status == PoolStatusRefreshing {
 			continue
@@ -183,6 +188,9 @@ func (m *Monitor) checkAndRefresh(ctx context.Context) {
 
 // triggerRefresh starts a refresh operation for a profile.
 func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, prevStatus PoolStatus) {
+	if provider == "cursor" {
+		return
+	}
 	// Try to acquire semaphore (non-blocking)
 	select {
 	case m.semaphore <- struct{}{}:
