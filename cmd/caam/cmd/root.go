@@ -146,8 +146,12 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		return tui.Run()
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if _, err := config.MigrateDataToCAAMHome(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: data migration skipped: %v\n", err)
+		// Environment exports are read-only, including when CAAM_HOME points
+		// at a new store that would otherwise trigger a legacy data migration.
+		if cmd.Name() != "env" {
+			if _, err := config.MigrateDataToCAAMHome(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: data migration skipped: %v\n", err)
+			}
 		}
 
 		// Initialize vault
@@ -179,6 +183,9 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		var err error
 		cfg, err = config.Load()
 		if err != nil {
+			if cmd.Name() == "env" {
+				emitEvalFailure(cmd)
+			}
 			return fmt.Errorf("load config: %w", err)
 		}
 
@@ -224,6 +231,7 @@ func ExitCode(err error) int {
 func shouldShowWarnings(cmd *cobra.Command) bool {
 	// Skip for commands that don't benefit from warnings
 	skipCommands := map[string]bool{
+		"env":        true, // Read-only exports must not mirror keychain credentials.
 		"version":    true, // Quick info command
 		"paths":      true, // Quick info command
 		"validate":   true, // Already doing token validation
@@ -345,7 +353,7 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// reads the real, current token; it also keeps TokenExpiresAt from
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
-	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (!liveExp.ExpiresAt.IsZero() || tool == "cursor") {
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (!liveExp.ExpiresAt.IsZero() || tool == "cursor" || tool == "claude") {
 		applyExpiryInfo(ph, liveExp)
 	} else if err == nil && expInfo != nil && (!expInfo.ExpiresAt.IsZero() || tool == "cursor") {
 		// Fallback: the vault snapshot is the best information we have.
@@ -380,7 +388,16 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 	)
 	switch tool {
 	case "claude":
-		info, err = health.ParseClaudeExpiry("")
+		if configDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); configDir != "" {
+			// An explicit native config directory owns this login. Missing or
+			// opaque credentials there must not borrow another account's TTL.
+			info, err = health.ParseClaudeExpiry(configDir)
+			if err != nil {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+		} else {
+			info, err = health.ParseClaudeExpiry("")
+		}
 	case "codex":
 		info, err = health.ParseCodexExpiry("")
 	case "gemini":
@@ -412,7 +429,7 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if tool == "cursor" {
 		applyExpiryInfo(ph, &health.ExpiryInfo{})
 	}
-	if info := liveAuthExpiry(tool); info != nil && (!info.ExpiresAt.IsZero() || tool == "cursor") {
+	if info := liveAuthExpiry(tool); info != nil && (!info.ExpiresAt.IsZero() || tool == "cursor" || tool == "claude") {
 		applyExpiryInfo(ph, info)
 	}
 }
@@ -435,9 +452,9 @@ func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
-// directory (following adoption symlinks). A present but unreadable Cursor
-// credential returns unknown expiry, so an older vault login cannot supply
-// a false deadline. Missing credentials return nil to allow a vault fallback.
+// directory (following adoption symlinks). Present but unreadable Cursor or
+// Claude credentials return unknown expiry, so an older vault login cannot
+// supply a false deadline. Missing credentials allow a vault fallback.
 func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	if profileStore == nil {
 		return nil
@@ -451,7 +468,27 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	case "codex":
 		info, err = health.ParseCodexExpiry(filepath.Join(prof.CodexHomePath(), "auth.json"))
 	case "claude":
-		info, err = health.ParseClaudeExpiry(filepath.Join(prof.HomePath(), ".claude"))
+		p := claude.New()
+		env, envErr := p.Env(context.Background(), prof)
+		if envErr != nil {
+			return &health.ExpiryInfo{}
+		}
+		configDir := env["CLAUDE_CONFIG_DIR"]
+		info, err = health.ParseClaudeExpiry(configDir)
+		if errors.Is(err, health.ErrNoAuthFile) && configDir == filepath.Join(prof.HomePath(), ".claude") {
+			// Old legacy-only profiles keep their session state beside .claude
+			// until the required native preflight places it in the selected dir.
+			info, err = health.ParseClaudeExpiry(prof.HomePath())
+		}
+		if err != nil {
+			if !errors.Is(err, health.ErrNoAuthFile) {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+			status, statusErr := p.Status(context.Background(), prof)
+			if statusErr != nil || (status != nil && (status.LoggedIn || status.Error != "")) {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+		}
 	case "gemini":
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
 	case "grok":

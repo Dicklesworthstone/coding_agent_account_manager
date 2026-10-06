@@ -29,7 +29,10 @@ import (
 // files it names, which is also what makes shallow profiles keep working: they
 // run under their own HOME, which has no login keychain.
 func claudeKeychainPath(fileSet AuthFileSet) string {
-	if fileSet.Tool != "claude" || !keychain.Enabled() {
+	// Explicit config directories use their own native keychain namespace.
+	// The default login item must never be mirrored into that account, even
+	// when the override happens to name the legacy ~/.claude directory.
+	if fileSet.Tool != "claude" || os.Getenv("CLAUDE_CONFIG_DIR") != "" || !keychain.Enabled() {
 		return ""
 	}
 	credPath := claudeFileSetPath(fileSet, claudeCredentialsFile)

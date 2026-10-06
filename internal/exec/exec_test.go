@@ -965,3 +965,85 @@ func TestRun_GlobalEnvSkipsProfileRefresh(t *testing.T) {
 		t.Fatalf("RefreshProfile must not run for a global-env launch, got %d calls", len(mock.refreshed))
 	}
 }
+
+type preparingProvider struct {
+	mockProvider
+	prepare func(*profile.Profile) error
+	called  int
+}
+
+func (p *preparingProvider) PrepareRun(_ context.Context, prof *profile.Profile) error {
+	p.called++
+	return p.prepare(prof)
+}
+
+func TestLaunchPreparationFailurePreventsNativeExecution(t *testing.T) {
+	for _, mode := range []string{"basic", "smart-claude", "smart-codex"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "native-started")
+			id := "claude"
+			if mode == "smart-codex" {
+				id = "codex"
+			}
+			prof := &profile.Profile{Name: "account", Provider: id, BasePath: dir}
+			preparationErr := errors.New("invalid shared policy")
+			prov := &preparingProvider{
+				mockProvider: mockProvider{id: id, defaultBin: "sh"},
+				prepare: func(got *profile.Profile) error {
+					if got != prof {
+						t.Fatal("prepared a different profile")
+					}
+					return preparationErr
+				},
+			}
+			opts := RunOptions{Profile: prof, Provider: prov, NoLock: true,
+				Args: []string{"-c", `printf started > "$NATIVE_MARKER"`},
+				Env:  map[string]string{"NATIVE_MARKER": marker},
+			}
+			runner := NewRunner(provider.NewRegistry())
+			var err error
+			if mode == "basic" {
+				err = runner.Run(context.Background(), opts)
+			} else {
+				err = NewSmartRunner(runner, SmartRunnerOptions{}).Run(context.Background(), opts)
+			}
+			if !errors.Is(err, preparationErr) || prov.called != 1 {
+				t.Fatalf("preparation error/calls = %v/%d, want required failure once", err, prov.called)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("native process ran despite failed preparation: %v", err)
+			}
+		})
+	}
+}
+
+func TestLaunchPreparationRunsBeforeNativeAndSkipsGlobalEnv(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "prepared")
+	prof := &profile.Profile{Name: "account", Provider: "claude", BasePath: dir}
+	prov := &preparingProvider{
+		mockProvider: mockProvider{id: "claude", defaultBin: "sh"},
+		prepare: func(_ *profile.Profile) error {
+			return os.WriteFile(marker, []byte("ready"), 0600)
+		},
+	}
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile: prof, Provider: prov, NoLock: true,
+		Args: []string{"-c", `test "$(cat "$PREPARED_MARKER")" = ready`},
+		Env:  map[string]string{"PREPARED_MARKER": marker},
+	})
+	if err != nil || prov.called != 1 {
+		t.Fatalf("native launch did not observe preparation: %v (calls=%d)", err, prov.called)
+	}
+	prov.prepare = func(*profile.Profile) error { return errors.New("must not prepare a vault/global launch") }
+	if err := runner.Run(context.Background(), RunOptions{
+		Profile: prof, Provider: prov, NoLock: true, UseGlobalEnv: true, Args: []string{"-c", "exit 0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if prov.called != 1 {
+		t.Fatal("global launch prepared an isolated profile")
+	}
+}

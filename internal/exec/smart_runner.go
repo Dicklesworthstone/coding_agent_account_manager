@@ -15,6 +15,7 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/handoff"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
@@ -217,6 +218,11 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	// would point the tool at a profile directory that is not logged in.
 	var providerEnv map[string]string
 	if !opts.UseGlobalEnv {
+		if preparer, ok := opts.Provider.(provider.ProfileRunPreparer); ok {
+			if err := preparer.PrepareRun(ctx, opts.Profile); err != nil {
+				return fmt.Errorf("prepare %s launch: %w", opts.Provider.ID(), err)
+			}
+		}
 		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)

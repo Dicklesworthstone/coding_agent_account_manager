@@ -45,10 +45,10 @@ func CheckPrivate(path, sharedPath string) error {
 }
 
 // PrepareIsolatedSettings refreshes all settings locations for ONE isolated
-// profile. Existing files keep their own auth. A missing location can be seeded
-// from another existing location of that same profile (legacy/XDG repair), never
-// from the real home's auth. An existing {} is not missing and stays auth-free.
-// All inputs are read and validated before any writes are returned to callers.
+// profile. Each location keeps its own auth. A missing location receives shared
+// policy only: copying a helper into an ignored directory could make it become
+// the selected native auth store between preparation and launch. All inputs are
+// read and validated before any writes are returned to callers.
 func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Update, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -61,7 +61,6 @@ func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Up
 		return nil, fmt.Errorf("shared Claude settings: %w", err)
 	}
 	current := make([][]byte, len(paths))
-	var seed []byte
 	seen := make(map[string]bool)
 	for i, path := range paths {
 		if path == "" || seen[filepath.Clean(path)] {
@@ -78,17 +77,10 @@ func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Up
 		if _, err := object(current[i]); err != nil {
 			return nil, fmt.Errorf("profile Claude settings %s: %w", path, err)
 		}
-		if seed == nil && current[i] != nil {
-			seed = current[i]
-		}
 	}
 	updates := make([]*Update, 0, len(paths))
 	for i, path := range paths {
-		account := current[i]
-		if account == nil {
-			account = seed
-		}
-		after, err := Merge(shared, account, p)
+		after, err := Merge(shared, current[i], p)
 		if err != nil {
 			return nil, err
 		}
@@ -110,7 +102,7 @@ func ApplyUpdates(updates []*Update) error {
 		}
 	}
 	for _, update := range updates {
-		if !bytes.Equal(update.before, update.after) {
+		if update.Changed() {
 			if err := update.Apply(); err != nil {
 				return err
 			}

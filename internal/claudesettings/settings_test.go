@@ -309,3 +309,50 @@ func TestReadErrorsAndInvalidPlansDoNotWrite(t *testing.T) {
 	got, _ := os.ReadFile(live)
 	assertJSON(t, got, `{"model":"kept"}`)
 }
+
+func TestSharedPathsHonorExplicitDirectoryWhenMissing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	settings, state := SharedPaths(home)
+	if settings != filepath.Join(home, ".claude", "settings.json") || state != filepath.Join(home, ".claude.json") {
+		t.Fatalf("default paths = %q, %q", settings, state)
+	}
+	explicit := filepath.Join(t.TempDir(), "not-created")
+	t.Setenv("CLAUDE_CONFIG_DIR", explicit)
+	settings, state = SharedPaths(home)
+	if settings != filepath.Join(explicit, "settings.json") || state != filepath.Join(explicit, ".claude.json") {
+		t.Fatalf("explicit missing directory lost authority: %q, %q", settings, state)
+	}
+}
+
+func TestRepeatedRefreshDoesNotReplacePrivateSettings(t *testing.T) {
+	dir := t.TempDir()
+	shared, account := filepath.Join(dir, "shared.json"), filepath.Join(dir, "account.json")
+	writeSettings(t, shared, `{"permissions":{"allow":["Read"]},"apiKeyHelper":"host"}`)
+	writeSettings(t, account, `{"apiKeyHelper":"account"}`)
+	update, err := PrepareRefresh(shared, account, Policy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !update.Changed() {
+		t.Fatal("missing initial policy change")
+	}
+	if err := update.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err = PrepareRefresh(shared, account, Policy{})
+	if err != nil || update.Changed() {
+		t.Fatalf("second refresh should be unchanged: %v", err)
+	}
+	if err := update.Apply(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(account)
+	if err != nil || !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("unchanged settings were replaced: %v", err)
+	}
+}

@@ -172,8 +172,9 @@ func TestRefreshProfileIsNoopForGlobalHome(t *testing.T) {
 }
 
 var _ provider.ProfileRefresher = (*Provider)(nil)
+var _ provider.ProfileRunPreparer = (*Provider)(nil)
 
-func TestAPIKeySettingsLandInEveryClaudeConfigDir(t *testing.T) {
+func TestAPIKeySettingsUseNativeConfigDir(t *testing.T) {
 	fakeRealHome(t)
 	prof := &profile.Profile{
 		Name:     "acct",
@@ -186,23 +187,17 @@ func TestAPIKeySettingsLandInEveryClaudeConfigDir(t *testing.T) {
 		t.Fatalf("PrepareProfile: %v", err)
 	}
 
-	paths := claudeSettingsPathsForProfile(prof)
-	if len(paths) != 2 {
-		t.Fatalf("settings paths = %v, want legacy + XDG", paths)
-	}
-	for _, settingsPath := range paths {
-		data, err := os.ReadFile(settingsPath)
-		if err != nil {
-			t.Fatalf("%s not written: %v", settingsPath, err)
-		}
-		if !strings.Contains(string(data), "apiKeyHelper") {
-			t.Fatalf("%s lacks apiKeyHelper: %s", settingsPath, data)
-		}
-	}
-
-	// Status must recognise the XDG-side settings alone.
-	if err := os.Remove(filepath.Join(prof.HomePath(), ".claude", "settings.json")); err != nil {
+	env, err := p.Env(context.Background(), prof)
+	if err != nil {
 		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(env["CLAUDE_CONFIG_DIR"], "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil || !strings.Contains(string(data), "apiKeyHelper") {
+		t.Fatalf("native settings lack apiKeyHelper: %s, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(claudeLegacyDirForProfile(prof), "settings.json")); !os.IsNotExist(err) {
+		t.Fatalf("enrollment duplicated authentication in the ignored legacy store: %v", err)
 	}
 	status, err := p.Status(context.Background(), prof)
 	if err != nil {
@@ -212,13 +207,11 @@ func TestAPIKeySettingsLandInEveryClaudeConfigDir(t *testing.T) {
 		t.Fatal("Status should report logged in from the XDG settings.json")
 	}
 
-	// Logout clears the XDG-side settings too.
+	// Logout clears account fields without discarding the settings document.
 	if err := p.Logout(context.Background(), prof); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
-	for _, settingsPath := range paths {
-		if _, err := os.Lstat(settingsPath); !os.IsNotExist(err) {
-			t.Fatalf("%s should be removed by Logout (err=%v)", settingsPath, err)
-		}
+	if hasAuth, err := claudeSettingsHasAPIKey(settingsPath); err != nil || hasAuth {
+		t.Fatalf("native settings retained authentication after logout: %v, %v", hasAuth, err)
 	}
 }

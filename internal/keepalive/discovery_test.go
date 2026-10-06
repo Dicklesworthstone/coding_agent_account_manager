@@ -406,8 +406,88 @@ func TestDiscoverIsolatedClaudeRefusesMultipleCredentialLocations(t *testing.T) 
 		t.Fatal(err)
 	}
 	grant := findDiscoveryGrant(t, grants, "isolated:claude/work")
-	if !strings.Contains(grant.BlockedReason, "both legacy and configured") {
+	if !strings.Contains(grant.BlockedReason, "conflicting accounts") {
 		t.Fatalf("ambiguous native credential selection accepted: %+v", grant)
+	}
+}
+
+func TestDiscoverIsolatedClaudeLegacyMetadataUsesSelectedStore(t *testing.T) {
+	for _, state := range []string{"legacy metadata", "config metadata", "malformed config metadata"} {
+		t.Run(state, func(t *testing.T) {
+			opts := discoveryFixture(t)
+			opts.Provider = "claude"
+			prof := &profile.Profile{Provider: "claude", Name: "work", AuthMode: "oauth", BasePath: filepath.Join(opts.ProfilesPath, "claude", "work")}
+			data, err := json.Marshal(prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeDiscoveryFile(t, filepath.Join(prof.BasePath, "profile.json"), string(data))
+			writeDiscoveryClaude(t, prof.HomePath(), "old-location", "old@example.test", "private-refresh")
+			wantState := filepath.Join(prof.HomePath(), ".claude.json")
+			wantID := "old-location"
+			if state != "legacy metadata" {
+				wantState = filepath.Join(prof.HomePath(), ".claude", ".claude.json")
+				wantID = "native-location"
+				body := `{"oauthAccount":{"accountUuid":"native-location","emailAddress":"native@example.test"}}`
+				if state == "malformed config metadata" {
+					body = `{broken`
+				}
+				writeDiscoveryFile(t, wantState, body)
+			}
+			before := discoveryTree(t, filepath.Dir(opts.Home))
+			grants, err := Discover(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := findDiscoveryGrant(t, grants, "isolated:claude/work")
+			if grant.AuthPath != filepath.Join(prof.HomePath(), ".claude", ".credentials.json") || grant.IdentityPath != wantState {
+				t.Fatalf("selected legacy paths changed: %+v", grant)
+			}
+			if state == "malformed config metadata" {
+				if grant.BlockedReason == "" {
+					t.Fatal("malformed selected metadata fell back to ignored legacy identity")
+				}
+			} else if grant.BlockedReason != "" || grant.Identity.AccountID != wantID {
+				t.Fatalf("wrong selected identity: %+v", grant)
+			}
+			if after := discoveryTree(t, filepath.Dir(opts.Home)); !reflect.DeepEqual(before, after) {
+				t.Fatal("discovery migrated metadata or changed a native credential")
+			}
+		})
+	}
+}
+
+func TestDiscoverIsolatedClaudeDoesNotRenewIgnoredLegacyOAuth(t *testing.T) {
+	for _, filename := range []string{"auth.json", "settings.json"} {
+		t.Run(filename, func(t *testing.T) {
+			opts := discoveryFixture(t)
+			opts.Provider = "claude"
+			prof := &profile.Profile{Provider: "claude", Name: "work", AuthMode: "oauth", BasePath: filepath.Join(opts.ProfilesPath, "claude", "work")}
+			data, err := json.Marshal(prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeDiscoveryFile(t, filepath.Join(prof.BasePath, "profile.json"), string(data))
+			writeDiscoveryClaude(t, prof.HomePath(), "ignored", "ignored@example.test", "ignored-refresh")
+			selected := filepath.Join(prof.XDGConfigPath(), "claude-code")
+			body := `{"accessToken":"native-selected-access"}`
+			if filename == "settings.json" {
+				body = `{"apiKeyHelper":"native-selected-helper"}`
+			}
+			writeDiscoveryFile(t, filepath.Join(selected, filename), body)
+			before := discoveryTree(t, filepath.Dir(opts.Home))
+			grants, err := Discover(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := findDiscoveryGrant(t, grants, "isolated:claude/work")
+			if grant.BlockedReason == "" || grant.AuthPath != filepath.Join(selected, ".credentials.json") || grant.Env["CLAUDE_CONFIG_DIR"] != selected {
+				t.Fatalf("missing native OAuth fell back to ignored legacy login: %+v", grant)
+			}
+			if after := discoveryTree(t, filepath.Dir(opts.Home)); !reflect.DeepEqual(before, after) {
+				t.Fatal("discovery changed the selected or ignored store")
+			}
+		})
 	}
 }
 
@@ -613,6 +693,10 @@ func TestDiscoverClaudePathAndNativeEnvironmentAgree(t *testing.T) {
 				wantAuth, wantIdentity = filepath.Join(configured, ".credentials.json"), filepath.Join(configured, ".claude.json")
 				if env["CLAUDE_CONFIG_DIR"] != configured || env["XDG_CONFIG_HOME"] != filepath.Dir(configured) {
 					t.Fatalf("XDG source is not pinned: %+v", env)
+				}
+			} else if kind == "isolated legacy" {
+				if env["CLAUDE_CONFIG_DIR"] != filepath.Join(home, ".claude") || env["XDG_CONFIG_HOME"] != filepath.Join(filepath.Dir(home), "xdg_config") {
+					t.Fatalf("isolated legacy source differs from provider-selected config: %+v", env)
 				}
 			} else if env["CLAUDE_CONFIG_DIR"] != "" || env["XDG_CONFIG_HOME"] != "" {
 				t.Fatalf("legacy source inherited a competing config directory: %+v", env)

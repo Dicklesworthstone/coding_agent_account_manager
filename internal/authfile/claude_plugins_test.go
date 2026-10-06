@@ -168,14 +168,19 @@ func TestRestoreRejectsUnparseableSnapshotSettings(t *testing.T) {
 }
 
 func TestIsClaudeUserSettings(t *testing.T) {
-	if !isClaudeUserSettings("claude", "/home/u/.claude/settings.json") {
-		t.Error("expected ~/.claude/settings.json to match")
+	for _, path := range []string{
+		"/home/u/.claude/settings.json",
+		"/home/u/other-dir/settings.json",
+	} {
+		if !isClaudeUserSettings("claude", path) {
+			t.Errorf("expected Claude settings at %q to match", path)
+		}
 	}
 	for _, tc := range []struct{ tool, path string }{
-		{"gemini", "/home/u/.gemini/settings.json"},   // other tool
-		{"cursor", "/home/u/.cursor/settings.json"},   // other tool
-		{"claude", "/home/u/.claude/.claude.json"},    // other file
-		{"claude", "/home/u/other-dir/settings.json"}, // wrong parent dir
+		{"gemini", "/home/u/.gemini/settings.json"}, // other tool
+		{"cursor", "/home/u/.cursor/settings.json"}, // other tool
+		{"gemini", "/home/u/other-dir/settings.json"},
+		{"claude", "/home/u/.claude/.claude.json"}, // other file
 	} {
 		if isClaudeUserSettings(tc.tool, tc.path) {
 			t.Errorf("isClaudeUserSettings(%q, %q) unexpectedly true", tc.tool, tc.path)

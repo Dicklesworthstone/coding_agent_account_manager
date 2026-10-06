@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -160,7 +161,7 @@ func TestSwitchWorkspace(t *testing.T) {
 	claudeTarget := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-WORK-CLAUDE"}}`
 	codexLive := `{"access_token":"SYNTHETIC-ORIGINAL-CODEX"}`
 	codexTarget := `{"access_token":"SYNTHETIC-WORK-CODEX"}`
-	claudePath := filepath.Join(home, ".claude", ".credentials.json")
+	claudePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
 	codexPath := filepath.Join(home, ".codex", "auth.json")
 	writeNativeTestCredential(t, claudePath, claudeLive)
 	writeNativeTestCredential(t, codexPath, codexLive)
@@ -190,9 +191,9 @@ func TestSwitchWorkspace(t *testing.T) {
 }
 
 func TestSwitchWorkspaceFailureKeepsPreviousWorkspace(t *testing.T) {
-	home := setupRobotCredentialEnv(t)
+	setupRobotCredentialEnv(t)
 	live := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-CURRENT"}}`
-	livePath := filepath.Join(home, ".claude", ".credentials.json")
+	livePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
 	writeNativeTestCredential(t, livePath, live)
 	writeRobotCredentialProfile(t, "claude", "invalid", map[string]string{".claude.json": `{"theme":"dark"}`})
 	writeRobotCredentialProfile(t, "codex", "work", map[string]string{"auth.json": `{"access_token":"SYNTHETIC-CODEX-WORK"}`})

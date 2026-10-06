@@ -206,6 +206,36 @@ type Update struct {
 	path   string
 	before []byte
 	after  []byte
+	detach bool
+}
+
+// Changed reports whether the prepared document differs or a shared symlink
+// must become a private file. Repeated refreshes leave private files untouched.
+func (u *Update) Changed() bool {
+	return u.detach || (u.before == nil) != (u.after == nil) || !bytes.Equal(u.before, u.after)
+}
+
+// RequirePrivateFile also breaks a recognized shared hard link, whose contents
+// may already match the desired policy but whose future writes are not private.
+func (u *Update) RequirePrivateFile() {
+	u.detach = true
+	if u.after == nil {
+		u.after = []byte("{}\n")
+	}
+}
+
+func preparedUpdate(path string, before, after []byte) (*Update, error) {
+	info, err := os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("stat destination settings: %w", err)
+	}
+	detach := err == nil && info.Mode()&os.ModeSymlink != 0
+	if detach && after == nil {
+		// A dangling shared link must not start exposing another account's
+		// settings when its target is created later.
+		after = []byte("{}\n")
+	}
+	return &Update{path: path, before: before, after: after, detach: detach}, nil
 }
 
 // Read returns nil for a missing file, but rejects unreadable files.
@@ -241,10 +271,6 @@ func prepare(accountPath, sharedPath, destination string, p Policy, merge func([
 	if err != nil {
 		return nil, fmt.Errorf("read live settings: %w", err)
 	}
-	merged, err := merge(live, account, p)
-	if err != nil {
-		return nil, err
-	}
 	before := live
 	if destination != sharedPath {
 		before, err = Read(destination)
@@ -252,7 +278,17 @@ func prepare(accountPath, sharedPath, destination string, p Policy, merge func([
 			return nil, fmt.Errorf("read destination settings: %w", err)
 		}
 	}
-	return &Update{path: destination, before: before, after: merged}, nil
+	if live == nil && account == nil && before != nil {
+		// An explicitly imported account without a settings document must
+		// still clear the previous account's helpers and routing variables.
+		// The destination can supply policy, but never account authentication.
+		live = before
+	}
+	merged, err := merge(live, account, p)
+	if err != nil {
+		return nil, err
+	}
+	return preparedUpdate(destination, before, merged)
 }
 
 // PrepareRefresh applies real-home policy to an isolated profile while taking
@@ -283,6 +319,14 @@ func (u *Update) Apply() error {
 		return fmt.Errorf("Claude settings changed during activation; retry")
 	}
 	if u.after == nil {
+		return nil
+	}
+	info, err := os.Lstat(u.path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	detach := err == nil && info.Mode()&os.ModeSymlink != 0
+	if !u.Changed() && !detach {
 		return nil
 	}
 	dir := filepath.Dir(u.path)
@@ -329,5 +373,5 @@ func PrepareAPIKeyHelper(path, helper string) (*Update, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Update{path: path, before: before, after: append(after, '\n')}, nil
+	return preparedUpdate(path, before, append(after, '\n'))
 }

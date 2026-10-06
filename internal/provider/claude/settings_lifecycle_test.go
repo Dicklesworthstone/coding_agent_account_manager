@@ -147,3 +147,44 @@ func TestPrepareRunReloadsPolicyAndPreflightsEveryFile(t *testing.T) {
 		t.Fatalf("read-only Env unexpectedly tried to apply policy: %v", err)
 	}
 }
+
+func TestPrepareRunKeepsLegacyOnlyHelperInNativeStore(t *testing.T) {
+	home, prof := claudeLifecycleFixture(t)
+	shared := filepath.Join(home, ".claude", "settings.json")
+	writeLifecycleFile(t, shared, `{"model":"current","apiKeyHelper":"host-helper","permissions":{"deny":["Bash(rm *)"]}}`)
+	legacy := filepath.Join(claudeLegacyDirForProfile(prof), "settings.json")
+	writeLifecycleFile(t, legacy, `{"apiKeyHelper":"profile-helper","model":"stale"}`)
+	p := New()
+	for _, prepare := range []struct {
+		name string
+		run  func(context.Context, *profile.Profile) error
+	}{
+		{"prepare_profile", p.PrepareProfile},
+		{"prepare_run", p.PrepareRun},
+	} {
+		t.Run(prepare.name, func(t *testing.T) {
+			if err := prepare.run(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			env, err := p.Env(context.Background(), prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env["CLAUDE_CONFIG_DIR"] != claudeLegacyDirForProfile(prof) {
+				t.Fatalf("settings preparation changed the native account store: %q", env["CLAUDE_CONFIG_DIR"])
+			}
+			native := readLifecycleObject(t, filepath.Join(env["CLAUDE_CONFIG_DIR"], "settings.json"))
+			ignored := readLifecycleObject(t, filepath.Join(claudeConfigDirForProfile(prof), "settings.json"))
+			if native["apiKeyHelper"] != "profile-helper" || native["model"] != "current" || native["permissions"] == nil {
+				t.Fatalf("native settings lost profile auth or current policy: %#v", native)
+			}
+			if ignored["apiKeyHelper"] != nil || ignored["model"] != "current" || ignored["permissions"] == nil {
+				t.Fatalf("ignored settings gained authentication or lost shared policy: %#v", ignored)
+			}
+			valid, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || !valid.Valid {
+				t.Fatalf("native helper and passive validation disagree: %+v, %v", valid, err)
+			}
+		})
+	}
+}

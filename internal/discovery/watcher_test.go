@@ -3,8 +3,13 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +17,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -277,7 +283,7 @@ func TestWatchOnce_AutoProfileWithoutIdentity(t *testing.T) {
 func TestWatchOnce_RejectsMalformedCredentials(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(homeDir, ".config", "claude-code"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CAAM_KEYCHAIN", "0")
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
@@ -823,4 +829,328 @@ func TestE2E_TokenRefreshNoNewProfile(t *testing.T) {
 	profiles2, _ := vault.List("claude")
 	assert.Len(t, profiles2, 1, "token refresh should not create new profile")
 	assert.Contains(t, profiles2, "refresh@example.com")
+}
+
+func watcherFixture(t *testing.T) (*authfile.Vault, string) {
+	t.Helper()
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	require.NoError(t, os.MkdirAll(home, 0700))
+	for key, value := range map[string]string{
+		"HOME": home, "USERPROFILE": home, "CAAM_HOME": filepath.Join(root, "caam"), "CAAM_KEYCHAIN": "0",
+		"XDG_CONFIG_HOME": filepath.Join(home, ".config"), "XDG_DATA_HOME": filepath.Join(home, ".local", "share"),
+		"CLAUDE_CONFIG_DIR": "", "CODEX_HOME": filepath.Join(home, ".codex"),
+		"GEMINI_HOME": filepath.Join(home, ".gemini"), "GROK_HOME": filepath.Join(home, ".grok"),
+		"CURSOR_CONFIG_DIR": filepath.Join(home, ".config", "cursor"), "APPDATA": filepath.Join(home, "AppData", "Roaming"),
+	} {
+		t.Setenv(key, value)
+	}
+	return authfile.NewVault(filepath.Join(root, "vault")), home
+}
+
+func writeWatcherFile(t *testing.T, path, contents string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0600))
+}
+
+func readWatcherFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(data)
+}
+
+func awaitWatcherDiscovery(t *testing.T, events <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-events:
+		require.Equal(t, want, got)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("watcher did not discover %s", want)
+	}
+}
+
+func grokWatcherCredential(generation string) string {
+	return fmt.Sprintf(`{"https://auth.example.test::client":{"key":%q,"refresh_token":%q,"expires_at":"2030-01-01T00:00:00Z","user_id":"grok-account","email":"grok@example.test"}}`, "access-"+generation, "refresh-"+generation)
+}
+
+func claudeWatcherCredential(generation string) string {
+	return fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":1893456000000}}`, "access-"+generation, "refresh-"+generation)
+}
+
+func TestWatcherClaudeExplicitDirectoryOwnsCredentialsAndIdentity(t *testing.T) {
+	vault, home := watcherFixture(t)
+	configured := filepath.Join(home, "custom-claude")
+	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	writeWatcherFile(t, filepath.Join(home, ".claude", ".credentials.json"), claudeWatcherCredential("ignored"))
+	writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"ignored","emailAddress":"ignored@example.test"}}`)
+	events := make(chan string, 4)
+	watcher, err := NewWatcher(vault, WatcherConfig{
+		Providers: []string{"claude"}, DebounceInterval: 20 * time.Millisecond, PollInterval: time.Hour,
+		OnDiscovery: func(provider, name string, _ *identity.Identity) { events <- provider + "/" + name },
+	})
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start(context.Background()))
+	defer watcher.Stop()
+	writeWatcherFile(t, filepath.Join(configured, ".claude.json"), `{"oauthAccount":{"accountUuid":"selected","emailAddress":"selected@example.test"}}`)
+	writeWatcherFile(t, filepath.Join(configured, ".credentials.json"), claudeWatcherCredential("selected"))
+	awaitWatcherDiscovery(t, events, "claude/selected@example.test")
+	require.Equal(t, claudeWatcherCredential("selected"), readWatcherFile(t, vault.BackupPath("claude", "selected@example.test", ".credentials.json")))
+	profiles, err := vault.List("claude")
+	require.NoError(t, err)
+	require.Equal(t, []string{"selected@example.test"}, profiles)
+}
+
+func quietWatcherConfig(providers []string, events chan<- string) WatcherConfig {
+	return WatcherConfig{Providers: providers, DebounceInterval: 20 * time.Millisecond, PollInterval: 30 * time.Millisecond,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), OnDiscovery: func(provider, profile string, _ *identity.Identity) {
+			events <- provider + "/" + profile
+		}}
+}
+
+func TestWatcherRoutesSharedBasenamesToTheirExactProviders(t *testing.T) {
+	vault, home := watcherFixture(t)
+	providers := []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
+	for _, provider := range providers {
+		fileSet, _ := authfile.GetAuthFileSet(provider)
+		for _, spec := range fileSet.Files {
+			require.NoError(t, os.MkdirAll(filepath.Dir(spec.Path), 0700))
+		}
+	}
+	events := make(chan string, 32)
+	cfg := quietWatcherConfig(nil, events)
+	cfg.PollInterval = time.Hour // Only real asynchronous notifications can discover these writes.
+	watcher, err := NewWatcher(vault, cfg)
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+
+	writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"}}`)
+	writeWatcherFile(t, filepath.Join(home, ".claude", ".credentials.json"), claudeWatcherCredential("one"))
+	codex, err := os.ReadFile("testdata/codex_initial_login.json")
+	require.NoError(t, err)
+	writeWatcherFile(t, filepath.Join(home, ".codex", "auth.json"), string(codex))
+	writeWatcherFile(t, filepath.Join(home, ".gemini", "settings.json"), `{"type":"authorized_user","email":"gemini@example.test","refresh_token":"synthetic-gemini-refresh"}`)
+	writeWatcherFile(t, filepath.Join(home, ".grok", "auth.json"), grokWatcherCredential("one"))
+	openCode := authfile.OpenCodeAuthFiles().Files[0].Path
+	writeWatcherFile(t, openCode, `{"access_token":"synthetic-opencode-access","email":"opencode@example.test"}`)
+	cursorPaths := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv)
+	writeWatcherFile(t, cursorPaths.AuthFile, `{"accessToken":"synthetic-cursor-session","refreshToken":"synthetic-cursor-refresh","email":"cursor@example.test"}`)
+
+	want := map[string]bool{"claude/claude@example.test": true, "codex/codex-user@example.com": true, "gemini/gemini@example.test": true,
+		"grok/grok@example.test": true, "opencode/opencode@example.test": true, "cursor/cursor@example.test": true}
+	for range len(want) {
+		select {
+		case got := <-events:
+			require.True(t, want[got], "duplicate or misrouted discovery: %s", got)
+			delete(want, got)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("missing asynchronous discoveries: %v", want)
+		}
+	}
+	writeWatcherFile(t, filepath.Join(cursorPaths.ConfigDir, "cli-config.json"), `{"theme":"changed","authInfo":{"email":"stale-config@example.test"}}`)
+	writeWatcherFile(t, filepath.Join(home, ".cursor", "settings.json"), `{"permissions":{"allow":["Read"]}}`)
+	require.Never(t, func() bool { return len(events) != 0 }, 150*time.Millisecond, 10*time.Millisecond, "Cursor config churn must not replace its auth.json identity")
+	require.NoError(t, watcher.Stop())
+	for _, provider := range providers {
+		profiles, err := vault.List(provider)
+		require.NoError(t, err)
+		require.Len(t, profiles, 1, "wrong provider snapshot count for %s", provider)
+	}
+	require.Equal(t, grokWatcherCredential("one"), readWatcherFile(t, vault.BackupPath("grok", "grok@example.test", "auth.json")))
+	require.Contains(t, readWatcherFile(t, vault.BackupPath("cursor", "cursor@example.test", "auth.json")), "synthetic-cursor-session")
+}
+
+func TestWatchOnceSavesModernClaudeRotationWithoutDuplicatingAliases(t *testing.T) {
+	for _, profile := range []string{"claude@example.test", "work"} {
+		t.Run(profile, func(t *testing.T) {
+			vault, home := watcherFixture(t)
+			auth := filepath.Join(home, ".claude", ".credentials.json")
+			writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"}}`)
+			writeWatcherFile(t, auth, claudeWatcherCredential("old"))
+			fileSet := authfile.ClaudeAuthFiles()
+			require.NoError(t, vault.Backup(fileSet, profile))
+			writeWatcherFile(t, auth, claudeWatcherCredential("rotated"))
+			active, err := vault.ActiveProfile(fileSet)
+			require.NoError(t, err)
+			require.Equal(t, profile, active, "the account must match despite changed token bytes")
+			discovered, err := WatchOnce(vault, []string{"claude"}, nil)
+			require.NoError(t, err)
+			require.Equal(t, []string{"claude/" + profile}, discovered)
+			require.Equal(t, claudeWatcherCredential("rotated"), readWatcherFile(t, vault.BackupPath("claude", profile, ".credentials.json")))
+			profiles, err := vault.List("claude")
+			require.NoError(t, err)
+			require.Equal(t, []string{profile}, profiles)
+
+			before := readWatcherFile(t, vault.BackupPath("claude", profile, "meta.json"))
+			writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"},"numStartups":900}`)
+			writeWatcherFile(t, filepath.Join(home, ".claude", "settings.json"), `{"permissions":{"allow":["Read"]},"model":"current"}`)
+			discovered, err = WatchOnce(vault, []string{"claude"}, nil)
+			require.NoError(t, err)
+			require.Empty(t, discovered, "shared policy churn must not trigger another snapshot")
+			require.Equal(t, before, readWatcherFile(t, vault.BackupPath("claude", profile, "meta.json")))
+		})
+	}
+}
+
+func TestWatcherRotatesClaudeAndIgnoresOptionalConfigChurn(t *testing.T) {
+	vault, home := watcherFixture(t)
+	auth := filepath.Join(home, ".claude", ".credentials.json")
+	writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"}}`)
+	writeWatcherFile(t, auth, claudeWatcherCredential("old"))
+	require.NoError(t, vault.Backup(authfile.ClaudeAuthFiles(), "work"))
+	events := make(chan string, 32)
+	watcher, err := NewWatcher(vault, quietWatcherConfig([]string{"claude"}, events))
+	require.NoError(t, err)
+	require.NoError(t, watcher.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	writeWatcherFile(t, auth+".new", claudeWatcherCredential("rotated"))
+	require.NoError(t, os.Rename(auth+".new", auth))
+	awaitWatcherDiscovery(t, events, "claude/work")
+	require.Equal(t, claudeWatcherCredential("rotated"), readWatcherFile(t, vault.BackupPath("claude", "work", ".credentials.json")))
+	writeWatcherFile(t, filepath.Join(home, ".claude", "settings.json"), `{"hooks":{"Stop":[]},"model":"new-preference"}`)
+	writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"},"numStartups":3}`)
+	require.Never(t, func() bool { return len(events) != 0 }, 180*time.Millisecond, 10*time.Millisecond, "optional config churn generated a backup")
+	require.NoError(t, watcher.Stop())
+	_, err = os.Stat(vault.BackupPath("claude", "work", "settings.json"))
+	require.True(t, os.IsNotExist(err), "workflow-only edits should not have rewritten the snapshot")
+}
+
+func TestWatchOnceOptionalOnlyCredentialsIgnoreSharedPolicy(t *testing.T) {
+	for _, provider := range []string{"claude", "cursor"} {
+		t.Run(provider, func(t *testing.T) {
+			vault, home := watcherFixture(t)
+			path := filepath.Join(home, ".claude", "settings.json")
+			initial, updated := `{"apiKeyHelper":"synthetic-helper","model":"initial"}`, `{"apiKeyHelper":"synthetic-helper","model":"changed","permissions":{"allow":["Read"]}}`
+			if provider == "cursor" {
+				path = filepath.Join(os.Getenv("CURSOR_CONFIG_DIR"), "cli-config.json")
+				initial, updated = `{"authInfo":{"email":"keychain@example.test"},"theme":"initial"}`, `{"authInfo":{"email":"keychain@example.test"},"theme":"changed"}`
+			}
+			writeWatcherFile(t, path, initial)
+			first, err := WatchOnce(vault, []string{provider}, nil)
+			require.NoError(t, err)
+			require.Len(t, first, 1)
+			profiles, err := vault.List(provider)
+			require.NoError(t, err)
+			require.Len(t, profiles, 1)
+			snapshot := vault.BackupPath(provider, profiles[0], filepath.Base(path))
+			before := readWatcherFile(t, snapshot)
+			writeWatcherFile(t, path, updated)
+			discovered, err := WatchOnce(vault, []string{provider}, nil)
+			require.NoError(t, err)
+			require.Empty(t, discovered, "optional-only auth must not generate new snapshots on policy changes")
+			require.Equal(t, before, readWatcherFile(t, snapshot))
+			after, err := vault.List(provider)
+			require.NoError(t, err)
+			require.Equal(t, profiles, after)
+		})
+	}
+}
+
+func TestWatcherPollingWorksWithoutBackendAndAfterDirectoryReplacement(t *testing.T) {
+	vault, home := watcherFixture(t)
+	events := make(chan string, 32)
+	watcher, err := NewWatcher(vault, quietWatcherConfig([]string{"grok"}, events))
+	require.NoError(t, err)
+	watcher.newBackend = func() (*fsnotify.Watcher, error) { return nil, errors.New("synthetic backend unavailable") }
+	require.NoError(t, watcher.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	dir := filepath.Join(home, ".grok")
+	auth := filepath.Join(dir, "auth.json")
+	writeWatcherFile(t, auth, grokWatcherCredential("first"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	require.NoError(t, os.Rename(dir, filepath.Join(home, "previous-grok")))
+	writeWatcherFile(t, auth, grokWatcherCredential("replacement"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	require.Equal(t, grokWatcherCredential("replacement"), readWatcherFile(t, vault.BackupPath("grok", "grok@example.test", "auth.json")))
+	writeWatcherFile(t, filepath.Join(dir, "config.toml"), "model = 'changed-preference'\n")
+	require.Never(t, func() bool { return len(events) != 0 }, 150*time.Millisecond, 10*time.Millisecond)
+	profiles, err := vault.List("grok")
+	require.NoError(t, err)
+	require.Equal(t, []string{"grok@example.test"}, profiles)
+}
+
+func TestWatcherReopensClosedBackend(t *testing.T) {
+	vault, home := watcherFixture(t)
+	dir := filepath.Join(home, ".grok")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	events := make(chan string, 32)
+	backends := make(chan *fsnotify.Watcher, 4)
+	watcher, err := NewWatcher(vault, quietWatcherConfig([]string{"grok"}, events))
+	require.NoError(t, err)
+	watcher.newBackend = func() (*fsnotify.Watcher, error) {
+		backend, err := fsnotify.NewWatcher()
+		if err == nil {
+			backends <- backend
+		}
+		return backend, err
+	}
+	require.NoError(t, watcher.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	first := <-backends
+	require.NoError(t, first.Close())
+	writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential("recovered"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	select {
+	case next := <-backends:
+		require.NotSame(t, first, next)
+		require.Contains(t, next.WatchList(), dir)
+	case <-time.After(5 * time.Second):
+		t.Fatal("notification backend was not recreated")
+	}
+}
+
+func TestWatcherReattachesReplacedNativeDirectory(t *testing.T) {
+	vault, home := watcherFixture(t)
+	dir := filepath.Join(home, ".grok")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	events := make(chan string, 32)
+	cfg := quietWatcherConfig([]string{"grok"}, events)
+	cfg.PollInterval = time.Hour
+	watcher, err := NewWatcher(vault, cfg)
+	require.NoError(t, err)
+	var backend *fsnotify.Watcher
+	watcher.newBackend = func() (*fsnotify.Watcher, error) {
+		var err error
+		backend, err = fsnotify.NewWatcher()
+		return backend, err
+	}
+	require.NoError(t, watcher.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential("first"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	require.NoError(t, os.Rename(dir, filepath.Join(home, "previous-grok")))
+	writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential("replacement"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	require.Contains(t, backend.WatchList(), dir, "replacement reconciliation must reattach the native directory before reporting discovery")
+	writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential("after-reattach"))
+	awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+	require.Equal(t, grokWatcherCredential("after-reattach"), readWatcherFile(t, vault.BackupPath("grok", "grok@example.test", "auth.json")))
+}
+
+func TestWatcherStopStartUsesFreshBackendAndWaitsForWrites(t *testing.T) {
+	vault, home := watcherFixture(t)
+	dir := filepath.Join(home, ".grok")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	events := make(chan string, 32)
+	cfg := quietWatcherConfig([]string{"grok"}, events)
+	cfg.PollInterval = time.Hour
+	watcher, err := NewWatcher(vault, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+	for _, generation := range []string{"first-run", "second-run"} {
+		require.NoError(t, watcher.Start(context.Background()))
+		writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential(generation))
+		awaitWatcherDiscovery(t, events, "grok/grok@example.test")
+		var group sync.WaitGroup
+		for range 4 {
+			group.Go(func() { assert.NoError(t, watcher.Stop()) })
+		}
+		group.Wait()
+		require.Equal(t, grokWatcherCredential(generation), readWatcherFile(t, vault.BackupPath("grok", "grok@example.test", "auth.json")))
+	}
+	writeWatcherFile(t, filepath.Join(dir, "auth.json"), grokWatcherCredential("after-stop"))
+	require.Never(t, func() bool { return len(events) != 0 }, 100*time.Millisecond, 10*time.Millisecond)
+	require.Equal(t, grokWatcherCredential("second-run"), readWatcherFile(t, vault.BackupPath("grok", "grok@example.test", "auth.json")))
 }

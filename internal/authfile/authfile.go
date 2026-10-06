@@ -76,7 +76,9 @@ func CodexAuthFiles() AuthFileSet {
 }
 
 // ClaudeAuthFiles returns the auth files for Claude Code.
-// Claude Code stores OAuth credentials in:
+// An explicit CLAUDE_CONFIG_DIR owns credentials, settings and session state;
+// it never falls back to the host's legacy files or Desktop credential cache.
+// Without that override, Claude Code stores OAuth credentials in:
 //   - ~/.claude/.credentials.json (primary - contains claudeAiOauth with tokens)
 //   - ~/.claude.json (settings file - not auth, but backed up for completeness)
 //   - ~/.config/claude-code/auth.json (auth credentials; or $CLAUDE_CONFIG_DIR/auth.json)
@@ -86,26 +88,32 @@ func CodexAuthFiles() AuthFileSet {
 func ClaudeAuthFiles() AuthFileSet {
 	homeDir, _ := os.UserHomeDir()
 	claudeConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	userConfigDir := filepath.Join(homeDir, ".claude")
+	statePath := filepath.Join(homeDir, ".claude.json")
+	explicitConfigDir := claudeConfigDir != ""
 	if claudeConfigDir == "" {
 		xdgConfig := os.Getenv("XDG_CONFIG_HOME")
 		if xdgConfig == "" {
 			xdgConfig = filepath.Join(homeDir, ".config")
 		}
 		claudeConfigDir = filepath.Join(xdgConfig, "claude-code")
+	} else {
+		userConfigDir = claudeConfigDir
+		statePath = filepath.Join(claudeConfigDir, ".claude.json")
 	}
 
-	return AuthFileSet{
+	fileSet := AuthFileSet{
 		Tool: "claude",
 		Files: []AuthFileSpec{
 			{
 				Tool:        "claude",
-				Path:        filepath.Join(homeDir, ".claude", ".credentials.json"),
+				Path:        filepath.Join(userConfigDir, ".credentials.json"),
 				Description: "Claude Code OAuth credentials (Claude Max subscription)",
 				Required:    true,
 			},
 			{
 				Tool:        "claude",
-				Path:        filepath.Join(homeDir, ".claude.json"),
+				Path:        statePath,
 				Description: "Claude Code settings and session state",
 				Required:    false, // This is a settings file, not strictly required for auth
 			},
@@ -117,19 +125,22 @@ func ClaudeAuthFiles() AuthFileSet {
 			},
 			{
 				Tool:        "claude",
-				Path:        filepath.Join(homeDir, ".claude", "settings.json"),
+				Path:        filepath.Join(userConfigDir, "settings.json"),
 				Description: "Claude Code user settings (apiKeyHelper / API key mode)",
-				Required:    false,
-			},
-			{
-				Tool:        "claude",
-				Path:        claudeDesktopConfigPath(homeDir),
-				Description: "Claude Desktop encrypted OAuth token cache (macOS)",
 				Required:    false,
 			},
 		},
 		AllowOptionalOnly: true,
 	}
+	if !explicitConfigDir {
+		fileSet.Files = append(fileSet.Files, AuthFileSpec{
+			Tool:        "claude",
+			Path:        claudeDesktopConfigPath(homeDir),
+			Description: "Claude Desktop encrypted OAuth token cache (macOS)",
+			Required:    false,
+		})
+	}
+	return fileSet
 }
 
 // claudeDesktopConfigPath is the macOS Claude Desktop config that holds the
@@ -1603,9 +1614,7 @@ var claudeDesktopTokenKeys = []string{claudeDesktopTokenKey, claudeDesktopTokenK
 // settings file (~/.claude/settings.json), which needs key-scoped merge
 // handling on restore rather than a whole-file copy.
 func isClaudeUserSettings(tool, path string) bool {
-	return tool == "claude" &&
-		filepath.Base(path) == "settings.json" &&
-		filepath.Base(filepath.Dir(path)) == ".claude"
+	return tool == "claude" && filepath.Base(path) == "settings.json"
 }
 
 // isClaudeDesktopConfig reports whether spec.Path is the macOS Claude Desktop

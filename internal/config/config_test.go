@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -602,6 +605,113 @@ func TestSaveRoundtrip(t *testing.T) {
 		if loaded.Passthroughs[i] != p {
 			t.Errorf("Passthroughs[%d] = %q, want %q", i, loaded.Passthroughs[i], p)
 		}
+	}
+}
+
+func TestClaudeSettingsSurviveUnrelatedConfigChanges(t *testing.T) {
+	cases := []struct {
+		name   string
+		input  string
+		policy claudesettings.Policy
+	}{
+		{name: "default shared", input: `{}`},
+		{
+			name:  "shared overrides",
+			input: `{"claude_settings":{"mode":"shared","profile_keys":["model"],"shared_env_keys":["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]}}`,
+			policy: claudesettings.Policy{
+				Mode: "shared", ProfileKeys: []string{"model"}, SharedEnvKeys: []string{"CLAUDE_CODE_MAX_OUTPUT_TOKENS"},
+			},
+		},
+		{
+			name: "per profile", input: `{"claude_settings":{"mode":"per-profile"}}`,
+			policy: claudesettings.Policy{Mode: "per-profile"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			path := ConfigPath()
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.SetDefault("claude", "work")
+			cfg.AddAlias("claude", "work", "w")
+			cfg.SetFavorites("claude", []string{"work"})
+			cfg.CreateWorkspace("office", map[string]string{"claude": "work"})
+			if err := cfg.Save(); err != nil {
+				t.Fatal(err)
+			}
+			reloaded, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(reloaded.ClaudeSettings, tc.policy) {
+				t.Fatalf("settings policy after config edit = %#v, want %#v", reloaded.ClaudeSettings, tc.policy)
+			}
+			policy, err := claudesettings.LoadPolicy()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(policy, tc.policy) {
+				t.Fatalf("activation policy after config edit = %#v, want %#v", policy, tc.policy)
+			}
+			merged, err := claudesettings.Merge([]byte(`{"permissions":{"deny":["Read(secret)"]}}`), []byte(`{"permissions":{"allow":["Read(*)"]}}`), policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shared := strings.Contains(string(merged), "deny"); shared != (tc.policy.Mode != "per-profile") {
+				t.Fatalf("settings lifecycle changed after unrelated config save: %s", merged)
+			}
+		})
+	}
+}
+
+func TestClaudeSettingsInvalidPolicyRejectsLoadAndSave(t *testing.T) {
+	for name, policy := range map[string]claudesettings.Policy{
+		"unknown mode":        {Mode: "per-profiel"},
+		"invalid profile key": {ProfileKeys: []string{"env"}},
+		"shared credential":   {SharedEnvKeys: []string{"ANTHROPIC_API_KEY"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			path := ConfigPath()
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			invalid, err := json.Marshal(Config{ClaudeSettings: policy})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, invalid, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "claude_settings") {
+				t.Fatalf("Load invalid policy error = %v", err)
+			}
+			const original = `{"default_provider":"codex"}`
+			if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.ClaudeSettings = policy
+			if err := cfg.Save(); err == nil || !strings.Contains(err.Error(), "claude_settings") {
+				t.Fatalf("Save invalid policy error = %v", err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != original {
+				t.Fatalf("invalid save changed config: %s, %v", got, err)
+			}
+			if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+				t.Fatalf("invalid save created temporary file: %v", err)
+			}
+		})
 	}
 }
 

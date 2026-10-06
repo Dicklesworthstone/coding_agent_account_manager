@@ -7,6 +7,17 @@ import (
 	"path/filepath"
 )
 
+// SharedPaths returns the native user's canonical settings and session-state
+// paths. An explicit CLAUDE_CONFIG_DIR remains authoritative when a file is
+// absent; ignored legacy policy must not be resurrected as a fallback.
+func SharedPaths(realHome string) (settingsPath, statePath string) {
+	settingsPath = SharedPath(realHome)
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return settingsPath, filepath.Join(dir, ".claude.json")
+	}
+	return settingsPath, filepath.Join(realHome, ".claude.json")
+}
+
 // CAAMConfigPath is shared with config.ConfigPath so every activation entry
 // point reads the same policy, including long-lived API/TUI/wrap processes.
 func CAAMConfigPath() string {

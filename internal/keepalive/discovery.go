@@ -294,18 +294,23 @@ func discoverIsolated(ctx context.Context, basePath, providerID string, vaultPat
 		switch providerID {
 		case "claude":
 			g.Env, err = claudeprovider.New().Env(ctx, &prof)
+			if err != nil {
+				g.BlockedReason = "cannot select one native Claude credential store: " + err.Error()
+				grants = append(grants, g)
+				continue
+			}
 			g.AuthPath = filepath.Join(g.Env["CLAUDE_CONFIG_DIR"], ".credentials.json")
 			g.IdentityPath = filepath.Join(g.Env["CLAUDE_CONFIG_DIR"], ".claude.json")
 			legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
-			if _, statErr := os.Lstat(g.AuthPath); errors.Is(statErr, os.ErrNotExist) {
-				// Legacy credentials must run with legacy path semantics, not
-				// a pinned, empty XDG directory that could create another grant.
-				g.AuthPath = legacy
-				g.IdentityPath = filepath.Join(prof.HomePath(), ".claude.json")
-				delete(g.Env, "CLAUDE_CONFIG_DIR")
-				delete(g.Env, "XDG_CONFIG_HOME")
-				g.Scrub = append(g.Scrub, "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME")
-			} else if legacyInfo, legacyErr := os.Stat(legacy); legacyErr == nil {
+			if g.Env["CLAUDE_CONFIG_DIR"] == filepath.Dir(legacy) {
+				// Before the first prepared launch, older isolated profiles keep
+				// their own paired state directly under HOME. Read that same
+				// migration source without moving it or changing the auth store.
+				if _, stateErr := os.Stat(g.IdentityPath); errors.Is(stateErr, os.ErrNotExist) {
+					g.IdentityPath = filepath.Join(prof.HomePath(), ".claude.json")
+				}
+			}
+			if legacyInfo, legacyErr := os.Stat(legacy); legacyErr == nil {
 				if currentInfo, currentErr := os.Stat(g.AuthPath); currentErr == nil && !os.SameFile(legacyInfo, currentInfo) {
 					g.BlockedReason = "both legacy and configured Claude credential files exist; choose one live owner before keepalive"
 				}

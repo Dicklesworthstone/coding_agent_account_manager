@@ -84,6 +84,24 @@ func keychainState(email string) string {
 	return string(raw)
 }
 
+func TestExplicitClaudeConfigDoesNotUseDefaultKeychain(t *testing.T) {
+	f := newKeychainFixture(t)
+	f.storeToken(keychainCreds("default-host-account"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Dir(f.credPath))
+	if path := claudeKeychainPath(ClaudeAuthFiles()); path != "" {
+		t.Fatalf("explicit configuration selected the default keychain bridge: %s", path)
+	}
+	if err := f.vault.Backup(ClaudeAuthFiles(), "explicit"); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("explicit configuration backed up the default host keychain: %v", err)
+	}
+	if _, err := os.Stat(f.credPath); !os.IsNotExist(err) {
+		t.Fatalf("default host keychain was mirrored into explicit configuration: %v", err)
+	}
+	if got, ok := f.storedToken(); !ok || got != keychainCreds("default-host-account") {
+		t.Fatal("explicit configuration changed the default host keychain")
+	}
+}
+
 // TestBackupCapturesKeychainToken is the headline of #98: with the token only
 // in the keychain, the vault profile must still get a .credentials.json.
 func TestBackupCapturesKeychainToken(t *testing.T) {

@@ -38,9 +38,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -145,19 +147,97 @@ func claudeSettingsPathsForProfile(prof *profile.Profile) []string {
 	return paths
 }
 
+// Existing XDG authentication is authoritative because that is the directory
+// modern isolated profiles launch with. Legacy-only profiles keep their native
+// store; a newer or healthier ignored token must never decide which account runs.
+func effectiveClaudeConfigDir(prof *profile.Profile) (string, error) {
+	xdg, legacy := claudeConfigDirForProfile(prof), claudeLegacyDirForProfile(prof)
+	xdgAuth, err := claudeDirHasAuth(xdg, filepath.Join(xdg, ".claude.json"))
+	if err != nil {
+		return "", err
+	}
+	legacyAuth, err := claudeDirHasAuth(legacy, legacyClaudeStatePath(prof))
+	if err != nil {
+		return "", err
+	}
+	if xdgAuth && legacyAuth {
+		xdgID, legacyID := claudeDirAccountID(xdg), claudeDirAccountID(legacy)
+		if xdgID != "" && legacyID != "" && xdgID != legacyID {
+			return "", fmt.Errorf("Claude profile contains conflicting accounts in legacy and XDG config directories")
+		}
+	}
+	if xdgAuth || !legacyAuth {
+		return xdg, nil
+	}
+	return legacy, nil
+}
+
+func legacyClaudeStatePath(prof *profile.Profile) string {
+	path := filepath.Join(claudeLegacyDirForProfile(prof), ".claude.json")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return path
+	}
+	return filepath.Join(prof.HomePath(), ".claude.json")
+}
+
+func claudeDirHasAuth(dir, statePath string) (bool, error) {
+	for _, filename := range []string{".credentials.json", "auth.json"} {
+		if _, err := os.Stat(filepath.Join(dir, filename)); err == nil {
+			// Even malformed or expired credentials select this store. Their
+			// error must not be hidden by another directory's valid login.
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("inspect Claude auth: %w", err)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "settings.json"), statePath} {
+		hasAuth, err := claudeDocumentHasAuth(path)
+		if err != nil || hasAuth {
+			return true, nil // A malformed selected document fails validation.
+		}
+	}
+	return false, nil
+}
+
+func claudeDirAccountID(dir string) string {
+	if data, err := os.ReadFile(filepath.Join(dir, ".credentials.json")); err == nil {
+		if creds, err := parseClaudeCredentials(data); err == nil && creds.ClaudeAiOauth != nil && strings.TrimSpace(creds.ClaudeAiOauth.AccountID) != "" {
+			return strings.TrimSpace(creds.ClaudeAiOauth.AccountID)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil && filepath.Base(dir) == ".claude" {
+		data, err = os.ReadFile(filepath.Join(filepath.Dir(dir), ".claude.json"))
+	}
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		Account struct {
+			ID string `json:"accountUuid"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(data, &state) != nil {
+		return ""
+	}
+	return strings.TrimSpace(state.Account.ID)
+}
+
 // AuthFiles returns the auth file specifications for Claude Code.
 // This is the key method for auth file backup/restore.
 func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 	homeDir, _ := os.UserHomeDir()
+	settingsPath, statePath := claudesettings.SharedPaths(homeDir)
+	credentialsPath := filepath.Join(filepath.Dir(settingsPath), ".credentials.json")
 
 	return []provider.AuthFileSpec{
 		{
-			Path:        filepath.Join(homeDir, ".claude", ".credentials.json"),
+			Path:        credentialsPath,
 			Description: "Claude Code OAuth credentials (Claude Max subscription)",
 			Required:    true,
 		},
 		{
-			Path:        filepath.Join(homeDir, ".claude.json"),
+			Path:        statePath,
 			Description: "Claude Code OAuth session state (legacy location)",
 			Required:    false,
 		},
@@ -167,7 +247,7 @@ func (p *Provider) AuthFiles() []provider.AuthFileSpec {
 			Required:    false, // May not exist in all setups
 		},
 		{
-			Path:        filepath.Join(homeDir, ".claude", "settings.json"),
+			Path:        settingsPath,
 			Description: "Claude Code settings (apiKeyHelper / API key mode)",
 			Required:    false,
 		},
@@ -223,6 +303,9 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 	// session inside the profile silently loses every user-level skill and
 	// plugin (issue #69 follow-up finding).
 	if err := shareClaudeUserAssetsForProfile(mgr.RealHome(), prof); err != nil {
+		return err
+	}
+	if err := p.PrepareRun(ctx, prof); err != nil {
 		return err
 	}
 
@@ -311,6 +394,14 @@ func shareClaudeUserAssets(realHome, profileClaudeDir string) error {
 func (p *Provider) setupAPIKeyHelper(prof *profile.Profile) error {
 	// Create a helper script path
 	helperPath := filepath.Join(prof.BasePath, "api_key_helper.sh")
+	configDir, err := effectiveClaudeConfigDir(prof)
+	if err != nil {
+		return err
+	}
+	update, err := claudesettings.PrepareAPIKeyHelper(filepath.Join(configDir, "settings.json"), helperPath)
+	if err != nil {
+		return fmt.Errorf("prepare API key settings: %w", err)
+	}
 
 	// Write the helper script
 	helperScript := `#!/bin/bash
@@ -349,22 +440,9 @@ exit 1
 		return fmt.Errorf("write helper script: %w", err)
 	}
 
-	// Write settings.json
-	settings := map[string]interface{}{
-		"apiKeyHelper": helperPath,
-	}
-
-	data, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal settings: %w", err)
-	}
-
-	// Write it under every config dir candidate: an XDG-aware build reads
-	// settings.json from CLAUDE_CONFIG_DIR, an older one from home/.claude.
-	for _, settingsPath := range claudeSettingsPathsForProfile(prof) {
-		if err := atomicWriteFile(settingsPath, data, 0600); err != nil {
-			return fmt.Errorf("write settings: %w", err)
-		}
+	// Change only the effective store's helper, preserving workflow policy.
+	if err := update.Apply(); err != nil {
+		return fmt.Errorf("write settings: %w", err)
 	}
 
 	return nil
@@ -372,10 +450,14 @@ exit 1
 
 // Env returns the environment variables for running Claude in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
+	configDir, err := effectiveClaudeConfigDir(prof)
+	if err != nil {
+		return nil, err
+	}
 	env := map[string]string{
 		"HOME":              prof.HomePath(),
 		"XDG_CONFIG_HOME":   prof.XDGConfigPath(),
-		"CLAUDE_CONFIG_DIR": claudeConfigDirForProfile(prof),
+		"CLAUDE_CONFIG_DIR": configDir,
 	}
 	return env, nil
 }
@@ -392,6 +474,9 @@ func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
 
 // loginWithOAuth launches Claude Code for interactive /login.
 func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) error {
+	if err := p.PrepareRun(ctx, prof); err != nil {
+		return err
+	}
 	env, err := p.Env(ctx, prof)
 	if err != nil {
 		return err
@@ -450,14 +535,41 @@ func (p *Provider) loginWithAPIKey(ctx context.Context, prof *profile.Profile) e
 
 // Logout clears authentication credentials.
 func (p *Provider) Logout(ctx context.Context, prof *profile.Profile) error {
-	// Remove auth files
+	policy, err := claudesettings.LoadPolicy()
+	if err != nil {
+		return err
+	}
+	var updates []*claudesettings.Update
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		update, err := claudesettings.PrepareClear(path, policy)
+		if err != nil {
+			return fmt.Errorf("prepare Claude logout: %w", err)
+		}
+		updates = append(updates, update)
+	}
+	for _, path := range []string{
+		filepath.Join(prof.HomePath(), ".claude.json"),
+		filepath.Join(claudeLegacyDirForProfile(prof), ".claude.json"),
+		filepath.Join(claudeConfigDirForProfile(prof), ".claude.json"),
+	} {
+		update, err := claudesettings.PrepareLegacyClear(path, policy)
+		if err != nil {
+			return fmt.Errorf("prepare Claude session logout: %w", err)
+		}
+		updates = append(updates, update)
+	}
+	for _, update := range updates {
+		if err := update.Apply(); err != nil {
+			return fmt.Errorf("clear Claude authentication settings: %w", err)
+		}
+	}
+	// Credentials are private artifacts; mixed settings retain workflow policy.
 	authPaths := []string{
 		claudeAuthPathForProfile(prof),
 		claudeXDGCredentialsPathForProfile(prof),
-		filepath.Join(prof.HomePath(), ".claude.json"),
+		filepath.Join(claudeLegacyDirForProfile(prof), "auth.json"),
 		filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
 	}
-	authPaths = append(authPaths, claudeSettingsPathsForProfile(prof)...)
 
 	for _, path := range authPaths {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -474,42 +586,22 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 		HasLockFile: prof.IsLocked(),
 	}
 
-	// Check if auth.json exists
-	authPath := claudeAuthPathForProfile(prof)
-	if _, err := os.Stat(authPath); err == nil {
-		status.LoggedIn = true
+	configDir, err := effectiveClaudeConfigDir(prof)
+	if err != nil {
+		return nil, err
 	}
-
-	// Also check .claude.json for OAuth state
-	claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
-	if _, err := os.Stat(claudeJsonPath); err == nil {
-		status.LoggedIn = true
+	statePath := filepath.Join(configDir, ".claude.json")
+	if configDir == claudeLegacyDirForProfile(prof) {
+		statePath = legacyClaudeStatePath(prof)
 	}
-
-	// Primary credentials file for newer Claude Code versions.
-	credentialsPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
-	if _, err := os.Stat(credentialsPath); err == nil {
-		status.LoggedIn = true
-	}
-
-	// XDG-aware Claude Code builds write .credentials.json under
-	// xdg_config/claude-code/ (the CLAUDE_CONFIG_DIR the profile env sets)
-	// instead of the legacy home/.claude/. Without this probe a profile logged
-	// in via `caam exec` + /login reported "Logged in: false" while the seat
-	// worked fine (issue #70).
-	if _, err := os.Stat(claudeXDGCredentialsPathForProfile(prof)); err == nil {
-		status.LoggedIn = true
-	}
-
-	// API key mode can be configured via settings.json or env var
-	if !status.LoggedIn && provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
-		for _, settingsPath := range claudeSettingsPathsForProfile(prof) {
-			hasKey, err := claudeSettingsHasAPIKey(settingsPath)
-			if err == nil && hasKey {
-				status.LoggedIn = true
-				break
-			}
+	for _, path := range []string{filepath.Join(configDir, ".credentials.json"), filepath.Join(configDir, "auth.json"), statePath, filepath.Join(configDir, "settings.json")} {
+		hasAuth, err := claudeDocumentHasAuth(path)
+		if err != nil {
+			status.LoggedIn = false
+			status.Error = fmt.Sprintf("invalid Claude auth: %v", err)
+			return status, nil
 		}
+		status.LoggedIn = status.LoggedIn || hasAuth
 	}
 
 	return status, nil
@@ -560,15 +652,11 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		Locations: []provider.AuthLocation{},
 	}
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
-	}
-
 	// On macOS the OAuth blob lives in the login keychain; ~/.claude/.credentials.json
 	// is its mirror. Refresh it or detection reports "no credentials found"
 	// for a perfectly good login (issue #98).
-	_, _ = keychain.EnsureMirror(filepath.Join(homeDir, ".claude", ".credentials.json"))
+	files := p.AuthFiles()
+	_, _ = keychain.EnsureMirror(files[0].Path)
 
 	// Define locations to check
 	locations := []struct {
@@ -576,19 +664,19 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		description string
 	}{
 		{
-			path:        filepath.Join(homeDir, ".claude", ".credentials.json"),
+			path:        files[0].Path,
 			description: "Claude Code OAuth credentials (primary location)",
 		},
 		{
-			path:        filepath.Join(homeDir, ".claude.json"),
+			path:        files[1].Path,
 			description: "Claude Code OAuth session state (legacy location)",
 		},
 		{
-			path:        filepath.Join(claudeConfigDir(), "auth.json"),
+			path:        files[2].Path,
 			description: "Claude Code auth credentials (CLAUDE_CONFIG_DIR or XDG_CONFIG_HOME)",
 		},
 		{
-			path:        filepath.Join(homeDir, ".claude", "settings.json"),
+			path:        files[3].Path,
 			description: "Claude Code settings (apiKeyHelper / API key mode)",
 		},
 	}
@@ -616,61 +704,13 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		authLoc.LastModified = info.ModTime()
 		authLoc.FileSize = info.Size()
 
-		// Basic validation: try to parse as JSON
-		data, err := os.ReadFile(loc.path)
+		hasAuth, err := claudeDocumentHasAuth(loc.path)
+		authLoc.IsValid = err == nil && hasAuth
 		if err != nil {
-			authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
-		} else {
-			switch filepath.Base(loc.path) {
-			case ".credentials.json":
-				creds, err := parseClaudeCredentials(data)
-				if err != nil {
-					authLoc.ValidationError = fmt.Sprintf("invalid JSON: %v", err)
-				} else if creds.hasToken() {
-					authLoc.IsValid = true
-				} else {
-					authLoc.ValidationError = "missing expected OAuth fields"
-				}
-			default:
-				var parsed map[string]interface{}
-				if err := json.Unmarshal(data, &parsed); err != nil {
-					authLoc.ValidationError = fmt.Sprintf("invalid JSON: %v", err)
-				} else {
-					// Check for expected fields based on file type
-					switch filepath.Base(loc.path) {
-					case ".claude.json":
-						// Check for oauthToken or similar
-						if _, ok := parsed["oauthToken"]; ok {
-							authLoc.IsValid = true
-						} else if _, ok := parsed["sessionKey"]; ok {
-							authLoc.IsValid = true
-						} else {
-							authLoc.ValidationError = "missing expected OAuth fields"
-						}
-					case "settings.json":
-						if _, ok := parsed["apiKeyHelper"]; ok {
-							authLoc.IsValid = true
-						} else if _, ok := parsed["apiKey"]; ok {
-							authLoc.IsValid = true
-						} else if _, ok := parsed["api_key"]; ok {
-							authLoc.IsValid = true
-						} else {
-							authLoc.IsValid = true // Accept valid settings JSON
-						}
-					default:
-						// auth.json - check for typical auth fields
-						if _, ok := parsed["accessToken"]; ok {
-							authLoc.IsValid = true
-						} else if _, ok := parsed["access_token"]; ok {
-							authLoc.IsValid = true
-						} else {
-							authLoc.IsValid = true // Accept any valid JSON
-						}
-					}
-				}
-			}
+			authLoc.ValidationError = fmt.Sprintf("invalid auth: %v", err)
+		} else if !hasAuth {
+			authLoc.ValidationError = "no credential material in document"
 		}
-
 		detection.Locations = append(detection.Locations, authLoc)
 
 		// Track most recent valid auth
@@ -709,51 +749,83 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 	if info.IsDir() {
 		return nil, fmt.Errorf("source path is a directory, not a file")
 	}
+	configDir, err := effectiveClaudeConfigDir(prof)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := claudesettings.LoadPolicy()
+	if err != nil {
+		return nil, err
+	}
+	realHome, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	sharedSettings, sharedState := claudesettings.SharedPaths(realHome)
 
 	var copiedFiles []string
 
 	// Determine target based on source file type
 	basename := filepath.Base(sourcePath)
+	if basename == ".credentials.json" || basename == "auth.json" || basename == "settings.json" || basename == ".claude.json" {
+		hasAuth, err := claudeDocumentHasAuth(sourcePath)
+		if err != nil || !hasAuth {
+			return nil, fmt.Errorf("source does not contain usable Claude authentication: %s", basename)
+		}
+		ignoredDir, ignoredState := claudeLegacyDirForProfile(prof), legacyClaudeStatePath(prof)
+		if configDir == ignoredDir {
+			ignoredDir = claudeConfigDirForProfile(prof)
+			ignoredState = filepath.Join(ignoredDir, ".claude.json")
+		}
+		ignoredAuth, err := claudeDirHasAuth(ignoredDir, ignoredState)
+		if err != nil {
+			return nil, err
+		}
+		sourceID, ignoredID := claudeDirAccountID(filepath.Dir(sourcePath)), claudeDirAccountID(ignoredDir)
+		if ignoredAuth && sourceID != "" && ignoredID != "" && sourceID != ignoredID {
+			return nil, fmt.Errorf("import would create conflicting Claude accounts in legacy and XDG config directories")
+		}
+	}
 	switch basename {
 	case ".credentials.json":
-		// Copy to profile's .claude directory
-		targetDir := filepath.Join(prof.HomePath(), ".claude")
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create .claude dir: %w", err)
+		// Import one native credential store. Duplicating a rotating token
+		// into the ignored directory would leave another stale generation.
+		if err := os.MkdirAll(configDir, 0700); err != nil {
+			return nil, fmt.Errorf("create Claude config dir: %w", err)
 		}
-		targetPath := filepath.Join(targetDir, ".credentials.json")
+		targetPath := filepath.Join(configDir, ".credentials.json")
 		if err := copyFile(sourcePath, targetPath); err != nil {
 			return nil, fmt.Errorf("copy .credentials.json: %w", err)
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
 	case ".claude.json":
-		// Copy to profile's home directory
-		targetPath := filepath.Join(prof.HomePath(), ".claude.json")
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy .claude.json: %w", err)
+		targetPath := filepath.Join(configDir, ".claude.json")
+		update, err := claudesettings.PrepareLegacyImport(sharedState, sourcePath, targetPath, policy)
+		if err != nil {
+			return nil, fmt.Errorf("prepare imported Claude session settings: %w", err)
+		}
+		if err := update.Apply(); err != nil {
+			return nil, fmt.Errorf("import .claude.json: %w", err)
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
 	case "settings.json":
-		// Copy to profile's .claude directory
-		targetDir := filepath.Join(prof.HomePath(), ".claude")
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create .claude dir: %w", err)
+		targetPath := filepath.Join(configDir, "settings.json")
+		update, err := claudesettings.PrepareImport(sharedSettings, sourcePath, targetPath, policy)
+		if err != nil {
+			return nil, fmt.Errorf("prepare imported Claude settings: %w", err)
 		}
-		targetPath := filepath.Join(targetDir, "settings.json")
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy settings.json: %w", err)
+		if err := update.Apply(); err != nil {
+			return nil, fmt.Errorf("import settings.json: %w", err)
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
 	case "auth.json":
-		// Copy to profile's XDG config claude-code directory
-		targetDir := claudeConfigDirForProfile(prof)
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create claude-code dir: %w", err)
+		if err := os.MkdirAll(configDir, 0700); err != nil {
+			return nil, fmt.Errorf("create Claude config dir: %w", err)
 		}
-		targetPath := filepath.Join(targetDir, "auth.json")
+		targetPath := filepath.Join(configDir, "auth.json")
 		if err := copyFile(sourcePath, targetPath); err != nil {
 			return nil, fmt.Errorf("copy auth.json: %w", err)
 		}
@@ -888,28 +960,36 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 // validateTokenPassive performs passive validation without network calls.
 func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profile, result *provider.ValidationResult) (*provider.ValidationResult, error) {
 	result.Method = "passive"
-
-	// Check auth files exist
-	claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
-	authJsonPath := claudeAuthPathForProfile(prof)
-	// XDG-aware Claude Code builds write credentials under
-	// xdg_config/claude-code/ instead of the legacy home/.claude/ (issue
-	// #70). A stale or corrupt legacy file must not shadow fresh XDG-side
-	// credentials (issue #72): probe both candidates and pick whichever is
-	// valid, preferring the fresher expiry when both are.
-	credentials := pickClaudeCredentials([]string{
-		filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
-		claudeXDGCredentialsPathForProfile(prof),
-	})
-	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
-
-	claudeJsonExists := fileExists(claudeJsonPath)
+	configDir, err := effectiveClaudeConfigDir(prof)
+	if err != nil {
+		result.Error = err.Error()
+		return result, nil
+	}
+	claudeJsonPath := filepath.Join(configDir, ".claude.json")
+	if configDir == claudeLegacyDirForProfile(prof) {
+		claudeJsonPath = legacyClaudeStatePath(prof)
+	}
+	authJsonPath := filepath.Join(configDir, "auth.json")
+	// Validate the exact store selected for native execution. An ignored
+	// legacy credential cannot rescue an expired or malformed XDG login.
+	credentials := readClaudeCredentialCandidate(filepath.Join(configDir, ".credentials.json"))
+	settingsPath := filepath.Join(configDir, "settings.json")
+	claudeJsonHasAuth, err := claudeDocumentHasAuth(claudeJsonPath)
+	if err != nil {
+		result.Error = fmt.Sprintf("invalid .claude.json: %v", err)
+		return result, nil
+	}
+	authJsonHasAuth, err := claudeDocumentHasAuth(authJsonPath)
+	if err != nil {
+		result.Error = fmt.Sprintf("invalid auth.json: %v", err)
+		return result, nil
+	}
 	authJsonExists := fileExists(authJsonPath)
 	credentialsExists := credentials != nil
 	settingsExists := fileExists(settingsPath)
 
-	if !claudeJsonExists && !authJsonExists && !credentialsExists {
-		if provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
+	if !claudeJsonHasAuth && !authJsonHasAuth && !credentialsExists {
+		if settingsExists || provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
 			hasKey, err := claudeSettingsHasAPIKey(settingsPath)
 			if err != nil && settingsExists {
 				result.Valid = false
@@ -947,8 +1027,8 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 		}
 	}
 
-	// Check .claude.json if it exists
-	if claudeJsonExists {
+	// Policy-only state is not a login and has no authentication expiry.
+	if claudeJsonHasAuth {
 		data, err := os.ReadFile(claudeJsonPath)
 		if err != nil {
 			result.Valid = false
@@ -1080,26 +1160,61 @@ func fileExists(path string) bool {
 }
 
 func claudeSettingsHasAPIKey(path string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	return claudeDocumentHasAuth(path)
+}
+
+// Mixed policy documents are not proof of a login. Accept only supported,
+// nonempty credential fields, including settings-based environment credentials.
+func claudeDocumentHasAuth(path string) (bool, error) {
+	data, err := claudesettings.Read(path)
+	if err != nil || data == nil {
 		return false, err
 	}
-
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return false, err
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
+		return false, fmt.Errorf("%s must contain a JSON object", filepath.Base(path))
 	}
-
-	if _, ok := parsed["apiKeyHelper"]; ok {
-		return true, nil
-	}
-	if _, ok := parsed["apiKey"]; ok {
-		return true, nil
-	}
-	if _, ok := parsed["api_key"]; ok {
-		return true, nil
+	switch filepath.Base(path) {
+	case ".credentials.json":
+		creds, err := parseClaudeCredentials(data)
+		if err != nil {
+			return false, err
+		}
+		return creds.ClaudeAiOauth != nil && strings.TrimSpace(creds.ClaudeAiOauth.AccessToken) != "", nil
+	case ".claude.json":
+		return nonemptyClaudeFields(obj, "oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey")
+	case "auth.json":
+		return nonemptyClaudeFields(obj, "accessToken", "access_token", "apiKey", "api_key")
+	case "settings.json":
+		found, err := nonemptyClaudeFields(obj, "apiKeyHelper", "apiKey", "api_key")
+		if err != nil {
+			return false, err
+		}
+		if raw, ok := obj["env"]; ok {
+			var env map[string]json.RawMessage
+			if json.Unmarshal(raw, &env) != nil || env == nil {
+				return false, fmt.Errorf("settings env must contain a JSON object")
+			}
+			envAuth, err := nonemptyClaudeFields(env, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+			return found || envAuth, err
+		}
+		return found, nil
 	}
 	return false, nil
+}
+
+func nonemptyClaudeFields(obj map[string]json.RawMessage, keys ...string) (bool, error) {
+	found := false
+	for _, key := range keys {
+		if raw, ok := obj[key]; ok {
+			var value string
+			if string(raw) == "null" || json.Unmarshal(raw, &value) != nil {
+				return false, fmt.Errorf("%s must be a string", key)
+			}
+			found = found || strings.TrimSpace(value) != ""
+		}
+	}
+	return found, nil
 }
 
 type claudeCredentials struct {
@@ -1110,6 +1225,7 @@ type claudeOAuth struct {
 	AccessToken  string  `json:"accessToken"`
 	RefreshToken string  `json:"refreshToken"`
 	ExpiresAt    float64 `json:"expiresAt"`
+	AccountID    string  `json:"accountId"`
 }
 
 func parseClaudeCredentials(data []byte) (*claudeCredentials, error) {
@@ -1141,6 +1257,9 @@ func loadClaudeCredentials(path string) (*credentialsInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	if creds.ClaudeAiOauth == nil || strings.TrimSpace(creds.ClaudeAiOauth.AccessToken) == "" {
+		return nil, fmt.Errorf("no access credential in .credentials.json")
+	}
 
 	info := &credentialsInfo{}
 	if creds.ClaudeAiOauth != nil && creds.ClaudeAiOauth.ExpiresAt > 0 {
@@ -1157,62 +1276,17 @@ type claudeCredCandidate struct {
 	expiresAt *time.Time
 }
 
-// pickClaudeCredentials probes candidate .credentials.json paths (listed in
-// precedence order, legacy home/.claude/ first) and returns the best existing
-// candidate, or nil when none exist. A candidate that parses and is unexpired
-// beats one that is corrupt or expired; within the same tier the fresher
-// expiry wins (a candidate without an expiry ranks oldest), and remaining
-// ties keep the earlier-listed candidate. This stops a stale or corrupt
-// legacy file from shadowing fresh XDG-side credentials (issue #72) while
-// preserving legacy-first precedence when both are equally usable.
-func pickClaudeCredentials(paths []string) *claudeCredCandidate {
-	var best *claudeCredCandidate
-	now := timeNow()
-	for _, path := range paths {
-		if !fileExists(path) {
-			continue
-		}
-		cand := &claudeCredCandidate{path: path}
-		if info, err := loadClaudeCredentials(path); err != nil {
-			cand.parseErr = err
-		} else {
-			cand.expiresAt = info.expiresAt
-		}
-		if best == nil || credCandidateBetter(cand, best, now) {
-			best = cand
-		}
+func readClaudeCredentialCandidate(path string) *claudeCredCandidate {
+	if !fileExists(path) {
+		return nil
 	}
-	return best
-}
-
-// credCandidateBetter reports whether a should be preferred over b.
-func credCandidateBetter(a, b *claudeCredCandidate, now time.Time) bool {
-	aUsable := credCandidateUsable(a, now)
-	bUsable := credCandidateUsable(b, now)
-	if aUsable != bUsable {
-		return aUsable
+	candidate := &claudeCredCandidate{path: path}
+	if info, err := loadClaudeCredentials(path); err != nil {
+		candidate.parseErr = err
+	} else {
+		candidate.expiresAt = info.expiresAt
 	}
-	// Same usability tier: strictly fresher expiry wins; on ties the earlier
-	// (legacy-first) candidate is kept.
-	return credCandidateExpiry(a).After(credCandidateExpiry(b))
-}
-
-// credCandidateUsable reports whether the candidate parsed and is unexpired.
-// A parseable file without an expiry timestamp counts as usable.
-func credCandidateUsable(c *claudeCredCandidate, now time.Time) bool {
-	if c.parseErr != nil {
-		return false
-	}
-	return c.expiresAt == nil || !c.expiresAt.Before(now)
-}
-
-// credCandidateExpiry returns the candidate's expiry, or the zero time when
-// it has none (ranking it oldest for freshness comparisons).
-func credCandidateExpiry(c *claudeCredCandidate) time.Time {
-	if c.expiresAt == nil {
-		return time.Time{}
-	}
-	return *c.expiresAt
+	return candidate
 }
 
 func parseExpiryTime(s string) (time.Time, error) {

@@ -3,7 +3,11 @@
 package discovery
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/fsnotify/fsnotify"
 )
@@ -27,6 +32,10 @@ type WatcherConfig struct {
 	// Multiple rapid changes are coalesced into one event.
 	// Default: 500ms
 	DebounceInterval time.Duration
+
+	// PollInterval reconciles credentials and repairs directory watches even
+	// when filesystem notifications are unavailable. Default: 5 seconds.
+	PollInterval time.Duration
 
 	// OnDiscovery is called when a new account is discovered.
 	// The callback receives the provider, email, and identity details.
@@ -44,25 +53,33 @@ type WatcherConfig struct {
 
 // Watcher monitors auth file changes and auto-discovers new accounts.
 type Watcher struct {
-	vault   *authfile.Vault
-	config  WatcherConfig
-	watcher *fsnotify.Watcher
-	logger  *slog.Logger
-	mu      sync.Mutex
-	pending map[string]time.Time // path -> last change time
-	stopCh  chan struct{}
-	doneCh  chan struct{}
-	// debounceDoneCh is closed when debounceLoop exits. Stop() waits on it so
-	// an in-flight processPending backup can never race a caller that removes
-	// the vault directory right after Stop() returns.
-	debounceDoneCh chan struct{}
-	watching       bool
+	vault      *authfile.Vault
+	config     WatcherConfig
+	logger     *slog.Logger
+	mu         sync.Mutex // Serializes complete Start/Stop transitions.
+	cancel     context.CancelFunc
+	done       chan struct{}
+	newBackend func() (*fsnotify.Watcher, error)
+}
+
+type pendingChange struct {
+	path string
+	at   time.Time
 }
 
 // NewWatcher creates a new auth file watcher.
 func NewWatcher(vault *authfile.Vault, config WatcherConfig) (*Watcher, error) {
+	if vault == nil {
+		return nil, fmt.Errorf("watcher requires a vault")
+	}
+	if config.DebounceInterval < 0 || config.PollInterval < 0 {
+		return nil, fmt.Errorf("watcher intervals must not be negative")
+	}
 	if config.DebounceInterval == 0 {
 		config.DebounceInterval = 500 * time.Millisecond
+	}
+	if config.PollInterval == 0 {
+		config.PollInterval = 5 * time.Second
 	}
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -71,20 +88,11 @@ func NewWatcher(vault *authfile.Vault, config WatcherConfig) (*Watcher, error) {
 		config.Providers = []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	}
 
-	fsWatcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, fmt.Errorf("create fsnotify watcher: %w", err)
-	}
-
 	return &Watcher{
-		vault:          vault,
-		config:         config,
-		watcher:        fsWatcher,
-		logger:         config.Logger,
-		pending:        make(map[string]time.Time),
-		stopCh:         make(chan struct{}),
-		doneCh:         make(chan struct{}),
-		debounceDoneCh: make(chan struct{}),
+		vault:      vault,
+		config:     config,
+		logger:     config.Logger,
+		newBackend: fsnotify.NewWatcher,
 	}, nil
 }
 
@@ -92,366 +100,394 @@ func NewWatcher(vault *authfile.Vault, config WatcherConfig) (*Watcher, error) {
 // Call Stop() to stop the watcher.
 func (w *Watcher) Start(ctx context.Context) error {
 	w.mu.Lock()
-	if w.watching {
-		w.mu.Unlock()
-		return fmt.Errorf("watcher already running")
+	defer w.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	w.watching = true
-	// Recreate channels for this run (in case of restart after Stop). Capture
-	// them locally while holding the lock: the goroutines below must signal on
-	// THIS run's channels even if a later Stop/Start cycle swaps the fields.
-	w.stopCh = make(chan struct{})
-	w.doneCh = make(chan struct{})
-	w.debounceDoneCh = make(chan struct{})
-	stopCh := w.stopCh
-	doneCh := w.doneCh
-	debounceDoneCh := w.debounceDoneCh
-	w.mu.Unlock()
-
-	// Add watches for all auth file directories
-	pathsToWatch := w.getWatchPaths()
-	for _, p := range pathsToWatch {
-		dir := filepath.Dir(p)
-		// Ensure directory exists
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			if err := os.MkdirAll(dir, 0700); err != nil {
-				w.logger.Warn("failed to create directory for watching",
-					"dir", dir, "error", err)
-				continue
-			}
-		}
-		if err := w.watcher.Add(dir); err != nil {
-			w.logger.Warn("failed to add watch",
-				"path", dir, "error", err)
-		} else {
-			w.logger.Debug("watching directory", "path", dir)
+	if w.done != nil {
+		select {
+		case <-w.done:
+		default:
+			return fmt.Errorf("watcher already running")
 		}
 	}
-
-	// Start event loop
-	go w.eventLoop(ctx, stopCh, doneCh)
-	go w.debounceLoop(ctx, stopCh, debounceDoneCh)
-
+	sources := make(map[string]authfile.AuthFileSet)
+	for _, provider := range w.config.Providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if fileSet, ok := authfile.GetAuthFileSet(provider); ok {
+			sources[provider] = fileSet
+		}
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	w.cancel, w.done = cancel, make(chan struct{})
+	// Set up watches before returning so the first login cannot race setup.
+	backend, watched := w.openBackend(sources)
+	go w.run(runCtx, w.done, sources, backend, watched)
 	return nil
 }
 
 // Stop halts the watcher.
 func (w *Watcher) Stop() error {
 	w.mu.Lock()
-	if !w.watching {
-		w.mu.Unlock()
-		return nil
+	defer w.mu.Unlock()
+	if w.cancel != nil {
+		w.cancel()
+		<-w.done // Includes any backup already in progress and backend close.
+		w.cancel, w.done = nil, nil
 	}
-	w.watching = false
-	stopCh := w.stopCh
-	doneCh := w.doneCh
-	debounceDoneCh := w.debounceDoneCh
-	w.mu.Unlock()
-
-	select {
-	case <-stopCh:
-	default:
-		close(stopCh)
-	}
-	<-doneCh
-	<-debounceDoneCh
-	return w.watcher.Close()
+	return nil
 }
 
-// getWatchPaths returns all auth file paths to monitor.
-func (w *Watcher) getWatchPaths() []string {
-	var paths []string
-
-	for _, provider := range w.config.Providers {
-		fileSet, ok := authfile.GetAuthFileSet(provider)
-		if !ok {
-			continue
-		}
-		for _, spec := range fileSet.Files {
-			paths = append(paths, spec.Path)
-		}
+func (w *Watcher) openBackend(sources map[string]authfile.AuthFileSet) (*fsnotify.Watcher, map[string]os.FileInfo) {
+	backend, err := w.newBackend()
+	if err != nil {
+		w.logger.Warn("filesystem notifications unavailable; polling auth files", "error", err)
+		return nil, nil
 	}
-
-	return paths
+	watched := make(map[string]os.FileInfo)
+	w.repairWatches(backend, watched, sources)
+	return backend, watched
 }
 
-// eventLoop handles fsnotify events. doneCh is closed on EVERY exit path (not
-// just the stopCh one): eventLoop can also exit via ctx cancellation/expiry or
-// a closed fsnotify channel, and Stop() blocks on <-doneCh — signalling only
-// on the stopCh path deadlocked any Stop() that followed a ctx-driven exit.
-func (w *Watcher) eventLoop(ctx context.Context, stopCh <-chan struct{}, doneCh chan<- struct{}) {
-	defer close(doneCh)
-
-	watchedPaths := make(map[string]string) // path -> provider
-	for _, provider := range w.config.Providers {
-		fileSet, ok := authfile.GetAuthFileSet(provider)
-		if !ok {
-			continue
-		}
+func (w *Watcher) repairWatches(backend *fsnotify.Watcher, watched map[string]os.FileInfo, sources map[string]authfile.AuthFileSet) {
+	wanted := make(map[string]os.FileInfo)
+	for _, fileSet := range sources {
 		for _, spec := range fileSet.Files {
-			watchedPaths[spec.Path] = provider
+			dir := filepath.Dir(spec.Path)
+			for {
+				info, err := os.Stat(dir)
+				if err == nil && info.IsDir() {
+					wanted[dir] = info
+					break
+				}
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				dir = parent
+			}
 		}
 	}
+	for dir, old := range watched {
+		if current, ok := wanted[dir]; !ok || !os.SameFile(old, current) {
+			_ = backend.Remove(dir)
+			delete(watched, dir)
+		}
+	}
+	for dir, info := range wanted {
+		if _, ok := watched[dir]; ok {
+			continue
+		}
+		if err := backend.Add(dir); err != nil {
+			w.logger.Debug("directory watch unavailable; polling auth files", "path", dir, "error", err)
+			continue
+		}
+		watched[dir] = info
+	}
+}
 
+// One goroutine owns the pending queue, reconciliation and native backend.
+// Backups cannot overlap, and a queued event never loses its provider binding.
+func (w *Watcher) run(ctx context.Context, done chan<- struct{}, sources map[string]authfile.AuthFileSet, backend *fsnotify.Watcher, watched map[string]os.FileInfo) {
+	defer close(done)
+	defer func() {
+		if backend != nil {
+			_ = backend.Close()
+		}
+	}()
+	poll := time.NewTicker(w.config.PollInterval)
+	defer poll.Stop()
+	debounce := time.NewTicker(min(w.config.DebounceInterval, 100*time.Millisecond))
+	defer debounce.Stop()
+	pending := make(map[string]pendingChange)
+	queueAll := func() {
+		for provider := range sources {
+			if _, ok := pending[provider]; !ok {
+				pending[provider] = pendingChange{at: time.Now()}
+			}
+		}
+	}
 	for {
+		var events <-chan fsnotify.Event
+		var failures <-chan error
+		if backend != nil {
+			events, failures = backend.Events, backend.Errors
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-stopCh:
-			return
-		case event, ok := <-w.watcher.Events:
-			if !ok {
-				return
+		case <-poll.C:
+			if backend == nil {
+				backend, watched = w.openBackend(sources)
+			} else {
+				w.repairWatches(backend, watched, sources)
 			}
-			// Check if this is a file we care about
-			provider, isWatched := watchedPaths[event.Name]
-			if !isWatched {
-				// Also check by base name (for files in watched directories)
-				for watchPath, prov := range watchedPaths {
-					if filepath.Base(event.Name) == filepath.Base(watchPath) &&
-						filepath.Dir(event.Name) == filepath.Dir(watchPath) {
-						provider = prov
-						isWatched = true
-						break
+			queueAll()
+		case <-debounce.C:
+			for provider, change := range pending {
+				if time.Since(change.at) < w.config.DebounceInterval {
+					continue
+				}
+				delete(pending, provider)
+				if ctx.Err() != nil {
+					return
+				}
+				if backend != nil {
+					// A replacement directory may have appeared after event-time
+					// repair selected its parent, but before that parent watch was
+					// attached. Rebind before reporting the reconciled login so
+					// subsequent writes in the replacement are observed too.
+					w.repairWatches(backend, watched, sources)
+				}
+				w.processChange(provider, sources[provider], change.path)
+			}
+		case event, ok := <-events:
+			if !ok {
+				_ = backend.Close()
+				backend = nil
+				queueAll()
+				continue
+			}
+			for provider, fileSet := range sources {
+				for _, spec := range fileSet.Files {
+					if filepath.Clean(event.Name) != filepath.Clean(spec.Path) {
+						continue
+					}
+					if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+						pending[provider] = pendingChange{path: spec.Path, at: time.Now()}
+						if w.config.OnChange != nil {
+							w.config.OnChange(provider, spec.Path)
+						}
 					}
 				}
 			}
-			if !isWatched {
-				continue
-			}
-
-			// Handle create/write events
-			if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				w.mu.Lock()
-				w.pending[event.Name] = time.Now()
-				w.mu.Unlock()
-
-				if w.config.OnChange != nil {
-					w.config.OnChange(provider, event.Name)
+			if event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+				_, wasWatchedDirectory := watched[event.Name]
+				info, statErr := os.Stat(event.Name)
+				isDirectory := statErr == nil && info.IsDir()
+				w.repairWatches(backend, watched, sources)
+				if wasWatchedDirectory || isDirectory {
+					// A new directory can already contain credentials by the
+					// time its watch is attached. Reconcile that event gap.
+					queueAll()
 				}
-				w.logger.Debug("auth file changed",
-					"provider", provider,
-					"path", event.Name,
-					"op", event.Op.String())
 			}
-
-		case err, ok := <-w.watcher.Errors:
-			if !ok {
-				return
+		case err, ok := <-failures:
+			if ok {
+				w.logger.Warn("filesystem notifications failed; polling auth files", "error", err)
+				if w.config.OnError != nil {
+					w.config.OnError(err)
+				}
 			}
-			w.logger.Error("fsnotify error", "error", err)
-			if w.config.OnError != nil {
-				w.config.OnError(err)
-			}
+			_ = backend.Close()
+			backend = nil
+			queueAll()
 		}
 	}
 }
 
-// debounceLoop processes pending changes after debounce interval. doneCh is
-// closed on every exit path; Stop() waits on it so no processPending backup
-// is still writing to the vault after Stop() returns.
-func (w *Watcher) debounceLoop(ctx context.Context, stopCh <-chan struct{}, doneCh chan<- struct{}) {
-	defer close(doneCh)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-stopCh:
-			return
-		case <-ticker.C:
-			w.processPending()
+func (w *Watcher) processChange(provider string, fileSet authfile.AuthFileSet, path string) {
+	name, ident, err := discoverAccount(w.vault, fileSet)
+	if err != nil {
+		w.logger.Warn("auth reconciliation failed", "provider", provider, "path", path, "error", err)
+		if w.config.OnError != nil {
+			w.config.OnError(err)
+		}
+		return
+	}
+	if name != "" {
+		w.logger.Info("saved discovered credentials", "provider", provider, "profile", name)
+		if w.config.OnDiscovery != nil {
+			w.config.OnDiscovery(provider, name, ident)
 		}
 	}
 }
 
-// processPending handles debounced file changes.
-func (w *Watcher) processPending() {
-	w.mu.Lock()
-	now := time.Now()
-	var toProcess []string
-	for path, lastChange := range w.pending {
-		if now.Sub(lastChange) >= w.config.DebounceInterval {
-			toProcess = append(toProcess, path)
-			delete(w.pending, path)
-		}
+// discoverAccount distinguishes an account match from an exact credential
+// generation. ActiveProfile intentionally survives native token rotation;
+// that must select the existing profile, not suppress its updated snapshot.
+func discoverAccount(vault *authfile.Vault, fileSet authfile.AuthFileSet) (string, *identity.Identity, error) {
+	if !authfile.HasAuthFiles(fileSet) {
+		return "", nil, nil
 	}
-	w.mu.Unlock()
-
-	for _, path := range toProcess {
-		w.processChange(path)
+	specs, err := generationFiles(fileSet)
+	if err != nil {
+		return "", nil, err
 	}
-}
-
-// processChange handles a single auth file change.
-func (w *Watcher) processChange(path string) {
-	// Determine provider from path
-	var provider string
-	var fileSet authfile.AuthFileSet
-	for _, prov := range w.config.Providers {
-		fs, ok := authfile.GetAuthFileSet(prov)
-		if !ok {
-			continue
-		}
-		for _, spec := range fs.Files {
-			if spec.Path == path || filepath.Base(spec.Path) == filepath.Base(path) {
-				provider = prov
-				fileSet = fs
-				break
-			}
-		}
-		if provider != "" {
+	generation, err := credentialGeneration(fileSet.Tool, specs, "")
+	if err != nil || len(generation) == 0 {
+		return "", nil, err
+	}
+	var ident *identity.Identity
+	for _, spec := range specs {
+		candidate, err := extractIdentity(fileSet.Tool, spec.Path)
+		if err == nil && candidate != nil && strings.TrimSpace(candidate.Email) != "" {
+			ident = candidate
 			break
 		}
 	}
-
-	if provider == "" {
-		w.logger.Warn("could not determine provider for path", "path", path)
-		return
-	}
-
-	// Extract identity from the auth file
-	ident, err := w.extractIdentity(provider, path)
+	name, err := vault.ActiveProfile(fileSet)
 	if err != nil {
-		w.logger.Debug("failed to extract identity; falling back to auto profile",
-			"provider", provider,
-			"path", path,
-			"error", err)
-		ident = nil
+		return "", nil, err
 	}
-
-	email := ""
-	if ident != nil {
-		email = strings.TrimSpace(ident.Email)
+	if authfile.IsSystemProfile(name) {
+		name = ""
 	}
-
-	if email == "" {
-		if !authfile.HasAuthFiles(fileSet) {
-			w.logger.Debug("no auth files found; skipping auto backup",
-				"provider", provider,
-				"path", path)
-			return
-		}
-
-		// If this auth state already matches a saved profile, skip.
-		if active, err := w.vault.ActiveProfile(fileSet); err == nil && active != "" {
-			w.logger.Debug("auth matches existing profile; identity missing",
-				"provider", provider,
-				"profile", active)
-			return
-		}
-
-		// No identity available; still back up with an auto-generated name.
-		autoName := w.autoProfileName(provider)
-		w.logger.Info("identity missing; backing up with auto profile name",
-			"provider", provider,
-			"profile", autoName)
-		if err := w.vault.Backup(fileSet, autoName); err != nil {
-			w.logger.Error("failed to backup auto profile",
-				"provider", provider,
-				"profile", autoName,
-				"error", err)
-			if w.config.OnError != nil {
-				w.config.OnError(fmt.Errorf("backup %s/%s: %w", provider, autoName, err))
-			}
-			return
-		}
-		if w.config.OnDiscovery != nil {
-			w.config.OnDiscovery(provider, autoName, ident)
-		}
-		return
+	if name == "" && ident != nil {
+		name = strings.TrimSpace(ident.Email)
 	}
-
-	// Check if this profile already exists in vault
-	email = strings.TrimSpace(email)
-	profiles, err := w.vault.List(provider)
+	profiles, err := vault.List(fileSet.Tool)
 	if err != nil {
-		w.logger.Error("failed to list profiles",
-			"provider", provider,
-			"error", err)
-		return
+		return "", ident, err
 	}
-
-	for _, p := range profiles {
-		if p == email {
-			// Profile already exists, check if content matches
-			active, err := w.vault.ActiveProfile(fileSet)
-			if err == nil && active == email {
-				w.logger.Debug("profile already active, skipping",
-					"provider", provider,
-					"email", email)
-				return
-			}
-			// Content differs - update existing profile
-			w.logger.Info("updating existing profile",
-				"provider", provider,
-				"email", email)
-			if err := w.vault.Backup(fileSet, email); err != nil {
-				w.logger.Error("failed to update profile",
-					"provider", provider,
-					"email", email,
-					"error", err)
-				return
-			}
-			if w.config.OnDiscovery != nil {
-				w.config.OnDiscovery(provider, email, ident)
-			}
-			return
+	for _, existing := range profiles {
+		if authfile.IsSystemProfile(existing) {
+			continue
+		}
+		// Only a listed snapshot may be read here. A new identity-derived
+		// name is validated by Backup before it can become a vault path.
+		profileDir := vault.ProfilePath(fileSet.Tool, existing)
+		if saved, err := credentialGeneration(fileSet.Tool, specs, profileDir); err == nil && bytes.Equal(generation, saved) {
+			return "", ident, nil
 		}
 	}
-
-	// New profile - backup it
-	w.logger.Info("discovered new account",
-		"provider", provider,
-		"email", email,
-		"plan", ident.PlanType)
-
-	if err := w.vault.Backup(fileSet, email); err != nil {
-		w.logger.Error("failed to backup new profile",
-			"provider", provider,
-			"email", email,
-			"error", err)
-		if w.config.OnError != nil {
-			w.config.OnError(fmt.Errorf("backup %s/%s: %w", provider, email, err))
-		}
-		return
+	if name == "" || authfile.IsSystemProfile(name) {
+		name = autoProfileName(vault, fileSet.Tool)
 	}
-
-	if w.config.OnDiscovery != nil {
-		w.config.OnDiscovery(provider, email, ident)
+	if err := vault.Backup(fileSet, name); err != nil {
+		return "", ident, fmt.Errorf("backup %s/%s: %w", fileSet.Tool, name, err)
 	}
+	return name, ident, nil
 }
 
-// autoProfileName generates a unique, user-deletable profile name when identity is missing.
-func (w *Watcher) autoProfileName(provider string) string {
-	base := "auto-" + time.Now().Format("20060102-150405")
-	if w == nil || w.vault == nil {
-		return base
+// generationFiles excludes optional workflow files when the primary OAuth
+// source exists. API-helper and keychain-only layouts still have a fallback.
+func generationFiles(fileSet authfile.AuthFileSet) ([]authfile.AuthFileSpec, error) {
+	primary := ""
+	switch fileSet.Tool {
+	case "claude":
+		primary = ".credentials.json"
+	case "cursor":
+		primary = "auth.json"
 	}
-	profiles, err := w.vault.List(provider)
-	if err != nil || len(profiles) == 0 {
-		return base
-	}
-	exists := make(map[string]struct{}, len(profiles))
-	for _, p := range profiles {
-		exists[p] = struct{}{}
-	}
-	if _, ok := exists[base]; !ok {
-		return base
-	}
-	for i := 2; i < 1000; i++ {
-		candidate := fmt.Sprintf("%s-%d", base, i)
-		if _, ok := exists[candidate]; !ok {
-			return candidate
+	if primary != "" {
+		for _, spec := range fileSet.Files {
+			if filepath.Base(spec.Path) != primary {
+				continue
+			}
+			if _, err := os.Stat(spec.Path); err == nil {
+				return []authfile.AuthFileSpec{spec}, nil
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("inspect %s credentials: %w", fileSet.Tool, err)
+			}
 		}
 	}
-	return base
+	var specs []authfile.AuthFileSpec
+	for _, spec := range fileSet.Files {
+		if fileSet.Tool == "grok" && filepath.Base(spec.Path) == "config.toml" {
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+// credentialGeneration is private comparison material, never logged or
+// serialized. JSON formatting and optional shared policy are not a login.
+func credentialGeneration(provider string, specs []authfile.AuthFileSpec, snapshotDir string) ([]byte, error) {
+	parts := make(map[string]json.RawMessage)
+	for _, spec := range specs {
+		path, filename := spec.Path, filepath.Base(spec.Path)
+		if snapshotDir != "" {
+			path = filepath.Join(snapshotDir, filename)
+		}
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() || info.Size() > 8<<20 {
+			return nil, fmt.Errorf("%s credential source is not a regular file smaller than 8 MiB", provider)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if filename == ".env" {
+			parts[filename], _ = json.Marshal(string(data))
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(data, &obj) != nil || obj == nil {
+			return nil, fmt.Errorf("%s credential source contains invalid JSON", provider)
+		}
+		if provider == "claude" {
+			switch filename {
+			case ".credentials.json":
+				var oauth map[string]json.RawMessage
+				if json.Unmarshal(obj["claudeAiOauth"], &oauth) != nil || oauth == nil {
+					return nil, fmt.Errorf("Claude credential has no OAuth grant")
+				}
+				obj = map[string]json.RawMessage{"accessToken": oauth["accessToken"], "refreshToken": oauth["refreshToken"]}
+			case "settings.json":
+				policy, err := claudesettings.LoadPolicy()
+				if err != nil {
+					return nil, err
+				}
+				data, err = claudesettings.Identity(data, policy)
+				if err != nil {
+					return nil, err
+				}
+				obj = nil
+				_ = json.Unmarshal(data, &obj)
+			case ".claude.json":
+				data, err = claudesettings.LegacyIdentity(data)
+				if err != nil {
+					return nil, err
+				}
+				obj = nil
+				_ = json.Unmarshal(data, &obj)
+			case "config.json":
+				for key := range obj {
+					if !strings.HasPrefix(key, "oauth:tokenCache") {
+						delete(obj, key)
+					}
+				}
+			}
+		} else if provider == "cursor" && filename != "auth.json" {
+			for key := range obj {
+				if key != "authInfo" && key != "apiKey" && key != "accessToken" && key != "refreshToken" {
+					delete(obj, key)
+				}
+			}
+		}
+		if len(obj) == 0 {
+			continue
+		}
+		data, err = json.Marshal(obj)
+		if err != nil {
+			return nil, fmt.Errorf("%s credential fields are malformed", provider)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		var canonical interface{}
+		if err := decoder.Decode(&canonical); err != nil {
+			return nil, fmt.Errorf("%s credential fields are malformed", provider)
+		}
+		parts[filename], _ = json.Marshal(canonical)
+	}
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	data, _ := json.Marshal(parts)
+	digest := sha256.Sum256(data)
+	return digest[:], nil
 }
 
 // extractIdentity extracts account identity from an auth file.
-func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, error) {
+func extractIdentity(provider, path string) (*identity.Identity, error) {
 	// Check file exists and is readable
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
@@ -463,52 +499,17 @@ func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, er
 		if strings.HasSuffix(path, ".credentials.json") {
 			return identity.ExtractFromClaudeCredentials(path)
 		}
-		// Also check the primary location if this isn't it
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("get home dir: %w", err)
-		}
-		credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
-		if _, err := os.Stat(credPath); err == nil {
-			return identity.ExtractFromClaudeCredentials(credPath)
-		}
 		return nil, fmt.Errorf("claude credentials not found")
 
 	case "codex":
 		if strings.HasSuffix(path, "auth.json") {
 			return identity.ExtractFromCodexAuth(path)
 		}
-		// Check default location
-		codexHome := os.Getenv("CODEX_HOME")
-		if codexHome == "" {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				return nil, fmt.Errorf("get home dir: %w", err)
-			}
-			codexHome = filepath.Join(homeDir, ".codex")
-		}
-		authPath := filepath.Join(codexHome, "auth.json")
-		if _, err := os.Stat(authPath); err == nil {
-			return identity.ExtractFromCodexAuth(authPath)
-		}
 		return nil, fmt.Errorf("codex auth not found")
 
 	case "gemini":
 		if strings.HasSuffix(path, "settings.json") || strings.HasSuffix(path, "oauth_creds.json") {
 			return identity.ExtractFromGeminiConfig(path)
-		}
-		// Check default location
-		geminiHome := os.Getenv("GEMINI_HOME")
-		if geminiHome == "" {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				return nil, fmt.Errorf("get home dir: %w", err)
-			}
-			geminiHome = filepath.Join(homeDir, ".gemini")
-		}
-		settingsPath := filepath.Join(geminiHome, "settings.json")
-		if _, err := os.Stat(settingsPath); err == nil {
-			return identity.ExtractFromGeminiConfig(settingsPath)
 		}
 		return nil, fmt.Errorf("gemini config not found")
 
@@ -538,6 +539,9 @@ func (w *Watcher) extractIdentity(provider, path string) (*identity.Identity, er
 // WatchOnce performs a one-time scan of current auth files and saves any new accounts.
 // This is useful for discovering accounts that were logged in before the watcher started.
 func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) ([]string, error) {
+	if vault == nil {
+		return nil, fmt.Errorf("watcher requires a vault")
+	}
 	if len(providers) == 0 {
 		providers = []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	}
@@ -546,158 +550,27 @@ func WatchOnce(vault *authfile.Vault, providers []string, logger *slog.Logger) (
 	}
 
 	var discovered []string
-
+	seen := make(map[string]bool)
 	for _, provider := range providers {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if seen[provider] {
+			continue
+		}
+		seen[provider] = true
 		fileSet, ok := authfile.GetAuthFileSet(provider)
 		if !ok {
 			continue
 		}
 
-		// Check if any auth files exist
-		if !authfile.HasAuthFiles(fileSet) {
-			logger.Debug("no auth files for provider", "provider", provider)
-			continue
-		}
-
-		// Extract identity
-		var ident *identity.Identity
-		var err error
-
-		switch provider {
-		case "claude":
-			homeDir, homeErr := os.UserHomeDir()
-			if homeErr != nil {
-				logger.Debug("failed to get home dir",
-					"provider", provider,
-					"error", homeErr)
-				continue
-			}
-			credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
-			ident, err = identity.ExtractFromClaudeCredentials(credPath)
-		case "codex":
-			codexHome := os.Getenv("CODEX_HOME")
-			if codexHome == "" {
-				homeDir, homeErr := os.UserHomeDir()
-				if homeErr != nil {
-					logger.Debug("failed to get home dir",
-						"provider", provider,
-						"error", homeErr)
-					continue
-				}
-				codexHome = filepath.Join(homeDir, ".codex")
-			}
-			authPath := filepath.Join(codexHome, "auth.json")
-			ident, err = identity.ExtractFromCodexAuth(authPath)
-		case "gemini":
-			geminiHome := os.Getenv("GEMINI_HOME")
-			if geminiHome == "" {
-				homeDir, homeErr := os.UserHomeDir()
-				if homeErr != nil {
-					logger.Debug("failed to get home dir",
-						"provider", provider,
-						"error", homeErr)
-					continue
-				}
-				geminiHome = filepath.Join(homeDir, ".gemini")
-			}
-			settingsPath := filepath.Join(geminiHome, "settings.json")
-			ident, err = identity.ExtractFromGeminiConfig(settingsPath)
-		case "grok":
-			for _, spec := range fileSet.Files {
-				if spec.Required {
-					ident, err = identity.ExtractFromGrokAuth(spec.Path)
-					break
-				}
-			}
-		case "opencode":
-			for _, spec := range fileSet.Files {
-				if spec.Required {
-					ident, err = identity.ExtractFromGenericAuth(spec.Path)
-					break
-				}
-			}
-		case "cursor":
-			for _, spec := range fileSet.Files {
-				ident, err = identity.ExtractFromGenericAuth(spec.Path)
-				if err == nil && ident != nil {
-					break
-				}
-			}
-		}
-
+		name, _, err := discoverAccount(vault, fileSet)
 		if err != nil {
-			logger.Debug("failed to extract identity; falling back to auto profile",
-				"provider", provider,
-				"error", err)
-			ident = nil
-		}
-
-		if ident == nil || ident.Email == "" {
-			// If current auth already matches a saved profile, skip.
-			if active, err := vault.ActiveProfile(fileSet); err == nil && active != "" {
-				logger.Debug("auth matches existing profile; identity missing",
-					"provider", provider,
-					"profile", active)
-				continue
-			}
-
-			// No identity available; still back up with an auto-generated name.
-			autoName := autoProfileName(vault, provider)
-			logger.Info("identity missing; backing up with auto profile name",
-				"provider", provider,
-				"profile", autoName)
-			if err := vault.Backup(fileSet, autoName); err != nil {
-				logger.Error("failed to backup auto profile",
-					"provider", provider,
-					"profile", autoName,
-					"error", err)
-				continue
-			}
-			discovered = append(discovered, fmt.Sprintf("%s/%s", provider, autoName))
+			logger.Warn("auth reconciliation failed", "provider", provider, "error", err)
 			continue
 		}
-
-		email := ident.Email
-
-		// Check if already in vault
-		profiles, _ := vault.List(provider)
-		alreadyExists := false
-		for _, p := range profiles {
-			if p == email {
-				alreadyExists = true
-				break
-			}
+		if name != "" {
+			logger.Info("saved discovered credentials", "provider", provider, "profile", name)
+			discovered = append(discovered, fmt.Sprintf("%s/%s", provider, name))
 		}
-
-		if alreadyExists {
-			// Check if content matches
-			active, err := vault.ActiveProfile(fileSet)
-			if err == nil && active == email {
-				logger.Debug("profile already exists and matches",
-					"provider", provider,
-					"email", email)
-				continue
-			}
-			// Update existing
-			logger.Info("updating existing profile",
-				"provider", provider,
-				"email", email)
-		} else {
-			logger.Info("discovered new account",
-				"provider", provider,
-				"email", email,
-				"plan", ident.PlanType)
-		}
-
-		if err := vault.Backup(fileSet, email); err != nil {
-			logger.Error("failed to backup profile",
-				"provider", provider,
-				"email", email,
-				"error", err)
-			continue
-		}
-
-		discovered = append(discovered, fmt.Sprintf("%s/%s", provider, email))
 	}
 
 	return discovered, nil

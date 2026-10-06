@@ -73,6 +73,46 @@ workflow policy. Mode and key overrides survive normal config saves such as
 changing aliases, defaults or workspaces. Invalid modes or unsafe environment
 exceptions are rejected on both load and save.
 
+## Isolated and shallow launches
+
+Isolated and shallow Claude sessions prepare shared settings before native
+execution. The required preparation hook aborts on malformed policy; optional
+skill sharing remains a separate operation. Every settings destination is
+validated before applying a batch, and edits made after preparation cause an
+error instead of being overwritten.
+
+An isolated profile uses the XDG `xdg_config/claude-code` directory when it
+contains authentication. A profile with only legacy authentication continues to
+use `home/.claude`; new profiles use XDG. Environment exports, imported files,
+health checks and keepalive discovery follow that same choice. A healthier or
+newer credential in an ignored directory cannot override the selected login.
+Known conflicting account IDs are reported as an error. Missing settings receive
+shared policy only, so preparing them cannot introduce a helper in an ignored
+directory and change the selected authentication store. Older profile-local
+`home/.claude.json` state is migrated into the selected legacy config directory
+before launch when needed.
+
+Shallow profiles keep `.claude/settings.json` private alongside credentials and
+session state. `--from-vault claude/<profile>` imports that account's saved
+settings while taking shared workflow policy from the current user. Existing
+links to the canonical user's settings are detached without copying that user's
+helpers or credential environment. Unknown links are rejected. Shared `.claude.json`
+preferences and per-project approvals also follow deletions, including approvals
+for projects removed from the canonical file; private history and runtime state
+are retained.
+
+`shallow-spawn --no-sync-config` skips policy refresh, but still requires a valid,
+private settings file and repairs recognized shared links. `shallow-spawn
+--print-env` and `caam env` are read-only. The latter supports safely quoted shell
+output and a data-only JSON representation with `--json` (`set` and `unset`
+fields); it does not trigger profile preparation or legacy store migration.
+
+For canonical user paths, an explicit `CLAUDE_CONFIG_DIR` selects
+`settings.json`, `.claude.json`, `.credentials.json` and `auth.json` in that
+directory. Even a missing directory is authoritative: backup, discovery and
+health cannot borrow the default user's credentials or policy. With no override,
+the usual `~/.claude` settings/credentials and `~/.claude.json` state paths apply.
+
 ## Existing divergent profiles
 
 CAAM cannot determine which of several old snapshots contains the intended

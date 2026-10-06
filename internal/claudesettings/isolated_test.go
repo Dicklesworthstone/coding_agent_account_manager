@@ -110,11 +110,15 @@ func TestIsolatedSettingsScopesAndMissingLocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := readIsolatedSettings(t, xdg)
-	if got["apiKeyHelper"] != "private" || got["model"] != "live" || got["hooks"].(map[string]interface{})["private"] == nil {
-		t.Fatalf("missing XDG settings did not use the profile auth: %#v", got)
+	if got["apiKeyHelper"] != nil || got["model"] != "live" || got["hooks"] != nil || got["mcpServers"] != nil {
+		t.Fatalf("missing XDG settings must receive policy without introducing another auth store: %#v", got)
 	}
-	if _, ok := got["mcpServers"].(map[string]interface{})["private"]; !ok {
-		t.Fatal("profile-scoped MCP settings were lost")
+	selected := readIsolatedSettings(t, legacy)
+	if selected["apiKeyHelper"] != "private" || selected["hooks"].(map[string]interface{})["private"] == nil {
+		t.Fatalf("selected legacy settings lost account-scoped fields: %#v", selected)
+	}
+	if _, ok := selected["mcpServers"].(map[string]interface{})["private"]; !ok {
+		t.Fatal("selected legacy settings lost profile-scoped MCP settings")
 	}
 	writeIsolatedSettings(t, xdg, `{}`)
 	updates, err = PrepareIsolatedSettings(shared, []string{legacy, xdg}, p)

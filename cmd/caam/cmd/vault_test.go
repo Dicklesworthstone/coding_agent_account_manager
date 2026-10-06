@@ -582,6 +582,9 @@ func TestVaultDelete(t *testing.T) {
 func TestStatus_LoggedInUnprofiled_CrossReferencesSavedProfiles(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("USERPROFILE", tmpDir)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CAAM_KEYCHAIN", "0")
 	t.Setenv("XDG_DATA_HOME", filepath.Join(tmpDir, "xdg-data"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, "xdg-config"))
 
@@ -590,23 +593,23 @@ func TestStatus_LoggedInUnprofiled_CrossReferencesSavedProfiles(t *testing.T) {
 	t.Cleanup(func() { vault = oldVault })
 	vault = authfile.NewVault(authfile.DefaultVaultPath())
 
-	// Create live claude auth (required file present -> HasAuthFiles == true).
+	// Create a real-shaped synthetic OAuth login, not a policy-only document.
 	claudeDir := filepath.Join(tmpDir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0700); err != nil {
 		t.Fatalf("mkdir claude: %v", err)
 	}
 	credPath := filepath.Join(claudeDir, ".credentials.json")
-	if err := os.WriteFile(credPath, []byte(`{"token":"original-live"}`), 0600); err != nil {
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"accessToken":"synthetic-saved-access","refreshToken":"synthetic-saved-refresh","accountId":"saved-account","email":"saved@example.test","expiresAt":1893456000000}}`), 0600); err != nil {
 		t.Fatalf("write live creds: %v", err)
 	}
 
-	// Save a vault profile from this state, then mutate live auth so it no
-	// longer matches -> ActiveProfile returns "" but List returns the profile.
+	// Save this account, then log in as a different account so neither its
+	// credential generation nor its identity matches the saved profile.
 	fileSet := tools["claude"]()
 	if err := vault.Backup(fileSet, "saved-one"); err != nil {
 		t.Fatalf("backup profile: %v", err)
 	}
-	if err := os.WriteFile(credPath, []byte(`{"token":"different-now"}`), 0600); err != nil {
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"accessToken":"synthetic-unsaved-access","refreshToken":"synthetic-unsaved-refresh","accountId":"unsaved-account","email":"unsaved@example.test","expiresAt":1893456000000}}`), 0600); err != nil {
 		t.Fatalf("rewrite live creds: %v", err)
 	}
 

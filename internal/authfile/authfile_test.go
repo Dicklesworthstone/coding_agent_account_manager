@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +59,129 @@ func TestDefaultVaultPath(t *testing.T) {
 			t.Errorf("DefaultVaultPath() = %q, want %q", path, want)
 		}
 	})
+}
+
+func TestClaudeAuthFilesConfigDirectoryPaths(t *testing.T) {
+	for _, mode := range []string{"legacy", "xdg", "explicit existing", "explicit missing"} {
+		t.Run(mode, func(t *testing.T) {
+			home, custom := t.TempDir(), filepath.Join(t.TempDir(), "claude-config")
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("XDG_CONFIG_HOME", "")
+			want := map[string]string{
+				".credentials.json": filepath.Join(home, ".claude", ".credentials.json"),
+				".claude.json":      filepath.Join(home, ".claude.json"),
+				"settings.json":     filepath.Join(home, ".claude", "settings.json"),
+				"auth.json":         filepath.Join(home, ".config", "claude-code", "auth.json"),
+				"config.json":       claudeDesktopConfigPath(home),
+			}
+			if mode == "xdg" {
+				xdg := t.TempDir()
+				t.Setenv("XDG_CONFIG_HOME", xdg)
+				want["auth.json"] = filepath.Join(xdg, "claude-code", "auth.json")
+			}
+			if strings.HasPrefix(mode, "explicit") {
+				t.Setenv("CLAUDE_CONFIG_DIR", custom)
+				delete(want, "config.json")
+				for file := range want {
+					want[file] = filepath.Join(custom, file)
+				}
+				if mode == "explicit existing" {
+					if err := os.MkdirAll(custom, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			files := ClaudeAuthFiles()
+			if len(files.Files) != len(want) {
+				t.Fatalf("resolved %d auth files, want %d", len(files.Files), len(want))
+			}
+			for _, spec := range files.Files {
+				if expected := want[filepath.Base(spec.Path)]; spec.Path != expected {
+					t.Errorf("resolved path %q, want %q", spec.Path, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeExplicitConfigBackupAndSettingsLifecycle(t *testing.T) {
+	home, canonical := t.TempDir(), filepath.Join(t.TempDir(), "configured-claude")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", canonical)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	legacy := map[string]string{
+		filepath.Join(home, ".claude", ".credentials.json"): `{"claudeAiOauth":{"accessToken":"host-access"}}`,
+		filepath.Join(home, ".claude", "settings.json"):     `{"apiKeyHelper":"host-helper","permissions":{"allow":["host"]}}`,
+		filepath.Join(home, ".claude.json"):                 `{"oauthToken":"host-token"}`,
+		claudeDesktopConfigPath(home):                       `{"oauth:tokenCache":"host-desktop"}`,
+	}
+	for path, data := range legacy {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, path, data)
+	}
+	files := ClaudeAuthFiles()
+	vault := NewVault(t.TempDir())
+	if HasAuthFiles(files) {
+		t.Fatal("missing canonical directory fell back to host credentials")
+	}
+	if err := vault.Backup(files, "missing"); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("missing canonical backup error = %v, want ErrNoCredentials", err)
+	}
+	canonicalData := map[string]string{
+		".credentials.json": `{"claudeAiOauth":{"accessToken":"canonical-access","refreshToken":"canonical-refresh"}}`,
+		".claude.json":      `{"oauthToken":"canonical-token","mcpServers":{"canonical":{}}}`,
+		"settings.json":     `{"apiKeyHelper":"canonical-helper","permissions":{"deny":["old-policy"]}}`,
+		"auth.json":         `{"access_token":"canonical-auth"}`,
+	}
+	if err := os.MkdirAll(canonical, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for file, data := range canonicalData {
+		writeFixtureFile(t, filepath.Join(canonical, file), data)
+	}
+	if err := vault.Backup(files, "canonical"); err != nil {
+		t.Fatal(err)
+	}
+	for file, want := range canonicalData {
+		got := readFixtureFile(t, vault.BackupPath("claude", "canonical", file))
+		var gotObject, wantObject map[string]interface{}
+		if err := json.Unmarshal([]byte(got), &gotObject); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(want), &wantObject); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(gotObject, wantObject) {
+			t.Fatalf("backup %s = %s, want canonical contents %s", file, got, want)
+		}
+	}
+	settingsPath := filepath.Join(canonical, "settings.json")
+	writeFixtureFile(t, settingsPath, `{"apiKeyHelper":"outgoing-helper","permissions":{"deny":["latest-policy"]}}`)
+	if err := vault.Restore(files, "canonical"); err != nil {
+		t.Fatal(err)
+	}
+	settings := readFixtureFile(t, settingsPath)
+	if !strings.Contains(settings, "canonical-helper") || !strings.Contains(settings, "latest-policy") || strings.Contains(settings, "old-policy") {
+		t.Fatalf("canonical settings bypassed shared policy merge: %s", settings)
+	}
+	if err := ClearAuthFiles(files); err != nil {
+		t.Fatal(err)
+	}
+	settings = readFixtureFile(t, settingsPath)
+	if strings.Contains(settings, "apiKeyHelper") || !strings.Contains(settings, "latest-policy") {
+		t.Fatalf("canonical clear lost policy or retained authentication: %s", settings)
+	}
+	for path, want := range legacy {
+		if got := readFixtureFile(t, path); got != want {
+			t.Fatalf("canonical lifecycle changed host file %s: %s", path, got)
+		}
+	}
 }
 
 func TestVaultProfilePath(t *testing.T) {

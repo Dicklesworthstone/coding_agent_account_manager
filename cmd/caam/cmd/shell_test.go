@@ -262,6 +262,21 @@ func TestFishQuote(t *testing.T) {
 		expected string
 	}{
 		{
+			name:     "empty argument",
+			input:    "",
+			expected: "''",
+		},
+		{
+			name:     "backslash before quote",
+			input:    "C:\\users\\owner's profile\\",
+			expected: "'C:\\\\users\\\\owner\\'s profile\\\\'",
+		},
+		{
+			name:     "consecutive backslashes",
+			input:    `\\server\profiles`,
+			expected: `'\\\\server\\profiles'`,
+		},
+		{
 			name:     "simple path no quoting needed",
 			input:    "/usr/local/bin/caam",
 			expected: "/usr/local/bin/caam",

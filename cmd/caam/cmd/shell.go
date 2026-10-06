@@ -227,6 +227,9 @@ complete -F _caam_completions caam
 
 // fishQuote returns a properly quoted string for fish shell.
 func fishQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
 	// If the string contains no special characters, return as-is
 	needsQuote := false
 	for _, c := range s {
@@ -242,8 +245,9 @@ func fishQuote(s string) string {
 	if !needsQuote {
 		return s
 	}
-	// Fish uses single quotes and escapes single quotes with \'
-	return "'" + strings.ReplaceAll(s, "'", "\\'") + "'"
+	// Fish interprets both \\ and \' inside single quotes, so preserve
+	// existing backslashes before escaping embedded quotes.
+	return "'" + strings.NewReplacer("\\", "\\\\", "'", "\\'").Replace(s) + "'"
 }
 
 func generateFishInit(caamPath string, tools []string, noWrap bool) string {

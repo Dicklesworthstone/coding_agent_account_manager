@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -654,15 +655,28 @@ func TestShallowSpawnFailsClosedOnIndeterminateProvider(t *testing.T) {
 	}
 }
 
-// TestShallowSpawnNoCommand requires a command after the profile name.
-func TestShallowSpawnNoCommand(t *testing.T) {
+// Default-provider launches must return native exec failures. Always inject
+// exec here: calling syscall.Exec would replace the test process and hide every
+// later test, including any failures already recorded by the testing package.
+func TestShallowSpawnNoCommandPropagatesLaunchFailure(t *testing.T) {
 	_, _ = shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
 		t.Fatal(err)
 	}
+	wantErr := errors.New("synthetic native launch failure")
+	calls := 0
+	origExec := spawnExec
+	t.Cleanup(func() { spawnExec = origExec })
+	spawnExec = func(bin string, args, _ []string) error {
+		calls++
+		if filepath.Base(bin) != "claude" || len(args) != 1 || args[0] != "claude" {
+			t.Fatalf("default native command = %s %v, want claude", bin, args)
+		}
+		return wantErr
+	}
 	_, _, err := runCmdCaptured(t, "shallow-spawn", "alice")
-	if err == nil {
-		t.Fatalf("expected error when no command provided")
+	if !errors.Is(err, wantErr) || calls != 1 {
+		t.Fatalf("native launch failure not propagated: err=%v calls=%d", err, calls)
 	}
 }
 
@@ -934,6 +948,102 @@ func TestShallowSpawnSyncsClaudeConfig(t *testing.T) {
 	realRaw, _ := os.ReadFile(filepath.Join(realHome, ".claude.json"))
 	if string(realRaw) != realState {
 		t.Fatal("real ~/.claude.json was modified by shallow-spawn")
+	}
+}
+
+func TestShallowSettingsFromVaultAndLaunchLifecycle(t *testing.T) {
+	base, realHome := shallowEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	vaultDir := filepath.Join(os.Getenv("CAAM_HOME"), "data", "vault", "claude", "alice")
+	if err := os.MkdirAll(vaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) string {
+		t.Helper()
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	credentials := `{"claudeAiOauth":{"accessToken":"synthetic-alice","refreshToken":"synthetic-refresh"}}`
+	accountSettings := `{"permissions":{"allow":["stale"]},"apiKeyHelper":"alice-helper","env":{"ANTHROPIC_API_KEY":"synthetic-alice-key"}}`
+	sharedSettings := `{"permissions":{"allow":["Read"]},"hooks":{"PreToolUse":[]},"apiKeyHelper":"host-helper","env":{"ANTHROPIC_API_KEY":"synthetic-host-key"}}`
+	sharedPath := filepath.Join(realHome, ".claude", "settings.json")
+	write(filepath.Join(vaultDir, ".credentials.json"), credentials)
+	write(filepath.Join(vaultDir, "settings.json"), accountSettings)
+	write(sharedPath, sharedSettings)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--from-vault", "claude/alice"); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(base, "alice")
+	profilePath := filepath.Join(profileHome, ".claude", "settings.json")
+	initial := read(profilePath)
+	if !strings.Contains(initial, "Read") || !strings.Contains(initial, "alice-helper") || strings.Contains(initial, "host-helper") || strings.Contains(initial, "synthetic-host-key") {
+		t.Fatalf("vault import did not combine shared policy with selected account: %s", initial)
+	}
+	if read(filepath.Join(vaultDir, "settings.json")) != accountSettings || read(sharedPath) != sharedSettings {
+		t.Fatal("profile creation changed an input settings document")
+	}
+	if info, err := os.Lstat(profilePath); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("settings must be private: info=%v err=%v", info, err)
+	}
+
+	updatedShared := `{"permissions":{"allow":["Grep"]},"apiKeyHelper":"another-host-helper"}`
+	write(sharedPath, updatedShared)
+	executions := 0
+	expectRefresh := false
+	origExec := spawnExec
+	t.Cleanup(func() { spawnExec = origExec })
+	spawnExec = func(_ string, _ []string, env []string) error {
+		executions++
+		if !slices.Contains(env, "HOME="+profileHome) {
+			t.Fatal("native command did not receive the selected shallow HOME")
+		}
+		actual := read(profilePath)
+		if expectRefresh {
+			if !strings.Contains(actual, "Grep") || strings.Contains(actual, "hooks") || !strings.Contains(actual, "alice-helper") || !strings.Contains(actual, "synthetic-alice-key") || strings.Contains(actual, "host-helper") {
+				t.Fatalf("native command saw stale policy or another account: %s", actual)
+			}
+		} else if actual != initial {
+			t.Fatalf("--no-sync-config changed private settings: %s", actual)
+		}
+		return nil
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env"); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 0 || read(profilePath) != initial {
+		t.Fatal("environment inspection changed settings or launched a process")
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--no-sync-config", "--", "sh"); err != nil {
+		t.Fatal(err)
+	}
+	expectRefresh = true
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh"); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 2 {
+		t.Fatalf("native executions = %d, want 2", executions)
+	}
+	if read(sharedPath) != updatedShared || read(filepath.Join(vaultDir, "settings.json")) != accountSettings || read(filepath.Join(profileHome, ".claude", ".credentials.json")) != credentials {
+		t.Fatal("launch changed canonical policy, saved account settings, or credentials")
+	}
+
+	beforeFailure := read(profilePath)
+	write(sharedPath, "{malformed")
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh"); err == nil {
+		t.Fatal("malformed shared settings must block the native command")
+	}
+	if executions != 2 || read(profilePath) != beforeFailure {
+		t.Fatal("failed preparation launched the native command or changed private settings")
 	}
 }
 

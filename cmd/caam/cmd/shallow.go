@@ -22,7 +22,7 @@ import (
 //
 // "Shallow" because each profile shares everything with the user's real HOME
 // EXCEPT the auth-bearing files (.claude/.credentials.json + .credentials.lock,
-// .claude.json). See internal/shallow for the layout rationale.
+// .claude/settings.json, .claude.json). See internal/shallow for the layout rationale.
 
 // resolveShallowManager returns a shallow.Manager rooted at the path implied by
 // (in priority order): --base flag, $CAAM_SHALLOW_HOMES_DIR, $CAAM_HOME/shallow-homes,
@@ -53,6 +53,7 @@ Layout under ~/orch-homes/<name>/ (claude shown):
 
   .claude/.credentials.json       (real file — per-identity OAuth tokens)
   .claude/.credentials.lock       (real file — per-identity flock target)
+  .claude/settings.json           (real file — shared policy, private auth helpers)
   .claude.json                    (real file — Claude rewrites this on each run)
   .claude/projects, .claude/todos (symlinks → ~/.claude/projects, etc.)
   .bashrc, .gitconfig, .ssh, ...  (symlinks → ~/.bashrc, etc.)
@@ -294,6 +295,9 @@ func resolveVaultProvider(spec string) (provider, primary string, extras map[str
 		if st := filepath.Join(dir, ".claude.json"); fileIsRegular(st) {
 			claudeState = st
 		}
+		if settings := filepath.Join(dir, "settings.json"); fileIsRegular(settings) {
+			extras = map[string]string{".claude/settings.json": settings}
+		}
 	case "codex":
 		primary = filepath.Join(dir, "auth.json")
 		if _, err := os.Stat(primary); err != nil {
@@ -507,15 +511,18 @@ to run anything else under the profile instead.
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
 profile, so spawned sessions see the same skill library as direct ones.
-Auth files stay real and private; nothing else is copied or overwritten.
+Auth files and mixed policy/auth configuration stay real and private.
 
 Each spawn additionally refreshes the SHARED configuration of the profile
 from your real HOME — the main lane is the source of truth for configuration:
 
-  claude  .claude.json preferences (theme, editor mode, notification channel),
+  claude  .claude/settings.json workflow policy, plus .claude.json preferences
+          (theme, editor mode, notification channel),
           user-scope mcpServers, and per-project trust / allowedTools / MCP
-          settings. Identity (oauthAccount), usage cache and session state are
-          never touched.
+          settings. Removed shared rules and approvals are removed here too.
+          Auth helpers, credential environment, identity (oauthAccount), usage
+          cache and session state stay private to the profile. The
+          claude_settings policy in caam's config controls sharing.
   codex   .codex/config.toml root settings and whole tables ([mcp_servers.*],
           [features], [skills], [hooks], [model_providers.*]). Each MCP server
           is replaced as one unit, so a stale command/args pair cannot survive
@@ -524,7 +531,9 @@ from your real HOME — the main lane is the source of truth for configuration:
           and cli_auth_credentials_store = "file" is re-enforced.
 
 Pass --no-sync-config to skip it, or run it on demand with
-'caam shallow-profile sync-config <name>'.
+'caam shallow-profile sync-config <name>'. Claude preparation errors stop the
+launch. Old links to shared Claude settings are made private even with
+--no-sync-config; --print-env remains read-only.
 
 An unknown name is an ERROR, not a new profile: a typo would otherwise become
 a fresh empty identity and a login prompt for the wrong account. The error
@@ -566,7 +575,7 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
-	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "for claude: do not refresh shared preferences (theme, editor mode, notification channel, user/project MCP servers, project trust and tool approvals) in the profile's .claude.json from your real ~/.claude.json before exec")
+	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "skip shared Claude/Codex policy refresh before exec; Claude settings must still be valid and private")
 	shallowSpawnCmd.Flags().Bool("create", false, "create the shallow profile (with EMPTY credentials) if it does not exist yet, then start the session; without this a name that does not exist is an error, so a typo cannot silently become a new identity")
 	shallowSpawnCmd.Flags().String("tool", "", "provider layout to use with --create: claude (default), codex, or agy. On an existing profile of a different provider it is an error, not a no-op.")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
@@ -590,9 +599,12 @@ block, after which codex refuses to parse its config at all
 
 What is refreshed, per provider:
 
-  claude (<home>/.claude.json)
-      preferences (theme, editor mode, notification channel, autoUpdates …),
-      user-scope mcpServers, and per-project trust / allowedTools / MCP settings
+  claude (<home>/.claude/settings.json and <home>/.claude.json)
+      workflow policy, preferences (theme, editor mode, notification channel,
+      autoUpdates …), user-scope mcpServers, and per-project trust / allowedTools
+      / MCP settings. Removed shared policy is removed from the profile too.
+      claude_settings.mode = "per-profile" skips shared policy refresh;
+      profile_keys and shared_env_keys customize the boundary.
 
   codex (<home>/.codex/config.toml)
       root settings (model, reasoning effort, personality, notify, …) and whole
@@ -602,17 +614,18 @@ What is refreshed, per provider:
 
 What is never touched:
 
-  claude   oauthAccount, usage caches, prompt history, per-project session state
+  claude   account helpers, credential environment, oauthAccount, usage caches,
+           prompt history, per-project session state
   codex    [hooks.state.*] (hook trust), [projects.*] (workspace trust),
            [notice.*] (dismissed notices), and auth.json
-  both     the profile's credentials, and any setting the real HOME does not
-           define — nothing is deleted
+  both     the profile's credentials
 
+Codex-only settings absent from the real HOME are retained, and
 cli_auth_credentials_store = "file" is re-enforced on every codex sync.
 
-Comments, key order and formatting are preserved: the edit is a structural
-splice, not a rewrite, so untouched regions stay byte-identical. Running it
-twice writes nothing the second time.
+Codex comments, key order and formatting are preserved by structural edits.
+Claude uses private JSON files. Running either sync twice writes nothing the
+second time. Malformed Claude policy blocks launch rather than being skipped.
 
 Examples:
   caam shallow-profile sync-config alice
@@ -945,14 +958,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
 	}
 
-	// Shared-configuration refresh (#93): a claude profile's .claude.json is a
-	// real, private file because it holds the login identity, but it also
-	// carries the operator's preferences and per-project approvals, which
-	// silently diverge from the real HOME after creation. Copy the allowlisted
-	// shared keys from the real ~/.claude.json into the profile before exec so
-	// the main lane stays the source of truth for configuration; identity,
-	// usage caches and session state stay the profile's own. Best-effort: a
-	// failure warns and never blocks the spawn.
+	// Refresh shared Claude settings and allowlisted legacy preferences before
+	// exec, while keeping account helpers and runtime state private. Invalid
+	// policy or a shared auth-bearing settings link must never reach the CLI.
 	//
 	// Codex has the same problem in a sharper form (#103): its config.toml is
 	// copied once at creation and never reconciled, so a real-home MCP entry
@@ -976,10 +984,17 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			changed, serr = mgr.SyncCodexConfig(name)
 		}
 		if serr != nil {
+			if normProv == "claude" {
+				return fmt.Errorf("prepare Claude shallow profile %q: %w", name, serr)
+			}
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh shared %s configuration in shallow profile %q: %v\n", label, name, serr)
 		} else if len(changed) > 0 {
 			fmt.Fprintf(cmd.ErrOrStderr(), "note: refreshed %d shared %s setting%s from your real HOME into shallow profile %q (--no-sync-config to skip)\n",
 				len(changed), label, map[bool]string{true: "", false: "s"}[len(changed) == 1], name)
+		}
+	} else if shallow.NormalizeProvider(provider) == "claude" {
+		if err := mgr.EnsureClaudeSettingsPrivate(name); err != nil {
+			return fmt.Errorf("prepare private Claude settings in %q: %w", name, err)
 		}
 	}
 

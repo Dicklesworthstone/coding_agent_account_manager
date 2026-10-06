@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 )
 
 // Key policy for a shallow claude profile's <home>/.claude.json.
@@ -45,7 +48,8 @@ import (
 // anonymous id, shared by every account logged in on the same machine (see
 // the authfile package's identity-key notes), so carrying it over is correct.
 var claudeAccountKeys = []string{
-	"oauthAccount",            // accountUuid, emailAddress, organization…
+	"oauthAccount", // accountUuid, emailAddress, organization…
+	"oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey",
 	"cachedUsageUtilization",  // the account's quota/usage snapshot
 	"modelAccessCache",        // models this account may use
 	"orgModelDefaultCache",    // the account's org default model
@@ -108,12 +112,9 @@ func seedClaudeJSONFromRealHome(src string) ([]byte, error) {
 	return marshalClaudeJSON(state)
 }
 
-// SyncClaudeConfig refreshes the shared preference keys of a claude shallow
-// profile's .claude.json from the user's real ~/.claude.json (issue #93). It
-// is a no-op for non-claude profiles and when the real HOME has no
-// .claude.json. It returns a description of every key it changed, sorted;
-// nothing is written when there is no change. The profile's identity, usage
-// caches and session state are never touched (see the key policy above).
+// SyncClaudeConfig refreshes shared settings.json policy and the allowlisted
+// .claude.json preferences. Account helpers, credential-routing environment,
+// identity, usage caches and session state stay with the profile.
 func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	home, err := m.HomeFor(name)
 	if err != nil {
@@ -126,8 +127,142 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	if provider != "claude" {
 		return nil, nil
 	}
+	policy, err := claudesettings.LoadPolicy()
+	if err != nil {
+		return nil, err
+	}
+	settings, err := m.prepareClaudeSettings(home, policy)
+	if err != nil {
+		return nil, err
+	}
+	changed, err := m.syncClaudeJSON(home, policy)
+	if err != nil {
+		return nil, err
+	}
+	if err := settings.Apply(); err != nil {
+		return nil, fmt.Errorf("write private Claude settings: %w", err)
+	}
+	if settings.Changed() {
+		changed = append(changed, ".claude/settings.json")
+	}
+	sort.Strings(changed)
+	return changed, nil
+}
 
-	realRaw, err := os.ReadFile(filepath.Join(m.realHome, ".claude.json"))
+// EnsureClaudeSettingsPrivate repairs old host-settings symlinks even when the
+// caller opts out of policy refresh. A private settings document is validated
+// without rewriting it, so --no-sync-config preserves the profile's policy.
+func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return err
+	}
+	provider, err := m.ResolveProvider(name)
+	if err != nil || provider != "claude" {
+		return err
+	}
+	policy, err := claudesettings.LoadPolicy()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".claude", "settings.json")
+	account, err := m.claudeSettingsAccountPath(home)
+	if err != nil {
+		return err
+	}
+	if account != "" {
+		_, err := claudesettings.PrepareRefresh(path, path, policy)
+		return err
+	}
+	settings, err := m.prepareClaudeSettings(home, policy)
+	if err != nil {
+		return err
+	}
+	return settings.Apply()
+}
+
+func (m *Manager) writeClaudeSettings(home string, opts CreateOptions) error {
+	policy, err := claudesettings.LoadPolicy()
+	if err != nil {
+		return err
+	}
+	shared, _ := claudesettings.SharedPaths(m.realHome)
+	account := opts.ExtraSources[".claude/settings.json"]
+	settings, err := claudesettings.PrepareImport(shared, account, filepath.Join(home, ".claude", "settings.json"), policy)
+	if err != nil {
+		return fmt.Errorf("prepare private Claude settings: %w", err)
+	}
+	return settings.Apply()
+}
+
+func (m *Manager) prepareClaudeSettings(home string, policy claudesettings.Policy) (*claudesettings.Update, error) {
+	account, err := m.claudeSettingsAccountPath(home)
+	if err != nil {
+		return nil, err
+	}
+	shared, _ := claudesettings.SharedPaths(m.realHome)
+	update, err := claudesettings.PrepareImport(shared, account, filepath.Join(home, ".claude", "settings.json"), policy)
+	if err != nil {
+		return nil, fmt.Errorf("prepare private Claude settings: %w", err)
+	}
+	if account == "" {
+		update.RequirePrivateFile()
+	}
+	return update, nil
+}
+
+// A historical link to the real user's settings has no profile-owned auth.
+// Detach only those recognized links; never treat their helpers as this login's.
+func (m *Manager) claudeSettingsAccountPath(home string) (string, error) {
+	dir := filepath.Join(home, ".claude")
+	info, err := os.Lstat(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return "", fmt.Errorf("Claude config directory must be private: %s", dir)
+	}
+	path := filepath.Join(dir, "settings.json")
+	info, err = os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	shared, _ := claudesettings.SharedPaths(m.realHome)
+	for _, source := range []string{shared, filepath.Join(m.realHome, ".claude", "settings.json")} {
+		if sourceInfo, serr := os.Stat(source); serr == nil {
+			if targetInfo, terr := os.Stat(path); terr == nil && os.SameFile(sourceInfo, targetInfo) {
+				return "", nil
+			}
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, rerr := os.Readlink(path)
+			if rerr != nil {
+				return "", rerr
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(dir, target)
+			}
+			if filepath.Clean(target) == filepath.Clean(source) {
+				return "", nil
+			}
+		}
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("Claude settings must be a private regular file: %s", path)
+	}
+	return path, nil
+}
+
+func (m *Manager) syncClaudeJSON(home string, policy claudesettings.Policy) ([]string, error) {
+	if policy.Mode == "per-profile" {
+		return nil, nil
+	}
+
+	_, realState := claudesettings.SharedPaths(m.realHome)
+	realRaw, err := os.ReadFile(realState)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -167,8 +302,15 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 
 	var changed []string
 	for _, k := range claudeSharedPreferenceKeys {
+		if slices.Contains(policy.ProfileKeys, k) {
+			continue
+		}
 		v, ok := real[k]
 		if !ok {
+			if _, exists := profile[k]; exists {
+				delete(profile, k)
+				changed = append(changed, k)
+			}
 			continue
 		}
 		if !rawJSONEqual(v, profile[k]) {
@@ -177,11 +319,13 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 		}
 	}
 
-	projChanged, err := syncClaudeProjects(real, profile)
-	if err != nil {
-		return nil, err
+	if !slices.Contains(policy.ProfileKeys, "projects") {
+		projChanged, err := syncClaudeProjects(real, profile)
+		if err != nil {
+			return nil, err
+		}
+		changed = append(changed, projChanged...)
 	}
-	changed = append(changed, projChanged...)
 
 	if len(changed) == 0 {
 		return nil, nil
@@ -197,18 +341,16 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	return changed, nil
 }
 
-// syncClaudeProjects copies claudeSharedProjectKeys for every project the
-// real file knows into the profile's projects map (creating the project entry
-// when the profile has none), mutating profile in place. It returns a
+// syncClaudeProjects reconciles claudeSharedProjectKeys against the real file,
+// removing stale approvals even for projects no longer present there. Private
+// project history and runtime fields stay with the profile. It returns a
 // "projects.<path>.<key>" entry per changed field.
 func syncClaudeProjects(real, profile map[string]json.RawMessage) ([]string, error) {
-	realRaw, ok := real["projects"]
-	if !ok {
-		return nil, nil
-	}
-	var realProjects map[string]map[string]json.RawMessage
-	if json.Unmarshal(realRaw, &realProjects) != nil || len(realProjects) == 0 {
-		return nil, nil
+	realProjects := map[string]map[string]json.RawMessage{}
+	if realRaw, ok := real["projects"]; ok {
+		if err := json.Unmarshal(realRaw, &realProjects); err != nil {
+			return nil, fmt.Errorf("real .claude.json has a malformed \"projects\" map; leaving profile alone")
+		}
 	}
 	profileProjects := map[string]map[string]json.RawMessage{}
 	if raw, ok := profile["projects"]; ok && len(bytes.TrimSpace(raw)) > 0 && string(bytes.TrimSpace(raw)) != "null" {
@@ -217,11 +359,16 @@ func syncClaudeProjects(real, profile map[string]json.RawMessage) ([]string, err
 		}
 	}
 
+	paths := make(map[string]struct{}, len(realProjects)+len(profileProjects))
+	for path := range realProjects {
+		paths[path] = struct{}{}
+	}
+	for path := range profileProjects {
+		paths[path] = struct{}{}
+	}
 	var changed []string
-	for path, realEntry := range realProjects {
-		if realEntry == nil {
-			continue
-		}
+	for path := range paths {
+		realEntry := realProjects[path]
 		entry := profileProjects[path]
 		if entry == nil {
 			entry = map[string]json.RawMessage{}
@@ -229,6 +376,10 @@ func syncClaudeProjects(real, profile map[string]json.RawMessage) ([]string, err
 		for _, k := range claudeSharedProjectKeys {
 			v, ok := realEntry[k]
 			if !ok {
+				if _, exists := entry[k]; exists {
+					delete(entry, k)
+					changed = append(changed, "projects."+path+"."+k)
+				}
 				continue
 			}
 			if !rawJSONEqual(v, entry[k]) {

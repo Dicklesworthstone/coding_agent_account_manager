@@ -325,7 +325,7 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	if err := config.ClaudeSettings.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("validate config: %w", err)
 	}
 
 	return config, nil
@@ -334,7 +334,7 @@ func Load() (*Config, error) {
 // Save writes the configuration to disk.
 func (c *Config) Save() error {
 	if err := c.ClaudeSettings.Validate(); err != nil {
-		return err
+		return fmt.Errorf("validate config: %w", err)
 	}
 	configPath := ConfigPath()
 

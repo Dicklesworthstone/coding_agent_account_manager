@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+func TestImportWithoutSettingsClearsPreviousAccount(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		dir := t.TempDir()
+		destination := filepath.Join(dir, "settings.json")
+		body := `{"apiKeyHelper":"old-account","env":{"ANTHROPIC_API_KEY":"synthetic-old"},"permissions":{"allow":["Read"]}}`
+		if legacy {
+			body = `{"oauthAccount":{"accountUuid":"old-account"},"apiKey":"synthetic-old","permissions":{"allow":["Read"]}}`
+		}
+		writeSettings(t, destination, body)
+		prepare := PrepareImport
+		if legacy {
+			prepare = PrepareLegacyImport
+		}
+		update, err := prepare("", "", destination, Policy{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := update.Apply(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertJSON(t, got, `{"permissions":{"allow":["Read"]}}`)
+	}
+}
+
 func TestLegacyMCPPolicyFollowsLiveNotAccountSnapshot(t *testing.T) {
 	live := []byte(`{"oauthAccount":{"accountUuid":"alice"},"sessionKey":"alice-session","mcpServers":{"new":{"command":"server"}},"projects":{"/repo":{"hasTrustDialogAccepted":true,"mcpServers":{"project":{}}}},"disabledMcpServers":["disabled"],"internalAccountCache":"alice"}`)
 	account := []byte(`{"oauthAccount":{"accountUuid":"bob"},"mcpServers":{"old":{}},"projects":{"/stale":{}},"enabledMcpServers":["deleted"],"internalAccountCache":"bob"}`)

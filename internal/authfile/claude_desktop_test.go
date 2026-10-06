@@ -76,7 +76,7 @@ func TestClaudeDesktopBackupRestoreRoundTrip(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	// Neutralize CLAUDE_CONFIG_DIR/XDG so ClaudeAuthFiles is deterministic.
-	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 
 	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
 	fs := ClaudeAuthFiles()

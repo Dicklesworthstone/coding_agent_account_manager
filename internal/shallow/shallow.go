@@ -17,6 +17,7 @@
 //	  .credentials.json            (real file — copied from a vault profile)
 //	  .credentials.lock            (real file — empty, prevents Claude from
 //	                                touching the symlinked .claude folder above)
+//	  settings.json                (private account fields plus shared policy)
 //	  projects/, todos/, ...       (symlinks to ~/.claude/projects, etc.)
 //	.claude.json                   (real file — the user's settings minus the
 //	                                account-bound keys; Claude rewrites this
@@ -49,6 +50,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 )
 
@@ -140,7 +142,7 @@ func layoutFor(provider string) (*providerLayout, error) {
 		return &providerLayout{
 			provider:          "claude",
 			realDirs:          []string{".claude"},
-			realEntries:       []string{".claude/.credentials.json", ".claude/.credentials.lock", ".claude.json", ProfileMetaFilename},
+			realEntries:       []string{".claude/.credentials.json", ".claude/.credentials.lock", ".claude/settings.json", ".claude.json", ProfileMetaFilename},
 			innerSymlinkRoots: []string{".claude"},
 			primaryCredRel:    ".claude/.credentials.json",
 			skillShareDirs:    []skillShareDir{{rel: ".claude/skills"}},
@@ -376,7 +378,8 @@ type CreateOptions struct {
 
 	// ExtraSources maps additional managed real-file destination relpaths (within
 	// the shallow HOME) to source file paths. Used for multi-file providers — the
-	// agy optional google_accounts.json / oauth_creds.json / settings.json. Each
+	// Claude settings.json or agy google_accounts.json / oauth_creds.json /
+	// settings.json. Each
 	// destination MUST be in the provider's realEntries set; each source is copied
 	// mode 0600 if it exists and skipped if absent.
 	ExtraSources map[string]string
@@ -596,6 +599,9 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 		if err := writeFileAtomic(lockPath, []byte(""), 0o600); err != nil {
 			return fmt.Errorf("create credentials lock: %w", err)
 		}
+		if err := m.writeClaudeSettings(home, opts); err != nil {
+			return err
+		}
 		if err := m.writeClaudeJSON(home, opts); err != nil {
 			return err
 		}
@@ -636,7 +642,7 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		}
 		return nil
 	}
-	realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
+	_, realClaudeJSON := claudesettings.SharedPaths(m.realHome)
 	if _, err := os.Stat(realClaudeJSON); err == nil {
 		seed, serr := seedClaudeJSONFromRealHome(realClaudeJSON)
 		if serr != nil {

@@ -75,7 +75,7 @@ func TestClaudeCredentialPreflightRejectsIncompleteSnapshots(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
 			t.Setenv("CAAM_KEYCHAIN", "0")
 			fileSet := ClaudeAuthFiles()
 			vault := NewVault(filepath.Join(home, "vault"))
@@ -131,7 +131,7 @@ func TestClaudeCredentialPreflightAcceptsSupportedSources(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
 			t.Setenv("CAAM_KEYCHAIN", "0")
 			fileSet := ClaudeAuthFiles()
 			vault := NewVault(filepath.Join(home, "vault"))
@@ -169,7 +169,7 @@ func TestClaudeCredentiallessLiveStateCannotCreateProfile(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			home := t.TempDir()
 			t.Setenv("HOME", home)
-			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
 			t.Setenv("CAAM_KEYCHAIN", "0")
 			fileSet := ClaudeAuthFiles()
 			writeClaudeSettingsTestFile(t, fileSet.Files[1].Path, body)

@@ -1,7 +1,23 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/spf13/cobra"
 )
 
 // =============================================================================
@@ -194,6 +210,7 @@ func TestEnvCmd_Flags(t *testing.T) {
 		{"unset", "false"},
 		{"export-prefix", "export"},
 		{"fish", "false"},
+		{"json", "false"},
 	}
 
 	for _, tt := range flags {
@@ -231,4 +248,235 @@ func TestEnvCmd_Args(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for 3 args")
 	}
+}
+
+func TestEnvCmdShellPathsRoundTrip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell paths contain characters Windows forbids")
+	}
+	base := filepath.Join(t.TempDir(), "literal $HOME $(printf substituted) `printf substituted` 'quote' \"double\" \\backslash\nnext")
+	prof := setupEnvCommandProfile(t, base)
+	for _, shell := range []string{"sh", "fish"} {
+		t.Run(shell, func(t *testing.T) {
+			bin, err := exec.LookPath(shell)
+			if err != nil {
+				t.Skipf("%s unavailable: %v", shell, err)
+			}
+			cmd, out := envOutputCommand(t, shell == "fish", false, false)
+			if err := envCmd.RunE(cmd, []string{"codex", prof.Name}); err != nil {
+				t.Fatal(err)
+			}
+			script := out.String() + "\nprintf '%s\\000' \"$HOME\" \"$CODEX_HOME\"\n"
+			got, err := exec.Command(bin, "-c", script).Output()
+			if err != nil {
+				t.Fatalf("evaluate exports: %v", err)
+			}
+			want := prof.HomePath() + "\x00" + prof.CodexHomePath() + "\x00"
+			if string(got) != want {
+				t.Fatalf("exported paths did not round-trip: got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestEnvCmdJSONIsDataOnlyAndReadOnly(t *testing.T) {
+	prof := setupEnvCommandProfile(t, t.TempDir())
+	snapshot := func() map[string]string {
+		files := make(map[string]string)
+		if err := filepath.WalkDir(prof.BasePath, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			files[path] = ""
+			if !entry.IsDir() {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				files[path] = string(data)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return files
+	}
+	beforeFiles := snapshot()
+	before, err := os.ReadFile(prof.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(prof.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSet, err := codex.New().Env(context.Background(), prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unset := range []bool{false, true, false} {
+		cmd, out := envOutputCommand(t, false, true, unset)
+		if err := envCmd.RunE(cmd, []string{"codex", prof.Name}); err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Set   map[string]string `json:"set"`
+			Unset []string          `json:"unset"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			t.Fatalf("output contains non-JSON text: %s, %v", out, err)
+		}
+		if unset {
+			if len(result.Set) != 0 || !reflect.DeepEqual(result.Unset, []string{"CODEX_HOME", "HOME"}) {
+				t.Fatalf("unexpected JSON unset operation: %#v", result)
+			}
+		} else if !reflect.DeepEqual(result.Set, wantSet) || len(result.Unset) != 0 {
+			t.Fatalf("unexpected JSON exports: %#v", result)
+		}
+	}
+	after, err := os.ReadFile(prof.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(prof.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) || !beforeInfo.ModTime().Equal(afterInfo.ModTime()) {
+		t.Fatal("printing environment rewrote the profile")
+	}
+	if !reflect.DeepEqual(beforeFiles, snapshot()) {
+		t.Fatal("printing environment changed profile contents")
+	}
+	if _, err := os.Stat(prof.LockPath()); !os.IsNotExist(err) {
+		t.Fatalf("printing environment created a profile lock: %v", err)
+	}
+}
+
+func TestEnvCmdErrorOutputByFormat(t *testing.T) {
+	setupEnvCommandProfile(t, t.TempDir())
+	for _, jsonOutput := range []bool{false, true} {
+		cmd, out := envOutputCommand(t, false, jsonOutput, false)
+		if err := envCmd.RunE(cmd, []string{"codex", "missing"}); err == nil {
+			t.Fatal("missing profile unexpectedly succeeded")
+		}
+		if jsonOutput && out.Len() != 0 {
+			t.Fatalf("JSON failure emitted shell text: %s", out)
+		}
+		if !jsonOutput && !strings.HasPrefix(out.String(), "false ") {
+			t.Fatalf("shell failure did not make eval fail: %s", out)
+		}
+	}
+}
+
+func TestEnvCommandDoesNotMigrateLegacyData(t *testing.T) {
+	legacyData, caamHome := t.TempDir(), t.TempDir()
+	t.Setenv("XDG_DATA_HOME", legacyData)
+	t.Setenv("CAAM_HOME", caamHome)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	legacyPath := filepath.Join(legacyData, "caam", "migration-marker.txt")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("keep in legacy store"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prof := setupEnvCommandProfile(t, profile.DefaultStorePath())
+	oldVault, oldProject, oldHealth, oldConfig, oldRunner := vault, projectStore, healthStore, cfg, runner
+	t.Cleanup(func() {
+		vault, projectStore, healthStore, cfg, runner = oldVault, oldProject, oldHealth, oldConfig, oldRunner
+	})
+	for _, jsonOutput := range []bool{false, true} {
+		cmd, out := envOutputCommand(t, false, jsonOutput, false)
+		cmd.Use = envCmd.Use
+		cmd.Args = envCmd.Args
+		cmd.RunE = envCmd.RunE
+		root := &cobra.Command{Use: "caam", PersistentPreRunE: rootCmd.PersistentPreRunE}
+		root.AddCommand(cmd)
+		root.SetArgs([]string{"env", "codex", prof.Name})
+		if err := root.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		if out.Len() == 0 {
+			t.Fatal("command emitted no environment")
+		}
+		if shouldShowWarnings(cmd) {
+			t.Fatal("environment export would inspect active credentials")
+		}
+		if _, err := os.Stat(filepath.Join(config.DefaultDataPath(), "migration-marker.txt")); !os.IsNotExist(err) {
+			t.Fatalf("environment command migrated legacy data: %v", err)
+		}
+	}
+	if got, err := os.ReadFile(legacyPath); err != nil || string(got) != "keep in legacy store" {
+		t.Fatalf("legacy source changed: %q, %v", got, err)
+	}
+}
+
+func TestEnvCommandPreflightFailureOutput(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("CAAM_HOME", t.TempDir())
+	setupEnvCommandProfile(t, profile.DefaultStorePath())
+	oldVault, oldProject, oldHealth, oldConfig, oldRunner := vault, projectStore, healthStore, cfg, runner
+	t.Cleanup(func() {
+		vault, projectStore, healthStore, cfg, runner = oldVault, oldProject, oldHealth, oldConfig, oldRunner
+	})
+	path := config.ConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"claude_settings":{"mode":"invalid"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"arguments": {"env", "codex"},
+		"config":    {"env", "codex", "exports"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, jsonOutput := range []bool{false, true} {
+				cmd, out := envOutputCommand(t, false, jsonOutput, false)
+				cmd.Use, cmd.Args, cmd.RunE = envCmd.Use, envCmd.Args, envCmd.RunE
+				root := &cobra.Command{Use: "caam", PersistentPreRunE: rootCmd.PersistentPreRunE}
+				root.AddCommand(cmd)
+				root.SetOut(out)
+				root.SetErr(&bytes.Buffer{})
+				root.SetArgs(args)
+				if err := root.Execute(); err == nil {
+					t.Fatal("preflight unexpectedly succeeded")
+				}
+				if jsonOutput && out.Len() != 0 {
+					t.Fatalf("JSON preflight failure emitted shell text: %s", out)
+				}
+				if !jsonOutput && !strings.HasPrefix(out.String(), "false ") {
+					t.Fatalf("shell preflight failure did not make eval fail: %s", out)
+				}
+			}
+		})
+	}
+}
+
+func setupEnvCommandProfile(t *testing.T, base string) *profile.Profile {
+	t.Helper()
+	oldStore, oldRegistry := profileStore, registry
+	t.Cleanup(func() { profileStore, registry = oldStore, oldRegistry })
+	profileStore = profile.NewStore(base)
+	registry = provider.NewRegistry()
+	registry.Register(codex.New())
+	prof, err := profileStore.Create("codex", "exports", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return prof
+}
+
+func envOutputCommand(t *testing.T, fish, jsonOutput, unset bool) (*cobra.Command, *bytes.Buffer) {
+	t.Helper()
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.Flags().Bool("fish", fish, "")
+	cmd.Flags().Bool("json", jsonOutput, "")
+	cmd.Flags().Bool("unset", unset, "")
+	cmd.Flags().String("export-prefix", "export", "")
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	return cmd, out
 }

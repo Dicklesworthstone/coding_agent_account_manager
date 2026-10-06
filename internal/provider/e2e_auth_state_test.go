@@ -2,8 +2,10 @@ package provider_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -101,11 +103,22 @@ func TestE2E_ClaudeAuthState(t *testing.T) {
 
 	h.Log.SetStep("test_claude_json")
 
-	// Create .claude.json (OAuth session state)
+	// A retained workflow/identity document alone must not count as a login.
 	claudeJsonPath := filepath.Join(homeDir, ".claude.json")
+	if err := os.WriteFile(claudeJsonPath, []byte(`{"model":"opus","oauthAccount":{"emailAddress":"profile@example.test"}}`), 0600); err != nil {
+		t.Fatalf("Failed to write policy-only .claude.json: %v", err)
+	}
+	status, err = prov.Status(ctx, prof)
+	if err != nil {
+		t.Fatalf("Status failed: %v", err)
+	}
+	if status.LoggedIn {
+		t.Error("Expected LoggedIn=false with only workflow policy and account identity")
+	}
+
+	// Create legacy .claude.json with a supported session credential.
 	claudeJsonContent := `{
-		"session_token": "test-session-token-12345",
-		"refresh_token": "test-refresh-token-67890",
+		"sessionKey": "test-session-token-12345",
 		"expires_at": "2099-12-31T23:59:59Z"
 	}`
 	if err := os.WriteFile(claudeJsonPath, []byte(claudeJsonContent), 0600); err != nil {
@@ -120,6 +133,10 @@ func TestE2E_ClaudeAuthState(t *testing.T) {
 
 	if !status.LoggedIn {
 		t.Errorf("Expected LoggedIn=true with .claude.json")
+	}
+	env, err := prov.Env(ctx, prof)
+	if err != nil || env["CLAUDE_CONFIG_DIR"] != claudeDir {
+		t.Fatalf("Legacy session must select its native directory: env=%v, error=%v", env, err)
 	}
 
 	h.Log.Info("With .claude.json: LoggedIn correctly true")
@@ -145,6 +162,10 @@ func TestE2E_ClaudeAuthState(t *testing.T) {
 
 	if !status.LoggedIn {
 		t.Errorf("Expected LoggedIn=true with auth.json")
+	}
+	env, err = prov.Env(ctx, prof)
+	if err != nil || env["CLAUDE_CONFIG_DIR"] != filepath.Dir(authJsonPath) {
+		t.Fatalf("XDG authentication must select its native directory: env=%v, error=%v", env, err)
 	}
 
 	h.Log.Info("With auth.json: LoggedIn correctly true")
@@ -408,12 +429,16 @@ func TestE2E_ProviderLogout(t *testing.T) {
 	// Create Claude auth files
 	claudeJsonPath := filepath.Join(claudeHomeDir, ".claude.json")
 	authJsonPath := filepath.Join(claudeXdgConfig, "claude-code", "auth.json")
+	settingsPath := filepath.Join(claudeXdgConfig, "claude-code", "settings.json")
 
-	if err := os.WriteFile(claudeJsonPath, []byte(`{"session": "test"}`), 0600); err != nil {
+	if err := os.WriteFile(claudeJsonPath, []byte(`{"sessionKey":"test-session","oauthAccount":{"accountUuid":"test-account"},"model":"opus","mcpServers":{"workflow":{"command":"synthetic-mcp"}}}`), 0600); err != nil {
 		t.Fatalf("Failed to write .claude.json: %v", err)
 	}
 	if err := os.WriteFile(authJsonPath, []byte(`{"access_token": "test"}`), 0600); err != nil {
 		t.Fatalf("Failed to write auth.json: %v", err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"apiKeyHelper":"synthetic-helper","env":{"ANTHROPIC_API_KEY":"synthetic-key"},"permissions":{"deny":["Bash(rm *)"]}}`), 0600); err != nil {
+		t.Fatalf("Failed to write settings.json: %v", err)
 	}
 
 	claudeProf := &profile.Profile{
@@ -445,15 +470,39 @@ func TestE2E_ProviderLogout(t *testing.T) {
 		t.Errorf("Expected Claude to be logged out after logout")
 	}
 
-	// Verify files removed
-	if !h.FileNotExists(claudeJsonPath) {
-		t.Errorf(".claude.json should be removed after logout")
+	// Mixed settings retain workflow policy while account fields are removed.
+	for _, path := range []string{claudeJsonPath, settingsPath} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("Logout removed workflow policy at %s: %v", path, err)
+		}
+		var document map[string]any
+		if err := json.Unmarshal(data, &document); err != nil {
+			t.Fatalf("Invalid retained policy at %s: %v", path, err)
+		}
+		if document["sessionKey"] != nil || document["oauthAccount"] != nil || document["apiKeyHelper"] != nil {
+			t.Errorf("Logout retained account fields at %s: %v", path, document)
+		}
+		if path == claudeJsonPath {
+			wantMCP := map[string]any{"workflow": map[string]any{"command": "synthetic-mcp"}}
+			if document["model"] != "opus" || !reflect.DeepEqual(document["mcpServers"], wantMCP) {
+				t.Errorf("Logout changed legacy workflow policy: %v", document)
+			}
+		} else {
+			if env, ok := document["env"].(map[string]any); ok && env["ANTHROPIC_API_KEY"] != nil {
+				t.Errorf("Logout retained settings API key: %v", document)
+			}
+			wantPermissions := map[string]any{"deny": []any{"Bash(rm *)"}}
+			if !reflect.DeepEqual(document["permissions"], wantPermissions) {
+				t.Errorf("Logout changed workflow permissions: %v", document)
+			}
+		}
 	}
 	if !h.FileNotExists(authJsonPath) {
 		t.Errorf("auth.json should be removed after logout")
 	}
 
-	h.Log.Info("Claude logout: auth files correctly removed")
+	h.Log.Info("Claude logout: authentication removed and workflow policy retained")
 
 	h.Log.SetStep("setup_codex")
 

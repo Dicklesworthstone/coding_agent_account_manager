@@ -451,11 +451,12 @@ func TestRobotCredentialActivateRefusalPreservesLiveAuthAndSettings(t *testing.T
 			continue
 		}
 		t.Run(tc.name, func(t *testing.T) {
-			home := setupRobotCredentialEnv(t)
+			setupRobotCredentialEnv(t)
+			configDir := os.Getenv("CLAUDE_CONFIG_DIR")
 			live := map[string]string{
-				filepath.Join(home, ".claude", ".credentials.json"): `{"claudeAiOauth":{"accessToken":"SYNTHETIC-LIVE-ACCESS","refreshToken":"SYNTHETIC-LIVE-REFRESH"}}`,
-				filepath.Join(home, ".claude.json"):                 `{"oauthAccount":{"emailAddress":"current@example.invalid","accountUuid":"current-account"},"theme":"light","hasCompletedOnboarding":true}`,
-				filepath.Join(home, ".claude", "settings.json"):     `{"permissions":{"allow":["Read"]},"env":{"SHARED_SETTING":"keep-me"}}`,
+				filepath.Join(configDir, ".credentials.json"): `{"claudeAiOauth":{"accessToken":"SYNTHETIC-LIVE-ACCESS","refreshToken":"SYNTHETIC-LIVE-REFRESH"}}`,
+				filepath.Join(configDir, ".claude.json"):      `{"oauthAccount":{"emailAddress":"current@example.invalid","accountUuid":"current-account"},"theme":"light","hasCompletedOnboarding":true}`,
+				filepath.Join(configDir, "settings.json"):     `{"permissions":{"allow":["Read"]},"env":{"SHARED_SETTING":"keep-me"}}`,
 			}
 			for path, content := range live {
 				writeNativeTestCredential(t, path, content)
@@ -484,8 +485,8 @@ func TestRobotCredentialActivateSwitchesUsableCredentials(t *testing.T) {
 			continue
 		}
 		t.Run(tc.name, func(t *testing.T) {
-			home := setupRobotCredentialEnv(t)
-			livePath := filepath.Join(home, ".claude", ".credentials.json")
+			setupRobotCredentialEnv(t)
+			livePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
 			writeNativeTestCredential(t, livePath, `{"claudeAiOauth":{"accessToken":"SYNTHETIC-CURRENT-ACCESS"}}`)
 			writeRobotCredentialProfile(t, "claude", "candidate", tc.files)
 			out, err := runRobotCredentialCommand(t, robotActCmd, "activate", "claude", "candidate")
@@ -617,8 +618,8 @@ func TestRobotCredentialProviderRejectionBlocksRenewableAccount(t *testing.T) {
 }
 
 func TestRobotCredentialUnnamedBackupPreservesNamedActiveAccount(t *testing.T) {
-	home := setupRobotCredentialEnv(t)
-	livePath := filepath.Join(home, ".claude", ".credentials.json")
+	setupRobotCredentialEnv(t)
+	livePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
 	credential := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-NAMED-ACCOUNT","refreshToken":"SYNTHETIC-NAMED-REFRESH","expiresAt":%d}}`, time.Now().Add(24*time.Hour).UnixMilli())
 	writeNativeTestCredential(t, livePath, credential)
 	fileSet := authfile.ClaudeAuthFiles()

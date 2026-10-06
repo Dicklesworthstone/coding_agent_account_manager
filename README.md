@@ -210,6 +210,7 @@ Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-f
 |------|------------------|-----|
 | `.claude/.credentials.json` | **real file** | The whole point: per-identity OAuth token. |
 | `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
+| `.claude/settings.json` | **real file** | Workflow policy is refreshed from the canonical user settings; API-key helpers and credential environment remain private to this account. Existing links to the user's settings are converted to private files before launch. |
 | `.claude.json` | **real file** | Claude Code rewrites this on every run (it holds the login identity); a symlink would mutate the user's real settings under the shallow identity. Seeded from your real `~/.claude.json` minus the account-bound keys (`oauthAccount`, usage/entitlement caches), and the shared preference keys (theme, editor mode, notification channel, user/project `mcpServers`, project trust and `allowedTools`) are refreshed from the real file on every `shallow-spawn` — the main lane is the source of truth for configuration; pass `--no-sync-config` to keep a profile's own values. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
 | `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
@@ -310,23 +311,30 @@ and `caam shallow-profile sync-config <name> [--all]` does it on demand:
 
 | Provider | Refreshed | Never touched |
 |----------|-----------|---------------|
+| claude (`.claude/settings.json`) | Shared workflow policy, including permissions, hooks, MCP configuration and explicitly shared environment keys | Account helpers, credential environment and `profile_keys` overrides |
 | claude (`.claude.json`) | preferences (theme, editor mode, notification channel, auto-updates), user-scope `mcpServers`, per-project trust / `allowedTools` / MCP settings | `oauthAccount`, usage caches, prompt history, per-project session state |
 | codex (`.codex/config.toml`) | root settings (`model`, `model_reasoning_effort`, `personality`, `notify`, …) and whole tables: `[mcp_servers.*]`, `[features]`, `[skills]`, `[hooks]`, `[model_providers.*]` | `[hooks.state.*]` (hook trust), `[projects.*]` (workspace trust), `[notice.*]` (dismissed notices), and `auth.json` |
 
-Two rules keep it safe to run on every spawn:
+The providers preserve their respective configuration formats:
 
 - **Sections are replaced as a unit, never merged key by key.** For an MCP
   server that is the whole point: `[mcp_servers.kernel]` and its subtables are
   dropped and re-inserted together, so a stale `command`/`args` pair cannot
   survive beside a new `url`.
-- **Nothing is deleted.** A table your profile has and your real HOME does not
-  is left alone; the real side wins only where it has an opinion.
+- **Claude removals propagate.** An existing canonical document is authoritative
+  for shared policy. Removed permissions, MCP entries and project approvals are
+  removed from the profile too. A missing canonical file preserves the profile's
+  policy, and account and runtime state remain private.
+- **Codex retains profile-only tables.** A table your profile has and your real
+  HOME does not is left alone; the real side wins where it defines a setting.
 
 `cli_auth_credentials_store = "file"` is re-enforced on every codex sync, so a
-profile can never be talked into a shared keychain. The edit is a structural
-splice over the raw file rather than a parse-and-rewrite, so comments, key
-order and formatting survive and an untouched region stays byte-identical —
-and a second sync writes nothing. Pass `--no-sync-config` to skip it.
+profile can never be talked into a shared keychain. Codex uses structural edits
+that preserve comments, key order and formatting; Claude writes private JSON
+documents. A second sync writes nothing. Pass `--no-sync-config` to skip policy
+refresh. Claude settings must still be valid and private: old links to host
+settings are detached even with this flag, and preparation failures stop the
+launch. `--print-env` stays read-only.
 
 > **Claude Agent View is disabled by default in shallow sessions (issue #49).** Claude Code's Agent View feature (the `--bg` background-supervisor daemon) runs a **long-lived, cross-session** supervisor process that is **not** bound to the shallow profile's `HOME`. On resume, a shallow `claude` session would reconnect to an already-running supervisor bound to a *different* identity (typically the VM's primary Claude auth), silently bypassing shallow-spawn's per-identity auth isolation and using the wrong account. caam cannot control that daemon's lifecycle, so `caam shallow-spawn <name> -- claude` injects `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` into the child environment by default. This keeps the session foreground and honoring the per-identity `~/.claude/.credentials.json`.
 >
@@ -364,6 +372,62 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 **macOS login keychain:** on a Mac, Claude Code keeps the OAuth blob as a generic password in the login keychain (service `Claude Code-credentials`) and only falls back to `~/.claude/.credentials.json` when the keychain is unreachable. caam treats the keychain as authoritative and that file as its 0600 mirror: `backup` reads the item into the profile, `activate` writes the profile's token back into it, and `logout` removes it. A locked keychain, or a denied access prompt, fails `backup` and `activate` loudly rather than reporting a switch that did not happen. `caam doctor` reports the item's readability; `CAAM_KEYCHAIN=0` turns the bridge off and falls back to the file. Shallow profiles are unaffected — `security` derives the keychain from `HOME`, so a shallow lane has no login keychain and Claude Code uses that lane's own credentials file.
 
 **Login Command:** Inside Claude Code, type `/login`
+
+#### Shared workflow settings and private account settings
+
+CAAM applies the same `claude_settings` policy to vault activation, isolated
+profiles and shallow profiles. The default mode, `shared`, takes workflow
+settings from your canonical user configuration and account fields from the
+selected profile. This lets permissions, hooks, MCP entries and preferences
+follow your current workflow while API-key helpers, authentication selectors
+and credential environment remain with their account.
+
+Configure it in `$XDG_CONFIG_HOME/caam/config.json` (default
+`~/.config/caam/config.json`):
+
+```json
+{
+  "claude_settings": {
+    "mode": "shared",
+    "profile_keys": ["hooks"],
+    "shared_env_keys": ["EDITOR", "ANTHROPIC_MODEL"]
+  }
+}
+```
+
+`profile_keys` keeps named top-level settings specific to each profile.
+Environment variables are account-specific unless explicitly listed in
+`shared_env_keys`; known credential and routing variables cannot be shared.
+Use `"mode": "per-profile"` to retain each profile's entire settings document.
+The policy is validated and preserved when CAAM saves its configuration.
+
+An existing shared document is authoritative, including deletions: removing a
+rule or approval does not leave a stale copy in another profile. A missing
+shared document allows the profile's saved policy to bootstrap a new machine.
+With `CLAUDE_CONFIG_DIR` set, `settings.json` and `.claude.json` in that directory
+are canonical, even when absent; CAAM does not borrow ignored legacy settings.
+Without the override, the sources are `~/.claude/settings.json` and
+`~/.claude.json`.
+
+Isolated Claude profiles use one native configuration directory consistently
+for environment exports, imports, health checks and launch. Existing XDG
+authentication in the profile's `xdg_config/claude-code` directory takes
+precedence; a profile with only legacy authentication keeps `home/.claude`.
+New profiles use the XDG directory. A newer token in an ignored directory
+does not change the selected account. Known conflicting account IDs stop the
+operation so the operator can resolve the profile explicitly.
+
+Settings preparation is required before native execution. Invalid policy
+stops the launch; it cannot silently leave an outdated policy in effect.
+API-key enrollment merges the account's helper into its existing policy, and
+logout clears account fields while retaining workflow settings. Environment
+inspection does not prepare, migrate or refresh files:
+
+```bash
+caam env claude work                 # safely quoted shell assignments
+caam env claude work --json          # {"set": {...}, "unset": []}
+caam env claude work --unset --json  # {"set": {}, "unset": [...]}
+```
 
 **Notes:** Claude Max has a 5-hour rolling usage window. When you hit it, you'll see rate limit messages. Switch accounts to continue.
 
