@@ -132,6 +132,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 	var providerEnv map[string]string
 	var err error
 	if !opts.UseGlobalEnv {
+		// Required policy is not a convenience-asset refresh. Refuse to start
+		// with stale permissions/settings when preflight cannot be completed.
+		if preparer, ok := opts.Provider.(provider.ProfileRunPreparer); ok {
+			if err := preparer.PrepareRun(ctx, opts.Profile); err != nil {
+				return fmt.Errorf("prepare %s profile for launch: %w", opts.Provider.ID(), err)
+			}
+		}
 		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)
