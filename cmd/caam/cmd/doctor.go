@@ -925,10 +925,11 @@ func checkAuthFiles() []CheckResult {
 	for tool, getFileSet := range tools {
 		fileSet := getFileSet()
 		hasAuth := authfile.HasAuthFiles(fileSet)
+		activeProfile := ""
 
 		if hasAuth {
 			// Check which profile is active
-			activeProfile, _ := vault.ActiveProfile(fileSet)
+			activeProfile, _ = vault.ActiveProfile(fileSet)
 			msg := "logged in"
 			if activeProfile != "" {
 				msg = fmt.Sprintf("logged in (profile: %s)", activeProfile)
@@ -946,6 +947,19 @@ func checkAuthFiles() []CheckResult {
 				Details: "Login with the tool first, then use 'caam backup' to save",
 			})
 		}
+		if tool == "cursor" && hasAuth && activeProfile == "" {
+			ph := &health.ProfileHealth{}
+			applyLiveExpiry(tool, ph)
+			if result := checkProfileTokenExpiry(tool, "", ph); result != nil {
+				result.Name = "cursor live token"
+				results = append(results, *result)
+			} else {
+				results = append(results, CheckResult{
+					Name: "cursor live token", Status: "warn", Message: "login expiry unknown",
+					Details: "No readable Cursor JWT expiry found in the live credential file",
+				})
+			}
+		}
 
 		// Check vault profile token expiry for all non-system profiles.
 		// This catches profiles that have drifted into expired/unusable state
@@ -957,20 +971,13 @@ func checkAuthFiles() []CheckResult {
 					continue
 				}
 				ph := buildProfileHealth(tool, profileName)
-				if tool == "cursor" {
-					if active, err := vault.ActiveProfile(fileSet); err == nil && active == profileName {
-						applyLiveExpiry(tool, ph)
-					}
-					if ph != nil && ph.CredentialRenewable() {
-						results = append(results, CheckResult{
-							Name:   fmt.Sprintf("%s/%s token", tool, profileName),
-							Status: "ok", Message: "API-key-backed credentials can renew",
-							Details: "Cursor renews the access token using the saved API key",
-						})
-						continue
-					}
+				if profileName == activeProfile {
+					applyLiveExpiry(tool, ph)
 				}
-				name := fmt.Sprintf("%s/%s token", tool, profileName)
+				if result := checkProfileTokenExpiry(tool, profileName, ph); result != nil {
+					results = append(results, *result)
+					continue
+				}
 				if ph == nil || ph.TokenExpiresAt.IsZero() {
 					// Cannot determine expiry: probe the token with a live API
 					// call to detect broken/reused tokens that look valid on disk.
@@ -979,43 +986,13 @@ func checkAuthFiles() []CheckResult {
 					}
 					continue
 				}
-				warningLead := 15 * time.Minute
-				if ph.ReloginWarningLead > warningLead {
-					warningLead = ph.ReloginWarningLead
-				}
-				if !ph.TokenExpiresAt.After(time.Now()) {
-					results = append(results, CheckResult{
-						Name:    name,
-						Status:  "fail",
-						Message: "token expired",
-						Details: fmt.Sprintf("Expired at %s; re-login with 'caam login %s %s'", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),
-					})
-				} else if time.Until(ph.TokenExpiresAt) <= warningLead {
-					details := fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName)
-					if ph.ReloginWarningLead > 0 {
-						details = fmt.Sprintf("Session cannot renew; log in again: 'caam login %s %s'", tool, profileName)
-					}
-					results = append(results, CheckResult{
-						Name:    name,
-						Status:  "warn",
-						Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
-						Details: details,
-					})
-				} else {
-					if tool == "cursor" {
-						results = append(results, CheckResult{
-							Name: name, Status: "ok", Message: "session token valid",
-							Details: fmt.Sprintf("Expires at %s; session cannot renew", ph.TokenExpiresAt.Format(time.RFC3339)),
-						})
-					}
-					// Token not expired and not expiring soon -- still probe Codex
-					// tokens with a live API call to catch refresh_token_reused state
-					// where the access token appears valid by expiry but the refresh
-					// token has been consumed, making the profile a ticking time bomb.
-					if tool == "codex" {
-						if result := probeVaultToken(tool, profileName); result != nil {
-							results = append(results, *result)
-						}
+				// Token not expired and not expiring soon -- still probe Codex
+				// tokens with a live API call to catch refresh_token_reused state
+				// where the access token appears valid by expiry but the refresh
+				// token has been consumed, making the profile a ticking time bomb.
+				if tool == "codex" {
+					if result := probeVaultToken(tool, profileName); result != nil {
+						results = append(results, *result)
 					}
 				}
 			}
@@ -1029,6 +1006,62 @@ func checkAuthFiles() []CheckResult {
 	}
 
 	return results
+}
+
+// checkProfileTokenExpiry distinguishes a hard session deadline from a
+// renewable cached access token. Cursor session logins need several days of
+// warning, and its API-key-backed credentials renew through Cursor itself.
+func checkProfileTokenExpiry(tool, profileName string, ph *health.ProfileHealth) *CheckResult {
+	if ph == nil {
+		return nil
+	}
+	name := fmt.Sprintf("%s/%s token", tool, profileName)
+	if tool == "cursor" && ph.CredentialRenewable() {
+		return &CheckResult{
+			Name: name, Status: "pass", Message: "API-key-backed credentials can renew",
+			Details: "Cursor renews the access token using the saved API key",
+		}
+	}
+	if ph.TokenExpiresAt.IsZero() || ph.SelfRefreshing {
+		return nil
+	}
+	remaining := time.Until(ph.TokenExpiresAt)
+	if remaining > max(15*time.Minute, ph.ReloginWarningLead) {
+		if tool == "cursor" {
+			return &CheckResult{
+				Name: name, Status: "pass", Message: fmt.Sprintf("session login valid, expires %s", formatExpiryDuration(ph.TokenExpiresAt)),
+				Details: fmt.Sprintf("Expires at %s; session cannot renew", ph.TokenExpiresAt.Format(time.RFC3339)),
+			}
+		}
+		return nil
+	}
+	result := &CheckResult{
+		Name:    name,
+		Status:  "warn",
+		Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
+	}
+	if ph.CredentialRenewable() {
+		if remaining <= 0 {
+			result.Message = "access token needs renewal"
+		}
+		result.Details = fmt.Sprintf("Renew with 'caam refresh %s %s'", tool, profileName)
+		return result
+	}
+	loginInstructions := fmt.Sprintf("Log in again with 'caam login %s %s'", tool, profileName)
+	if tool == "cursor" {
+		loginInstructions = health.CursorReloginInstructions(profileName)
+	}
+	result.Details = fmt.Sprintf("Expires at %s. %s", ph.TokenExpiresAt.Format(time.RFC3339), loginInstructions)
+	if ph.ReloginWarningLead > 0 {
+		result.Message = fmt.Sprintf("session expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt))
+		result.Details += "; this session cannot be refreshed"
+	}
+	if remaining <= 0 {
+		result.Status = "fail"
+		result.Message = "token expired"
+		result.Details = fmt.Sprintf("Expired at %s. %s", ph.TokenExpiresAt.Format(time.RFC3339), loginInstructions)
+	}
+	return result
 }
 
 // normalizeIdentity extracts the primary identifier from an identity string

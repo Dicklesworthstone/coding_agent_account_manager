@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 func TestVerifyProfileResult(t *testing.T) {
@@ -153,18 +155,20 @@ func TestGenerateRecommendations(t *testing.T) {
 	output := &VerifyOutput{
 		Profiles: []VerifyProfileResult{
 			{
-				Provider:    "claude",
-				Profile:     "work",
-				Status:      "critical",
-				TokenExpiry: &expiredTime,
-				ExpiresIn:   "expired",
+				Provider:       "claude",
+				Profile:        "work",
+				Status:         "critical",
+				TokenExpiry:    &expiredTime,
+				ExpiresIn:      "expired",
+				Recommendation: health.FormatRecommendation("claude", "work", &health.ProfileHealth{TokenExpiresAt: expiredTime}),
 			},
 			{
-				Provider:    "codex",
-				Profile:     "dev",
-				Status:      "warning",
-				TokenExpiry: &expiringSoonTime,
-				ExpiresIn:   "30m",
+				Provider:       "codex",
+				Profile:        "dev",
+				Status:         "warning",
+				TokenExpiry:    &expiringSoonTime,
+				ExpiresIn:      "30m",
+				Recommendation: health.FormatRecommendation("codex", "dev", &health.ProfileHealth{TokenExpiresAt: expiringSoonTime, TokenRenewable: true}),
 			},
 		},
 		Summary: VerifySummary{
@@ -196,7 +200,7 @@ func TestGenerateRecommendations(t *testing.T) {
 	// Check for re-login recommendation
 	hasRelogin := false
 	for _, r := range recs {
-		if strings.Contains(r, "Re-login") {
+		if strings.Contains(r, "caam login") {
 			hasRelogin = true
 			break
 		}

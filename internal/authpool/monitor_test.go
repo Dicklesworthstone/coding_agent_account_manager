@@ -177,6 +177,46 @@ func TestMonitor_RefreshesExpiringSoon(t *testing.T) {
 	}
 }
 
+func TestMonitorCursorProfilesPreservedWithoutRefresh(t *testing.T) {
+	pool := NewAuthPool()
+	refresher := NewMockRefresher()
+	cfg := DefaultMonitorConfig()
+	monitor := NewMonitor(pool, refresher, cfg)
+
+	// A persisted expired/error Cursor profile must remain visible but
+	// cannot be repaired by repeatedly invoking an unsupported refresh.
+	for _, status := range []PoolStatus{PoolStatusReady, PoolStatusExpired, PoolStatusError} {
+		name := status.String()
+		pool.AddProfile("cursor", name)
+		pool.UpdateTokenExpiry("cursor", name, time.Now().Add(time.Minute))
+		if err := pool.SetStatus("cursor", name, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool.AddProfile("codex", "renewable")
+	pool.UpdateTokenExpiry("codex", "renewable", time.Now().Add(time.Minute))
+	for i := 0; i < 3; i++ {
+		monitor.checkAndRefresh(context.Background())
+		monitor.refreshWg.Wait()
+	}
+	if got := refresher.Calls(); len(got) != 1 || got[0] != "codex/renewable" {
+		t.Fatalf("refresh calls = %v, want only the renewable provider", got)
+	}
+	for _, status := range []PoolStatus{PoolStatusReady, PoolStatusExpired, PoolStatusError} {
+		name := status.String()
+		if err := monitor.ForceRefresh(context.Background(), "cursor", name); err == nil {
+			t.Errorf("ForceRefresh(cursor/%s) must report unavailable refresh", name)
+		}
+		got := pool.GetProfile("cursor", name)
+		if got == nil || got.Status != status || !got.LastRefresh.IsZero() {
+			t.Errorf("unsupported profile status was changed: %+v, want %s", got, status)
+		}
+	}
+	if got := refresher.CallCount(); got != 1 {
+		t.Errorf("forced unsupported refresh reached refresher: %d calls", got)
+	}
+}
+
 func TestMonitor_RefreshesExpired(t *testing.T) {
 	pool := NewAuthPool()
 	refresher := NewMockRefresher()

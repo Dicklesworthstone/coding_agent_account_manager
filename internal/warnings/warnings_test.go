@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 func TestLevelString(t *testing.T) {
@@ -665,6 +668,175 @@ func TestCheckerCustomThresholds(t *testing.T) {
 	}
 }
 
+func writeCursorWarningAuth(t *testing.T, path string, expiry time.Time, apiKey string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": "synthetic-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".synthetic"
+	data, err := json.Marshal(map[string]any{
+		"accessToken": token,
+		// A field named refreshToken does not make a Cursor browser session
+		// renewable; only a stored API key can mint another access token.
+		"refreshToken": "synthetic-session-refresh-value",
+		"apiKey":       apiKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckerCursorVaultSessionsAndAPIKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		ttl     time.Duration
+		apiKey  string
+		want    bool
+		level   Level
+		expired bool
+	}{
+		{name: "fresh session", ttl: 8 * 24 * time.Hour},
+		{name: "long lead session", ttl: 6 * 24 * time.Hour, want: true, level: LevelWarning},
+		{name: "session inside hour", ttl: 30 * time.Minute, want: true, level: LevelCritical},
+		{name: "expired session", ttl: -time.Hour, want: true, level: LevelCritical, expired: true},
+		{name: "blank key remains session", ttl: 2 * 24 * time.Hour, apiKey: " \t", want: true, level: LevelWarning},
+		{name: "API key soon", ttl: 30 * time.Minute, apiKey: "synthetic-api-key"},
+		{name: "API key lapsed", ttl: -time.Hour, apiKey: "synthetic-api-key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vault := authfile.NewVault(t.TempDir())
+			path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+			writeCursorWarningAuth(t, path, time.Now().Add(tt.ttl), tt.apiKey)
+			got := NewChecker(vault, nil, nil).CheckAll(context.Background())
+			if !tt.want {
+				if len(got) != 0 {
+					t.Fatalf("unexpected warnings: %+v", got)
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d warnings, want 1: %+v", len(got), got)
+			}
+			if got[0].Level != tt.level || got[0].Tool != "cursor" || got[0].Profile != "work" {
+				t.Errorf("incorrect warning: %+v", got[0])
+			}
+			if !strings.Contains(got[0].Action, "cursor-agent login") || !strings.Contains(got[0].Action, "caam backup cursor") || strings.Contains(got[0].Action, "caam refresh") {
+				t.Errorf("session action = %q, want native login and vault backup", got[0].Action)
+			}
+			if tt.expired && !strings.Contains(got[0].Message, "EXPIRED") {
+				t.Errorf("expired session warning = %q", got[0].Message)
+			}
+		})
+	}
+}
+
+func TestCheckerCursorWarningBoundaries(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	checker := NewChecker(authfile.NewVault(t.TempDir()), nil, nil)
+	tests := []struct {
+		name  string
+		ttl   time.Duration
+		want  bool
+		level Level
+	}{
+		{"outside relogin lead", health.CursorReloginLead + time.Nanosecond, false, LevelInfo},
+		{"at relogin lead", health.CursorReloginLead, true, LevelWarning},
+		{"above critical", time.Hour + time.Nanosecond, true, LevelWarning},
+		{"at critical", time.Hour, true, LevelCritical},
+		{"at expiry", 0, true, LevelCritical},
+		{"after expiry", -time.Nanosecond, true, LevelCritical},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := &health.ExpiryInfo{ExpiresAt: now.Add(tt.ttl), ReloginWarningLead: health.CursorReloginLead}
+			got := checker.expiryWarnings("cursor", "work", info, now)
+			if !tt.want {
+				if len(got) != 0 {
+					t.Fatalf("unexpected warning outside lead: %+v", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Level != tt.level {
+				t.Fatalf("boundary warning = %+v, want level %s and login action", got, tt.level)
+			}
+			if !strings.Contains(got[0].Action, "cursor-agent login") || !strings.Contains(got[0].Action, "caam backup cursor") || strings.Contains(got[0].Action, "caam refresh") {
+				t.Errorf("boundary action lacks native login/backup guidance: %q", got[0].Action)
+			}
+			if tt.ttl <= 0 && !strings.Contains(got[0].Message, "EXPIRED") {
+				t.Errorf("at/past expiry is not reported expired: %q", got[0].Message)
+			}
+		})
+	}
+}
+
+func TestCheckerCursorActiveUsesLiveAuthAtResolvedPath(t *testing.T) {
+	for _, backedUp := range []bool{false, true} {
+		name := "unmatched live session"
+		if backedUp {
+			name = "matched despite config churn"
+		}
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			xdg := t.TempDir()
+			configDir := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", xdg)
+			t.Setenv("APPDATA", t.TempDir())
+			t.Setenv("CURSOR_CONFIG_DIR", configDir)
+			paths := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv)
+			writeCursorWarningAuth(t, paths.AuthFile, time.Now().Add(3*24*time.Hour), "")
+			configPath := filepath.Join(paths.ConfigDir, "cli-config.json")
+			if err := os.WriteFile(configPath, []byte(`{"authInfo":{"email":"session@example.test"},"theme":"dark"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			vault := authfile.NewVault(t.TempDir())
+			if backedUp {
+				if err := vault.Backup(authfile.CursorAuthFiles(), "work"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(configPath, []byte(`{"authInfo":{"email":"session@example.test"},"theme":"light","model":"new-model"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			checker := NewChecker(vault, nil, nil)
+			got := checker.CheckActive(context.Background())
+			if len(got) != 1 || got[0].Tool != "cursor" || got[0].Level != LevelWarning {
+				t.Fatalf("live warning = %+v, want long-lead Cursor warning", got)
+			}
+			if backedUp {
+				if !strings.Contains(got[0].Action, "cursor-agent login") || !strings.Contains(got[0].Action, "caam backup cursor") || !strings.Contains(got[0].Action, "work") {
+					t.Errorf("matched live action lacks native login/backup guidance: %q", got[0].Action)
+				}
+			} else if got[0].Action != "cursor-agent login" {
+				t.Errorf("unmatched live action = %q, want cursor-agent login", got[0].Action)
+			}
+			if strings.Contains(got[0].Action, "caam refresh") {
+				t.Errorf("non-renewable live session recommends refresh: %q", got[0].Action)
+			}
+
+			// A new live login supersedes a stale snapshot even if that login
+			// has not yet been backed up to a named profile.
+			writeCursorWarningAuth(t, paths.AuthFile, time.Now().Add(30*24*time.Hour), "")
+			if got := checker.CheckActive(context.Background()); len(got) != 0 {
+				t.Errorf("fresh live session must not inherit vault warning: %+v", got)
+			}
+			writeCursorWarningAuth(t, paths.AuthFile, time.Now().Add(-time.Hour), "synthetic-api-key")
+			if got := checker.CheckActive(context.Background()); len(got) != 0 {
+				t.Errorf("live API-key login must not inherit session warning: %+v", got)
+			}
+		})
+	}
+}
+
 func TestCursorSessionWarnings(t *testing.T) {
 	vault := authfile.NewVault(t.TempDir())
 	checker := NewChecker(vault, nil, nil)
@@ -700,8 +872,8 @@ func TestCursorSessionWarnings(t *testing.T) {
 			if len(warnings) != tc.count {
 				t.Fatalf("warnings=%v, want %d", warnings, tc.count)
 			}
-			if len(warnings) > 0 && warnings[0].Action != "caam login cursor "+tc.name {
-				t.Fatalf("action=%q", warnings[0].Action)
+			if len(warnings) > 0 && (!strings.Contains(warnings[0].Action, "cursor-agent login") || !strings.Contains(warnings[0].Action, "caam backup cursor") || !strings.Contains(warnings[0].Action, tc.name) || strings.Contains(warnings[0].Action, "caam refresh")) {
+				t.Fatalf("action lacks native login/backup guidance: %q", warnings[0].Action)
 			}
 		})
 	}

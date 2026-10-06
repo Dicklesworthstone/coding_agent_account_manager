@@ -191,6 +191,7 @@ func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, 
 	if provider == "cursor" {
 		return
 	}
+
 	// Try to acquire semaphore (non-blocking)
 	select {
 	case m.semaphore <- struct{}{}:
@@ -274,6 +275,10 @@ func (m *Monitor) doRefresh(ctx context.Context, provider, profile string) {
 // ForceRefresh triggers an immediate refresh for a specific profile.
 // This respects the MaxConcurrent semaphore to prevent overwhelming the system.
 func (m *Monitor) ForceRefresh(ctx context.Context, provider, profile string) error {
+	if provider == "cursor" {
+		return fmt.Errorf("automatic refresh is unavailable for %s/%s", provider, profile)
+	}
+
 	// Acquire semaphore slot (blocking, with context cancellation)
 	select {
 	case m.semaphore <- struct{}{}:

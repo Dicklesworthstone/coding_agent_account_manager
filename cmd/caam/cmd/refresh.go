@@ -287,6 +287,12 @@ func shouldRefreshProfile(tool, profile string, threshold time.Duration, force b
 		}
 		return false, "", err
 	}
+	if tool == "cursor" && info != nil {
+		if info.Renewable {
+			return false, "Cursor renews credentials from the stored API key", nil
+		}
+		return false, "session login cannot be refreshed. " + health.CursorReloginInstructions(profile), nil
+	}
 	if info == nil || !info.HasRefreshToken {
 		return false, "no refresh token", nil
 	}
@@ -325,7 +331,7 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 	case "cursor":
 		return health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
 	case "opencode", "grok":
-		// These providers do not support CAAM refresh.
+		// No caam refresh support for opencode/grok yet.
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("refresh not supported for tool: %s", tool)

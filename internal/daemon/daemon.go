@@ -81,9 +81,12 @@ type Daemon struct {
 	configChanged chan struct{} // Signal to reload config in runLoop
 	wg            sync.WaitGroup
 
-	mu              sync.Mutex
-	running         bool
-	stats           Stats
+	mu      sync.Mutex
+	running bool
+	stats   Stats
+
+	// reloginWarnings remembers logins already warned about across vault and
+	// live aliases. It is protected by mu; replacement logins have new fingerprints.
 	reloginWarnings map[string]string
 
 	configMu sync.RWMutex // Protects config access during runtime reloads
@@ -628,6 +631,9 @@ func (d *Daemon) checkAndRefresh() {
 		}
 
 		for _, profile := range profiles {
+			if authfile.IsSystemProfile(profile) {
+				continue
+			}
 			totalChecked++
 			wg.Add(1)
 			sem <- struct{}{} // Acquire token
@@ -658,9 +664,11 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	if ph == nil {
 		return
 	}
-
 	if provider == "cursor" {
-		d.warnCursorSession(profile, ph)
+		d.warnCursorSession(profile, ph, time.Now())
+		return
+	}
+	if ph.SelfRefreshing {
 		return
 	}
 
@@ -704,10 +712,13 @@ func (d *Daemon) checkProfile(provider, profile string) {
 
 // getProfileHealth returns the health data for a profile.
 func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealth {
-	// First try the health store
-	if provider != "cursor" && d.healthStore != nil {
-		ph, err := d.healthStore.GetProfile(provider, profile)
-		if err == nil && ph != nil && !ph.TokenExpiresAt.IsZero() {
+	var ph *health.ProfileHealth
+	if d.healthStore != nil {
+		ph, _ = d.healthStore.GetProfile(provider, profile)
+		// Cursor renewability and the login fingerprint are derived from
+		// the current credential, never persisted. A cached timestamp must
+		// not conceal a new login or carry a session warning onto an API key.
+		if provider != "cursor" && ph != nil && !ph.TokenExpiresAt.IsZero() {
 			return ph
 		}
 	}
@@ -737,13 +748,15 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		return nil
 	}
 
-	return &health.ProfileHealth{
-		TokenExpiresAt:        expiryInfo.ExpiresAt,
-		SelfRefreshing:        expiryInfo.SelfRefreshing,
-		TokenRenewable:        expiryInfo.Renewable,
-		ReloginWarningLead:    expiryInfo.ReloginWarningLead,
-		CredentialFingerprint: expiryInfo.Fingerprint,
+	if ph == nil {
+		ph = &health.ProfileHealth{}
 	}
+	ph.TokenExpiresAt = expiryInfo.ExpiresAt
+	ph.SelfRefreshing = expiryInfo.SelfRefreshing
+	ph.TokenRenewable = expiryInfo.Renewable
+	ph.ReloginWarningLead = expiryInfo.ReloginWarningLead
+	ph.CredentialFingerprint = expiryInfo.Fingerprint
+	return ph
 }
 
 // isUnsupportedError checks if an error is an UnsupportedError.
@@ -868,22 +881,24 @@ func StopDaemonByPID(pid int) error {
 	return nil
 }
 
-// warnCursorSession warns once for each login's expiry, without attempting
-// the unsupported refresh of a browser session.
-func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth) {
-	if ph.CredentialRenewable() || ph.TokenExpiresAt.IsZero() {
+// warnCursorSession logs once per login, without attempting an unsupported
+// refresh. A digest identifies replacement credentials even when they happen
+// to expire at the same instant; no token material is retained or logged.
+func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth, now time.Time) {
+	if ph == nil || ph.TokenExpiresAt.IsZero() || ph.CredentialRenewable() {
 		return
 	}
 	lead := ph.ReloginWarningLead
 	if lead <= 0 {
-		lead = 7 * 24 * time.Hour
+		lead = health.CursorReloginLead
 	}
-	if time.Until(ph.TokenExpiresAt) > lead {
+	if ph.TokenExpiresAt.Sub(now) > lead {
 		return
 	}
-	fingerprint := ph.TokenExpiresAt.UTC().Format(time.RFC3339Nano)
-	if ph.CredentialFingerprint != "" {
-		fingerprint = ph.CredentialFingerprint
+
+	fingerprint := ph.CredentialFingerprint
+	if fingerprint == "" {
+		fingerprint = ph.TokenExpiresAt.UTC().Format(time.RFC3339Nano)
 	}
 	key := fingerprint
 	d.mu.Lock()
@@ -896,34 +911,48 @@ func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth) {
 	}
 	d.reloginWarnings[key] = fingerprint
 	d.mu.Unlock()
-	d.logger.Printf("cursor/%s: session expires %s; log in again: caam login cursor %s", profile, ph.TokenExpiresAt.Format(time.RFC3339), profile)
+
+	action := health.CursorReloginInstructions(profile)
+	if profile == "" {
+		profile = "active"
+		action = "log in again with cursor-agent login"
+	}
+	ttl := ph.TokenExpiresAt.Sub(now)
+	if ttl <= 0 {
+		d.logger.Printf("cursor/%s: session EXPIRED; %s", profile, action)
+	} else {
+		d.logger.Printf("cursor/%s: session expires in %v; %s", profile, ttl.Round(time.Minute), action)
+	}
 }
 
+// checkCursorSessions remains active when the auth pool handles renewable
+// providers. A session that needs a human login must still warn well before
+// the pool's short refresh threshold.
 func (d *Daemon) checkCursorSessions() {
-	d.checkLiveCursorSession()
 	profiles, err := d.vault.List("cursor")
-	if err != nil {
-		return
+	if err == nil {
+		for _, profile := range profiles {
+			if !authfile.IsSystemProfile(profile) {
+				d.checkProfile("cursor", profile)
+			}
+		}
 	}
-	for _, profile := range profiles {
-		d.checkProfile("cursor", profile)
-	}
+	d.checkLiveCursorSession()
 }
 
+// checkLiveCursorSession inspects the current login using cursor-agent's
+// resolved paths, even when it has not been backed up to a named profile.
 func (d *Daemon) checkLiveCursorSession() {
 	info, err := health.ParseCursorExpiry("")
 	if err != nil || info == nil {
 		return
 	}
 	profile, _ := d.vault.ActiveProfile(authfile.CursorAuthFiles())
-	if profile == "" {
-		profile = "active"
-	}
 	d.warnCursorSession(profile, &health.ProfileHealth{
 		TokenExpiresAt:        info.ExpiresAt,
 		SelfRefreshing:        info.SelfRefreshing,
 		TokenRenewable:        info.Renewable,
 		ReloginWarningLead:    info.ReloginWarningLead,
 		CredentialFingerprint: info.Fingerprint,
-	})
+	}, time.Now())
 }

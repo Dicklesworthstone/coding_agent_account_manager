@@ -375,10 +375,21 @@ CAAM reads the access JWT expiry from Cursor's `auth.json`: on Linux,
 `$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config/cursor/auth.json`);
 on macOS, `~/.cursor/auth.json`; on Windows, `%APPDATA%\Cursor\auth.json`.
 Browser/session logins cannot auto-refresh, even when `refreshToken` is
-present. CAAM warns seven days before expiry and recommends
-`caam login cursor <profile>`; an expired session requires a new login.
-Active profile matching uses `auth.json` when present, so changing models
-or settings does not lose the active marker.
+present. CAAM warns seven days before expiry; an expired session requires a
+new login. Active profile matching uses `auth.json` when present, so changing
+models or settings does not lose the active marker.
+
+For a saved vault profile, replace the expiring login and save it again:
+
+```bash
+caam activate cursor <profile>
+cursor-agent login
+caam backup cursor <profile>
+```
+
+For an isolated profile created with `caam profile add`, use
+`caam login cursor <profile>`. That command operates on the isolated profile,
+not a vault-only profile.
 
 A stored `apiKey` lets cursor-agent re-mint its access token automatically;
 that token's deadline does not require a relogin. For unattended runs,
@@ -763,9 +774,9 @@ The penalty system uses **exponential decay** (20% reduction every 5 minutes) so
 #### Refreshable tokens are not expired accounts
 
 A short-lived access token that can be renewed **without a human** is not an
-unhealthy account, and caam does not report it as one. Every provider's
-credential carries a refresh token or it does not, and that — not the raw
-expiry timestamp — decides the verdict. Codex is the case that forced the
+unhealthy account, and caam does not report it as one. Renewal depends on the
+provider's credential type: a supported refresh token, or a stored API key
+that the provider's CLI uses to obtain new access tokens. Codex is the case that forced the
 distinction: its access token routinely sits expired for days while the CLI
 renews it from the refresh token on next use, and three live accounts were
 reading `warning` in `caam ls` from an expiry months in the past.
@@ -777,12 +788,12 @@ Two questions used to share one flag, and they have different answers:
 | "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — Claude Code renews itself and caam's Claude refresh is disabled | **yes** — caam has a refresher and runs off this signal |
 | "Must a human log in again?" | `caam ls` status, rotation eligibility | no | **no** |
 
-`caam ls --json` and `caam status --json` therefore carry three additive
-signals per profile alongside the composite `status`:
+`caam ls --json`, `caam status --json`, `caam verify --json`, and robot
+profile reports carry three additive signals alongside the composite `status`:
 
 | Field | Meaning |
 |-------|---------|
-| `refresh_due` | caam should renew this credential soon. `false` for a self-refreshing Claude credential (caam must leave it alone) and for one with no refresh token (there is nothing to renew from — it needs a login, not a scheduler). |
+| `refresh_due` | caam should renew this credential soon. `false` for credentials the provider's CLI renews itself, and for non-renewable sessions that need a new login. |
 | `launch_usable` | a new session can start on this account right now — this is what a rotation controller should route on, not warning severity |
 | `login_required` | a human must re-authenticate: the credential has lapsed **and** carries nothing to renew itself with |
 
@@ -794,7 +805,42 @@ until the cap clears — but it is not a login problem, so `login_required` stay
 
 A lapsed-but-renewable credential shows as `Auto-refresh` rather than
 `Expired`, and its recommendation is `caam refresh <provider> <profile>`, never
-`caam login` (a login is disruptive and would fix nothing).
+`caam login` (a login is disruptive and would fix nothing). Credentials that
+the provider's CLI renews itself do not get a caam refresh recommendation.
+
+#### Cursor session expiry
+
+Cursor browser/session logins have a fixed expiry in the `accessToken` JWT
+inside `auth.json`. A `refreshToken` field alone does **not** make this login
+renewable. caam starts warning **seven days before expiry** so there is time
+to log in again with `cursor-agent login` and re-save a vault profile with
+`caam backup cursor <profile>` (activate it first if needed). Isolated
+profiles use `caam login cursor <profile>`. The session remains
+`launch_usable: true` before its deadline, including during the warning
+window; at expiry, `login_required` becomes `true` and `launch_usable` becomes
+`false`. A rate-limit cooldown can independently prevent launching.
+
+A non-empty `apiKey` stored in the same credential file means Cursor can
+obtain new access tokens itself. An expired cached JWT, or the absence of a
+cached JWT, does not trigger a login warning for that credential. Neither
+Cursor credential type is refreshed by caam, so `refresh_due` is `false` and
+`caam refresh cursor <profile> --force` explains why it skips the profile.
+
+Expiry uses the same platform paths as Cursor backup and activation:
+
+| Platform | File-backed credential location |
+|----------|--------------------------------|
+| Linux | `$XDG_CONFIG_HOME/cursor/auth.json`, defaulting to `~/.config/cursor/auth.json` |
+| macOS | `~/.cursor/auth.json` |
+| Windows | `%APPDATA%/Cursor/auth.json` |
+
+`CURSOR_CONFIG_DIR` changes the CLI configuration location, not the credential
+location. Isolated profiles resolve these paths under their own HOME. When
+file-backed credentials are present, unrelated changes in `cli-config.json`
+or `settings.json` no longer hide the matching active profile. A keychain-only
+login or unreadable JWT still has unknown expiry; caam does not invent a
+deadline. `ls`, `status`, `doctor`, `verify`, robot health, warnings, and the
+daemon all use these session-versus-API-key rules.
 
 #### Provider verification
 

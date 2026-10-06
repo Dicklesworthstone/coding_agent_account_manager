@@ -9,11 +9,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
@@ -1588,6 +1590,211 @@ func TestDaemon_getProfileHealth_ParseGeminiExpiry(t *testing.T) {
 	}
 }
 
+func writeDaemonCursorAuth(t *testing.T, path string, expiry time.Time, session, apiKey string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": session})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"accessToken":  "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".synthetic",
+		"refreshToken": "synthetic-session-value",
+		"apiKey":       apiKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonCursorHealthUsesCurrentCredential(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	if err := store.UpdateProfile("cursor", "work", &health.ProfileHealth{
+		TokenExpiresAt: time.Now().Add(-24 * time.Hour),
+		PlanType:       "pro",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := New(vault, store, nil)
+	path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+	expiry := time.Now().Add(2 * 24 * time.Hour).Truncate(time.Second)
+	writeDaemonCursorAuth(t, path, expiry, "login-one", "")
+	ph := d.getProfileHealth("cursor", "work")
+	if ph == nil || !ph.TokenExpiresAt.Equal(expiry) {
+		t.Fatalf("current expiry was hidden by cached health: %+v", ph)
+	}
+	if ph.CredentialRenewable() || ph.SelfRefreshing || ph.ReloginWarningLead != health.CursorReloginLead {
+		t.Errorf("incorrect session semantics: %+v", ph)
+	}
+	if ph.CredentialFingerprint == "" || ph.PlanType != "pro" {
+		t.Errorf("lost current credential identity or cached profile metadata: %+v", ph)
+	}
+	oldFingerprint := ph.CredentialFingerprint
+
+	// Switching to an API key must replace all session-derived semantics,
+	// even when its cached access token already expired.
+	expiry = time.Now().Add(-time.Hour).Truncate(time.Second)
+	writeDaemonCursorAuth(t, path, expiry, "api-login", "synthetic-api-key")
+	ph = d.getProfileHealth("cursor", "work")
+	if ph == nil || !ph.TokenExpiresAt.Equal(expiry) || !ph.CredentialRenewable() || !ph.SelfRefreshing || ph.ReloginWarningLead != 0 {
+		t.Fatalf("incorrect API-key semantics: %+v", ph)
+	}
+	if ph.CredentialFingerprint == oldFingerprint {
+		t.Error("replacement login retained the old session fingerprint")
+	}
+
+	// A stale health record without a current credential is not evidence of
+	// an expiring login and must never drive a refresh or session warning.
+	if err := store.UpdateProfile("cursor", "missing", &health.ProfileHealth{TokenExpiresAt: expiry}); err != nil {
+		t.Fatal(err)
+	}
+	if ph := d.getProfileHealth("cursor", "missing"); ph != nil {
+		t.Errorf("returned stale health without a current Cursor credential: %+v", ph)
+	}
+}
+
+func TestDaemonCursorSessionWarningsDeduplicateAndReset(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	d := New(vault, nil, nil)
+	var output bytes.Buffer
+	d.logger = log.New(&output, "", 0)
+	path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+	expiry := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+	writeDaemonCursorAuth(t, path, expiry, "login-one", "")
+	d.checkProfile("cursor", "work")
+	d.checkProfile("cursor", "work")
+	if got := strings.Count(output.String(), "log in again"); got != 1 {
+		t.Fatalf("same login generated %d warnings, want 1: %s", got, output.String())
+	}
+	if !strings.Contains(output.String(), "cursor-agent login") || !strings.Contains(output.String(), "caam backup cursor") || strings.Contains(output.String(), "caam refresh") {
+		t.Errorf("warning lacks native login/backup guidance: %s", output.String())
+	}
+
+	// A different login with the exact same expiry still needs its own
+	// warning. Deduplication by expiry timestamp alone would miss it.
+	writeDaemonCursorAuth(t, path, expiry, "login-two", "")
+	d.checkProfile("cursor", "work")
+	d.checkProfile("cursor", "work")
+	if got := strings.Count(output.String(), "log in again"); got != 2 {
+		t.Fatalf("replacement login warning count = %d, want 2: %s", got, output.String())
+	}
+
+	writeDaemonCursorAuth(t, path, expiry, "api-login", "synthetic-api-key")
+	d.checkProfile("cursor", "work")
+	writeDaemonCursorAuth(t, path, time.Now().Add(30*24*time.Hour), "fresh-login", "")
+	d.checkProfile("cursor", "work")
+	if got := strings.Count(output.String(), "log in again"); got != 2 {
+		t.Fatalf("fresh/API-key login unexpectedly warned: %s", output.String())
+	}
+	writeDaemonCursorAuth(t, path, time.Now().Add(-time.Minute), "expired-login", "")
+	d.checkProfile("cursor", "work")
+	d.checkProfile("cursor", "work")
+	if got := strings.Count(output.String(), "log in again"); got != 3 || !strings.Contains(output.String(), "session EXPIRED") {
+		t.Errorf("expired replacement warning missing or repeated: %s", output.String())
+	}
+	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+		t.Errorf("Cursor session attempted refresh: %+v", stats)
+	}
+}
+
+func TestDaemonCursorReloginBoundaries(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name string
+		ttl  time.Duration
+		want bool
+	}{
+		{"outside long lead", health.CursorReloginLead + time.Nanosecond, false},
+		{"at long lead", health.CursorReloginLead, true},
+		{"at expiry", 0, true},
+		{"after expiry", -time.Nanosecond, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := New(authfile.NewVault(t.TempDir()), nil, nil)
+			var output bytes.Buffer
+			d.logger = log.New(&output, "", 0)
+			ph := &health.ProfileHealth{
+				TokenExpiresAt: now.Add(tt.ttl), ReloginWarningLead: health.CursorReloginLead,
+				CredentialFingerprint: "synthetic-login",
+			}
+			d.warnCursorSession("work", ph, now)
+			if got := output.Len() != 0; got != tt.want {
+				t.Fatalf("warning present = %v, want %v: %s", got, tt.want, output.String())
+			}
+			if tt.want {
+				// Entering expiry after the advance warning does not repeat the
+				// same login warning at every daemon tick.
+				d.warnCursorSession("work", ph, ph.TokenExpiresAt.Add(time.Second))
+				if got := strings.Count(output.String(), "log in again"); got != 1 {
+					t.Errorf("same login warned %d times", got)
+				}
+			}
+		})
+	}
+}
+
+func TestDaemonCursorUnmatchedLiveSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("CURSOR_CONFIG_DIR", t.TempDir())
+	t.Setenv("APPDATA", t.TempDir())
+	paths := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv)
+	writeDaemonCursorAuth(t, paths.AuthFile, time.Now().Add(4*24*time.Hour), "live-login", "")
+	d := New(authfile.NewVault(t.TempDir()), nil, nil)
+	var output bytes.Buffer
+	d.logger = log.New(&output, "", 0)
+	d.checkAndRefresh()
+	d.checkAndRefresh()
+	if got := strings.Count(output.String(), "cursor/active:"); got != 1 || !strings.Contains(output.String(), "cursor-agent login") {
+		t.Fatalf("unmatched live session warning = %s, want one login warning", output.String())
+	}
+	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+		t.Errorf("unmatched live session attempted refresh: %+v", stats)
+	}
+}
+
+func TestDaemonCursorWarningsContinueWithAuthPool(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+	writeDaemonCursorAuth(t, path, time.Now().Add(3*24*time.Hour), "pool-login", "")
+	d := New(vault, nil, &Config{UseAuthPool: true, CheckInterval: 10 * time.Millisecond})
+	d.backupScheduler = nil
+	var output bytes.Buffer
+	d.logger = log.New(&output, "", 0)
+	d.ctx, d.cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer d.cancel()
+	if err := d.authPool.LoadFromVault(d.ctx); err != nil {
+		t.Fatal(err)
+	}
+	// An old persisted error must not cause automatic retries, even though
+	// the warning path observes the new live credential on disk.
+	if err := d.authPool.SetStatus("cursor", "work", authpool.PoolStatusError); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.poolMonitor.Start(d.ctx); err != nil {
+		t.Fatal(err)
+	}
+	d.runLoop()
+	d.poolMonitor.Stop()
+	if got := strings.Count(output.String(), "log in again"); got != 1 {
+		t.Errorf("pool mode generated %d Cursor warnings, want 1: %s", got, output.String())
+	}
+	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+		t.Errorf("pool mode attempted a Cursor refresh: %+v", stats)
+	}
+	if profile := d.authPool.GetProfile("cursor", "work"); profile == nil || !profile.LastRefresh.IsZero() {
+		t.Errorf("Cursor profile removed or falsely refreshed: %+v", profile)
+	}
+}
+
 func TestCursorSessionDaemonWarnsOnceWithoutRefresh(t *testing.T) {
 	vault := authfile.NewVault(t.TempDir())
 	path := vault.ProfilePath("cursor", "session")
@@ -1619,14 +1826,14 @@ func TestCursorSessionDaemonWarnsOnceWithoutRefresh(t *testing.T) {
 	}
 	d.checkProfile("cursor", "session")
 	d.checkProfile("cursor", "session")
-	d.warnCursorSession("active", parsed)
+	d.warnCursorSession("active", parsed, time.Now())
 	if strings.Count(logs.String(), "log in again") != 1 {
 		t.Fatalf("logs=%s", logs.String())
 	}
 	// Two logins can have the same exp: deduplicate by credential, not date.
 	other := *parsed
 	other.CredentialFingerprint = "another-synthetic-login"
-	d.warnCursorSession("other", &other)
+	d.warnCursorSession("other", &other, time.Now())
 	if strings.Count(logs.String(), "log in again") != 2 {
 		t.Fatalf("distinct login with same expiry not warned: %s", logs.String())
 	}

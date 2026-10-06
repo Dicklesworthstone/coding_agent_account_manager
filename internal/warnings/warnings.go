@@ -114,27 +114,28 @@ func (c *Checker) CheckActive(ctx context.Context) []Warning {
 			continue
 		}
 
-		// Cursor's live credentials may be newer than the saved profile, or may
-		// not have been saved yet. Always inspect the live login.
+		// Find active profile
+		activeProfile, err := c.vault.ActiveProfile(fileSet)
 		if tool == "cursor" {
-			activeProfile, _ := c.vault.ActiveProfile(fileSet)
-			if activeProfile == "" {
-				activeProfile = "active"
+			// Cursor's current session can differ from a vault snapshot after
+			// a fresh login, or may never have been backed up. Always inspect
+			// the live auth file at the platform-aware location; the profile
+			// match only supplies a name for the warning and login command.
+			if err != nil {
+				activeProfile = ""
 			}
 			for _, spec := range fileSet.Files {
-				if filepath.Base(spec.Path) == "auth.json" {
-					info, err := health.ParseCursorExpiry(spec.Path)
-					if err == nil {
-						warnings = append(warnings, c.expiryWarnings(tool, activeProfile, info)...)
-					}
-					break
+				if filepath.Base(spec.Path) != "auth.json" {
+					continue
 				}
+				expInfo, err := health.ParseCursorExpiry(spec.Path)
+				if err == nil {
+					warnings = append(warnings, c.expiryWarnings(tool, activeProfile, expInfo, time.Now())...)
+				}
+				break
 			}
 			continue
 		}
-
-		// Find active profile
-		activeProfile, err := c.vault.ActiveProfile(fileSet)
 		if err != nil || activeProfile == "" {
 			continue
 		}
@@ -176,10 +177,12 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 	if err != nil {
 		return warnings
 	}
-	return c.expiryWarnings(tool, profileName, expInfo)
+	return c.expiryWarnings(tool, profileName, expInfo, time.Now())
 }
 
-func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.ExpiryInfo) []Warning {
+// expiryWarnings applies the same expiry policy to vault and live credentials.
+// An empty profile name denotes a live login that has no matching vault entry.
+func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.ExpiryInfo, now time.Time) []Warning {
 	var warnings []Warning
 	if expInfo == nil || expInfo.ExpiresAt.IsZero() {
 		return warnings
@@ -193,16 +196,30 @@ func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.Expir
 		return warnings
 	}
 
+	// Check expiry
+	remaining := expInfo.ExpiresAt.Sub(now)
+	warningThreshold := c.WarningThreshold
+	if !expInfo.Renewable && expInfo.ReloginWarningLead > warningThreshold {
+		warningThreshold = expInfo.ReloginWarningLead
+	}
 	action := fmt.Sprintf("caam refresh %s %s", tool, profileName)
-	threshold := c.WarningThreshold
-	if tool == "cursor" && !expInfo.Renewable {
+	if !expInfo.Renewable {
 		action = fmt.Sprintf("caam login %s %s", tool, profileName)
-		if expInfo.ReloginWarningLead > threshold {
-			threshold = expInfo.ReloginWarningLead
+		if tool == "cursor" {
+			if profileName == "" {
+				action = "cursor-agent login"
+			} else {
+				action = health.CursorReloginInstructions(profileName)
+			}
 		}
 	}
-	// Check expiry
-	remaining := time.Until(expInfo.ExpiresAt)
+	noun := "Token"
+	if tool == "cursor" && !expInfo.Renewable {
+		noun = "Session"
+	}
+	if profileName == "" {
+		profileName = "active"
+	}
 
 	if remaining <= 0 {
 		// Token expired. A credential that carries a refresh token is not a
@@ -223,8 +240,8 @@ func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.Expir
 				Level:   LevelCritical,
 				Tool:    tool,
 				Profile: profileName,
-				Message: "Token EXPIRED",
-				Action:  fmt.Sprintf("caam login %s %s", tool, profileName),
+				Message: noun + " EXPIRED",
+				Action:  action,
 			})
 		}
 	} else if remaining <= c.CriticalThreshold {
@@ -233,16 +250,16 @@ func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.Expir
 			Level:   LevelCritical,
 			Tool:    tool,
 			Profile: profileName,
-			Message: fmt.Sprintf("Token expires in %s", formatDuration(remaining)),
+			Message: fmt.Sprintf("%s expires in %s", noun, formatDuration(remaining)),
 			Action:  action,
 		})
-	} else if remaining <= threshold {
+	} else if remaining <= warningThreshold {
 		// Expires within warning threshold
 		warnings = append(warnings, Warning{
 			Level:   LevelWarning,
 			Tool:    tool,
 			Profile: profileName,
-			Message: fmt.Sprintf("Token expires in %s", formatDuration(remaining)),
+			Message: fmt.Sprintf("%s expires in %s", noun, formatDuration(remaining)),
 			Action:  action,
 		})
 	}
@@ -312,7 +329,11 @@ func Print(w io.Writer, warnings []Warning, noColor bool) bool {
 
 		fmt.Fprintf(w, "%s%s Warning: %s/%s: %s%s\n", colorStart, prefix, warn.Tool, warn.Profile, warn.Message, colorEnd)
 		if warn.Action != "" {
-			fmt.Fprintf(w, "    Run: %s\n", warn.Action)
+			if warn.Tool == "cursor" {
+				fmt.Fprintf(w, "    %s\n", warn.Action)
+			} else {
+				fmt.Fprintf(w, "    Run: %s\n", warn.Action)
+			}
 		}
 	}
 

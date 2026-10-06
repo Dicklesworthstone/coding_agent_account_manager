@@ -175,7 +175,7 @@ func TestCursorVaultExpiryPropagation(t *testing.T) {
 					if tc.apiKey == "" && (check.Status != "warn" || !strings.Contains(check.Details, "caam login cursor session")) {
 						t.Fatalf("Cursor session doctor = %+v", check)
 					}
-					if tc.apiKey != "" && (check.Status != "ok" || !strings.Contains(check.Message, "can renew")) {
+					if tc.apiKey != "" && (check.Status != "pass" || !strings.Contains(check.Message, "can renew")) {
 						t.Fatalf("Cursor API doctor = %+v", check)
 					}
 				}

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -248,6 +249,21 @@ func TestPoolRefresher_GetTokenExpiry_GeminiNoFile(t *testing.T) {
 	_, err := refresher.getTokenExpiry("gemini", "nonexistent")
 	if err == nil {
 		t.Error("expected error for nonexistent gemini profile")
+	}
+}
+
+func TestPoolRefresherGetCursorExpiry(t *testing.T) {
+	vault := authfile.NewVault(t.TempDir())
+	refresher := NewPoolRefresher(vault, nil)
+	expiry := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+	writeDaemonCursorAuth(t, path, expiry, "session", "")
+	got, err := refresher.getTokenExpiry("cursor", "work")
+	if err != nil || !got.Equal(expiry) {
+		t.Fatalf("Cursor expiry = %v, %v; want %v", got, err, expiry)
+	}
+	if _, err := refresher.getTokenExpiry("cursor", "missing"); err == nil {
+		t.Error("missing Cursor auth must not report a successful zero expiry")
 	}
 }
 

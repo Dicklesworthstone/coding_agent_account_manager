@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 // TestGetHealthReasonRateLimitCap covers PR #82: an active rate-limit cooldown
@@ -126,5 +129,93 @@ func TestApplyLiveExpiryMarksClaudeSelfRefreshing(t *testing.T) {
 	}
 	if status := health.CalculateStatus(ph); status == health.StatusHealthy {
 		t.Errorf("status = %v, want a downgraded verdict for a non-refreshable token expiring in 10m", status)
+	}
+}
+
+func TestCursorHealthUsesIsolatedPathsAndClearsSessionExpiry(t *testing.T) {
+	livePaths := setupCursorHealthVault(t)
+	profileStore = profile.NewStore(filepath.Join(t.TempDir(), "profiles"))
+	prof, err := profileStore.Create("cursor", "seat", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Second)
+	expiry := now.Add(8 * 24 * time.Hour)
+	paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(string) string { return "" })
+	writeNativeTestCredential(t, paths.AuthFile, string(cursorHealthCredential(t, expiry, false)))
+	// Neither ambient paths nor the profile's separate XDG directory are
+	// where Cursor's provider launches the isolated CLI.
+	writeNativeTestCredential(t, livePaths.AuthFile, string(cursorHealthCredential(t, now.Add(40*24*time.Hour), false)))
+	writeNativeTestCredential(t, filepath.Join(prof.XDGConfigPath(), "cursor", "auth.json"), string(cursorHealthCredential(t, now.Add(-time.Hour), false)))
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "seat"), "auth.json"), string(cursorHealthCredential(t, now.Add(-24*time.Hour), false)))
+	if err := healthStore.SetTokenExpiry("cursor", "seat", now.Add(-40*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	ph := buildProfileHealth("cursor", "seat")
+	if !ph.TokenExpiresAt.Equal(expiry) || ph.ReloginWarningLead != health.CursorReloginLead || ph.CredentialRenewable() {
+		t.Fatalf("isolated Cursor health used another credential source: %+v", ph)
+	}
+	writeNativeTestCredential(t, paths.AuthFile, string(cursorHealthCredential(t, time.Time{}, true)))
+	ph = buildProfileHealth("cursor", "seat")
+	if !ph.TokenExpiresAt.IsZero() || !ph.SelfRefreshing || !ph.TokenRenewable || ph.ReloginWarningLead != 0 {
+		t.Fatalf("API-key-only isolated login inherited stale session expiry: %+v", ph)
+	}
+	assertCursorSignals(t, health.CredentialSignals(ph, health.DefaultHealthConfig()), false, true)
+
+	// An existing opaque or damaged isolated login is newer evidence than
+	// the parseable, expired vault snapshot. Only a missing isolated auth
+	// file permits the vault fallback.
+	for _, data := range []string{`{"accessToken":"SYNTHETIC-OPAQUE"}`, `{"accessToken":`} {
+		writeNativeTestCredential(t, paths.AuthFile, data)
+		ph = buildProfileHealth("cursor", "seat")
+		if !ph.TokenExpiresAt.IsZero() || ph.CredentialRenewable() || ph.ReloginWarningLead != 0 {
+			t.Fatalf("unparseable isolated login inherited the vault deadline: %+v", ph)
+		}
+		signals := health.CredentialSignals(ph, health.DefaultHealthConfig())
+		if signals.LoginRequired != nil || signals.LaunchUsable != nil || signals.RefreshDue != nil {
+			t.Errorf("unparseable isolated expiry must remain unknown: %+v", signals)
+		}
+	}
+	if _, err := profileStore.Create("cursor", "missing-auth", "oauth"); err != nil {
+		t.Fatal(err)
+	}
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "missing-auth"), "auth.json"), string(cursorHealthCredential(t, expiry, false)))
+	if ph := buildProfileHealth("cursor", "missing-auth"); !ph.TokenExpiresAt.Equal(expiry) {
+		t.Fatalf("missing isolated credential prevented valid vault fallback: %+v", ph)
+	}
+
+	// The live helper must make the same decision when the active session is
+	// replaced with an API key with no access token yet.
+	ph = &health.ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), ReloginWarningLead: health.CursorReloginLead}
+	writeNativeTestCredential(t, livePaths.AuthFile, string(cursorHealthCredential(t, time.Time{}, true)))
+	applyLiveExpiry("cursor", ph)
+	if !ph.TokenExpiresAt.IsZero() || !ph.SelfRefreshing || !ph.TokenRenewable || ph.ReloginWarningLead != 0 {
+		t.Fatalf("active API key inherited stale session state: %+v", ph)
+	}
+	assertCursorSignals(t, health.CredentialSignals(ph, health.DefaultHealthConfig()), false, true)
+}
+
+func TestCursorHealthDoesNotInventAnExpiryForOpaqueCredentials(t *testing.T) {
+	paths := setupCursorHealthVault(t)
+	past := time.Now().Add(-time.Hour)
+	if err := healthStore.SetTokenExpiry("cursor", "seat", past); err != nil {
+		t.Fatal(err)
+	}
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "seat"), "auth.json"), `{"accessToken":"SYNTHETIC-OPAQUE-SESSION"}`)
+	ph := buildProfileHealth("cursor", "seat")
+	if !ph.TokenExpiresAt.IsZero() || ph.CredentialRenewable() || ph.ReloginWarningLead != 0 {
+		t.Fatalf("opaque credential inherited historical health: %+v", ph)
+	}
+	signals := health.CredentialSignals(ph, health.DefaultHealthConfig())
+	if signals.LoginRequired != nil || signals.LaunchUsable != nil || signals.RefreshDue != nil {
+		t.Errorf("opaque expiry must remain unknown: %+v", signals)
+	}
+	writeNativeTestCredential(t, paths.AuthFile, `{"accessToken":"SYNTHETIC-OPAQUE-SESSION"}`)
+	ph.TokenExpiresAt = past
+	ph.ReloginWarningLead = health.CursorReloginLead
+	applyLiveExpiry("cursor", ph)
+	if !ph.TokenExpiresAt.IsZero() || ph.ReloginWarningLead != 0 {
+		t.Fatalf("opaque active login kept an unrelated expiry: %+v", ph)
 	}
 }

@@ -303,6 +303,12 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 			ph = stored
 		}
 	}
+	if tool == "cursor" {
+		// Expiry belongs to the credential currently on disk. If a Cursor
+		// login changes to an opaque token or malformed file, stored health
+		// must not invent a deadline from its previous credential.
+		applyExpiryInfo(ph, &health.ExpiryInfo{})
+	}
 
 	// Get auth files from vault profile
 	vaultPath := vault.ProfilePath(tool, profileName)
@@ -339,10 +345,12 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// reads the real, current token; it also keeps TokenExpiresAt from
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
-	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (tool == "cursor" || !liveExp.ExpiresAt.IsZero()) {
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (!liveExp.ExpiresAt.IsZero() || tool == "cursor") {
 		applyExpiryInfo(ph, liveExp)
-	} else if err == nil && expInfo != nil && (tool == "cursor" || !expInfo.ExpiresAt.IsZero()) {
+	} else if err == nil && expInfo != nil && (!expInfo.ExpiresAt.IsZero() || tool == "cursor") {
 		// Fallback: the vault snapshot is the best information we have.
+		// Cursor API keys can have no JWT at all; still copy their renewal
+		// semantics and clear any expiry left by a previous session login.
 		applyExpiryInfo(ph, expInfo)
 	}
 
@@ -401,7 +409,10 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if ph == nil {
 		return
 	}
-	if info := liveAuthExpiry(tool); info != nil && (tool == "cursor" || !info.ExpiresAt.IsZero()) {
+	if tool == "cursor" {
+		applyExpiryInfo(ph, &health.ExpiryInfo{})
+	}
+	if info := liveAuthExpiry(tool); info != nil && (!info.ExpiresAt.IsZero() || tool == "cursor") {
 		applyExpiryInfo(ph, info)
 	}
 }
@@ -424,8 +435,9 @@ func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
-// directory (following adoption symlinks). Best-effort; returns nil on any
-// failure.
+// directory (following adoption symlinks). A present but unreadable Cursor
+// credential returns unknown expiry, so an older vault login cannot supply
+// a false deadline. Missing credentials return nil to allow a vault fallback.
 func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	if profileStore == nil {
 		return nil
@@ -445,13 +457,14 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
 	case "cursor":
-		paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(key string) string {
-			if key == "XDG_CONFIG_HOME" {
-				return prof.XDGConfigPath()
-			}
-			return ""
-		})
+		// The provider pins Cursor's environment to the defaults under its
+		// isolated HOME. Do not inherit the caller's XDG or APPDATA paths,
+		// or use the separate profile XDG tree which Cursor does not use.
+		paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(string) string { return "" })
 		info, err = health.ParseCursorExpiry(paths.AuthFile)
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{Source: paths.AuthFile}
+		}
 	default:
 		return nil
 	}
@@ -913,6 +926,25 @@ type statusHealth struct {
 	health.VerificationInfo
 }
 
+func buildStatusHealth(ph *health.ProfileHealth) *statusHealth {
+	if ph == nil {
+		return nil
+	}
+	result := &statusHealth{
+		Status:           health.CalculateStatus(ph).String(),
+		ErrorCount:       ph.ErrorCount1h,
+		Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+		VerificationInfo: health.VerificationFor(ph),
+	}
+	if !ph.TokenExpiresAt.IsZero() {
+		result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+	}
+	if reasons := health.StatusReasons(ph); len(reasons) > 0 {
+		result.Reason = strings.Join(reasons, ", ")
+	}
+	return result
+}
+
 // statusCmd shows which profile is currently active.
 var statusCmd = &cobra.Command{
 	Use:   "status [tool]",
@@ -939,7 +971,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
-	toolsToCheck := []string{"codex", "claude", "gemini"}
+	toolsToCheck := []string{"codex", "claude", "gemini", "cursor"}
 	if len(args) > 0 {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
@@ -959,7 +991,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, tool := range toolsToCheck {
-		fileSet := tools[tool]()
+		getFileSet := tools[tool]
+		if getFileSet == nil {
+			continue
+		}
+		fileSet := getFileSet()
 		hasAuth := authfile.HasAuthFiles(fileSet)
 
 		if !hasAuth {
@@ -995,11 +1031,26 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			// `ls` lists saved profiles for the tool is confusing (issue #20).
 			savedProfiles, _ := vault.List(tool)
 			savedCount := len(savedProfiles)
+			var liveHealth *health.ProfileHealth
+			if tool == "cursor" {
+				// A live browser session can expire even before it has a saved
+				// profile. Report its own deadline without borrowing a vault name.
+				liveHealth = &health.ProfileHealth{}
+				applyLiveExpiry(tool, liveHealth)
+				liveStatus := health.CalculateStatus(liveHealth)
+				if liveStatus == health.StatusWarning || liveStatus == health.StatusCritical {
+					warnings = append(warnings, "cursor (live): "+health.FormatStatusWithReason(liveStatus, liveHealth, health.FormatOptions{NoColor: true}))
+				}
+				if rec := health.FormatRecommendation(tool, "", liveHealth); rec != "" {
+					recommendations = append(recommendations, rec)
+				}
+			}
 			if jsonOutput {
 				output.Tools = append(output.Tools, statusTool{
 					Tool:          tool,
 					LoggedIn:      true,
 					SavedProfiles: savedCount,
+					Health:        buildStatusHealth(liveHealth),
 				})
 			} else {
 				if savedCount > 0 {
@@ -1010,6 +1061,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					fmt.Printf("%-10s  (logged in; live auth matches no saved profile — %d saved %s available, see `caam ls %s`)\n", tool, savedCount, noun, tool)
 				} else {
 					fmt.Printf("%-10s  (logged in, no matching profile; none saved — save one with `caam add %s <name>`)\n", tool, tool)
+				}
+				if liveHealth != nil {
+					fmt.Printf("  Live login: %s\n", health.FormatStatusWithReason(health.CalculateStatus(liveHealth), liveHealth, formatOpts))
 				}
 			}
 			continue
@@ -1027,18 +1081,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				LoggedIn:      true,
 				ActiveProfile: activeProfile,
 				Identity:      id,
-				Health: &statusHealth{
-					Status:           status.String(),
-					ErrorCount:       ph.ErrorCount1h,
-					Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
-					VerificationInfo: health.VerificationFor(ph),
-				},
-			}
-			if !ph.TokenExpiresAt.IsZero() {
-				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
-			}
-			if reasons := health.StatusReasons(ph); len(reasons) > 0 {
-				st.Health.Reason = strings.Join(reasons, ", ")
+				Health:        buildStatusHealth(ph),
 			}
 			// Get cooldown info
 			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})
@@ -1269,7 +1312,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
-			if tool == "cursor" && p == activeProfile {
+			if p == activeProfile {
 				applyLiveExpiry(tool, ph)
 			}
 			status := health.CalculateStatus(ph)
@@ -1372,7 +1415,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
-			if tool == "cursor" && p == activeProfile {
+			if p == activeProfile {
 				applyLiveExpiry(tool, ph)
 			}
 			status := health.CalculateStatus(ph)

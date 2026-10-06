@@ -76,7 +76,8 @@ type RobotStatusSummary struct {
 	ActiveProfiles     int  `json:"active_profiles"`
 	HealthyProfiles    int  `json:"healthy_profiles"`
 	CooldownProfiles   int  `json:"cooldown_profiles"`
-	ExpiringSoon       int  `json:"expiring_soon"` // < 24h
+	ExpiringSoon       int  `json:"expiring_soon"` // within 24h or the session's longer warning window
+	ReloginSoon        int  `json:"relogin_soon"`  // non-renewable sessions inside their warning window
 	AllProfilesBlocked bool `json:"all_profiles_blocked"`
 }
 
@@ -104,14 +105,14 @@ type RobotProfileInfo struct {
 
 // RobotHealthInfo contains health status.
 type RobotHealthInfo struct {
+	Status       string `json:"status"` // healthy, warning, critical, unknown
+	Reason       string `json:"reason,omitempty"`
+	ExpiresAt    string `json:"expires_at,omitempty"`
+	ExpiresIn    string `json:"expires_in,omitempty"` // human-readable
+	ErrorCount1h int    `json:"error_count_1h"`
 	health.Signals
 	Renewable          bool          `json:"renewable"`
 	ReloginWarningLead time.Duration `json:"relogin_warning_lead,omitempty"`
-	Status             string        `json:"status"` // healthy, warning, critical, unknown
-	Reason             string        `json:"reason,omitempty"`
-	ExpiresAt          string        `json:"expires_at,omitempty"`
-	ExpiresIn          string        `json:"expires_in,omitempty"` // human-readable
-	ErrorCount1h       int           `json:"error_count_1h"`
 }
 
 // RobotCooldown contains cooldown information.
@@ -346,20 +347,28 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 			if inCooldown {
 				data.Summary.CooldownProfiles++
 			}
-			// Count profiles that are usable (healthy AND not in cooldown)
-			if isHealthy && !inCooldown {
+			// A long-lead relogin warning does not prevent launching today.
+			// Prefer the credential signal over the composite health verdict.
+			usable := isHealthy && !inCooldown
+			if p.Health.LaunchUsable != nil {
+				usable = *p.Health.LaunchUsable && !inCooldown
+			}
+			if usable {
 				usableProfiles++
 			}
 			if p.Health.ExpiresAt != "" && !p.Health.Renewable {
 				if exp, err := time.Parse(time.RFC3339, p.Health.ExpiresAt); err == nil {
-					lead := 24 * time.Hour
-					if p.Health.ReloginWarningLead > lead {
-						lead = p.Health.ReloginWarningLead
-					}
-					if time.Until(exp) <= lead {
+					remaining := time.Until(exp)
+					if remaining <= max(24*time.Hour, p.Health.ReloginWarningLead) {
 						data.Summary.ExpiringSoon++
 					}
+					if remaining > 0 && p.Health.ReloginWarningLead > 0 && remaining <= p.Health.ReloginWarningLead {
+						data.Summary.ReloginSoon++
+					}
 				}
+			}
+			if p.Recommendation != "" && p.Recommendation != "ready to activate" {
+				suggestions = append(suggestions, p.Recommendation)
 			}
 		}
 	}
@@ -372,7 +381,10 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 
 	// Add suggestions based on status
 	if data.Summary.ExpiringSoon > 0 {
-		suggestions = append(suggestions, fmt.Sprintf("%d profile(s) expiring soon. Renew credentials; log in again for non-renewable sessions.", data.Summary.ExpiringSoon))
+		suggestions = append(suggestions, fmt.Sprintf("%d non-renewable profile(s) are inside their expiry warning window or have expired; log in again.", data.Summary.ExpiringSoon))
+	}
+	if data.Summary.ReloginSoon > 0 {
+		suggestions = append(suggestions, fmt.Sprintf("%d session profile(s) need a new login before expiry; see each profile's recommendation.", data.Summary.ReloginSoon))
 	}
 
 	// Check coordinators if requested
@@ -465,11 +477,11 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 	status := health.CalculateStatus(ph)
 
 	pInfo.Health = RobotHealthInfo{
-		Renewable:          ph.CredentialRenewable(),
-		Signals:            health.CredentialSignals(ph, health.DefaultHealthConfig()),
-		ReloginWarningLead: ph.ReloginWarningLead,
 		Status:             status.String(),
 		ErrorCount1h:       ph.ErrorCount1h,
+		Signals:            health.CredentialSignals(ph, health.DefaultHealthConfig()),
+		Renewable:          ph.CredentialRenewable(),
+		ReloginWarningLead: ph.ReloginWarningLead,
 	}
 
 	if !ph.TokenExpiresAt.IsZero() {
@@ -479,7 +491,7 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 			pInfo.Health.ExpiresIn = robotFormatDuration(remaining)
 		} else {
 			pInfo.Health.ExpiresIn = "expired"
-			if !ph.RateLimited(time.Now()) && !ph.CredentialRenewable() {
+			if !ph.CredentialRenewable() && !ph.RateLimited(time.Now()) {
 				pInfo.Health.Reason = "token expired"
 			}
 		}
@@ -519,7 +531,10 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 
 	// Generate recommendation (unless compact)
 	if !compact {
-		pInfo.Recommendation = generateRecommendation(pInfo)
+		pInfo.Recommendation = health.FormatRecommendation(tool, profileName, ph)
+		if pInfo.Recommendation == "" {
+			pInfo.Recommendation = generateRecommendation(pInfo)
+		}
 	}
 
 	return pInfo
@@ -533,7 +548,16 @@ func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) strin
 	// be reported as a token problem: the recorded expiry may be a stale
 	// vault snapshot, and the cap clears on its own timer (PR #82).
 	if now := time.Now(); ph.RateLimited(now) {
-		return fmt.Sprintf("rate limited (resets in %s)", robotFormatDuration(ph.RateLimitedUntil.Sub(now)))
+		reason := fmt.Sprintf("rate limited (resets in %s)", robotFormatDuration(ph.RateLimitedUntil.Sub(now)))
+		// A known non-renewable session deadline still needs action: a
+		// cooldown resetting cannot restore an expired Cursor login.
+		if !ph.CredentialRenewable() && ph.ReloginWarningLead > 0 && !ph.TokenExpiresAt.IsZero() && ph.TokenExpiresAt.Sub(now) <= ph.ReloginWarningLead {
+			if !ph.TokenExpiresAt.After(now) {
+				return reason + "; session expired; login required"
+			}
+			return reason + "; session expiring soon; login required before expiry"
+		}
+		return reason
 	}
 
 	if status == health.StatusCritical {
@@ -546,7 +570,7 @@ func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) strin
 			}
 			return reason + "; login required"
 		}
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
 			if ph.ReloginWarningLead > 0 {
 				return "session expired; login required"
 			}
@@ -555,15 +579,15 @@ func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) strin
 		if ph.ErrorCount1h >= cfg.ErrorCountCritical {
 			return fmt.Sprintf("high error rate (%d errors in 1h)", ph.ErrorCount1h)
 		}
-		if !ph.CredentialRenewable() && ph.ReloginWarningLead > 0 && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
-			return "session expiring soon; login required"
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && ph.ReloginWarningLead > 0 && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
+			return "session expiring soon; login required before expiry"
 		}
 	}
 	if status == health.StatusWarning {
-		if ph.ReloginWarningLead > 0 && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
-			return "session expiring soon; login required"
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && ph.ReloginWarningLead > 0 && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
+			return "session expiring soon; login required before expiry"
 		}
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) < 24*time.Hour {
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) < 24*time.Hour {
 			return "token expiring soon"
 		}
 		if ph.ErrorCount1h >= cfg.ErrorCountWarning {
@@ -578,6 +602,9 @@ func generateRecommendation(p RobotProfileInfo) string {
 		return fmt.Sprintf("wait for cooldown (%s remaining)", p.Cooldown.RemainingStr)
 	}
 	if p.Health.Status == "critical" {
+		if p.Health.LoginRequired != nil && *p.Health.LoginRequired {
+			return "log in again"
+		}
 		if strings.Contains(p.Health.Reason, "login required") {
 			return "log in again"
 		}
@@ -588,7 +615,7 @@ func generateRecommendation(p RobotProfileInfo) string {
 	}
 	if p.Health.Status == "warning" {
 		if strings.Contains(p.Health.Reason, "login required") {
-			return "log in again before session expires"
+			return "log in again before session expiry"
 		}
 		if strings.Contains(p.Health.Reason, "expiring") {
 			return "consider refreshing token soon"
@@ -761,7 +788,7 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 		}
 
 		// Token expiry consideration
-		if pInfo.Health.ExpiresAt != "" {
+		if pInfo.Health.ExpiresAt != "" && !pInfo.Health.Renewable {
 			if exp, err := time.Parse(time.RFC3339, pInfo.Health.ExpiresAt); err == nil {
 				remaining := exp.Sub(now)
 				if remaining > 7*24*time.Hour {
@@ -1068,7 +1095,11 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check each provider
-	for _, tool := range []string{"codex", "claude", "gemini"} {
+	for _, tool := range []string{"codex", "claude", "gemini", "cursor"} {
+		fileSetFn := tools[tool]
+		if fileSetFn == nil {
+			continue
+		}
 		profiles, err := vault.List(tool)
 		if err != nil {
 			continue
@@ -1076,12 +1107,18 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 
 		healthyCount := 0
 		totalCount := len(profiles)
+		activeProfile, _ := vault.ActiveProfile(fileSetFn())
 
 		for _, profileName := range profiles {
-			ph := buildProfileHealth(tool, profileName)
+			ph, _ := getProfileHealthWithIdentity(tool, profileName)
+			if profileName == activeProfile {
+				applyLiveExpiry(tool, ph)
+			}
 			status := health.CalculateStatus(ph)
 			if status == health.StatusHealthy {
 				healthyCount++
+			} else if recommendation := health.FormatRecommendation(tool, profileName, ph); recommendation != "" {
+				result.Suggestions = append(result.Suggestions, recommendation)
 			}
 		}
 
@@ -1711,12 +1748,14 @@ type RobotValidateData struct {
 
 // RobotValidateResult is a single validation result.
 type RobotValidateResult struct {
-	Provider  string `json:"provider"`
-	Profile   string `json:"profile"`
-	Valid     bool   `json:"valid"`
-	ExpiresAt string `json:"expires_at,omitempty"`
-	ExpiresIn string `json:"expires_in,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Provider       string `json:"provider"`
+	Profile        string `json:"profile"`
+	Valid          bool   `json:"valid"`
+	ExpiresAt      string `json:"expires_at,omitempty"`
+	ExpiresIn      string `json:"expires_in,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Recommendation string `json:"recommendation,omitempty"`
+	health.Signals
 }
 
 // RobotValidateSummary contains validation summary.
@@ -1745,7 +1784,7 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 			profileFilter = args[1]
 		}
 	} else {
-		providersToCheck = []string{"codex", "claude", "gemini"}
+		providersToCheck = []string{"codex", "claude", "gemini", "cursor"}
 	}
 
 	data := RobotValidateData{
@@ -1754,10 +1793,15 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, provider := range providersToCheck {
+		fileSetFn := tools[provider]
+		if fileSetFn == nil {
+			continue
+		}
 		profiles, err := vault.List(provider)
 		if err != nil {
 			continue
 		}
+		activeProfile, _ := vault.ActiveProfile(fileSetFn())
 
 		for _, profileName := range profiles {
 			if strings.HasPrefix(profileName, "_") {
@@ -1774,23 +1818,33 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 
 			// Get health info for token expiry
 			ph, _ := getProfileHealthWithIdentity(provider, profileName)
+			if profileName == activeProfile {
+				applyLiveExpiry(provider, ph)
+			}
+			result.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
+			result.Recommendation = health.FormatRecommendation(provider, profileName, ph)
+			result.Valid = true
 			if !ph.TokenExpiresAt.IsZero() {
 				result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
 				remaining := time.Until(ph.TokenExpiresAt)
 				if remaining > 0 {
 					result.ExpiresIn = robotFormatDuration(remaining)
-					result.Valid = true
-					data.Summary.Valid++
 				} else {
 					result.ExpiresIn = "expired"
-					result.Valid = false
-					result.Error = "token expired"
-					data.Summary.Invalid++
+					if !ph.CredentialRenewable() {
+						result.Valid = false
+						result.Error = "token expired; log in again"
+					}
 				}
-			} else {
-				// No expiry info - assume valid
-				result.Valid = true
+			}
+			if ph.ProviderRejected() {
+				result.Valid = false
+				result.Error = "provider rejected credential; log in again"
+			}
+			if result.Valid {
 				data.Summary.Valid++
+			} else {
+				data.Summary.Invalid++
 			}
 
 			data.Summary.Total++
