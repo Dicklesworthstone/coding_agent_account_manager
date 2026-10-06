@@ -1,7 +1,6 @@
 package claudesettings
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -53,7 +52,8 @@ func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Up
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
-	shared, err := Read(sharedPath)
+	inputs := make(settingsInputs)
+	shared, err := inputs.read(sharedPath)
 	if err != nil {
 		return nil, fmt.Errorf("read shared Claude settings: %w", err)
 	}
@@ -84,28 +84,31 @@ func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Up
 		if err != nil {
 			return nil, err
 		}
-		updates = append(updates, &Update{path: path, before: current[i], after: after})
+		update, err := preparedUpdate(path, current[i], after)
+		if err != nil {
+			return nil, err
+		}
+		update.inputs = inputs
+		updates = append(updates, update)
 	}
 	return updates, nil
 }
 
 // ApplyUpdates applies preflighted settings writes without rewriting unchanged
-// documents on every launch. Even a no-op checks its input for concurrent edits.
+// documents on every launch. Every source and destination is checked before
+// the first write, including no-ops. This is preflight, not multi-file atomicity.
 func ApplyUpdates(updates []*Update) error {
 	for _, update := range updates {
-		current, err := Read(update.path)
-		if err != nil {
-			return err
+		if update == nil {
+			return fmt.Errorf("nil Claude settings update")
 		}
-		if (current == nil) != (update.before == nil) || !bytes.Equal(current, update.before) {
-			return fmt.Errorf("Claude settings changed during activation; retry")
+		if err := update.checkUnchanged(); err != nil {
+			return err
 		}
 	}
 	for _, update := range updates {
-		if update.Changed() {
-			if err := update.Apply(); err != nil {
-				return err
-			}
+		if err := update.Apply(); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -207,6 +207,52 @@ type Update struct {
 	before []byte
 	after  []byte
 	detach bool
+	inputs settingsInputs
+}
+
+// settingsInputs captures each path once, including absence. In a refresh the
+// account and destination are the same file: a second read could otherwise
+// pair old account data with a newer "before" value and overwrite that edit.
+// Paths are absolute so a later working-directory change cannot retarget them.
+type settingsInputs map[string][]byte
+
+func (inputs settingsInputs) read(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if data, ok := inputs[abs]; ok {
+		return data, nil
+	}
+	data, err := Read(abs)
+	if err != nil {
+		return nil, err
+	}
+	inputs[abs] = data
+	return data, nil
+}
+
+func (u *Update) checkUnchanged() error {
+	current, err := Read(u.path)
+	if err != nil {
+		return err
+	}
+	if (current == nil) != (u.before == nil) || !bytes.Equal(current, u.before) {
+		return fmt.Errorf("Claude settings changed during activation; retry")
+	}
+	for path, before := range u.inputs {
+		current, err := Read(path)
+		if err != nil {
+			return fmt.Errorf("read Claude settings source during activation: %w", err)
+		}
+		if (current == nil) != (before == nil) || !bytes.Equal(current, before) {
+			return fmt.Errorf("Claude settings source changed during activation; retry")
+		}
+	}
+	return nil
 }
 
 // Changed reports whether the prepared document differs or a shared symlink
@@ -225,6 +271,13 @@ func (u *Update) RequirePrivateFile() {
 }
 
 func preparedUpdate(path string, before, after []byte) (*Update, error) {
+	if path == "" {
+		return nil, fmt.Errorf("Claude settings destination is required")
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("stat destination settings: %w", err)
@@ -263,25 +316,18 @@ func PrepareImport(sharedPath, accountPath, destination string, p Policy) (*Upda
 }
 
 func prepare(accountPath, sharedPath, destination string, p Policy, merge func([]byte, []byte, Policy) ([]byte, error)) (*Update, error) {
-	account, err := Read(accountPath)
+	inputs := make(settingsInputs)
+	account, err := inputs.read(accountPath)
 	if err != nil {
 		return nil, fmt.Errorf("read profile settings: %w", err)
 	}
-	live, err := Read(sharedPath)
+	live, err := inputs.read(sharedPath)
 	if err != nil {
 		return nil, fmt.Errorf("read live settings: %w", err)
 	}
-	before := live
-	if destination == accountPath {
-		// Refresh must compare against the same account snapshot it merges.
-		// Reading the destination again could bless a concurrent native login
-		// as the baseline, then overwrite it with the older account bytes.
-		before = account
-	} else if destination != sharedPath {
-		before, err = Read(destination)
-		if err != nil {
-			return nil, fmt.Errorf("read destination settings: %w", err)
-		}
+	before, err := inputs.read(destination)
+	if err != nil {
+		return nil, fmt.Errorf("read destination settings: %w", err)
 	}
 	if live == nil && account == nil && before != nil {
 		// An explicitly imported account without a settings document must
@@ -293,7 +339,12 @@ func prepare(accountPath, sharedPath, destination string, p Policy, merge func([
 	if err != nil {
 		return nil, err
 	}
-	return preparedUpdate(destination, before, merged)
+	update, err := preparedUpdate(destination, before, merged)
+	if err != nil {
+		return nil, err
+	}
+	update.inputs = inputs
+	return update, nil
 }
 
 // PrepareRefresh applies real-home policy to an isolated profile while taking
@@ -312,16 +363,13 @@ func PrepareClear(path string, p Policy) (*Update, error) {
 	return PrepareRestore("", path, p)
 }
 
-// Apply checks for edits since preparation, then writes via a private, fsynced
-// temporary file and atomic rename. It does not follow a destination symlink
-// when writing, so profile settings can never overwrite a shared source file.
+// Apply checks all source and destination inputs, then writes via a private,
+// fsynced temporary file and atomic rename. Sources are rechecked after staging
+// too: a revoked permission or rotated helper must not be silently reinstalled.
+// These checks detect intervening edits, not a filesystem-wide transaction.
 func (u *Update) Apply() error {
-	current, err := Read(u.path)
-	if err != nil {
+	if err := u.checkUnchanged(); err != nil {
 		return err
-	}
-	if (current == nil) != (u.before == nil) || !bytes.Equal(current, u.before) {
-		return fmt.Errorf("Claude settings changed during activation; retry")
 	}
 	if u.after == nil {
 		return nil
@@ -357,6 +405,9 @@ func (u *Update) Apply() error {
 		return err
 	}
 	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := u.checkUnchanged(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, u.path)
