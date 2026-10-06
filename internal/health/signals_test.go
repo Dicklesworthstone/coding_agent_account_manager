@@ -214,6 +214,21 @@ func TestCredentialSignals(t *testing.T) {
 			health:     &ProfileHealth{RateLimitedUntil: now.Add(time.Hour)},
 			refreshDue: nil, launchUsable: ptr(false), loginReq: nil,
 		},
+		{
+			name:       "Cursor API key without minted access token",
+			health:     &ProfileHealth{TokenRenewable: true, SelfRefreshing: true},
+			refreshDue: ptr(false), launchUsable: ptr(true), loginReq: ptr(false),
+		},
+		{
+			name:       "Cursor API key without token but capped",
+			health:     &ProfileHealth{TokenRenewable: true, SelfRefreshing: true, RateLimitedUntil: now.Add(time.Hour)},
+			refreshDue: ptr(false), launchUsable: ptr(false), loginReq: ptr(false),
+		},
+		{
+			name:       "renewable credential without refresh timing evidence",
+			health:     &ProfileHealth{TokenRenewable: true},
+			refreshDue: nil, launchUsable: ptr(true), loginReq: ptr(false),
+		},
 	}
 
 	for _, tc := range tests {

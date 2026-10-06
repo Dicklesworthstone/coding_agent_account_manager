@@ -146,14 +146,24 @@ func StatusReasons(h *ProfileHealth) []string {
 	// renewable-but-lapsed Codex or Grok credential.
 	if !h.TokenExpiresAt.IsZero() && !h.CredentialRenewable() {
 		ttl := h.TokenExpiresAt.Sub(now)
+		warningTTL := time.Hour
+		if h.ReloginWarningLead > warningTTL {
+			warningTTL = h.ReloginWarningLead
+		}
 		if ttl <= 0 {
-			if !rateLimited {
-				reasons = append(reasons, "Token expired")
+			if !rateLimited || h.ReloginWarningLead > 0 {
+				if h.ReloginWarningLead > 0 {
+					reasons = append(reasons, "Login expired; cannot auto-refresh, log in again")
+				} else {
+					reasons = append(reasons, "Token expired")
+				}
 			}
-		} else if h.ReloginWarningLead > 0 && ttl <= h.ReloginWarningLead {
-			reasons = append(reasons, fmt.Sprintf("Login expires in %s; cannot auto-refresh, log in again", formatDurationNatural(ttl)))
-		} else if ttl < time.Hour {
-			reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
+		} else if ttl <= warningTTL {
+			if h.ReloginWarningLead > 0 {
+				reasons = append(reasons, fmt.Sprintf("Login expires in %s; cannot auto-refresh, log in again", formatDurationNatural(ttl)))
+			} else {
+				reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
+			}
 		}
 	}
 
@@ -214,31 +224,47 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 	var recs []string
 	now := time.Now()
 
-	if health.RateLimited(now) {
+	rateLimited := health.RateLimited(now)
+	if rateLimited {
 		// A usage cap clears on its own timer. Re-authenticating does not
 		// lift it, and a login is disruptive (claude login is machine-wide),
 		// so never steer a rate-limited profile toward "caam login" (PR #82).
 		recs = append(recs, fmt.Sprintf("%s/%s is rate limited - wait %s for the cap to reset (re-login will not clear it)",
 			provider, profile, formatDurationNatural(health.RateLimitedUntil.Sub(now))))
-	} else if !health.TokenExpiresAt.IsZero() && !health.SelfRefreshing {
+	}
+	if health.ProviderRejected() {
+		if provider == "cursor" {
+			recs = append(recs, CursorReloginInstructions(profile))
+		} else {
+			recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to replace the rejected credential", provider, profile))
+		}
+	} else if (!rateLimited || health.ReloginWarningLead > 0) && !health.TokenExpiresAt.IsZero() && !health.SelfRefreshing {
 		// Check token expiry. Nothing to recommend for a self-refreshing
 		// credential: the provider's CLI renews it on next use, "caam
 		// refresh" is unsupported for it, and a re-login is disruptive.
 		ttl := health.TokenExpiresAt.Sub(now)
+		warningTTL := time.Hour
+		if !health.CredentialRenewable() && health.ReloginWarningLead > warningTTL {
+			warningTTL = health.ReloginWarningLead
+		}
 		if ttl <= 0 {
 			// A lapsed access token that still has something to renew itself
 			// with does not need a login; sending the operator through one
 			// would be disruptive and would fix nothing (issue #102).
 			if health.TokenRenewable {
 				recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to renew the lapsed access token (no re-login needed)", provider, profile))
+			} else if provider == "cursor" {
+				recs = append(recs, CursorReloginInstructions(profile))
 			} else {
 				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
 			}
-		} else if ttl < time.Hour || (!health.CredentialRenewable() && ttl <= health.ReloginWarningLead) {
+		} else if ttl <= warningTTL {
 			if health.CredentialRenewable() {
 				recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to refresh expiring token", provider, profile))
+			} else if provider == "cursor" {
+				recs = append(recs, CursorReloginInstructions(profile))
 			} else {
-				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to log in again; login cannot auto-refresh", provider, profile))
+				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" before the login expires; it cannot auto-refresh", provider, profile))
 			}
 		}
 	}
@@ -249,6 +275,16 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 	}
 
 	return strings.Join(recs, "\n")
+}
+
+// CursorReloginInstructions distinguishes vault snapshots from isolated
+// profiles: caam login accepts only isolated profiles, while a vault login
+// must be replaced through Cursor's native login and backed up again.
+func CursorReloginInstructions(profile string) string {
+	if profile == "" {
+		return "Log in again with \"cursor-agent login\"."
+	}
+	return fmt.Sprintf("For a vault profile, run \"caam activate cursor %s\", log in again with \"cursor-agent login\", then run \"caam backup cursor %s\" to save the replacement. For an isolated profile, use \"caam login cursor %s\".", profile, profile, profile)
 }
 
 // FormatPlanType returns a formatted plan type string.

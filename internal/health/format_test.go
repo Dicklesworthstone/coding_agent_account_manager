@@ -204,6 +204,53 @@ func TestSelfRefreshingFormatting(t *testing.T) {
 	}
 }
 
+func TestCursorReloginFormatting(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name       string
+		health     *ProfileHealth
+		wantReason string
+		wantLogin  bool
+	}{
+		{"healthy session", &ProfileHealth{TokenExpiresAt: now.Add(11 * 24 * time.Hour), ReloginWarningLead: CursorReloginLead}, "", false},
+		{"session in lead window", &ProfileHealth{TokenExpiresAt: now.Add(5*24*time.Hour + time.Minute), ReloginWarningLead: CursorReloginLead}, "Login expires in 5 days; cannot auto-refresh, log in again", true},
+		{"expired session", &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), ReloginWarningLead: CursorReloginLead}, "Login expired; cannot auto-refresh, log in again", true},
+		{"expired session in cooldown", &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), ReloginWarningLead: CursorReloginLead, RateLimitedUntil: now.Add(time.Hour)}, "Login expired; cannot auto-refresh, log in again", true},
+		{"API key with lapsed token", &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), TokenRenewable: true, SelfRefreshing: true}, "", false},
+		{"API key without token", &ProfileHealth{TokenRenewable: true, SelfRefreshing: true}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reasons := strings.Join(StatusReasons(tc.health), "; ")
+			if tc.wantReason == "" && reasons != "" {
+				t.Errorf("reasons = %q, want none", reasons)
+			} else if tc.wantReason != "" && !strings.Contains(reasons, tc.wantReason) {
+				t.Errorf("reasons = %q, want %q", reasons, tc.wantReason)
+			}
+			rec := FormatRecommendation("cursor", "work", tc.health)
+			if strings.Contains(rec, "caam refresh") {
+				t.Errorf("Cursor cannot use caam refresh: %q", rec)
+			}
+			if strings.Contains(rec, "caam login cursor work") != tc.wantLogin {
+				t.Errorf("recommendation = %q, wantLogin = %v", rec, tc.wantLogin)
+			}
+			if tc.wantLogin && (!strings.Contains(rec, "cursor-agent login") || !strings.Contains(rec, "caam backup cursor work")) {
+				t.Errorf("vault recovery must replace the live login and save the snapshot: %q", rec)
+			}
+			if !tc.wantLogin && rec != "" {
+				t.Errorf("healthy/renewable login recommendation = %q, want none", rec)
+			}
+		})
+	}
+}
+
+func TestCursorReloginInstructionsWithoutSavedProfile(t *testing.T) {
+	h := &ProfileHealth{TokenExpiresAt: time.Now().Add(-time.Hour), ReloginWarningLead: CursorReloginLead}
+	rec := FormatRecommendation("cursor", "", h)
+	if rec != "Log in again with \"cursor-agent login\"." {
+		t.Errorf("unbacked login recommendation = %q; must not invent a saved profile", rec)
+	}
+}
+
 func TestFormatRecommendation(t *testing.T) {
 	now := time.Now()
 
@@ -233,8 +280,15 @@ func TestFormatRecommendation(t *testing.T) {
 			name:     "Expiring token",
 			provider: "codex",
 			profile:  "work",
-			health:   &ProfileHealth{TokenExpiresAt: now.Add(30 * time.Minute)},
+			health:   &ProfileHealth{TokenExpiresAt: now.Add(30 * time.Minute), TokenRenewable: true},
 			contains: "refresh",
+		},
+		{
+			name:     "Expiring non-renewable token",
+			provider: "cursor",
+			profile:  "work",
+			health:   &ProfileHealth{TokenExpiresAt: now.Add(30 * time.Minute), ReloginWarningLead: CursorReloginLead},
+			contains: "caam login cursor work",
 		},
 		{
 			name:     "High errors",

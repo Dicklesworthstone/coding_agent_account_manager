@@ -74,9 +74,9 @@ type ProfileHealth struct {
 	RateLimitedUntil time.Time `json:"-"`
 
 	// SelfRefreshing marks TokenExpiresAt as the expiry of an access token
-	// the provider's own CLI renews in place (Claude Code, when a refresh
-	// token is present). Set at report time alongside TokenExpiresAt and
-	// never persisted: the token's TTL is then informational only and must
+	// the provider's own CLI renews in place (Claude Code with a refresh
+	// token, or Cursor with a stored API key). Set at report time alongside
+	// TokenExpiresAt and never persisted: the token's TTL is then informational only and must
 	// not lower the verdict, list a reason, or recommend a refresh caam
 	// cannot perform (PR #84).
 	SelfRefreshing bool `json:"-"`
@@ -93,7 +93,10 @@ type ProfileHealth struct {
 	// must not be reported as an expired account (issue #102).
 	TokenRenewable bool `json:"-"`
 
-	// ReloginWarningLead is a report-time warning window for human logins.
+	// ReloginWarningLead is extra warning time for a non-renewable login with a hard
+	// deadline, such as a Cursor session. Derived alongside TokenExpiresAt at
+	// report time and never persisted, so switching to an API-key credential
+	// immediately removes the relogin warning.
 	ReloginWarningLead time.Duration `json:"-"`
 }
 

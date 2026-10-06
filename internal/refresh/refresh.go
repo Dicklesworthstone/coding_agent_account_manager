@@ -27,6 +27,12 @@ func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 	if h == nil || h.TokenExpiresAt.IsZero() {
 		return false // Unknown expiry, do not assume refresh needed (avoid loops)
 	}
+	if h.SelfRefreshing || (!h.CredentialRenewable() && h.ReloginWarningLead > 0) {
+		// Cursor API keys and Claude renew through their own CLI. A Cursor
+		// session has a hard login deadline and cannot be refreshed at all.
+		// Activation must not announce or attempt a refresh for either kind.
+		return false
+	}
 
 	if threshold == 0 {
 		threshold = DefaultRefreshThreshold
@@ -74,7 +80,13 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 		err = refreshCodex(ctx, vaultPath)
 	case "gemini":
 		err = refreshGemini(ctx, provider, profile, store, vaultPath)
-	case "opencode", "cursor":
+	case "cursor":
+		info, parseErr := health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+		if parseErr == nil && info.SelfRefreshing {
+			return &UnsupportedError{Provider: provider, Reason: "cursor-agent renews tokens from the stored API key automatically"}
+		}
+		return &UnsupportedError{Provider: provider, Reason: "Cursor session logins cannot refresh. " + health.CursorReloginInstructions(profile)}
+	case "opencode":
 		// Token refresh not yet supported for these providers
 		return nil
 	default:

@@ -8,6 +8,27 @@ import (
 	"time"
 )
 
+func TestCursorReloginStateIsNotPersisted(t *testing.T) {
+	storage := NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	expiry := time.Now().Add(5 * 24 * time.Hour).Truncate(time.Second)
+	if err := storage.UpdateProfile("cursor", "work", &ProfileHealth{
+		TokenExpiresAt: expiry, ReloginWarningLead: CursorReloginLead,
+		TokenRenewable: true, SelfRefreshing: true, CredentialFingerprint: "synthetic-fingerprint",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := storage.GetProfile("cursor", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == nil || !loaded.TokenExpiresAt.Equal(expiry) {
+		t.Fatalf("stored expiry did not survive: %+v", loaded)
+	}
+	if loaded.ReloginWarningLead != 0 || loaded.TokenRenewable || loaded.SelfRefreshing || loaded.CredentialFingerprint != "" {
+		t.Errorf("report-time credential properties must be re-read from auth.json: %+v", loaded)
+	}
+}
+
 func TestNewStorage(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "health.json")

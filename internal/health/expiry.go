@@ -28,12 +28,17 @@ var ErrNoExpiry = errors.New("expiry not found in auth file")
 // ErrNoAuthFile indicates that the auth file does not exist.
 var ErrNoAuthFile = errors.New("auth file not found")
 
+// CursorReloginLead gives operators time to replace a non-renewable Cursor
+// session login before its hard deadline interrupts unattended work.
+const CursorReloginLead = 7 * 24 * time.Hour
+
 // ExpiryInfo contains parsed token expiry information.
 type ExpiryInfo struct {
 	// ExpiresAt is when the token expires.
 	ExpiresAt time.Time
 
-	// HasRefreshToken indicates if a refresh token is available.
+	// HasRefreshToken indicates that a usable refresh token is available.
+	// Cursor leaves it false: its refreshToken field cannot renew the login.
 	HasRefreshToken bool
 
 	// SelfRefreshing reports that the provider's own CLI renews this access
@@ -43,9 +48,10 @@ type ExpiryInfo struct {
 	// hours and are renewed on next use, so a short TTL is routine lifecycle
 	// rather than a fault to warn about (PR #84).
 	//
-	// It answers only "must caam stay out of the way?", which is why it is
-	// set for Claude alone. Whether a lapsed token needs a human is the
-	// separate Renewable question below.
+	// It answers only "must caam stay out of the way?". Cursor API-key logins
+	// also qualify: cursor-agent re-mints their tokens from the stored API
+	// key. Whether a lapsed token needs a human is the separate Renewable
+	// question below.
 	SelfRefreshing bool
 
 	// Renewable reports that an expired or expiring access token here can be
@@ -56,7 +62,7 @@ type ExpiryInfo struct {
 	// answer different questions and Codex answers them differently:
 	//
 	//   - "Does this credential need a refresh soon?" — SelfRefreshing says
-	//     caam must not act (Claude only). For Codex the answer is yes: caam
+	//     caam must not act. For Codex the answer is yes: caam
 	//     has a Codex refresher and a pool refresher that both run off the
 	//     expiry signal, so the warning must survive.
 	//   - "Is this account unusable until someone logs in again?" — Renewable
@@ -65,17 +71,19 @@ type ExpiryInfo struct {
 	//     it as expired made healthy profiles look dead in `caam ls` and had
 	//     controllers route around working accounts.
 	//
-	// Most providers set it from HasRefreshToken. Cursor requires a stored
-	// API key instead; its session refreshToken cannot renew the login.
+	// OAuth providers set it from HasRefreshToken. Cursor sets it only from
+	// a stored apiKey, never from its misleading refreshToken field. A
+	// self-refreshing credential is renewable by construction.
 	Renewable bool
 
-	// ReloginWarningLead widens the warning window for credentials that
-	// require a human login. Derived from the credential, never persisted.
-	ReloginWarningLead time.Duration
+	// ReloginWarningLead widens the warning window for credentials that need a human
+	// login to replace them. It is derived from the credential at report time,
+	// never persisted, and ignored for renewable credentials.
+	ReloginWarningLead time.Duration `json:"-"`
 
 	// Fingerprint identifies the credential that was parsed (see
-	// CodexCredentialFingerprint). Empty for providers that do not record
-	// provider verification.
+	// CodexCredentialFingerprint). Cursor uses it to warn once per login.
+	// Empty for providers that do not need credential identity here.
 	Fingerprint string
 
 	// Source describes where the expiry was parsed from.
@@ -408,6 +416,62 @@ func jwtExpiry(token string) time.Time {
 	return id.ExpiresAt
 }
 
+// ParseCursorExpiry reads the accessToken JWT expiry from Cursor's auth.json.
+// An empty path resolves the live credential through ResolveCursorPaths, so
+// Linux XDG, macOS and Windows use the same paths as backup and activation.
+//
+// A browser/session login cannot refresh, even when refreshToken is present
+// (it is normally the same JWT as accessToken). Only a stored apiKey lets
+// cursor-agent exchange the key for new tokens without another login. Ambient
+// CURSOR_API_KEY is deliberately not applied to saved profiles: it belongs to
+// the current process, not necessarily the account in the snapshot.
+func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		authPath = authfile.ResolveCursorPaths(homeDir, runtime.GOOS, os.Getenv).AuthFile
+	}
+
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+
+	var auth struct {
+		AccessToken string `json:"accessToken"`
+		APIKey      string `json:"apiKey"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil, fmt.Errorf("parse Cursor auth JSON: %w", err)
+	}
+
+	renewable := strings.TrimSpace(auth.APIKey) != ""
+	info := &ExpiryInfo{
+		ExpiresAt:      jwtExpiry(auth.AccessToken),
+		Renewable:      renewable,
+		SelfRefreshing: renewable,
+		Source:         authPath,
+	}
+	if info.ExpiresAt.IsZero() && !renewable {
+		return nil, ErrNoExpiry
+	}
+
+	credential := "cursor-session\x00" + auth.AccessToken
+	if renewable {
+		credential = "cursor-api-key\x00" + auth.APIKey
+	} else {
+		info.ReloginWarningLead = CursorReloginLead
+	}
+	digest := sha256.Sum256([]byte(credential))
+	info.Fingerprint = fmt.Sprintf("%x", digest)
+	return info, nil
+}
+
 // ParseGrokExpiry extracts token expiry from Grok Build's auth.json.
 //
 // Grok does not use either Codex layout. Its file is a JSON object keyed by a
@@ -460,50 +524,6 @@ func ParseGrokExpiry(authPath string) (*ExpiryInfo, error) {
 	}
 	info.Renewable = info.HasRefreshToken
 	info.Source = authPath
-	return info, nil
-}
-
-// ParseCursorExpiry reads the access JWT's deadline. Cursor's refreshToken
-// is not a renewal credential (session logins store the same JWT twice).
-// Only a stored apiKey lets cursor-agent re-mint tokens without a login.
-// Ambient API keys are deliberately ignored for saved-profile health.
-func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
-	if authPath == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		authPath = authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv).AuthFile
-	}
-	data, err := os.ReadFile(authPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNoAuthFile
-		}
-		return nil, err
-	}
-	var auth struct {
-		AccessToken string `json:"accessToken"`
-		APIKey      string `json:"apiKey"`
-	}
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return nil, fmt.Errorf("parse Cursor JSON: %w", err)
-	}
-	renewable := strings.TrimSpace(auth.APIKey) != ""
-	fingerprint := sha256.Sum256([]byte(auth.AccessToken))
-	info := &ExpiryInfo{
-		ExpiresAt:      jwtExpiry(auth.AccessToken),
-		Renewable:      renewable,
-		SelfRefreshing: renewable,
-		Source:         authPath,
-		Fingerprint:    fmt.Sprintf("%x", fingerprint),
-	}
-	if !renewable {
-		info.ReloginWarningLead = 7 * 24 * time.Hour
-	}
-	if info.ExpiresAt.IsZero() && !renewable {
-		return nil, ErrNoExpiry
-	}
 	return info, nil
 }
 
@@ -921,6 +941,9 @@ func (e *ExpiryInfo) NeedsRefresh(threshold time.Duration) bool {
 	}
 	if e == nil || e.ExpiresAt.IsZero() {
 		return false // Unknown expiry - can't determine if refresh needed
+	}
+	if e.SelfRefreshing || (e.ReloginWarningLead > 0 && !e.Renewable) {
+		return false // The provider renews it, or only another login can replace it.
 	}
 	return time.Until(e.ExpiresAt) < threshold
 }

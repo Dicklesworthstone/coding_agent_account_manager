@@ -1,15 +1,49 @@
 package refresh
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
+
+func TestRefreshCursorDoesNotReportNoOpSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{"session", `{"accessToken":"SYNTHETIC-SESSION","refreshToken":"SYNTHETIC-SESSION"}`, "caam login cursor work"},
+		{"API key", `{"apiKey":"SYNTHETIC-KEY"}`, "cursor-agent renews tokens"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := authfile.NewVault(t.TempDir())
+			path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := RefreshProfile(context.Background(), "cursor", "work", vault, nil)
+			if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("RefreshProfile error = %v, want unsupported with %q", err, tc.want)
+			}
+			after, readErr := os.ReadFile(path)
+			if readErr != nil || !bytes.Equal(after, []byte(tc.body)) {
+				t.Fatalf("unsupported refresh changed auth.json: read error = %v", readErr)
+			}
+		})
+	}
+}
 
 // =============================================================================
 // ShouldRefresh Tests
@@ -31,6 +65,44 @@ func TestShouldRefresh_ZeroExpiry(t *testing.T) {
 	result := ShouldRefresh(h, DefaultRefreshThreshold)
 	if result {
 		t.Error("ShouldRefresh with zero expiry = true, want false")
+	}
+}
+
+func TestShouldRefresh_CredentialPolicy(t *testing.T) {
+	expiry := time.Now().Add(5 * time.Minute)
+	for _, tc := range []struct {
+		name   string
+		health health.ProfileHealth
+		want   bool
+	}{
+		{
+			name:   "Cursor session needs a login",
+			health: health.ProfileHealth{TokenExpiresAt: expiry, ReloginWarningLead: 7 * 24 * time.Hour},
+		},
+		{
+			name:   "Cursor API key renews through cursor-agent",
+			health: health.ProfileHealth{TokenExpiresAt: expiry, TokenRenewable: true, SelfRefreshing: true},
+		},
+		{
+			name:   "Claude self-refresh remains CLI-owned",
+			health: health.ProfileHealth{TokenExpiresAt: expiry, SelfRefreshing: true},
+		},
+		{
+			name:   "caam-owned renewable token can refresh",
+			health: health.ProfileHealth{TokenExpiresAt: expiry, TokenRenewable: true},
+			want:   true,
+		},
+		{
+			name:   "stale relogin lead cannot block a renewable token",
+			health: health.ProfileHealth{TokenExpiresAt: expiry, TokenRenewable: true, ReloginWarningLead: 7 * 24 * time.Hour},
+			want:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ShouldRefresh(&tc.health, 0); got != tc.want {
+				t.Errorf("ShouldRefresh = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -110,12 +110,15 @@ func CalculateStatus(health *ProfileHealth) HealthStatus {
 // CalculateHealth performs detailed health scoring based on multiple factors.
 // Returns the status and the raw numerical score.
 func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float64) {
+	return calculateHealthAt(h, config, time.Now())
+}
+
+func calculateHealthAt(h *ProfileHealth, config HealthConfig, now time.Time) (HealthStatus, float64) {
 	if h == nil {
 		return StatusUnknown, 0
 	}
 
 	score := 0.0
-	now := time.Now()
 	warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
 	if !h.CredentialRenewable() && h.ReloginWarningLead > warningTTL {
 		warningTTL = h.ReloginWarningLead
@@ -130,7 +133,7 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score += 1.0
 	} else if h.TokenExpiresAt.IsZero() {
 		// Unknown expiry - neutral
-	} else if h.TokenExpiresAt.Before(now) {
+	} else if !h.TokenExpiresAt.After(now) {
 		score -= 1.0 // Expired
 	} else {
 		ttl := h.TokenExpiresAt.Sub(now)
@@ -184,8 +187,8 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	// months-old access-token expiry that the CLI renews on next use
 	// (issue #102).
 	if !h.TokenExpiresAt.IsZero() && !h.CredentialRenewable() {
-		if h.TokenExpiresAt.Before(now) {
-			if h.RateLimited(now) {
+		if !h.TokenExpiresAt.After(now) {
+			if h.RateLimited(now) && h.ReloginWarningLead <= 0 {
 				// An active rate-limit cooldown outranks the recorded expiry:
 				// the account recovers on the reset timer, not via re-login,
 				// and the expiry timestamp may come from a stale vault
@@ -203,7 +206,7 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 			if criticalTTL > 0 && ttl <= criticalTTL {
 				status = StatusCritical
 			} else if warningTTL > 0 && ttl <= warningTTL {
-				// If within warning window (e.g. < 1h), ensure at least Warning
+				// Include the longer lead for logins that only a human can replace.
 				if status == StatusHealthy {
 					status = StatusWarning
 				}
