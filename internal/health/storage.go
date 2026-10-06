@@ -92,6 +92,9 @@ type ProfileHealth struct {
 	// expiry (it has a Codex refresher), but a lapsed-yet-refreshable token
 	// must not be reported as an expired account (issue #102).
 	TokenRenewable bool `json:"-"`
+
+	// ReloginWarningLead is a report-time warning window for human logins.
+	ReloginWarningLead time.Duration `json:"-"`
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.

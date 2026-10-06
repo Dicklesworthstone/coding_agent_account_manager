@@ -11,6 +11,54 @@ func envMap(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
+func TestCursorActiveProfileIgnoresConfigChurn(t *testing.T) {
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.json")
+	config := filepath.Join(dir, "cli-config.json")
+	settings := filepath.Join(dir, "settings.json")
+	set := AuthFileSet{Tool: "cursor", AllowOptionalOnly: true, Files: []AuthFileSpec{
+		{Path: config}, {Path: auth}, {Path: settings},
+	}}
+	for path, data := range map[string]string{auth: `{"accessToken":"session-a","refreshToken":"session-a"}`, config: `{"model":"a"}`, settings: `{"theme":"a"}`} {
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	if err := vault.Backup(set, "work"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{config, settings} {
+		if err := os.WriteFile(path, []byte(`{"changed":true}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := vault.ActiveProfile(set); err != nil || got != "work" {
+		t.Fatalf("after churn = %q, %v", got, err)
+	}
+	if err := os.WriteFile(auth, []byte(`{"accessToken":"session-b"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := vault.ActiveProfile(set); err != nil || got != "" {
+		t.Fatalf("different login = %q, %v", got, err)
+	}
+
+	// A config-only/keychain profile still matches optional config files.
+	configOnly := AuthFileSet{Tool: "cursor", AllowOptionalOnly: true, Files: []AuthFileSpec{{Path: config}, {Path: settings}}}
+	if err := vault.Backup(configOnly, "keychain"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := vault.ActiveProfile(configOnly); err != nil || got != "keychain" {
+		t.Fatalf("config-only = %q, %v", got, err)
+	}
+	if err := os.WriteFile(config, []byte(`{"changed":"again"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := vault.ActiveProfile(configOnly); err != nil || got != "" {
+		t.Fatalf("config-only churn = %q, %v", got, err)
+	}
+}
+
 func TestResolveCursorPaths(t *testing.T) {
 	home := filepath.Join("/h", "u")
 	tests := []struct {

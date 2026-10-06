@@ -150,6 +150,8 @@ func StatusReasons(h *ProfileHealth) []string {
 			if !rateLimited {
 				reasons = append(reasons, "Token expired")
 			}
+		} else if h.ReloginWarningLead > 0 && ttl <= h.ReloginWarningLead {
+			reasons = append(reasons, fmt.Sprintf("Login expires in %s; cannot auto-refresh, log in again", formatDurationNatural(ttl)))
 		} else if ttl < time.Hour {
 			reasons = append(reasons, fmt.Sprintf("Token expires in %s", formatDurationNatural(ttl)))
 		}
@@ -232,8 +234,12 @@ func FormatRecommendation(provider, profile string, health *ProfileHealth) strin
 			} else {
 				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to re-authenticate", provider, profile))
 			}
-		} else if ttl < time.Hour {
-			recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to refresh expiring token", provider, profile))
+		} else if ttl < time.Hour || (!health.CredentialRenewable() && ttl <= health.ReloginWarningLead) {
+			if health.CredentialRenewable() {
+				recs = append(recs, fmt.Sprintf("Run \"caam refresh %s %s\" to refresh expiring token", provider, profile))
+			} else {
+				recs = append(recs, fmt.Sprintf("Run \"caam login %s %s\" to log in again; login cannot auto-refresh", provider, profile))
+			}
 		}
 	}
 

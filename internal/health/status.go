@@ -116,6 +116,10 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 
 	score := 0.0
 	now := time.Now()
+	warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
+	if !h.CredentialRenewable() && h.ReloginWarningLead > warningTTL {
+		warningTTL = h.ReloginWarningLead
+	}
 
 	// Factor 1: Token expiry (primary)
 	if h.CredentialRenewable() {
@@ -131,7 +135,7 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	} else {
 		ttl := h.TokenExpiresAt.Sub(now)
 		switch {
-		case ttl > time.Duration(config.TokenExpiryWarningMinutes)*time.Minute:
+		case ttl > warningTTL:
 			score += 1.0 // Healthy
 		case ttl > time.Duration(config.TokenExpiryCriticalMinutes)*time.Minute:
 			score += 0.5 // Warning zone
@@ -196,7 +200,6 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		} else {
 			ttl := h.TokenExpiresAt.Sub(now)
 			criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
-			warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
 			if criticalTTL > 0 && ttl <= criticalTTL {
 				status = StatusCritical
 			} else if warningTTL > 0 && ttl <= warningTTL {

@@ -1,9 +1,52 @@
 package health
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestCursorSessionHealthBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		want HealthStatus
+	}{
+		{"outside lead", 7*24*time.Hour + time.Minute, StatusHealthy},
+		{"at lead", 7 * 24 * time.Hour, StatusWarning},
+		{"inside lead", 6 * 24 * time.Hour, StatusWarning},
+		{"critical", 10 * time.Minute, StatusCritical},
+		{"expiry boundary", 0, StatusCritical},
+		{"expired", -time.Hour, StatusCritical},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProfileHealth{TokenExpiresAt: time.Now().Add(tc.ttl), ReloginWarningLead: 7 * 24 * time.Hour, PlanType: "enterprise"}
+			if got := CalculateStatus(h); got != tc.want {
+				t.Fatalf("status = %v, want %v", got, tc.want)
+			}
+			signals := CredentialSignals(h, DefaultHealthConfig())
+			if signals.RefreshDue == nil || *signals.RefreshDue {
+				t.Fatal("session must never request refresh")
+			}
+			if signals.LoginRequired == nil || *signals.LoginRequired != (tc.ttl <= 0) {
+				t.Fatalf("login signal = %+v", signals)
+			}
+			if tc.want != StatusHealthy {
+				rec := FormatRecommendation("cursor", "work", h)
+				if !strings.Contains(rec, "caam login cursor work") || strings.Contains(rec, "caam refresh") {
+					t.Fatalf("recommendation = %s", rec)
+				}
+			}
+			h.TokenRenewable, h.SelfRefreshing = true, true
+			if got := CalculateStatus(h); got != StatusHealthy {
+				t.Fatalf("API key status = %v", got)
+			}
+			if rec := FormatRecommendation("cursor", "work", h); rec != "" {
+				t.Fatalf("API key recommendation = %s", rec)
+			}
+		})
+	}
+}
 
 func TestCalculateHealth(t *testing.T) {
 	now := time.Now()

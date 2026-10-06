@@ -6,10 +6,94 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
+
+func TestParseCursorExpiry(t *testing.T) {
+	exp := time.Now().Add(11 * 24 * time.Hour).Truncate(time.Second)
+	token := unsignedJWT(t, map[string]any{"type": "session", "exp": exp.Unix()})
+	for _, tc := range []struct {
+		name, access, key string
+		wantErr           bool
+	}{
+		{"session", token, "", false},
+		{"API key", token, "synthetic-key", false},
+		{"key only", "", "synthetic-key", false},
+		{"malformed session", "invalid", "", true},
+		{"missing exp", unsignedJWT(t, map[string]any{"type": "session"}), "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			data, err := json.Marshal(map[string]string{"accessToken": tc.access, "refreshToken": tc.access, "apiKey": tc.key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := ParseCursorExpiry(path)
+			if tc.wantErr {
+				if !errors.Is(err, ErrNoExpiry) {
+					t.Fatalf("error = %v, want ErrNoExpiry", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Renewable != (tc.key != "") || info.SelfRefreshing != (tc.key != "") || info.HasRefreshToken {
+				t.Fatalf("incorrect renewal semantics: %+v", info)
+			}
+			if tc.access != "" && !info.ExpiresAt.Equal(exp) {
+				t.Fatalf("expiry = %v, want %v", info.ExpiresAt, exp)
+			}
+			if tc.key == "" && info.ReloginWarningLead != 7*24*time.Hour {
+				t.Fatal("missing session lead")
+			}
+			if tc.key != "" && info.ReloginWarningLead != 0 {
+				t.Fatal("API key should not warn for relogin")
+			}
+		})
+	}
+	if _, err := ParseCursorExpiry(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, ErrNoAuthFile) {
+		t.Fatalf("missing error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(path, []byte(`{`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCursorExpiry(path); err == nil || errors.Is(err, ErrNoExpiry) {
+		t.Fatalf("JSON error = %v", err)
+	}
+
+	t.Run("live platform path", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+		t.Setenv("APPDATA", filepath.Join(home, "appdata"))
+		t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(home, "config-only"))
+		path := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv).AuthFile
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(map[string]string{"accessToken": token, "refreshToken": token})
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := ParseCursorExpiry("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Source != path || !info.ExpiresAt.Equal(exp) {
+			t.Fatalf("live parse = %+v", info)
+		}
+	})
+}
 
 func TestParseOAuthFile(t *testing.T) {
 	testdata := "testdata"

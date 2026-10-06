@@ -5,6 +5,7 @@
 package health
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
@@ -66,6 +68,10 @@ type ExpiryInfo struct {
 	// Every provider sets it from HasRefreshToken; a self-refreshing
 	// credential is renewable by construction.
 	Renewable bool
+
+	// ReloginWarningLead widens the warning window for credentials that
+	// require a human login. Derived from the credential, never persisted.
+	ReloginWarningLead time.Duration
 
 	// Fingerprint identifies the credential that was parsed (see
 	// CodexCredentialFingerprint). Empty for providers that do not record
@@ -457,6 +463,50 @@ func ParseGrokExpiry(authPath string) (*ExpiryInfo, error) {
 	return info, nil
 }
 
+// ParseCursorExpiry reads the access JWT's deadline. Cursor's refreshToken
+// is not a renewal credential (session logins store the same JWT twice).
+// Only a stored apiKey lets cursor-agent re-mint tokens without a login.
+// Ambient API keys are deliberately ignored for saved-profile health.
+func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
+	if authPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		authPath = authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv).AuthFile
+	}
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+	var auth struct {
+		AccessToken string `json:"accessToken"`
+		APIKey      string `json:"apiKey"`
+	}
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return nil, fmt.Errorf("parse Cursor JSON: %w", err)
+	}
+	renewable := strings.TrimSpace(auth.APIKey) != ""
+	fingerprint := sha256.Sum256([]byte(auth.AccessToken))
+	info := &ExpiryInfo{
+		ExpiresAt:      jwtExpiry(auth.AccessToken),
+		Renewable:      renewable,
+		SelfRefreshing: renewable,
+		Source:         authPath,
+		Fingerprint:    fmt.Sprintf("%x", fingerprint),
+	}
+	if !renewable {
+		info.ReloginWarningLead = 7 * 24 * time.Hour
+	}
+	if info.ExpiresAt.IsZero() && !renewable {
+		return nil, ErrNoExpiry
+	}
+	return info, nil
+}
+
 // parseGrokAuthJSON extracts expiry info from the contents of a Grok
 // auth.json in either the flat or the dynamic-key layout.
 func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
@@ -835,6 +885,9 @@ func ParseAllExpiry() map[string]*ExpiryInfo {
 	}
 	if info, err := ParseGeminiExpiry(""); err == nil {
 		results["gemini"] = info
+	}
+	if info, err := ParseCursorExpiry(""); err == nil {
+		results["cursor"] = info
 	}
 
 	return results

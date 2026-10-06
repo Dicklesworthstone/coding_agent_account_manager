@@ -1209,6 +1209,14 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 			continue
 		}
 		base := filepath.Base(spec.Path)
+		// Cursor rewrites config files on model changes. When file-backed
+		// auth exists, it alone identifies the active login; without it retain
+		// optional config matching for keychain-backed macOS logins.
+		if fileSet.Tool == "cursor" && base == "auth.json" {
+			requiredFound = true
+			currentHashes[base] = hash
+			continue
+		}
 		if spec.Required {
 			requiredFound = true
 			currentHashes[base] = hash
