@@ -20,16 +20,7 @@ import (
 
 // claudeAccountKeys are stripped when seeding from the real HOME. The userID
 // installation identifier is deliberately shared, not an account identifier.
-var claudeAccountKeys = []string{
-	"oauthAccount",
-	"oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey",
-	"cachedUsageUtilization",
-	"modelAccessCache",
-	"orgModelDefaultCache",
-	"passesEligibilityCache",
-	"passesLastSeenRemaining",
-	"cachedExtraUsageDisabledReason",
-}
+var claudeAccountKeys = claudesettings.LegacyAccountKeys()
 
 // Keep enrollment's account/shared invariant tied to the common classifier,
 // not a second independently maintained list of refreshable preferences.
@@ -37,10 +28,14 @@ var claudeSharedPreferenceKeys = claudesettings.LegacySharedPolicyKeys()
 
 // seedClaudeJSONFromRealHome returns the bytes to write as a fresh profile's
 // .claude.json when the seed is the user's real ~/.claude.json: the file with
-// claudeAccountKeys removed. A source that is not a JSON object cannot carry
-// an identity, so it is returned verbatim.
+// known and configured private fields removed by the common classifier.
+// Preserve the legacy non-object seed behavior; launch validation rejects it.
 func seedClaudeJSONFromRealHome(src string) ([]byte, error) {
 	raw, err := os.ReadFile(src)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := claudesettings.LoadPolicy()
 	if err != nil {
 		return nil, err
 	}
@@ -48,10 +43,7 @@ func seedClaudeJSONFromRealHome(src string) ([]byte, error) {
 	if json.Unmarshal(raw, &state) != nil || state == nil {
 		return raw, nil
 	}
-	for _, k := range claudeAccountKeys {
-		delete(state, k)
-	}
-	return marshalClaudeJSON(state)
+	return claudesettings.SeedLegacy(raw, policy)
 }
 
 // SyncClaudeConfig prepares both Claude documents before writing either one.
@@ -92,8 +84,8 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 }
 
 // EnsureClaudeSettingsPrivate repairs old host-settings symlinks even when the
-// caller opts out of policy refresh. A private settings document is validated
-// without rewriting it, so --no-sync-config preserves the profile's policy.
+// caller opts out of policy refresh. Both documents must be valid and private
+// before any repair is applied; --no-sync-config is not an auth-isolation bypass.
 func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 	home, err := m.HomeFor(name)
 	if err != nil {
@@ -107,20 +99,30 @@ func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 	if err != nil {
 		return err
 	}
+	sharedSettings, sharedLegacy := claudesettings.SharedPaths(m.realHome)
+	legacy, err := claudesettings.PreparePrivate(
+		filepath.Join(home, ".claude.json"), sharedLegacy, filepath.Join(m.realHome, ".claude.json"),
+	)
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(home, ".claude", "settings.json")
 	account, err := m.claudeSettingsAccountPath(home)
 	if err != nil {
 		return err
 	}
-	if account != "" {
-		_, err := claudesettings.PrepareRefresh(path, path, policy)
-		return err
+	var settings *claudesettings.Update
+	if account == "" {
+		settings, err = m.prepareClaudeSettings(home, policy)
+	} else {
+		settings, err = claudesettings.PreparePrivate(
+			path, sharedSettings, filepath.Join(m.realHome, ".claude", "settings.json"),
+		)
 	}
-	settings, err := m.prepareClaudeSettings(home, policy)
 	if err != nil {
 		return err
 	}
-	return settings.Apply()
+	return claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy})
 }
 
 func (m *Manager) writeClaudeSettings(home string, opts CreateOptions) error {

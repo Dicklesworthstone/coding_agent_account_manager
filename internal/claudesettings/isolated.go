@@ -20,6 +20,22 @@ func SharedPath(home string) string {
 // authentication source. Atomic rename protects a symlink's referent on write,
 // but by itself does not prevent reading another account's auth through it.
 func CheckPrivate(path, sharedPath string) error {
+	if path == "" {
+		return fmt.Errorf("Claude profile settings path is required")
+	}
+	if sharedPath != "" {
+		private, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		shared, err := filepath.Abs(sharedPath)
+		if err != nil {
+			return err
+		}
+		if private == shared {
+			return fmt.Errorf("Claude profile settings aliases the shared file: %s", path)
+		}
+	}
 	for _, candidate := range []string{filepath.Dir(path), path} {
 		info, err := os.Lstat(candidate)
 		if os.IsNotExist(err) {
@@ -41,6 +57,43 @@ func CheckPrivate(path, sharedPath string) error {
 		return fmt.Errorf("Claude profile settings aliases the shared file: %s", path)
 	}
 	return nil
+}
+
+// PreparePrivate validates an isolated document without refreshing policy,
+// reformatting it, or reading any canonical document's contents. Opting out of
+// sync must not opt out of the auth boundary. Missing private files stay absent.
+// The guards are rechecked by Apply, including when the bytes are unchanged.
+func PreparePrivate(path string, sharedPaths ...string) (*Update, error) {
+	// The empty entry still checks the private path when there is no host file.
+	guards := []string{""}
+	for _, shared := range sharedPaths {
+		if shared == "" {
+			continue
+		}
+		abs, err := filepath.Abs(shared)
+		if err != nil {
+			return nil, err
+		}
+		guards = append(guards, abs)
+	}
+	for _, shared := range guards {
+		if err := CheckPrivate(path, shared); err != nil {
+			return nil, err
+		}
+	}
+	before, err := Read(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := object(before); err != nil {
+		return nil, fmt.Errorf("private Claude settings %s: %w", path, err)
+	}
+	update, err := preparedUpdate(path, before, before)
+	if err != nil {
+		return nil, err
+	}
+	update.privateSources = guards
+	return update, nil
 }
 
 // PrepareIsolatedSettings refreshes all settings locations for ONE isolated

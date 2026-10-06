@@ -92,6 +92,22 @@ workflow policy. Mode and key overrides survive normal config saves such as
 changing aliases, defaults or workspaces. Invalid modes or unsafe environment
 exceptions are rejected on both load and save.
 
+### New shallow profiles
+
+An implicit real-home `.claude.json` seed obeys the same account classification
+at creation, before the first launch. It excludes known credentials, helpers,
+account caches and every configured `profile_keys` field. Its `env` object is
+private by default; only explicitly approved `shared_env_keys` are seeded.
+This prevents a fresh profile from inheriting host-only MCP headers, hook
+commands or project settings that the operator marked private. Other existing
+onboarding/preference bootstrap behavior is retained in shared mode.
+
+In `per-profile` mode, a fresh implicit seed carries only the installation
+`userID` and `hasCompletedOnboarding` markers, unless those keys are themselves
+configured private. It does not adopt the host's workflow policy as the new
+account's private policy. An explicitly selected `.claude.json` snapshot remains
+an account-owned source, not an implicit host seed.
+
 ## Isolated and shallow launches
 
 Isolated and shallow Claude sessions prepare shared settings before native
@@ -128,9 +144,22 @@ destination after preparation are rejected, and a semantically unchanged legacy
 file is not reformatted on every spawn. Change reports identify keys rather than
 printing potentially credential-bearing values.
 
-`shallow-spawn --no-sync-config` skips policy refresh, but still requires a valid,
-private settings file and repairs recognized shared links. `shallow-spawn
---print-env` and `caam env` are read-only. The latter supports safely quoted shell
+Prepared updates also capture their shared-policy and selected-account source
+files, including absence. If a source is edited, removed or created before
+application, activation fails instead of reinstalling revoked permissions or
+stale authentication settings. Batch updates check all inputs before the first
+write, and each file is checked again after staging. These are optimistic edit
+checks: they do not lock the native CLI or guarantee a multi-file transaction.
+
+`shallow-spawn --no-sync-config` skips policy refresh, not identity isolation.
+It validates both private `settings.json` and `.claude.json` before repairing
+any recognized shared settings link. A symlinked, host-hard-linked or malformed
+`.claude.json` stops launch. Existing valid private documents are not reformatted
+or refreshed, missing private files remain absent, and canonical policy content
+is not read unless a settings link needs repair. Path privacy is rechecked when
+applying the prepared validation, even if the file's bytes have not changed.
+
+`shallow-spawn --print-env` and `caam env` are read-only. The latter supports safely quoted shell
 output and a data-only JSON representation with `--json` (`set` and `unset`
 fields); it does not trigger profile preparation or legacy store migration.
 
@@ -148,3 +177,8 @@ the live file, keep credential-bearing fields out of that reconciliation, and
 retain backups. Subsequent vault switches preserve that live policy. Do not copy
 one entire account's settings over every vault snapshot: that can duplicate
 `apiKeyHelper` or environment-based authentication across accounts.
+
+New private-key exceptions cannot establish the provenance of fields already
+copied into an older profile. Review those profile-owned values against that
+account's trusted settings; CAAM must not guess that an existing private helper,
+MCP header or hook secret belongs to the currently selected host account.

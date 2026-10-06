@@ -28,6 +28,71 @@ var legacyAuthKeys = []string{
 	"oauthAccount", "oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey",
 }
 
+var legacyAccountCacheKeys = []string{
+	"cachedUsageUtilization", "modelAccessCache", "orgModelDefaultCache",
+	"passesEligibilityCache", "passesLastSeenRemaining", "cachedExtraUsageDisabledReason",
+}
+
+// LegacyAccountKeys returns the known authentication and account-cache fields
+// excluded from an implicit real-home seed. Callers get an independent copy.
+func LegacyAccountKeys() []string {
+	keys := append([]string(nil), authKeys...)
+	keys = append(keys, legacyAuthKeys...)
+	return append(keys, legacyAccountCacheKeys...)
+}
+
+// SeedLegacy keeps enrollment's onboarding/preference bootstrap while removing
+// known or configured account state. In particular, a private MCP/hook/project
+// exception must take effect at creation, not just on the first refresh. This
+// is only for an implicit host seed; an explicit snapshot is account-owned.
+func SeedLegacy(data []byte, p Policy) ([]byte, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	state, err := object(data)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	env := envOf(state)
+	if p.Mode == "per-profile" {
+		// Only installation/readiness markers bootstrap a fresh private-policy
+		// profile. Never seed the host's workflow choices as that account's own.
+		seed := make(map[string]json.RawMessage)
+		for _, key := range []string{"userID", "hasCompletedOnboarding"} {
+			if value, ok := state[key]; ok && !p.scoped(key) {
+				seed[key] = value
+			}
+		}
+		state = seed
+	} else {
+		for _, key := range LegacyAccountKeys() {
+			delete(state, key)
+		}
+		for key := range state {
+			if p.scoped(key) {
+				delete(state, key)
+			}
+		}
+		sharedEnv := make(map[string]json.RawMessage)
+		for _, key := range p.SharedEnvKeys {
+			if value, ok := env[key]; ok {
+				sharedEnv[key] = value
+			}
+		}
+		if len(sharedEnv) > 0 {
+			state["env"], _ = json.Marshal(sharedEnv)
+		}
+	}
+	result, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(result, '\n'), nil
+}
+
 // LegacySharedPolicyKeys returns an independent copy of the legacy workflow
 // allowlist for callers checking enrollment invariants. MergeLegacy remains
 // the authority for applying policy, including configurable profile scopes.

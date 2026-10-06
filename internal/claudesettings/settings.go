@@ -208,6 +208,9 @@ type Update struct {
 	after  []byte
 	detach bool
 	inputs settingsInputs
+	// Non-empty only for read-only validation of an isolated document. Each
+	// entry is a canonical host path that must not alias this private file.
+	privateSources []string
 }
 
 // settingsInputs captures each path once, including absence. In a refresh the
@@ -236,6 +239,11 @@ func (inputs settingsInputs) read(path string) ([]byte, error) {
 }
 
 func (u *Update) checkUnchanged() error {
+	for _, shared := range u.privateSources {
+		if err := CheckPrivate(u.path, shared); err != nil {
+			return err
+		}
+	}
 	current, err := Read(u.path)
 	if err != nil {
 		return err
