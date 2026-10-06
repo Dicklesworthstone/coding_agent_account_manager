@@ -22,7 +22,7 @@ type Policy struct {
 }
 
 var authKeys = []string{
-	"apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+	"apiKeyHelper", "apiKey", "api_key", "awsAuthRefresh", "awsCredentialExport",
 	"forceLoginMethod", "forceLoginOrgUUID", "otelHeadersHelper",
 }
 
@@ -48,6 +48,14 @@ func (p Policy) Validate() error {
 
 func sensitiveEnv(key string) bool {
 	key = strings.ToUpper(key)
+	// Known model/effort controls are not credentials or backend selectors.
+	// They still require explicit opt-in; prefix filtering must not make the
+	// documented non-auth environment controls impossible to share.
+	switch key {
+	case "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_MAX_OUTPUT_TOKENS":
+		return false
+	}
 	for _, prefix := range []string{"ANTHROPIC_", "AWS_", "GOOGLE_", "GCLOUD_", "CLOUD_ML_", "AZURE_", "CLAUDE_CODE_USE_"} {
 		if strings.HasPrefix(key, prefix) {
 			return true
@@ -215,37 +223,42 @@ func Read(path string) ([]byte, error) {
 // PrepareRestore plans a vault-to-live activation, even if the snapshot has no
 // settings file. In that case account fields are removed, not carried over.
 func PrepareRestore(snapshotPath, livePath string, p Policy) (*Update, error) {
-	account, err := Read(snapshotPath)
+	return prepare(snapshotPath, livePath, livePath, p, Merge)
+}
+
+// PrepareImport combines canonical shared policy with an explicitly selected
+// auth source, rather than treating the destination's previous auth as current.
+func PrepareImport(sharedPath, accountPath, destination string, p Policy) (*Update, error) {
+	return prepare(accountPath, sharedPath, destination, p, Merge)
+}
+
+func prepare(accountPath, sharedPath, destination string, p Policy, merge func([]byte, []byte, Policy) ([]byte, error)) (*Update, error) {
+	account, err := Read(accountPath)
 	if err != nil {
 		return nil, fmt.Errorf("read profile settings: %w", err)
 	}
-	live, err := Read(livePath)
+	live, err := Read(sharedPath)
 	if err != nil {
 		return nil, fmt.Errorf("read live settings: %w", err)
 	}
-	merged, err := Merge(live, account, p)
+	merged, err := merge(live, account, p)
 	if err != nil {
 		return nil, err
 	}
-	return &Update{path: livePath, before: live, after: merged}, nil
+	before := live
+	if destination != sharedPath {
+		before, err = Read(destination)
+		if err != nil {
+			return nil, fmt.Errorf("read destination settings: %w", err)
+		}
+	}
+	return &Update{path: destination, before: before, after: merged}, nil
 }
 
 // PrepareRefresh applies real-home policy to an isolated profile while taking
 // auth only from that profile. It never copies the real home's credentials.
 func PrepareRefresh(sharedPath, profilePath string, p Policy) (*Update, error) {
-	shared, err := Read(sharedPath)
-	if err != nil {
-		return nil, err
-	}
-	account, err := Read(profilePath)
-	if err != nil {
-		return nil, err
-	}
-	merged, err := Merge(shared, account, p)
-	if err != nil {
-		return nil, err
-	}
-	return &Update{path: profilePath, before: account, after: merged}, nil
+	return PrepareImport(sharedPath, profilePath, profilePath, p)
 }
 
 // PrepareClear scrubs account fields on logout without deleting policy. The
@@ -298,4 +311,23 @@ func (u *Update) Apply() error {
 		return err
 	}
 	return os.Rename(tmp, u.path)
+}
+
+// PrepareAPIKeyHelper changes only this profile's helper during enrollment;
+// setup must not erase already initialized permissions, MCP or hook policy.
+func PrepareAPIKeyHelper(path, helper string) (*Update, error) {
+	before, err := Read(path)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := object(before)
+	if err != nil {
+		return nil, err
+	}
+	obj["apiKeyHelper"], _ = json.Marshal(helper)
+	after, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return &Update{path: path, before: before, after: append(after, '\n')}, nil
 }

@@ -1,11 +1,7 @@
 package authfile
 
-// Tests for issue #55: Claude Code plugin state must survive account switches.
-// Plugin content, marketplaces, and install records live under
-// ~/.claude/plugins/ (shared; caam never touches them), but plugin ENABLEMENT
-// lives in ~/.claude/settings.json, which caam swaps per account. Restore
-// therefore merges: the vault snapshot is written, but the LIVE machine's
-// enabledPlugins key (value or absence) wins.
+// Regressions for issues #55 and #115: plugin enablement and other live
+// workflow policy must survive switches, while account authentication changes.
 
 import (
 	"encoding/json"
@@ -21,6 +17,7 @@ import (
 func claudeSettingsFixture(t *testing.T, vaultSettings, liveSettings string) (*Vault, AuthFileSet, string) {
 	t.Helper()
 	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	vaultDir := filepath.Join(tmp, "vault")
 	home := filepath.Join(tmp, "home")
 
@@ -70,9 +67,8 @@ func readJSONMap(t *testing.T, path string) map[string]interface{} {
 }
 
 func TestRestorePreservesLiveEnabledPlugins(t *testing.T) {
-	// Bob's snapshot predates any plugin install; the live machine (alice
-	// active) has plugins enabled. After activating bob, plugins must still be
-	// enabled — but bob's own settings must otherwise win.
+	// Bob's snapshot predates any plugin install. Both live plugin enablement
+	// and live model choice must survive, but bob's helper must replace auth.
 	vault, fileSet, livePath := claudeSettingsFixture(t,
 		`{"model":"opus-bob","apiKeyHelper":"/bin/bob-helper"}`,
 		`{"model":"opus-alice","enabledPlugins":{"frontend-design@official":true,"playwright@official":false}}`,
@@ -83,8 +79,8 @@ func TestRestorePreservesLiveEnabledPlugins(t *testing.T) {
 	}
 
 	got := readJSONMap(t, livePath)
-	if got["model"] != "opus-bob" {
-		t.Errorf("model = %v, want bob's snapshot value", got["model"])
+	if got["model"] != "opus-alice" {
+		t.Errorf("model = %v, want the live value", got["model"])
 	}
 	if got["apiKeyHelper"] != "/bin/bob-helper" {
 		t.Errorf("apiKeyHelper = %v, want bob's snapshot value", got["apiKeyHelper"])
@@ -115,8 +111,8 @@ func TestRestoreDropsSnapshotPluginsWhenLiveHasNone(t *testing.T) {
 	if _, exists := got["enabledPlugins"]; exists {
 		t.Errorf("enabledPlugins resurrected from stale snapshot: %v", got)
 	}
-	if got["model"] != "opus-bob" {
-		t.Errorf("model = %v, want bob's snapshot value", got["model"])
+	if got["model"] != "opus-alice" {
+		t.Errorf("model = %v, want the live value", got["model"])
 	}
 }
 
@@ -133,42 +129,41 @@ func TestRestoreSettingsVerbatimWhenNoLiveFile(t *testing.T) {
 	got := readJSONMap(t, livePath)
 	plugins, ok := got["enabledPlugins"].(map[string]interface{})
 	if !ok || plugins["kept@official"] != true {
-		t.Errorf("with no live file the snapshot restores verbatim, got %v", got)
+		t.Errorf("with no live file the snapshot bootstraps settings, got %v", got)
 	}
 }
 
-func TestRestoreSettingsVerbatimWhenLiveUnparseable(t *testing.T) {
+func TestRestoreRejectsUnparseableLiveSettings(t *testing.T) {
 	vault, fileSet, livePath := claudeSettingsFixture(t,
 		`{"model":"opus-bob"}`,
 		`{not json`,
 	)
 
-	if err := vault.Restore(fileSet, "bob"); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if err := vault.Restore(fileSet, "bob"); err == nil {
+		t.Fatal("expected malformed live settings to stop activation")
 	}
-
-	got := readJSONMap(t, livePath) // must now parse: the snapshot replaced it
-	if got["model"] != "opus-bob" {
-		t.Errorf("unparseable live file should be replaced by the snapshot, got %v", got)
+	if raw, err := os.ReadFile(livePath); err != nil || string(raw) != `{not json` {
+		t.Fatalf("live settings changed on failure: %q, %v", raw, err)
+	}
+	if _, err := os.Stat(fileSet.Files[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("credentials were touched before settings validation: %v", err)
 	}
 }
 
-func TestRestoreSettingsVerbatimWhenSnapshotUnparseable(t *testing.T) {
+func TestRestoreRejectsUnparseableSnapshotSettings(t *testing.T) {
+	const live = `{"enabledPlugins":{"x@y":true}}`
 	vault, fileSet, livePath := claudeSettingsFixture(t,
-		`corrupt-snapshot`,
-		`{"enabledPlugins":{"x@y":true}}`,
+		`corrupt-snapshot`, live,
 	)
 
-	if err := vault.Restore(fileSet, "bob"); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if err := vault.Restore(fileSet, "bob"); err == nil {
+		t.Fatal("expected malformed snapshot settings to stop activation")
 	}
-
-	raw, err := os.ReadFile(livePath)
-	if err != nil {
-		t.Fatal(err)
+	if raw, err := os.ReadFile(livePath); err != nil || string(raw) != live {
+		t.Fatalf("live settings changed on failure: %q, %v", raw, err)
 	}
-	if string(raw) != `corrupt-snapshot` {
-		t.Errorf("unparseable snapshot should restore verbatim, got %q", raw)
+	if _, err := os.Stat(fileSet.Files[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("credentials were touched before settings validation: %v", err)
 	}
 }
 
