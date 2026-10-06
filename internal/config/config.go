@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 )
 
 // Config holds the global caam configuration.
@@ -65,6 +67,11 @@ type Config struct {
 	// Backup configures automatic backup scheduling.
 	Backup BackupConfig `json:"backup,omitempty"`
 
+	// ClaudeSettings controls shared policy versus profile-scoped auth. Keep it
+	// in the normal config model so alias/default/workspace saves cannot erase
+	// an operator's isolation overrides (issue #115).
+	ClaudeSettings claudesettings.Policy `json:"claude_settings,omitempty"`
+
 	// SyncPolicy configures how credential payloads replicate between
 	// machines during `caam sync` (issue #66). Providers with rotating
 	// OAuth refresh-token families default to "host-local" (payload never
@@ -97,15 +104,7 @@ func DefaultConfig() *Config {
 // ConfigPath returns the path to the config file.
 // Falls back to current directory if home directory cannot be determined.
 func ConfigPath() string {
-	if xdgConfig := os.Getenv("XDG_CONFIG_HOME"); xdgConfig != "" {
-		return filepath.Join(xdgConfig, "caam", "config.json")
-	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		// Fallback to current directory - unusual but handles edge cases
-		return filepath.Join(".config", "caam", "config.json")
-	}
-	return filepath.Join(homeDir, ".config", "caam", "config.json")
+	return claudesettings.CAAMConfigPath()
 }
 
 // DefaultDataPath returns the base caam data directory path.
@@ -325,12 +324,18 @@ func Load() (*Config, error) {
 	if err := json.Unmarshal(data, config); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if err := config.ClaudeSettings.Validate(); err != nil {
+		return nil, err
+	}
 
 	return config, nil
 }
 
 // Save writes the configuration to disk.
 func (c *Config) Save() error {
+	if err := c.CludeSettings.Validate(); err != nil {
+		return err
+	}
 	configPath := ConfigPath()
 
 	// Ensure directory exists
