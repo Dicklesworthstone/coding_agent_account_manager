@@ -60,6 +60,101 @@ func TestNativeQuotaRejectsMalformedNumbers(t *testing.T) {
 	}
 }
 
+func TestGrokBillingOmittedZeroRequiresActivePeriod(t *testing.T) {
+	now := time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC)
+	const active = `"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-10-05T21:44:41.777818+00:00","end":"2026-10-12T21:44:41.777818+00:00"}`
+	cases := []struct {
+		name, config string
+		known        bool
+		percent      int
+	}{
+		{"reset zero", active + `,"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"prepaidBalance":{"val":0},"isUnifiedBillingUser":true`, true, 0},
+		{"explicit percent", active + `,"creditUsagePercent":25`, true, 25},
+		{"explicit snake percent", active + `,"credit_usage_percent":25`, true, 25},
+		{"used ratio", active + `,"used":{"val":25},"monthlyLimit":{"val":100}`, true, 25},
+		{"explicit zero", active + `,"creditUsagePercent":0`, true, 0},
+		{"start inclusive", `"currentPeriod":{"start":"2026-10-06T08:00:00Z","end":"2026-10-13T08:00:00Z"}`, true, 0},
+		{"top level bounds", `"billingPeriodStart":"2026-10-05T21:44:41.777818Z","billingPeriodEnd":"2026-10-12T21:44:41.777818Z"`, true, 0},
+		{"snake bounds", `"current_period":{"start":"2026-10-05T21:44:41.777818Z","end":"2026-10-12T21:44:41.777818Z"}`, true, 0},
+		{"null period with fallback", `"currentPeriod":null,"billingPeriodStart":"2026-10-05T21:44:41Z","billingPeriodEnd":"2026-10-12T21:44:41Z"`, false, 0},
+		{"incomplete period with fallback", `"currentPeriod":{"end":"2026-10-12T21:44:41Z"},"billingPeriodStart":"2026-10-05T21:44:41Z"`, false, 0},
+		{"contradictory bounds", active + `,"billingPeriodStart":"2026-10-04T21:44:41Z"`, false, 0},
+		{"null alternate bound", active + `,"billing_period_end":null`, false, 0},
+		{"missing period", ``, false, 0},
+		{"null period", `"currentPeriod":null`, false, 0},
+		{"malformed period", `"currentPeriod":[]`, false, 0},
+		{"missing start", `"currentPeriod":{"end":"2026-10-12T21:44:41Z"}`, false, 0},
+		{"missing end", `"currentPeriod":{"start":"2026-10-05T21:44:41Z"}`, false, 0},
+		{"null start", `"currentPeriod":{"start":null,"end":"2026-10-12T21:44:41Z"}`, false, 0},
+		{"bad start", `"currentPeriod":{"start":"bad","end":"2026-10-12T21:44:41Z"}`, false, 0},
+		{"bad end", `"currentPeriod":{"start":"2026-10-05T21:44:41Z","end":"bad"}`, false, 0},
+		{"inverted", `"currentPeriod":{"start":"2026-10-12T21:44:41Z","end":"2026-10-05T21:44:41Z"}`, false, 0},
+		{"empty interval", `"currentPeriod":{"start":"2026-10-06T08:00:00Z","end":"2026-10-06T08:00:00Z"}`, false, 0},
+		{"future", `"currentPeriod":{"start":"2026-10-12T21:44:41Z","end":"2026-10-19T21:44:41Z"}`, false, 0},
+		{"expired", `"currentPeriod":{"start":"2026-09-28T21:44:41Z","end":"2026-10-05T21:44:41Z"}`, false, 0},
+		{"end exclusive", `"currentPeriod":{"start":"2026-09-29T08:00:00Z","end":"2026-10-06T08:00:00Z"}`, false, 0},
+		{"used without limit", active + `,"used":0`, false, 0},
+		{"limit without used", active + `,"monthlyLimit":100`, false, 0},
+		{"snake limit without used", active + `,"monthly_limit":100`, false, 0},
+	}
+	for _, key := range []string{"creditUsagePercent", "credit_usage_percent", "used", "monthlyLimit", "monthly_limit"} {
+		for _, raw := range []string{`null`, `"12junk"`, `true`, `[]`, `-1`, `101`, `1e999`} {
+			cases = append(cases, struct {
+				name, config string
+				known        bool
+				percent      int
+			}{key + "/" + raw, active + fmt.Sprintf(",%q:%s", key, raw), false, 0})
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := parseGrokBilling([]byte(`{"config":{`+tc.config+`}}`), now)
+			if info.NumericQuotaKnown() != tc.known {
+				t.Fatalf("known=%v, want %v: %+v", info.NumericQuotaKnown(), tc.known, info)
+			}
+			if tc.known {
+				w := info.PrimaryWindow
+				if info.QuotaStatus != QuotaOK || info.Error != "" || info.QuotaNote != "" || w == nil || w.Unmeasured ||
+					w.UsedPercent != tc.percent || w.Utilization != float64(tc.percent)/100 || w.WindowDuration != 7*24*time.Hour || !w.ResetsAt.After(now) {
+					t.Fatalf("unexpected measured window: %+v / %+v", info, w)
+				}
+			} else if info.QuotaStatus != QuotaDegraded || info.AvailabilityScore() != 0 {
+				t.Fatalf("unknown quota became available: %+v", info)
+			}
+		})
+	}
+	for _, raw := range []string{``, `{`, `null`, `[]`} {
+		info := parseGrokBilling([]byte(raw), now)
+		if info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() {
+			t.Errorf("invalid JSON/object became quota: %q: %+v", raw, info)
+		}
+	}
+	for _, raw := range []string{`{}`, `{"config":null}`} {
+		info := parseGrokBilling([]byte(raw), now)
+		if info.QuotaStatus != QuotaDegraded || info.NumericQuotaKnown() {
+			t.Errorf("missing config became quota: %s: %+v", raw, info)
+		}
+	}
+}
+
+func TestGrokResetZeroIsEligibleForUsageAwareRouting(t *testing.T) {
+	now := time.Date(2026, 10, 6, 8, 0, 0, 0, time.UTC)
+	info := parseGrokBilling([]byte(`{"config":{"currentPeriod":{"start":"2026-10-06T08:00:00Z","end":"2026-10-13T08:00:00Z"}}}`), now)
+	unknown := parseGrokBilling([]byte(`{"config":{"creditUsagePercent":null}}`), now)
+	if !info.NumericQuotaKnown() || info.AvailabilityScore() != 100 {
+		t.Fatalf("fresh account did not retain full headroom: %+v", info)
+	}
+	for _, mode := range RankModes {
+		result := RankProfiles([]ProfileUsage{
+			{Provider: "grok", ProfileName: "unknown", Usage: unknown},
+			{Provider: "grok", ProfileName: "reset", Usage: info},
+		}, RankOptions{Mode: mode, Now: now})
+		if result.Selected == nil || result.Selected.Profile != "reset" {
+			t.Errorf("%s did not select freshly reset account: %+v", mode, result)
+		}
+	}
+}
+
 func TestCursorInvalidSpendDoesNotFallBackToRemaining(t *testing.T) {
 	for _, fields := range []string{
 		`"includedSpend":-0.1,"remaining":100`,

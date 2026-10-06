@@ -247,7 +247,8 @@ func sanitizeProviderText(_ string) string {
 }
 
 // parseGrokBilling turns an `_x.ai/billing` result into UsageInfo.
-// Missing or non-numeric usage fields leave the percentage unknown.
+// Proto3 may omit zero usage. Only infer it for a valid active period when
+// every usage key is absent; present but unusable values stay unknown.
 func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 	info := &UsageInfo{
 		Provider:    "grok",
@@ -348,6 +349,22 @@ func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 			}
 		}
 	}
+	if measured == nil {
+		usageAbsent := true
+		for _, key := range []string{"creditUsagePercent", "credit_usage_percent", "used", "monthlyLimit", "monthly_limit"} {
+			// Check map membership, not firstRaw: null is present and must not
+			// be interpreted as proto3's omitted scalar zero.
+			if _, present := cfg[key]; present {
+				usageAbsent = false
+				break
+			}
+		}
+		start := parseProviderTime(bill.PeriodStart)
+		if usageAbsent && grokPeriodConsistent(cfg, start, reset) && !start.IsZero() && reset.After(start) &&
+			!info.FetchedAt.Before(start) && info.FetchedAt.Before(reset) {
+			measured = percentWindow(0, reset, bill.PeriodType, bill.PeriodStart, bill.PeriodEnd)
+		}
+	}
 
 	if measured != nil {
 		info.PrimaryWindow = measured
@@ -369,6 +386,39 @@ func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
 		}
 	}
 	return info
+}
+
+// Do not let fallback bounds repair an explicitly malformed or contradictory
+// period when inferring an omitted zero. Every supplied bound must agree.
+func grokPeriodConsistent(cfg map[string]json.RawMessage, start, end time.Time) bool {
+	check := func(obj map[string]json.RawMessage, key string, expected time.Time) bool {
+		if raw, present := obj[key]; present {
+			var s string
+			if json.Unmarshal(raw, &s) != nil {
+				return false
+			}
+			parsed := parseProviderTime(s)
+			return !parsed.IsZero() && parsed.Equal(expected)
+		}
+		return true
+	}
+	for _, key := range []string{"currentPeriod", "current_period"} {
+		if raw, present := cfg[key]; present {
+			var period map[string]json.RawMessage
+			if json.Unmarshal(raw, &period) != nil || period == nil ||
+				!check(period, "start", start) || !check(period, "end", end) {
+				return false
+			}
+			if _, present := period["start"]; !present {
+				return false
+			}
+			if _, present := period["end"]; !present {
+				return false
+			}
+		}
+	}
+	return check(cfg, "billingPeriodStart", start) && check(cfg, "billing_period_start", start) &&
+		check(cfg, "billingPeriodEnd", end) && check(cfg, "billing_period_end", end)
 }
 
 func percentWindow(pct float64, reset time.Time, periodType, start, end string) *UsageWindow {
