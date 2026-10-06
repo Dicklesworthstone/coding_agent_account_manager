@@ -48,6 +48,8 @@ Examples:
   caam limits codex --rank earliest-reset-headroom --format json   # Which seat to spend next
   caam limits claude --cached     # Offline: read the snapshot Claude Code cached on disk
   caam limits claude --profile work --source isolated   # Read a specific credential store
+  caam limits grok --profile work --source live         # Read the same account's current host login
+  caam limits cursor --profile work --source live --format json
 
 Claude reports a separate weekly allowance per model on top of the 5-hour and
 weekly windows. The SCOPED column shows the per-model allowance closest to its
@@ -64,6 +66,13 @@ the namespace and path it read, lists the other namespaces holding the same
 name, and refuses to report a verdict when an unselected namespace holds a
 strictly healthier credential. Pass --source vault|isolated|shallow to choose
 explicitly. Credentials are never copied between namespaces.
+
+For Grok and Cursor, --source live reads the host's current file-backed login.
+It requires a provider and --profile, and verifies that the live credential
+belongs to that saved account. Unknown or different identities are refused.
+This follows native token rotation without repeatedly backing up the login.
+It does not change the vault or the live credential. Cursor uses its platform
+credential path; Grok honors GROK_HOME.
 
 Offline mode (--cached)
 -----------------------
@@ -116,7 +125,7 @@ func init() {
 	limitsCmd.Flags().Bool("recommend", false, "show smart rotation recommendations")
 	limitsCmd.Flags().Bool("forecast", false, "show usage forecasts and optimal switch times")
 	limitsCmd.Flags().String("model", "", "model the work will run on (e.g. opus, fable); scores and eligibility then honor that model's own quota")
-	limitsCmd.Flags().String("source", "", "credential namespace to read: vault (default), isolated, or shallow")
+	limitsCmd.Flags().String("source", "", "credential namespace: vault (default), isolated, shallow, or live (grok/cursor; requires --profile)")
 	limitsCmd.Flags().Bool("cached", false, "read the usage snapshot Claude Code cached on disk instead of querying the API (offline, presents no token; claude only)")
 	addLimitsRankFlags(limitsCmd)
 }
@@ -137,7 +146,18 @@ func runLimits(cmd *cobra.Command, args []string) error {
 
 	source = strings.ToLower(strings.TrimSpace(source))
 	if source != "" && !ValidCredNamespace(source) {
-		return fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+		return fmt.Errorf("unknown --source %q (want one of: %s)", source, credentialSourceNames)
+	}
+	if source == credNamespaceLive {
+		if len(args) != 1 || (strings.ToLower(args[0]) != "grok" && strings.ToLower(args[0]) != "cursor") {
+			return fmt.Errorf("--source live requires one provider: grok or cursor")
+		}
+		if strings.TrimSpace(profileArg) == "" {
+			return fmt.Errorf("--source live requires --profile to verify the live account against its saved identity")
+		}
+		if cached {
+			return fmt.Errorf("--source live is unavailable with --cached: Grok and Cursor have no offline usage cache")
+		}
 	}
 
 	// --best and --rank answer different questions ("which seat is idlest"
@@ -216,6 +236,10 @@ func runLimits(cmd *cobra.Command, args []string) error {
 			// name means before reading anything (issue #100).
 			res, err := resolveProfileCredential(lookup, provider, profileArg, source)
 			if err != nil {
+				if source == credNamespaceLive {
+					cmd.SilenceUsage = true
+					return err
+				}
 				if format != "json" {
 					fmt.Fprintf(out, "%s/%s: %v\n", provider, profileArg, err)
 				}

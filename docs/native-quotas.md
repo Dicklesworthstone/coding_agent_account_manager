@@ -8,6 +8,8 @@ retaining main's newer Cursor path resolver and canonical vault layout.
 ```sh
 caam limits grok --profile work --source vault
 caam limits cursor --profile work --source isolated --format json
+caam limits grok --profile work --source live --format json
+caam limits cursor --profile work --source live --format json
 caam limits cursor --rank earliest-reset-headroom --format json
 caam next cursor --usage-aware --dry-run
 caam run grok --precheck -- "review this diff"
@@ -30,11 +32,43 @@ as the provider on main, not the caller's ambient XDG or APPDATA settings.
 An invalid selected credential does not cause a search in a different tree.
 Usage-aware activation reads the same vault and candidate set it will restore.
 
-Grok receives only the selected credential in its staging home, not arbitrary
-client configuration, hooks, or MCP servers. Ambient API keys and configuration
-roots are removed or replaced. Cancellation closes inherited protocol pipes
+For a native CLI running under the host's own HOME, use `--source live` with
+`--profile` to keep quota polling on its current login as tokens rotate. This
+source supports Grok and Cursor and requires one explicit provider and a saved
+account profile. Grok honors `GROK_HOME`; Cursor uses the same platform and
+environment path resolver as backup and activation. On macOS this reads the
+file-backed credential, not the login keychain.
+
+The live credential must match the saved account: Grok `user_id` or Cursor's
+JWT `sub` is authoritative when both copies provide it. A matching email
+carried by the credentials is accepted only when one side lacks an account
+ID. Cursor's separate `cli-config.json` email is a display label and cannot
+establish this match. Missing, malformed, conflicting, or different identities
+fail before a quota request. The identity check runs again on the exact bytes
+used by the fetcher, so a simultaneous account switch cannot attribute another
+login's quota to the requested profile. A same-account token rotation is allowed.
+
+JSON rows report `credential_source.namespace: "live"` and the actual path.
+Neither source selection nor quota fetching writes the live file or the vault.
+The default source remains the vault, and `next --usage-aware` continues to
+measure the saved credentials it would activate. `--source live` requires
+`--profile`; it does not infer a profile name from an active marker.
+
+Grok receives the selected credential with renewal secrets removed in its
+staging home. Refresh tokens and client secrets are stripped from flat and
+nested credential entries, preventing a billing read from consuming a
+single-use refresh token that belongs to a running native CLI. Expired access
+credentials therefore fail the read; only the owning native CLI can renew
+them. No arbitrary client configuration, hooks, or MCP servers are copied.
+Ambient API keys and configuration roots are removed or replaced.
+Cancellation closes inherited protocol pipes
 as well as terminating the direct child. Provider error text is not repeated,
 because even an opaque error can contain a credential.
+Direct Grok auth overrides (`GROK_AUTH`, `GROK_AUTH_PATH`) and API key variables
+are scrubbed so they cannot replace the selected credential. Explicit native
+authentication rejections and Cursor 401/403 usage responses report
+`unauthorized: token expired or invalid`; protocol and transport failures
+remain separate errors.
 
 Cursor's production endpoint is fixed rather than read from an ambient
 endpoint override. Credential-bearing redirects are not followed. Requests

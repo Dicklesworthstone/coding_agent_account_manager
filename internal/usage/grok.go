@@ -41,30 +41,44 @@ func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, e
 	if f == nil {
 		f = NewGrokFetcher()
 	}
-	home := strings.TrimPrefix(strings.TrimSpace(grokHome), "grok-home:")
-	if home == "" || strings.ContainsAny(home, "\r\n") {
-		info.Error = "no grok profile home"
+	authPath, auth, live, err := readNativeLiveCredential("grok", grokHome)
+	if err != nil {
+		info.Error = err.Error()
 		info.QuotaNote = info.Error
 		return info, nil
 	}
-	if st, err := os.Stat(home); err == nil && !st.IsDir() {
-		home = filepath.Dir(home)
-	}
-	authPath := filepath.Join(home, "auth.json")
-	if _, err := os.Stat(authPath); err != nil {
-		info.Error = "grok auth.json not found for this profile"
-		info.QuotaNote = info.Error
-		return info, nil
+	if !live {
+		home := strings.TrimPrefix(strings.TrimSpace(grokHome), "grok-home:")
+		if home == "" || strings.ContainsAny(home, "\r\n") {
+			info.Error = "no grok profile home"
+			info.QuotaNote = info.Error
+			return info, nil
+		}
+		if st, err := os.Stat(home); err == nil && !st.IsDir() {
+			home = filepath.Dir(home)
+		}
+		authPath = filepath.Join(home, "auth.json")
+		auth, err = os.ReadFile(authPath)
+		if err != nil {
+			info.Error = "grok auth.json not found for this profile"
+			info.QuotaNote = info.Error
+			return info, nil
+		}
 	}
 
-	raw, err := f.queryBilling(ctx, home)
+	raw, err := f.queryBilling(ctx, auth)
 	if err != nil {
 		info.Error = err.Error()
 		info.QuotaNote = info.Error
 		return info, nil
 	}
 	parsed := parseGrokBilling(raw, info.FetchedAt)
-	if email := grokAccountEmail(authPath); email != "" {
+	if id, err := nativeCredentialIdentity("grok", auth); err == nil && live {
+		parsed.AccountID = id.AccountID
+		if parsed.AccountID == "" {
+			parsed.AccountID = id.Email
+		}
+	} else if email := grokAccountEmail(authPath); email != "" {
 		parsed.AccountID = email
 	}
 	return parsed, nil
@@ -73,8 +87,8 @@ func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, e
 // queryBilling copies the profile's auth into a private GROK_HOME and asks
 // the CLI for `_x.ai/billing`. The copy is removed before returning. Nothing
 // from the credential file is written to the error text.
-func (f *GrokFetcher) queryBilling(ctx context.Context, srcHome string) (json.RawMessage, error) {
-	stage, err := stageGrokHome(srcHome)
+func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMessage, error) {
+	stage, err := stageGrokHome(auth)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +167,7 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, srcHome string) (json.Ra
 				ID     *int            `json:"id"`
 				Result json.RawMessage `json:"result"`
 				Error  *struct {
+					Code    int    `json:"code"`
 					Message string `json:"message"`
 				} `json:"error"`
 			}
@@ -160,6 +175,11 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, srcHome string) (json.Ra
 				continue
 			}
 			if msg.Error != nil {
+				if msg.Error.Code == 401 || msg.Error.Code == 403 ||
+					strings.Contains(strings.ToLower(msg.Error.Message), "unauthorized") ||
+					strings.Contains(strings.ToLower(msg.Error.Message), "token expired") {
+					return nil, fmt.Errorf("unauthorized: token expired or invalid")
+				}
 				return nil, fmt.Errorf("grok %s: %s", method, sanitizeProviderText(msg.Error.Message))
 			}
 			return msg.Result, nil
@@ -191,12 +211,19 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, srcHome string) (json.Ra
 	return call("_x.ai/billing", map[string]any{})
 }
 
-func stageGrokHome(src string) (string, error) {
+func stageGrokHome(auth []byte) (string, error) {
+	// Native clients can renew an expiring token while handling a read.
+	// Never give this temporary copy a single-use refresh token: consuming
+	// it here could invalidate the real login without updating its owner.
+	readOnlyAuth, err := grokAccessOnlyAuth(auth)
+	if err != nil {
+		return "", err
+	}
 	stage, err := os.MkdirTemp("", "caam-grok-billing-")
 	if err != nil {
 		return "", err
 	}
-	if err := copyCredentialFile(filepath.Join(src, "auth.json"), filepath.Join(stage, "auth.json")); err != nil {
+	if err := os.WriteFile(filepath.Join(stage, "auth.json"), readOnlyAuth, 0600); err != nil {
 		os.RemoveAll(stage)
 		return "", fmt.Errorf("stage grok auth: %w", err)
 	}
@@ -205,17 +232,44 @@ func stageGrokHome(src string) (string, error) {
 	return stage, nil
 }
 
-func copyCredentialFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
+func grokAccessOnlyAuth(auth []byte) ([]byte, error) {
+	var root map[string]any
+	dec := json.NewDecoder(bytes.NewReader(auth))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return nil, fmt.Errorf("grok credential was not a valid JSON object")
 	}
-	return os.WriteFile(dst, data, 0600)
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("grok credential was not a valid JSON object")
+	}
+	stripGrokRenewalSecrets(root)
+	return json.Marshal(root)
+}
+
+func stripGrokRenewalSecrets(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+			switch normalized {
+			case "refresh", "refreshtoken", "refreshtokens", "renewaltoken", "renewtoken", "clientsecret":
+				delete(value, key)
+			default:
+				stripGrokRenewalSecrets(child)
+			}
+		}
+	case []any:
+		for _, child := range value {
+			stripGrokRenewalSecrets(child)
+		}
+	}
 }
 
 func grokChildEnv(home string) []string {
 	drop := map[string]struct{}{
-		"HOME": {}, "GROK_HOME": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {},
+		"HOME": {}, "GROK_HOME": {}, "GROK_AUTH": {}, "GROK_AUTH_PATH": {},
+		"GROK_API_KEY": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {}, "XAI_API_TOKEN": {},
 		"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_CACHE_HOME": {},
 		"XDG_STATE_HOME": {}, "XDG_CONFIG_DIRS": {}, "XDG_DATA_DIRS": {},
 	}

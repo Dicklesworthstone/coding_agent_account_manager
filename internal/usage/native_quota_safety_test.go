@@ -402,7 +402,11 @@ func TestGrokStagesOnlyCredentialsAndIsolatesConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("# Do not copy executable hooks or MCP configuration\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	stage, err := stageGrokHome(home)
+	auth, err := os.ReadFile(filepath.Join(home, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := stageGrokHome(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +418,7 @@ func TestGrokStagesOnlyCredentialsAndIsolatesConfig(t *testing.T) {
 	if err != nil || (runtime.GOOS != "windows" && st.Mode().Perm() != 0600) {
 		t.Fatalf("staged credential permissions: %v, %v", st, err)
 	}
-	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "GROK_DEPLOYMENT_KEY", "XAI_API_KEY"} {
+	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "GROK_AUTH", "GROK_AUTH_PATH", "GROK_API_KEY", "GROK_DEPLOYMENT_KEY", "XAI_API_KEY", "XAI_API_TOKEN"} {
 		t.Setenv(key, "SYNTHETIC-AMBIENT")
 	}
 	for _, entry := range grokChildEnv(stage) {
@@ -541,4 +545,75 @@ done
 			t.Fatal("billing protocol failure modified the source credential")
 		}
 	})
+}
+
+func TestCursorAuthRejectionCannotBeHiddenByAnotherUsageResponse(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		for _, rejectedPath := range []string{cursorPeriodUsagePath, cursorUsagePath} {
+			t.Run(fmt.Sprintf("%d/%s", code, rejectedPath), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == rejectedPath {
+						w.WriteHeader(code)
+						fmt.Fprint(w, "SYNTHETIC-PROVIDER-SECRET")
+					} else if r.URL.Path == cursorPeriodUsagePath {
+						fmt.Fprint(w, `{"planUsage":{"includedSpend":10,"limit":100}}`)
+					} else {
+						fmt.Fprint(w, `{}`)
+					}
+				}))
+				defer server.Close()
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"accessToken":"SYNTHETIC"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				info, err := (&CursorFetcher{BaseURL: server.URL, ClientVersion: "synthetic"}).Fetch(context.Background(), dir)
+				if err != nil || info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() || info.Error != "unauthorized: token expired or invalid" {
+					t.Fatalf("rejected token reported quota: %+v %v", info, err)
+				}
+			})
+		}
+	}
+}
+
+func TestGrokAuthRejectionClassification(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "grok")
+	script := `#!/bin/sh
+IFS= read -r line
+id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$CAAM_TEST_GROK_AUTH_ERROR"
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, body   string
+		unauthorized bool
+	}{
+		{"401", `{"code":401,"message":"SYNTHETIC"}`, true},
+		{"403", `{"code":403,"message":"SYNTHETIC"}`, true},
+		{"expired token", `{"code":-32603,"message":"token expired: SYNTHETIC"}`, true},
+		{"unauthorized", `{"code":-32603,"message":"Unauthorized: SYNTHETIC"}`, true},
+		{"server error", `{"code":-32000,"message":"SYNTHETIC"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CAAM_TEST_GROK_AUTH_ERROR", tc.body)
+			info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+			if err != nil || info.NumericQuotaKnown() || info.QuotaStatus != QuotaUnavailable || info.Error == "" {
+				t.Fatalf("failure reported quota: %+v %v", info, err)
+			}
+			if got := info.Error == "unauthorized: token expired or invalid"; got != tc.unauthorized {
+				t.Fatalf("authentication classification=%t want %t: %s", got, tc.unauthorized, info.Error)
+			}
+			if strings.Contains(info.Error, "SYNTHETIC") {
+				t.Fatal("error echoed provider credential text")
+			}
+		})
+	}
 }

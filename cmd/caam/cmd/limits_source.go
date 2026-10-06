@@ -49,11 +49,14 @@ const (
 	credNamespaceVault    = "vault"
 	credNamespaceIsolated = "isolated"
 	credNamespaceShallow  = "shallow"
+	credNamespaceLive     = "live"
 )
 
 // credNamespaces is the resolution order: the vault stays first so an
 // unqualified --profile keeps meaning what it always meant.
 var credNamespaces = []string{credNamespaceVault, credNamespaceIsolated, credNamespaceShallow}
+
+const credentialSourceNames = "vault, isolated, shallow, live"
 
 // Credential states, worst to best. A namespace that holds no credential for
 // the name at all is credStateMissing.
@@ -85,6 +88,8 @@ type credentialLookup struct {
 	Profiles   *profile.Store
 	Shallow    *shallow.Manager
 	LiveHome   string // real HOME, for the live .claude.json of the active profile
+	LiveEnv    func(string) string
+	LiveOS     string
 	ActiveName func(provider string) string
 	Now        time.Time
 }
@@ -118,6 +123,9 @@ type resolvedCredential struct {
 
 // ValidCredNamespace reports whether s names a namespace.
 func ValidCredNamespace(s string) bool {
+	if s == credNamespaceLive {
+		return true
+	}
 	for _, n := range credNamespaces {
 		if n == s {
 			return true
@@ -131,6 +139,28 @@ func ValidCredNamespace(s string) bool {
 // returns nothing.
 func (l credentialLookup) candidatePaths(namespace, provider, name string) []string {
 	switch namespace {
+	case credNamespaceLive:
+		if l.LiveHome == "" {
+			return nil
+		}
+		getenv := l.LiveEnv
+		if getenv == nil {
+			getenv = os.Getenv
+		}
+		switch provider {
+		case "grok":
+			home := getenv("GROK_HOME")
+			if home == "" {
+				home = filepath.Join(l.LiveHome, ".grok")
+			}
+			return []string{filepath.Join(home, "auth.json")}
+		case "cursor":
+			goos := l.LiveOS
+			if goos == "" {
+				goos = runtime.GOOS
+			}
+			return []string{authfile.ResolveCursorPaths(l.LiveHome, goos, getenv).AuthFile}
+		}
 	case credNamespaceVault:
 		dir := filepath.Join(l.VaultDir, provider, name)
 		switch provider {
@@ -263,8 +293,8 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 }
 
 // credentialState classifies a credential file that was read successfully.
-// A renewable credential counts as healthy even past its expiry: the CLI or
-// caam's refresher renews it without a human (issue #102).
+// Claude/Codex retain their renewable-credential classification (issue #102).
+// Native quota reads use access credentials only and cannot renew them.
 func (l credentialLookup) credentialState(provider, path string) (string, time.Time) {
 	var (
 		info *health.ExpiryInfo
@@ -275,6 +305,10 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 		info, err = health.ParseClaudeExpiry(filepath.Dir(path))
 	case "codex":
 		info, err = health.ParseCodexExpiry(path)
+	case "grok":
+		info, err = health.ParseGrokExpiry(path)
+	case "cursor":
+		info, err = health.ParseCursorExpiry(path)
 	}
 	if err != nil || info == nil || info.ExpiresAt.IsZero() {
 		return credStateUnknown, time.Time{}
@@ -283,7 +317,8 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if info.ExpiresAt.After(now) || info.Renewable {
+	renewable := info.Renewable && provider != "grok" && provider != "cursor"
+	if info.ExpiresAt.After(now) || renewable {
 		return credStateHealthy, info.ExpiresAt
 	}
 	return credStateExpired, info.ExpiresAt
@@ -299,7 +334,10 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 func resolveProfileCredential(l credentialLookup, provider, name, source string) (*resolvedCredential, error) {
 	source = strings.ToLower(strings.TrimSpace(source))
 	if source != "" && !ValidCredNamespace(source) {
-		return nil, fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+		return nil, fmt.Errorf("unknown --source %q (want one of: %s)", source, credentialSourceNames)
+	}
+	if source == credNamespaceLive {
+		return resolveLiveCredential(l, provider, name)
 	}
 
 	found := make([]credentialCandidate, 0, len(credNamespaces))
@@ -330,6 +368,38 @@ func resolveProfileCredential(l credentialLookup, provider, name, source string)
 	for _, alt := range res.Alternatives {
 		if credStateRank(alt.State) > credStateRank(selected.State) {
 			res.Healthier = append(res.Healthier, alt)
+		}
+	}
+	return res, nil
+}
+
+// Live credentials have no profile name of their own. Bind them to an
+// explicit saved profile by account identity, never by the active marker or
+// a filename; native CLIs can rotate credentials or switch logins themselves.
+func resolveLiveCredential(l credentialLookup, provider, name string) (*resolvedCredential, error) {
+	if provider != "grok" && provider != "cursor" {
+		return nil, fmt.Errorf("--source live supports grok and cursor only")
+	}
+	if name == "" || authfile.IsSystemProfile(name) {
+		return nil, fmt.Errorf("--source live requires a saved account selected with --profile")
+	}
+	paths := l.candidatePaths(credNamespaceLive, provider, name)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("cannot resolve live %s credential path", provider)
+	}
+	vaultPath := filepath.Join(l.VaultDir, provider, name, "auth.json")
+	locator, err := usage.NativeLiveCredentialLocator(provider, paths[0], vaultPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: --source live (%s): %w", provider, name, paths[0], err)
+	}
+	state, expiresAt := l.credentialState(provider, paths[0])
+	res := &resolvedCredential{
+		Selected: credentialCandidate{Namespace: credNamespaceLive, Path: paths[0], Token: locator, State: state, ExpiresAt: expiresAt},
+		Explicit: true,
+	}
+	for _, ns := range credNamespaces {
+		if c := l.inspect(ns, provider, name); c.Found() {
+			res.Alternatives = append(res.Alternatives, c)
 		}
 	}
 	return res, nil
@@ -423,6 +493,8 @@ func (r *resolvedCredential) describe(provider, name string) string {
 func namespaceProfileNames(l credentialLookup, namespace, provider string) ([]string, error) {
 	var names []string
 	switch namespace {
+	case credNamespaceLive:
+		return nil, fmt.Errorf("--source live requires --profile to verify the live account against its saved identity")
 	case credNamespaceVault:
 		entries, err := os.ReadDir(filepath.Join(l.VaultDir, provider))
 		if err != nil {

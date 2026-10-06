@@ -60,14 +60,25 @@ func (f *CursorFetcher) Fetch(ctx context.Context, locator string) (*UsageInfo, 
 	if f == nil {
 		f = NewCursorFetcher()
 	}
-	root := strings.TrimPrefix(strings.TrimSpace(locator), "cursor-root:")
-	authPath, err := findCursorAuth(root)
+	authPath, data, live, err := readNativeLiveCredential("cursor", locator)
 	if err != nil {
 		info.Error = err.Error()
 		info.QuotaNote = info.Error
 		return info, nil
 	}
-	token, err := readCursorAccessToken(authPath)
+	root := strings.TrimPrefix(strings.TrimSpace(locator), "cursor-root:")
+	if !live {
+		authPath, err = findCursorAuth(root)
+		if err == nil {
+			data, err = os.ReadFile(authPath)
+		}
+		if err != nil {
+			info.Error = "cursor access token is missing or unreadable"
+			info.QuotaNote = info.Error
+			return info, nil
+		}
+	}
+	token, err := cursorAccessToken(data)
 	if err != nil {
 		info.Error = "cursor access token is missing or unreadable"
 		info.QuotaNote = info.Error
@@ -80,6 +91,12 @@ func (f *CursorFetcher) Fetch(ctx context.Context, locator string) (*UsageInfo, 
 	periodBody, periodCode, periodErr := f.post(ctx, token, cursorPeriodUsagePath)
 	statusBody, statusCode, statusErr := f.post(ctx, token, cursorUsagePath)
 	planBody, planCode, _ := f.post(ctx, token, cursorPlanInfoPath)
+	if periodCode == http.StatusUnauthorized || periodCode == http.StatusForbidden ||
+		statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		info.Error = "unauthorized: token expired or invalid"
+		info.QuotaNote = info.Error
+		return info, nil
+	}
 
 	var period, status *UsageInfo
 	if periodErr == nil && periodCode >= 200 && periodCode < 300 {
@@ -128,7 +145,12 @@ func (f *CursorFetcher) Fetch(ctx context.Context, locator string) (*UsageInfo, 
 			info.PlanType = name
 		}
 	}
-	if email := cursorAccountEmail(root, authPath); email != "" {
+	if id, err := nativeCredentialIdentity("cursor", data); err == nil && live {
+		info.AccountID = id.AccountID
+		if info.AccountID == "" {
+			info.AccountID = id.Email
+		}
+	} else if email := cursorAccountEmail(root, authPath); email != "" {
 		info.AccountID = email
 	}
 	// A numeric pool does not override a provider-reported restriction. Until
@@ -227,6 +249,10 @@ func readCursorAccessToken(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return cursorAccessToken(data)
+}
+
+func cursorAccessToken(data []byte) (string, error) {
 	var parsed map[string]json.RawMessage
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return "", err

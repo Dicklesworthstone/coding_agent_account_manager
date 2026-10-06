@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,82 @@ func TestLimitsAcceptsGrokAndCursor(t *testing.T) {
 		if strings.Contains(buf.String(), "not supported") {
 			t.Fatalf("output treated %s as unsupported: %s", provider, buf.String())
 		}
+	}
+}
+
+func TestLimitsLiveSourceRequiresProviderAndSavedProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, profile, message string
+		cached                           bool
+	}{
+		{"provider required", "", "work", "one provider", false},
+		{"unsupported provider", "claude", "work", "grok or cursor", false},
+		{"saved profile required", "cursor", "", "requires --profile", false},
+		{"offline unsupported", "grok", "work", "unavailable with --cached", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &cobra.Command{Use: "limits"}
+			cmd.Flags().String("source", "live", "")
+			cmd.Flags().String("profile", tc.profile, "")
+			cmd.Flags().String("format", "json", "")
+			cmd.Flags().Bool("cached", tc.cached, "")
+			var args []string
+			if tc.provider != "" {
+				args = []string{tc.provider}
+			}
+			err := runLimits(cmd, args)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+}
+
+func TestLimitsLiveSourceReportsMeasuredAccountAndRefusesMismatch(t *testing.T) {
+	setupGrokResetProfiles(t)
+	// The command resolves the configured vault root, not the fixture's
+	// in-memory vault object. Give it an old snapshot of the same account.
+	savedPath := filepath.Join(getVaultDir(), "grok", "fresh", "auth.json")
+	livePath := filepath.Join(os.Getenv("GROK_HOME"), "auth.json")
+	saved := `{"user_id":"seat-A","key":"SYNTHETIC-STALE","email":"fresh@example.com"}`
+	live := `{"user_id":"seat-A","key":"SYNTHETIC-FRESH","email":"fresh@example.com"}`
+	writeNativeTestCredential(t, savedPath, saved)
+	writeNativeTestCredential(t, livePath, live)
+	cmd := &cobra.Command{Use: "limits"}
+	cmd.Flags().String("source", "live", "")
+	cmd.Flags().String("profile", "fresh", "")
+	cmd.Flags().String("format", "json", "")
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	if err := runLimits(cmd, []string{"grok"}); err != nil {
+		t.Fatal(err)
+	}
+	var rows []usage.ProfileUsage
+	if err := json.Unmarshal(buf.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("limits JSON: %v\n%s", err, buf.String())
+	}
+	row := rows[0]
+	if row.ProfileName != "fresh" || row.Usage == nil || !row.Usage.NumericQuotaKnown() ||
+		row.Usage.QuotaStatus != usage.QuotaOK || row.Usage.PrimaryWindow.UsedPercent != 0 {
+		t.Fatalf("fresh live account lost its measured quota: %+v", row)
+	}
+	if row.CredentialSource == nil || row.CredentialSource.Namespace != "live" || row.CredentialSource.Path != livePath || !row.CredentialSource.Explicit {
+		t.Fatalf("limits omitted live credential provenance: %+v", row.CredentialSource)
+	}
+	for path, want := range map[string]string{savedPath: saved, livePath: live} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatal("limits changed a source credential")
+		}
+	}
+	// A mismatch is a command failure in JSON mode, never a successful
+	// empty array or another account reported under the requested name.
+	writeNativeTestCredential(t, livePath, `{"user_id":"seat-B","key":"SYNTHETIC-FRESH","email":"fresh@example.com"}`)
+	buf.Reset()
+	err := runLimits(cmd, []string{"grok"})
+	if err == nil || !strings.Contains(err.Error(), "does not match") || buf.Len() != 0 {
+		t.Fatalf("mismatch error=%v output=%q", err, buf.String())
 	}
 }
 

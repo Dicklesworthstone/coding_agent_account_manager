@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,6 +82,7 @@ func newNamespaceFixture(t *testing.T) *namespaceFixture {
 		Profiles: f.store,
 		Shallow:  f.shallow,
 		LiveHome: realHome,
+		LiveEnv:  func(string) string { return "" },
 		Now:      time.Now(),
 	}
 	return f
@@ -111,6 +114,112 @@ func (f *namespaceFixture) shallowClaude(t *testing.T, name string, expires time
 		t.Fatal(err)
 	}
 	claudeCreds(t, path, expires, refreshable)
+}
+
+func TestResolveLiveCredentialUsesCanonicalPathsAndSavedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, goos string
+		env                  map[string]string
+		path                 string
+	}{
+		{"grok default", "grok", "linux", nil, "home/.grok/auth.json"},
+		{"grok override", "grok", "linux", map[string]string{"GROK_HOME": "grok-custom"}, "grok-custom/auth.json"},
+		{"cursor linux default", "cursor", "linux", nil, "home/.config/cursor/auth.json"},
+		{"cursor linux XDG", "cursor", "linux", map[string]string{"XDG_CONFIG_HOME": "xdg", "CURSOR_CONFIG_DIR": "metadata-only"}, "xdg/cursor/auth.json"},
+		{"cursor macOS", "cursor", "darwin", map[string]string{"XDG_CONFIG_HOME": "xdg"}, "home/.cursor/auth.json"},
+		{"cursor windows", "cursor", "windows", map[string]string{"APPDATA": "appdata"}, "appdata/Cursor/auth.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNamespaceFixture(t)
+			f.lookup.LiveOS = tc.goos
+			f.lookup.LiveEnv = func(key string) string {
+				if v := tc.env[key]; v != "" {
+					return filepath.Join(f.root, v)
+				}
+				return ""
+			}
+			livePath := filepath.Join(f.root, filepath.FromSlash(tc.path))
+			savedPath := filepath.Join(f.vaultDir, tc.provider, "work", "auth.json")
+			auth := `{"user_id":"seat-A","access_token":"SYNTHETIC"}`
+			if tc.provider == "cursor" {
+				token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"seat-A"}`)) + ".SYNTHETIC"
+				auth = `{"accessToken":"` + token + `"}`
+			}
+			writeNativeTestCredential(t, savedPath, auth)
+			writeNativeTestCredential(t, livePath, auth)
+			res, err := resolveProfileCredential(f.lookup, tc.provider, "work", credNamespaceLive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Selected.Namespace != credNamespaceLive || res.Selected.Path != livePath || !res.Explicit {
+				t.Fatalf("selected live source = %+v", res.Selected)
+			}
+			report := res.report()
+			if report.Namespace != "live" || report.Path != livePath || !report.Explicit {
+				t.Fatalf("source report = %+v", report)
+			}
+			if len(report.Alternatives) != 1 || report.Alternatives[0].Namespace != credNamespaceVault {
+				t.Fatalf("missing saved source metadata: %+v", report)
+			}
+			defaultSource, err := resolveProfileCredential(f.lookup, tc.provider, "work", "")
+			if err != nil || defaultSource.Selected.Namespace != credNamespaceVault || len(defaultSource.Alternatives) != 0 {
+				t.Fatalf("live source changed default resolution: %+v %v", defaultSource, err)
+			}
+		})
+	}
+}
+
+func TestResolveLiveCredentialFailsClosed(t *testing.T) {
+	f := newNamespaceFixture(t)
+	writeNativeTestCredential(t, filepath.Join(f.vaultDir, "grok", "work", "auth.json"), `{"user_id":"seat-A"}`)
+	writeNativeTestCredential(t, filepath.Join(f.lookup.LiveHome, ".grok", "auth.json"), `{"user_id":"seat-B"}`)
+	for _, tc := range []struct{ provider, name, message string }{
+		{"grok", "work", "does not match"},
+		{"grok", "unsaved", "saved credential is missing"},
+		{"grok", "", "requires a saved account"},
+		{"grok", "_original", "requires a saved account"},
+		{"claude", "work", "grok and cursor only"},
+		{"codex", "work", "grok and cursor only"},
+	} {
+		t.Run(tc.provider+"/"+tc.name, func(t *testing.T) {
+			_, err := resolveProfileCredential(f.lookup, tc.provider, tc.name, credNamespaceLive)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+	if _, err := namespaceProfileNames(f.lookup, credNamespaceLive, "grok"); err == nil {
+		t.Fatal("live source listed unnamed or unverified accounts")
+	}
+}
+
+func TestNativeCredentialSourceStateRequiresUnexpiredAccess(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	for _, provider := range []string{"grok", "cursor"} {
+		for _, tc := range []struct {
+			name, state string
+			expires     time.Time
+		}{
+			{"expired", credStateExpired, now.Add(-time.Hour)},
+			{"expiry boundary", credStateExpired, now},
+			{"unexpired", credStateHealthy, now.Add(time.Hour)},
+		} {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "auth.json")
+				auth := fmt.Sprintf(`{"key":"SYNTHETIC-ACCESS","refresh_token":"SYNTHETIC-REFRESH","expires_at":%q}`, tc.expires.Format(time.RFC3339))
+				if provider == "cursor" {
+					payload := fmt.Sprintf(`{"sub":"seat-A","exp":%d}`, tc.expires.Unix())
+					token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".SYNTHETIC"
+					auth = fmt.Sprintf(`{"accessToken":%q,"apiKey":"SYNTHETIC-RENEWAL"}`, token)
+				}
+				writeNativeTestCredential(t, path, auth)
+				state, expires := (credentialLookup{Now: now}).credentialState(provider, path)
+				if state != tc.state || !expires.Equal(tc.expires) {
+					t.Fatalf("source state=%s expiry=%v, want %s %v", state, expires, tc.state, tc.expires)
+				}
+			})
+		}
+	}
 }
 
 // TestResolveProfileCredentialRefusesTheStaleVaultCopy is the reported bug.
