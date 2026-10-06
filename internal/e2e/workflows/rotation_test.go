@@ -45,13 +45,12 @@ stealth:
 	createProfile := func(name string) {
 		dir := filepath.Join(vaultDir, "claude", name)
 		require.NoError(t, os.MkdirAll(dir, 0755))
-		// Mock auth file. The identity-bearing field for Claude's .claude.json is
-		// oauthAccount; it must be distinct per profile, otherwise every profile
-		// hashes to the same "no-identity" sentinel and ActiveProfile (which
-		// content-matches) would always resolve to the first profile, breaking
-		// round-robin's current-profile detection across activations.
+		// Each account needs real credential material as well as identity. An
+		// oauthAccount label alone cannot install a different Claude login.
 		content := fmt.Sprintf(`{"oauthAccount":{"emailAddress":"%s@example.com","accountUuid":"uuid-%s"}}`, name, name)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(content), 0600))
+		credentials := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"%s-access","refreshToken":"%s-refresh"}}`, name, name)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(credentials), 0600))
 	}
 
 	createProfile("p1")
@@ -98,6 +97,12 @@ stealth:
 		output, err := cmd.CombinedOutput()
 		return string(output), err
 	}
+	assertLiveCredentials := func(name string) {
+		t.Helper()
+		credentials, err := os.ReadFile(filepath.Join(homeDir, ".claude", ".credentials.json"))
+		require.NoError(t, err)
+		assert.JSONEq(t, fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"%s-access","refreshToken":"%s-refresh"}}`, name, name), string(credentials))
+	}
 
 	h.EndStep("Setup")
 
@@ -109,6 +114,7 @@ stealth:
 	}
 	// Should pick p1 (first alphabetically)
 	assert.Contains(t, out, "Activated claude profile 'p1'")
+	assertLiveCredentials("p1")
 
 	// Verify active profile
 	// We can verify by checking which file content is in home
@@ -123,6 +129,7 @@ stealth:
 	require.NoError(t, err)
 	// Round robin: next after p1 is p2
 	assert.Contains(t, out, "Activated claude profile 'p2'")
+	assertLiveCredentials("p2")
 	h.EndStep("Round2")
 
 	// 4. Activate Auto (Round 3)
@@ -131,6 +138,7 @@ stealth:
 	require.NoError(t, err)
 	// Round robin: next after p2 is p3
 	assert.Contains(t, out, "Activated claude profile 'p3'")
+	assertLiveCredentials("p3")
 	h.EndStep("Round3")
 
 	// 5. Activate Auto (Round 4 - Loop)
@@ -139,5 +147,6 @@ stealth:
 	require.NoError(t, err)
 	// Round robin: next after p3 is p1
 	assert.Contains(t, out, "Activated claude profile 'p1'")
+	assertLiveCredentials("p1")
 	h.EndStep("Round4")
 }

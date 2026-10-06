@@ -28,14 +28,18 @@ func readClaudeSettingsSnapshot(path string, policy claudesettings.Policy) (clau
 	if err != nil {
 		return claudeSettingsSnapshot{}, err
 	}
-	identity, err := claudesettings.Identity(data, policy)
+	_, err = claudesettings.Identity(data, policy)
 	if filepath.Base(path) == ".claude.json" {
-		identity, err = claudesettings.LegacyIdentity(data)
+		_, err = claudesettings.LegacyIdentity(data)
 	}
 	if err != nil {
 		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
 	}
-	return claudeSettingsSnapshot{data: data, hasAuth: string(identity) != "{}"}, nil
+	hasAuth, err := claudeCredentialMaterial(data, filepath.Base(path))
+	if err != nil {
+		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
+	}
+	return claudeSettingsSnapshot{data: data, hasAuth: hasAuth}, nil
 }
 
 // readClaudeSettingsForBackup validates settings before any snapshot files are

@@ -263,7 +263,7 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 
 	oauth := creds.ClaudeAiOauth
 	info := &ExpiryInfo{
-		HasRefreshToken: oauth.RefreshToken != "",
+		HasRefreshToken: strings.TrimSpace(oauth.RefreshToken) != "",
 	}
 
 	// Parse expiresAt (Unix milliseconds)
@@ -613,6 +613,16 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		return info, nil
 	}
 
+	// Older vault snapshots used this filename. Passive readers must inspect
+	// it in place rather than migrate the snapshot just to learn its expiry.
+	legacyOAuthPath := filepath.Join(authDir, "oauth_credentials.json")
+	info, err = parseOAuthFile(legacyOAuthPath)
+	if err == nil {
+		info.Renewable = info.HasRefreshToken
+		info.Source = legacyOAuthPath
+		return info, nil
+	}
+
 	// Try gcloud ADC format (only if checking system state)
 	adcPath := ""
 	if checkSystem {
@@ -628,13 +638,14 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	// Report ErrNoAuthFile only when *none* of the supported auth files exist.
 	_, settingsErr := os.Stat(settingsPath)
 	_, oauthErr := os.Stat(oauthPath)
+	_, legacyOAuthErr := os.Stat(legacyOAuthPath)
 	adcExists := false
 	if checkSystem && adcPath != "" {
 		if _, err := os.Stat(adcPath); err == nil {
 			adcExists = true
 		}
 	}
-	if os.IsNotExist(settingsErr) && os.IsNotExist(oauthErr) && !adcExists {
+	if os.IsNotExist(settingsErr) && os.IsNotExist(oauthErr) && os.IsNotExist(legacyOAuthErr) && !adcExists {
 		return nil, ErrNoAuthFile
 	}
 

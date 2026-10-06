@@ -320,7 +320,7 @@ func TestE2E_CrossProviderWorkflows(t *testing.T) {
 
 	// Create Claude auth
 	claudeAuthPath := filepath.Join(homeDir, ".claude.json")
-	claudeContent := `{"session_token": "claude-session-456", "provider": "claude"}`
+	claudeContent := `{"sessionKey": "claude-session-456", "provider": "claude"}`
 	if err := os.WriteFile(claudeAuthPath, []byte(claudeContent), 0600); err != nil {
 		t.Fatalf("Failed to write claude auth: %v", err)
 	}
@@ -331,14 +331,14 @@ func TestE2E_CrossProviderWorkflows(t *testing.T) {
 		t.Fatalf("Failed to create claude config dir: %v", err)
 	}
 	claudeConfigAuthPath := filepath.Join(claudeConfigDir, "auth.json")
-	claudeConfigContent := `{"refresh_token": "claude-refresh-789"}`
+	claudeConfigContent := `{"access_token": "claude-access-789", "refresh_token": "claude-refresh-789"}`
 	if err := os.WriteFile(claudeConfigAuthPath, []byte(claudeConfigContent), 0600); err != nil {
 		t.Fatalf("Failed to write claude config auth: %v", err)
 	}
 
 	h.Log.Info("Created auth files for multiple providers", map[string]interface{}{
-		"codex_path":        codexAuthPath,
-		"claude_path":       claudeAuthPath,
+		"codex_path":         codexAuthPath,
+		"claude_path":        claudeAuthPath,
 		"claude_config_path": claudeConfigAuthPath,
 	})
 
@@ -770,7 +770,7 @@ func TestE2E_OptionalFilesHandling(t *testing.T) {
 
 	// Create required file only
 	claudeAuth := filepath.Join(homeDir, ".claude.json")
-	if err := os.WriteFile(claudeAuth, []byte(`{"session": "test"}`), 0600); err != nil {
+	if err := os.WriteFile(claudeAuth, []byte(`{"sessionKey": "test"}`), 0600); err != nil {
 		t.Fatalf("Failed to write claude auth: %v", err)
 	}
 

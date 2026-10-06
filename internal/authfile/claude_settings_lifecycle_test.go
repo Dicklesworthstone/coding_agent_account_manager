@@ -3,6 +3,7 @@ package authfile
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +30,162 @@ func saveClaudeSettingsTestPolicy(t *testing.T, p claudesettings.Policy) {
 		t.Fatal(err)
 	}
 	writeClaudeSettingsTestFile(t, claudesettings.CAAMConfigPath(), string(data))
+}
+
+// A selected account must contain a credential before restore changes live
+// settings or auth. Identity metadata is especially misleading after a macOS
+// backup failed to capture the login keychain (issue #113).
+func TestClaudeCredentialPreflightRejectsIncompleteSnapshots(t *testing.T) {
+	tests := []struct {
+		name  string
+		files map[string]string
+		want  error
+	}{
+		{"metadata only", nil, ErrNoCredentials},
+		{"account identity only", map[string]string{".claude.json": `{"oauthAccount":{"emailAddress":"target@example.com","accountUuid":"target"}}`}, ErrNoCredentials},
+		{"shared policy only", map[string]string{".claude.json": `{"mcpServers":{},"permissions":{"allow":["Read"]}}`}, ErrNoCredentials},
+		{"login selection only", map[string]string{"settings.json": `{"forceLoginMethod":"claudeai","forceLoginOrgUUID":"target"}`}, ErrNoCredentials},
+		{"unrelated environment", map[string]string{"settings.json": `{"env":{"EDITOR":"vim","ANTHROPIC_BASE_URL":"https://example.invalid"}}`}, ErrNoCredentials},
+		{"empty helper", map[string]string{"settings.json": `{"apiKeyHelper":"  "}`}, ErrNoCredentials},
+		{"empty API key", map[string]string{"settings.json": `{"env":{"ANTHROPIC_API_KEY":""}}`}, ErrNoCredentials},
+		{"unrecognized token field", map[string]string{".claude.json": `{"token":"looks-like-auth"}`}, ErrNoCredentials},
+		{"empty primary object", map[string]string{".credentials.json": `{}`}, ErrNoCredentials},
+		{"refresh without access", map[string]string{".credentials.json": `{"claudeAiOauth":{"refreshToken":"target-refresh"}}`}, ErrNoCredentials},
+		{"expiry without access", map[string]string{".credentials.json": `{"claudeAiOauth":{"expiresAt":1893456000000}}`}, ErrNoCredentials},
+		{"blank access", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":" "}}`}, ErrNoCredentials},
+		{"null primary", map[string]string{".credentials.json": `null`}, ErrInvalidCredentials},
+		{"array primary", map[string]string{".credentials.json": `[]`}, ErrInvalidCredentials},
+		{"empty primary file", map[string]string{".credentials.json": ``}, ErrInvalidCredentials},
+		{"malformed primary", map[string]string{".credentials.json": `{"claudeAiOauth":`}, ErrInvalidCredentials},
+		{"null OAuth block", map[string]string{".credentials.json": `{"claudeAiOauth":null}`}, ErrInvalidCredentials},
+		{"null access", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":null}}`}, ErrInvalidCredentials},
+		{"numeric access", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":123}}`}, ErrInvalidCredentials},
+		{"null refresh", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","refreshToken":null}}`}, ErrInvalidCredentials},
+		{"numeric refresh", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","refreshToken":123}}`}, ErrInvalidCredentials},
+		{"null expiry", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","expiresAt":null}}`}, ErrInvalidCredentials},
+		{"malformed expiry", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","expiresAt":"broken"}}`}, ErrInvalidCredentials},
+		{"negative expiry", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","expiresAt":-1}}`}, ErrInvalidCredentials},
+		{"overflow expiry", map[string]string{".credentials.json": `{"claudeAiOauth":{"accessToken":"opaque","expiresAt":1e100}}`}, ErrInvalidCredentials},
+		{"null primary cannot fall through to helper", map[string]string{".credentials.json": `null`, "settings.json": `{"apiKeyHelper":"target-helper"}`}, ErrInvalidCredentials},
+		{"empty primary cannot fall through to helper", map[string]string{".credentials.json": `{}`, "settings.json": `{"apiKeyHelper":"target-helper"}`}, ErrNoCredentials},
+		{"null legacy token", map[string]string{".claude.json": `{"oauthToken":null}`}, ErrInvalidCredentials},
+		{"null helper", map[string]string{"settings.json": `{"apiKeyHelper":null}`}, ErrInvalidCredentials},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			fileSet := ClaudeAuthFiles()
+			vault := NewVault(filepath.Join(home, "vault"))
+			profileDir := vault.ProfilePath("claude", "target")
+			writeClaudeSettingsTestFile(t, filepath.Join(profileDir, "meta.json"), `{"identity":"target@example.com"}`)
+			for name, body := range tt.files {
+				writeClaudeSettingsTestFile(t, filepath.Join(profileDir, name), body)
+			}
+			live := map[string]string{
+				fileSet.Files[0].Path: `{"claudeAiOauth":{"accessToken":"live-access","refreshToken":"live-refresh"}}`,
+				fileSet.Files[1].Path: `{"oauthAccount":{"accountUuid":"live"},"mcpServers":{"live":{}}}`,
+				fileSet.Files[3].Path: `{"apiKeyHelper":"live-helper","permissions":{"allow":["Read"]}}`,
+			}
+			for path, body := range live {
+				writeClaudeSettingsTestFile(t, path, body)
+			}
+			if err := vault.ValidateProfileCredentials(fileSet, "target"); !errors.Is(err, tt.want) {
+				t.Fatalf("ValidateProfileCredentials() = %v, want %v", err, tt.want)
+			}
+			if err := vault.Restore(fileSet, "target"); !errors.Is(err, tt.want) {
+				t.Fatalf("Restore() = %v, want %v", err, tt.want)
+			}
+			for path, body := range live {
+				if got, err := os.ReadFile(path); err != nil || string(got) != body {
+					t.Fatalf("failed activation changed live %s: %v", filepath.Base(path), err)
+				}
+			}
+			for name, body := range tt.files {
+				if got, err := os.ReadFile(filepath.Join(profileDir, name)); err != nil || string(got) != body {
+					t.Fatalf("validation/restore changed snapshot %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeCredentialPreflightAcceptsSupportedSources(t *testing.T) {
+	tests := []struct{ name, filename, body string }{
+		{"opaque OAuth access without expiry", ".credentials.json", `{"claudeAiOauth":{"accessToken":"opaque"}}`},
+		{"OAuth with refresh and expiry", ".credentials.json", `{"claudeAiOauth":{"accessToken":"opaque","refreshToken":"refresh","expiresAt":1893456000000}}`},
+		{"expired OAuth remains locally restorable", ".credentials.json", `{"claudeAiOauth":{"accessToken":"opaque","refreshToken":"refresh","expiresAt":1000}}`},
+		{"empty refresh is access-only", ".credentials.json", `{"claudeAiOauth":{"accessToken":"opaque","refreshToken":""}}`},
+		{"legacy OAuth token", ".claude.json", `{"oauthToken":"opaque"}`},
+		{"legacy session key", ".claude.json", `{"sessionKey":"opaque"}`},
+		{"legacy API key", ".claude.json", `{"primaryApiKey":"test-key"}`},
+		{"flat OAuth", "auth.json", `{"access_token":"opaque","refresh_token":"refresh"}`},
+		{"API helper", "settings.json", `{"apiKeyHelper":"target-helper"}`},
+		{"API key environment", "settings.json", `{"env":{"ANTHROPIC_API_KEY":"test-key"}}`},
+		{"OAuth environment", "settings.json", `{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"opaque"}}`},
+		{"encrypted desktop cache", "config.json", `{"oauth:tokenCacheV2":"encrypted-cache"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			fileSet := ClaudeAuthFiles()
+			vault := NewVault(filepath.Join(home, "vault"))
+			snapshot := vault.BackupPath("claude", "target", tt.filename)
+			writeClaudeSettingsTestFile(t, snapshot, tt.body)
+			if err := vault.ValidateProfileCredentials(fileSet, "target"); err != nil {
+				t.Fatalf("ValidateProfileCredentials() = %v", err)
+			}
+			// Preflight never materializes live credentials, even for a source
+			// with no expiry or a helper which can only be checked by running it.
+			for _, spec := range fileSet.Files {
+				if _, err := os.Stat(spec.Path); !os.IsNotExist(err) {
+					t.Fatalf("preflight wrote live %s: %v", spec.Path, err)
+				}
+			}
+			if err := vault.Restore(fileSet, "target"); err != nil {
+				t.Fatalf("Restore() = %v", err)
+			}
+			if !HasAuthFiles(fileSet) {
+				t.Fatal("restored credential source is not recognized as auth")
+			}
+			if active, err := vault.ActiveProfile(fileSet); err != nil || active != "target" {
+				t.Fatalf("ActiveProfile() = %q, %v; want target", active, err)
+			}
+		})
+	}
+}
+
+func TestClaudeCredentiallessLiveStateCannotCreateProfile(t *testing.T) {
+	for _, body := range []string{
+		`{"oauthAccount":{"accountUuid":"identity-only"}}`,
+		`{"mcpServers":{"local":{}},"projects":{}}`,
+		`{"oauthToken":""}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			fileSet := ClaudeAuthFiles()
+			writeClaudeSettingsTestFile(t, fileSet.Files[1].Path, body)
+			writeClaudeSettingsTestFile(t, fileSet.Files[3].Path, `{"forceLoginMethod":"claudeai","env":{"EDITOR":"vim"}}`)
+			vault := NewVault(filepath.Join(home, "vault"))
+			if HasAuthFiles(fileSet) {
+				t.Fatal("account labels or settings were reported as a live login")
+			}
+			if err := vault.Backup(fileSet, "empty"); !errors.Is(err, ErrNoCredentials) {
+				t.Fatalf("Backup() = %v, want ErrNoCredentials", err)
+			}
+			if _, err := os.Stat(vault.ProfilePath("claude", "empty")); !os.IsNotExist(err) {
+				t.Fatalf("failed backup created an empty profile: %v", err)
+			}
+		})
+	}
 }
 
 func TestClaudeSettingsVaultMultiProfileLifecycle(t *testing.T) {

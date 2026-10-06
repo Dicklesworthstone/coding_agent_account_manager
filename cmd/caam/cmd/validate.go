@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -18,22 +18,20 @@ import (
 var validateCmd = &cobra.Command{
 	Use:   "validate [tool] [profile]",
 	Short: "Validate authentication tokens",
-	Long: `Validate that authentication tokens actually work.
+	Long: `Check saved authentication credentials and their known expiry.
 
 By default, performs passive validation (no network calls):
   - Check auth file existence
   - Check token format/structure
   - Check expiry timestamps
 
-Use --active for active validation (makes minimal API calls):
-  - Verifies token is actually valid with the provider
-  - May incur minimal API costs
+Provider probing is not supported for saved vault profiles. Requests with
+--active fail explicitly; passive results do not prove provider acceptance.
 
 Examples:
   caam validate                    # Validate all profiles (passive)
   caam validate claude             # Validate all Claude profiles
   caam validate claude work        # Validate specific profile
-  caam validate --active           # Active validation for all profiles
   caam validate claude work --json # JSON output`,
 	Args: cobra.MaximumNArgs(2),
 	RunE: runValidate,
@@ -46,7 +44,7 @@ var (
 )
 
 func init() {
-	validateCmd.Flags().BoolVar(&validateActive, "active", false, "Perform active validation (API calls)")
+	validateCmd.Flags().BoolVar(&validateActive, "active", false, "Request provider verification (unsupported for saved vault profiles)")
 	validateCmd.Flags().BoolVar(&validateJSON, "json", false, "Output in JSON format")
 	validateCmd.Flags().BoolVar(&validateAll, "all", false, "Validate all profiles (default behavior)")
 	rootCmd.AddCommand(validateCmd)
@@ -54,13 +52,15 @@ func init() {
 
 // ValidationOutput represents the JSON output for validation results.
 type ValidationOutput struct {
-	Provider  string    `json:"provider"`
-	Profile   string    `json:"profile"`
-	Valid     bool      `json:"valid"`
-	Method    string    `json:"method"`
-	ExpiresAt string    `json:"expires_at,omitempty"`
-	Error     string    `json:"error,omitempty"`
-	CheckedAt time.Time `json:"checked_at"`
+	Provider       string    `json:"provider"`
+	Profile        string    `json:"profile"`
+	Valid          bool      `json:"valid"`
+	Method         string    `json:"method"`
+	ExpiresAt      string    `json:"expires_at,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	CheckedAt      time.Time `json:"checked_at"`
+	Recommendation string    `json:"recommendation,omitempty"`
+	health.Signals
 }
 
 func runValidate(cmd *cobra.Command, args []string) error {
@@ -89,12 +89,9 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Active validation against saved vault profiles is not implemented; vault
-	// profiles are raw auth files, not isolated profile homes. Surface this on
-	// stderr (diagnostics) and proceed with passive validation rather than
-	// silently pretending to make API calls.
+	// A passive result cannot satisfy a request to verify with the provider.
 	if validateActive {
-		fmt.Fprintln(os.Stderr, "note: --active is not supported for saved vault profiles; performing passive validation")
+		return fmt.Errorf("active validation is not supported for saved vault profiles; omit --active for passive credential checks")
 	}
 
 	results := []ValidationOutput{}
@@ -106,7 +103,7 @@ func runValidate(cmd *cobra.Command, args []string) error {
 
 		profiles, err := vault.List(tool)
 		if err != nil {
-			continue // No profiles for this tool
+			return fmt.Errorf("list %s profiles: %w", tool, err)
 		}
 		sort.Strings(profiles)
 
@@ -117,24 +114,94 @@ func runValidate(cmd *cobra.Command, args []string) error {
 			if profileFilter != "" && profileName != profileFilter {
 				continue
 			}
-			results = append(results, validateVaultProfile(tool, profileName))
+			result, _ := validateVaultProfile(tool, profileName)
+			results = append(results, result)
 		}
+	}
+	if profileFilter != "" && len(results) == 0 {
+		return fmt.Errorf("saved profile %s/%s not found", toolFilter, profileFilter)
 	}
 
 	// Output results. Encode empty results as [] (not null) for agent parsing.
+	var outputErr error
 	if validateJSON {
-		return outputJSON(results)
+		outputErr = outputJSON(results)
+	} else {
+		outputErr = outputHuman(results)
 	}
-	return outputHuman(results)
+	if outputErr != nil {
+		return outputErr
+	}
+	for _, result := range results {
+		if !result.Valid {
+			return fmt.Errorf("one or more saved profiles failed passive validation")
+		}
+	}
+	return nil
 }
 
-// validateVaultProfile passively validates a single saved vault profile. A
-// profile is valid when its auth files are present and parseable. An expired
-// access token does NOT make the profile invalid if a refresh token is present:
-// such profiles are refreshable, and reporting them as hard-expired is
-// misleading (issue #22). Only credentials with no refresh capability are
-// reported as expired/invalid.
-func validateVaultProfile(tool, profileName string) ValidationOutput {
+// readVaultProfileHealth checks the saved credential before reading its expiry.
+// An identity file, settings file, or stale health record cannot establish that
+// a profile contains credentials. The saved files are also the source used by
+// activation; a different live or isolated login must not validate this copy.
+func readVaultProfileHealth(tool, profileName string) (*health.ProfileHealth, error) {
+	ph := &health.ProfileHealth{}
+	if healthStore != nil {
+		stored, err := healthStore.GetProfile(tool, profileName)
+		if err != nil {
+			return ph, fmt.Errorf("read profile health: %w", err)
+		}
+		if stored != nil {
+			ph = stored
+		}
+	}
+	// Expiry and renewal capability belong to the current credential, even if
+	// it has no expiry. Retain only persisted error and verification metadata.
+	applyExpiryInfo(ph, &health.ExpiryInfo{})
+	fileSet, ok := tools[tool]
+	if !ok {
+		return ph, fmt.Errorf("unknown tool: %s", tool)
+	}
+	if err := vault.ValidateProfileCredentials(fileSet(), profileName); err != nil {
+		return ph, err
+	}
+
+	dir := vault.ProfilePath(tool, profileName)
+	var info *health.ExpiryInfo
+	var err error
+	switch tool {
+	case "claude":
+		info, err = health.ParseClaudeExpiry(dir)
+	case "codex":
+		info, err = health.ParseCodexExpiry(filepath.Join(dir, "auth.json"))
+	case "gemini":
+		info, err = health.ParseGeminiExpiry(dir)
+	case "grok":
+		info, err = health.ParseGrokExpiry(filepath.Join(dir, "auth.json"))
+	case "cursor":
+		info, err = health.ParseCursorExpiry(filepath.Join(dir, "auth.json"))
+	}
+	// A supported credential may have no expiry parser (for example, a legacy
+	// Claude API key). Presence was established above, independently of expiry.
+	if err != nil && !errors.Is(err, health.ErrNoExpiry) && !errors.Is(err, health.ErrNoAuthFile) {
+		return ph, err
+	}
+	if info != nil {
+		applyExpiryInfo(ph, info)
+	}
+	return ph, nil
+}
+
+func invalidCredentialSignals() health.Signals {
+	no, yes := false, true
+	return health.Signals{RefreshDue: &no, LaunchUsable: &no, LoginRequired: &yes}
+}
+
+// validateVaultProfile is shared by the human and robot validation surfaces.
+// Valid describes a passive local check, not a successful provider probe. An
+// expired access token remains valid when the credential is renewable, unless
+// the provider has already rejected that same credential.
+func validateVaultProfile(tool, profileName string) (ValidationOutput, *health.ProfileHealth) {
 	out := ValidationOutput{
 		Provider:  tool,
 		Profile:   profileName,
@@ -142,33 +209,23 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		CheckedAt: time.Now(),
 	}
 
-	info, err := loadExpiryInfo(tool, profileName)
+	ph, err := readVaultProfileHealth(tool, profileName)
 	if err != nil {
-		switch {
-		case errors.Is(err, health.ErrNoAuthFile):
-			out.Valid = false
-			out.Error = "no auth files found"
-		case errors.Is(err, health.ErrNoExpiry):
-			// Auth files exist but carry no parseable expiry/refresh metadata.
-			// Treat as valid-but-unknown: the credentials are present.
-			out.Valid = true
-		default:
-			out.Valid = false
-			out.Error = err.Error()
-		}
-		return out
+		out.Error = err.Error()
+		out.Signals = invalidCredentialSignals()
+		out.Recommendation = fmt.Sprintf("log in with %s, then run 'caam backup %s %s' to save the credentials", tool, tool, profileName)
+		return out, ph
+	}
+	out.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
+	out.Recommendation = health.FormatRecommendation(tool, profileName, ph)
+	if ph.ProviderRejected() {
+		out.Error = "provider rejected credential; log in again"
+		return out, ph
 	}
 
-	// Tools without expiry parsing (opencode/cursor/agy/grok) return nil info; the
-	// presence of the vault profile dir is the validation signal for them.
-	if info == nil {
-		out.Valid = true
-		return out
-	}
-
-	expired := !info.ExpiresAt.IsZero() && time.Until(info.ExpiresAt) <= 0
+	expired := !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0
 	switch {
-	case expired && info.HasRefreshToken:
+	case expired && ph.CredentialRenewable():
 		// Refreshable: short-lived access token expired but a refresh token
 		// remains. Considered valid/refreshable, not hard-expired. Avoid
 		// presenting the access-token expiry as account expiry (issue #22).
@@ -180,12 +237,12 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		out.ExpiresAt = "expired"
 	default:
 		out.Valid = true
-		if !info.ExpiresAt.IsZero() {
-			out.ExpiresAt = formatExpiryTime(info.ExpiresAt)
+		if !ph.TokenExpiresAt.IsZero() {
+			out.ExpiresAt = formatExpiryTime(ph.TokenExpiresAt)
 		}
 	}
 
-	return out
+	return out, ph
 }
 
 func formatExpiryTime(t time.Time) string {

@@ -56,7 +56,7 @@ func TestActivateCommand_Extended(t *testing.T) {
 	require.NoError(t, os.MkdirAll(profileDir, 0755))
 
 	authPath := filepath.Join(profileDir, "auth.json")
-	require.NoError(t, os.WriteFile(authPath, []byte(`{"token":"work"}`), 0600))
+	require.NoError(t, os.WriteFile(authPath, []byte(`{"access_token":"work"}`), 0600))
 
 	// Define target location for restore
 	homeDir := filepath.Join(rootDir, "home")
@@ -97,7 +97,7 @@ func TestActivateCommand_Extended(t *testing.T) {
 	// Verify file restored
 	content, err := os.ReadFile(targetPath)
 	require.NoError(t, err)
-	assert.Equal(t, `{"token":"work"}`, string(content))
+	assert.Equal(t, `{"access_token":"work"}`, string(content))
 
 	h.EndStep("Activate")
 

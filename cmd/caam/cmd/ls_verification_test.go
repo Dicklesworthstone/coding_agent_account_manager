@@ -116,7 +116,7 @@ func TestCursorStatusKeepsActiveLoginAfterConfigChange(t *testing.T) {
 
 func TestCursorVaultExpiryPropagation(t *testing.T) {
 	vaultDir, _ := setupCodexVerificationVault(t)
-	tools["cursor"] = func() authfile.AuthFileSet { return authfile.AuthFileSet{Tool: "cursor"} }
+	tools["cursor"] = authfile.CursorAuthFiles
 	expires := time.Now().Add(3 * 24 * time.Hour).Truncate(time.Second)
 	payload, err := json.Marshal(map[string]any{"exp": expires.Unix()})
 	if err != nil {

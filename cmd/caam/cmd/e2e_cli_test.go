@@ -617,9 +617,9 @@ func TestE2E_MultiProviderWorkflow(t *testing.T) {
 		},
 		{
 			tool:     "claude",
-			homeDir:  homeDir,
-			authFile: ".claude.json",
-			content:  `{"session_token": "claude-token"}`,
+			homeDir:  filepath.Join(homeDir, ".claude"),
+			authFile: ".credentials.json",
+			content:  `{"claudeAiOauth":{"accessToken":"claude-token","refreshToken":"claude-refresh"}}`,
 		},
 	}
 

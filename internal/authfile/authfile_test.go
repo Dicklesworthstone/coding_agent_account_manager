@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -360,9 +361,18 @@ func TestVaultRestore(t *testing.T) {
 		tmpDir := t.TempDir()
 		vaultDir := filepath.Join(tmpDir, "vault")
 
-		// Create profile dir but without the required file
+		// A partial snapshot must be rejected before its first file replaces
+		// the live account. Discovering the missing file during copying is late.
 		profileDir := filepath.Join(vaultDir, "testtool", "profile1")
 		if err := os.MkdirAll(profileDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(profileDir, "first.json"), []byte(`{"token":"target"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		livePath := filepath.Join(tmpDir, "first.json")
+		const live = `{"token":"live"}`
+		if err := os.WriteFile(livePath, []byte(live), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -370,13 +380,17 @@ func TestVaultRestore(t *testing.T) {
 		fileSet := AuthFileSet{
 			Tool: "testtool",
 			Files: []AuthFileSpec{
-				{Tool: "testtool", Path: "/some/auth.json", Required: true},
+				{Tool: "testtool", Path: livePath, Required: true},
+				{Tool: "testtool", Path: filepath.Join(tmpDir, "missing.json"), Required: true},
 			},
 		}
 
 		err := v.Restore(fileSet, "profile1")
-		if err == nil {
-			t.Fatal("Restore() should fail for missing required backup")
+		if !errors.Is(err, ErrNoCredentials) {
+			t.Fatalf("Restore() = %v, want ErrNoCredentials", err)
+		}
+		if got, err := os.ReadFile(livePath); err != nil || string(got) != live {
+			t.Fatalf("partial snapshot changed live credentials: %v", err)
 		}
 	})
 
@@ -498,6 +512,15 @@ func TestVaultRestore_MigratesGeminiFilename(t *testing.T) {
 			{Tool: "gemini", Path: authFile, Required: false},
 		},
 		AllowOptionalOnly: true,
+	}
+	if err := v.ValidateProfileCredentials(fileSet, "testprofile"); err != nil {
+		t.Fatalf("ValidateProfileCredentials() error = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(profileDir, "oauth_credentials.json")); err != nil || string(got) != string(oldContent) {
+		t.Fatalf("validation changed legacy snapshot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "oauth_creds.json")); !os.IsNotExist(err) {
+		t.Fatalf("validation migrated the legacy snapshot: %v", err)
 	}
 
 	if err := v.Restore(fileSet, "testprofile"); err != nil {

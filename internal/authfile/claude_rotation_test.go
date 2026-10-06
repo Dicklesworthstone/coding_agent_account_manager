@@ -215,6 +215,33 @@ func TestActiveProfileIdentityPrefersNamedOverSystemProfile(t *testing.T) {
 	}
 }
 
+func TestActiveProfileNamedIdentityWinsOverCurrentSystemSnapshot(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("alice", aliceGen1, aliceSettings(1))
+	f.writeLive(aliceGen2, aliceSettings(9))
+	if err := f.vault.Backup(f.fileSet, "_backup_current"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.active(); got != "alice" {
+		t.Fatalf("a current safety snapshot displaced named account alice: %q", got)
+	}
+}
+
+func TestActiveProfileDoesNotMatchCredentiallessIdentity(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.fileSet.AllowOptionalOnly = true
+	f.writeLive(aliceGen2, aliceSettings(9))
+	profileDir := f.vault.ProfilePath("claude", "empty-alice")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(profileDir, ".claude.json"), aliceSettings(1))
+	writeFixtureFile(t, filepath.Join(profileDir, "meta.json"), `{"identity_keys":["uuid:`+rotAliceUUID+`"]}`)
+	if got := f.active(); got != "" {
+		t.Fatalf("identity-only profile reported active: %q", got)
+	}
+}
+
 func TestActiveProfileIdentityFromMetaWhenSnapshotLacksSettings(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	// Snapshot has no .claude.json (backed up while it was absent) but Backup

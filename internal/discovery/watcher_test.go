@@ -31,9 +31,10 @@ func TestWatchOnce(t *testing.T) {
 	creds := map[string]interface{}{
 		"claudeAiOauth": map[string]interface{}{
 			"email":            "test@example.com",
+			"accessToken":      "test-access-token",
 			"subscriptionType": "max",
 			"accountId":        "acct_123",
-			"expiresAt":        time.Now().Add(time.Hour).Unix(),
+			"expiresAt":        time.Now().Add(time.Hour).UnixMilli(),
 		},
 	}
 	credsData, _ := json.Marshal(creds)
@@ -112,9 +113,10 @@ func TestWatcher_Discovery(t *testing.T) {
 	creds := map[string]interface{}{
 		"claudeAiOauth": map[string]interface{}{
 			"email":            "newuser@example.com",
+			"accessToken":      "new-user-access-token",
 			"subscriptionType": "max",
 			"accountId":        "acct_456",
-			"expiresAt":        time.Now().Add(time.Hour).Unix(),
+			"expiresAt":        time.Now().Add(time.Hour).UnixMilli(),
 		},
 	}
 	credsData, _ := json.Marshal(creds)
@@ -203,9 +205,10 @@ func TestWatcher_UpdateExisting(t *testing.T) {
 	creds := map[string]interface{}{
 		"claudeAiOauth": map[string]interface{}{
 			"email":            "existing@example.com",
+			"accessToken":      "initial-access-token",
 			"subscriptionType": "max",
 			"accountId":        "acct_789",
-			"expiresAt":        time.Now().Add(time.Hour).Unix(),
+			"expiresAt":        time.Now().Add(time.Hour).UnixMilli(),
 		},
 	}
 	credsData, _ := json.Marshal(creds)
@@ -221,8 +224,10 @@ func TestWatcher_UpdateExisting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, profiles, "existing@example.com")
 
-	// Update credentials (new expiry)
-	creds["claudeAiOauth"].(map[string]interface{})["expiresAt"] = time.Now().Add(2 * time.Hour).Unix()
+	// A real native refresh changes the token generation as well as expiry.
+	// Expiry-only metadata edits do not represent a different credential.
+	creds["claudeAiOauth"].(map[string]interface{})["accessToken"] = "rotated-access-token"
+	creds["claudeAiOauth"].(map[string]interface{})["expiresAt"] = time.Now().Add(2 * time.Hour).UnixMilli()
 	credsData, _ = json.Marshal(creds)
 	require.NoError(t, os.WriteFile(credsPath, credsData, 0600))
 
@@ -235,7 +240,7 @@ func TestWatcher_UpdateExisting(t *testing.T) {
 	assert.Equal(t, "claude/existing@example.com", discovered[0])
 }
 
-func TestWatchOnce_AutoProfileOnIdentityError(t *testing.T) {
+func TestWatchOnce_AutoProfileWithoutIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	vaultDir := filepath.Join(tmpDir, "vault")
 	homeDir := filepath.Join(tmpDir, "home")
@@ -254,7 +259,9 @@ func TestWatchOnce_AutoProfileOnIdentityError(t *testing.T) {
 	}()
 
 	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
-	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
+	// Current Claude tokens may be opaque and carry no account identity.
+	// That still permits a backup; malformed JSON does not.
+	require.NoError(t, os.WriteFile(credsPath, []byte(`{"claudeAiOauth":{"accessToken":"opaque-without-identity"}}`), 0600))
 
 	discovered, err := WatchOnce(vault, []string{"claude"}, nil)
 	require.NoError(t, err)
@@ -267,7 +274,26 @@ func TestWatchOnce_AutoProfileOnIdentityError(t *testing.T) {
 	assert.True(t, strings.HasPrefix(profiles[0], "auto-"))
 }
 
-func TestWatcher_AutoProfileOnIdentityError(t *testing.T) {
+func TestWatchOnce_RejectsMalformedCredentials(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(homeDir, ".config", "claude-code"))
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
+	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
+	vault := authfile.NewVault(filepath.Join(homeDir, "vault"))
+
+	discovered, err := WatchOnce(vault, []string{"claude"}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, discovered, "malformed auth cannot produce a discovered account")
+	require.ErrorIs(t, vault.Backup(authfile.ClaudeAuthFiles(), "malformed"), authfile.ErrInvalidCredentials)
+	profiles, err := vault.List("claude")
+	require.NoError(t, err)
+	assert.Empty(t, profiles, "refused auth must not leave an empty auto profile")
+}
+
+func TestWatcher_AutoProfileWithoutIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 	vaultDir := filepath.Join(tmpDir, "vault")
 	homeDir := filepath.Join(tmpDir, "home")
@@ -308,7 +334,7 @@ func TestWatcher_AutoProfileOnIdentityError(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	credsPath := filepath.Join(homeDir, ".claude", ".credentials.json")
-	require.NoError(t, os.WriteFile(credsPath, []byte("{invalid"), 0600))
+	require.NoError(t, os.WriteFile(credsPath, []byte(`{"claudeAiOauth":{"accessToken":"opaque-without-identity"}}`), 0600))
 
 	// Poll instead of a fixed sleep: under heavy machine load the fsnotify
 	// event + debounce interval can take well over 500ms to fire.
@@ -653,8 +679,8 @@ func TestE2E_PartialWriteRecovery(t *testing.T) {
 	validData, _ := json.Marshal(validCreds)
 	require.NoError(t, os.WriteFile(credsPath, validData, 0600))
 
-	// Should have at least one successful discovery (the valid one).
-	// The partial write might create an auto-profile or be skipped.
+	// Only the complete credential can produce a successful discovery.
+	// Malformed snapshots are refused before creating an auto profile.
 	// Poll instead of a fixed sleep: under heavy machine load the fsnotify
 	// event + debounce interval can take well over 400ms to fire.
 	deadline := time.Now().Add(4 * time.Second)
@@ -670,7 +696,7 @@ func TestE2E_PartialWriteRecovery(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.GreaterOrEqual(t, len(discoveries), 1, "should have at least one discovery")
+	assert.Len(t, discoveries, 1, "only the valid credential should be discovered")
 }
 
 // TestE2E_MultiProviderDiscovery verifies that watch mode can detect

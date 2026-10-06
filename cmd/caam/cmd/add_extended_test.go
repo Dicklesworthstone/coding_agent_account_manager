@@ -22,7 +22,7 @@ func TestAddHelperProcess(t *testing.T) {
 	}
 
 	// This code runs inside the "mocked" process (e.g., 'claude login')
-	
+
 	// Read where we should write the auth file
 	authPath := os.Getenv("MOCK_AUTH_PATH")
 	if authPath == "" {
@@ -76,8 +76,8 @@ func TestAddExtended(t *testing.T) {
 	require.NoError(t, os.MkdirAll(vaultDir, 0755))
 
 	// Defines paths
-	fakeAuthPath := filepath.Join(homeDir, "claude_auth.json")
-	
+	fakeAuthPath := filepath.Join(homeDir, ".claude.json")
+
 	// Pre-create "old" auth file to test backup logic
 	oldAuthContent := `{"sessionKey": "old-session-key"}`
 	require.NoError(t, os.WriteFile(fakeAuthPath, []byte(oldAuthContent), 0600))
@@ -116,7 +116,7 @@ func TestAddExtended(t *testing.T) {
 		cs := []string{"-test.run=TestAddHelperProcess", "--", name}
 		cs = append(cs, args...)
 		cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-		cmd.Env = append(os.Environ(), 
+		cmd.Env = append(os.Environ(),
 			"GO_WANT_HELPER_PROCESS=1",
 			"MOCK_AUTH_PATH="+fakeAuthPath,
 		)
@@ -126,13 +126,13 @@ func TestAddExtended(t *testing.T) {
 
 	// 2. Execute Command
 	h.StartStep("Execute", "Run add command for claude")
-	
+
 	// We need to provide "claude" and "new-profile" as args
 	// We also set --force to skip confirmation prompts
 	// And --no-activate to simplify assertion
 	addCmd.Flags().Set("force", "true")
 	addCmd.Flags().Set("no-activate", "true")
-	
+
 	err := runAdd(addCmd, []string{"claude", "test-profile"})
 	require.NoError(t, err)
 	h.EndStep("Execute")
@@ -158,19 +158,17 @@ func TestAddExtended(t *testing.T) {
 
 	// Verify content of the new profile
 	profilePath := vault.ProfilePath("claude", "test-profile")
-	
-	// The vault structure mirrors the file structure relative to HOME if configured that way,
-	// or it flattens it. Let's check how Backup works.
-	// authfile.Backup copies files into the profile dir.
-	// Since our fakeAuthPath is just "claude_auth.json", it should be at the root of profile dir.
-	// However, `authfile` usually preserves structure relative to common base?
-	// Let's check `vault.List` again.
-	
+
+	// Legacy sessionKey credentials belong in .claude.json. Backup preserves
+	// that basename so the saved file can be recognized and restored.
+
 	// Just check if the file exists inside the profile dir
 	foundFile := false
 	err = filepath.Walk(profilePath, func(path string, info os.FileInfo, err error) error {
-		if err != nil { return err }
-		if !info.IsDir() && info.Name() == "claude_auth.json" {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && info.Name() == ".claude.json" {
 			foundFile = true
 			content, _ := os.ReadFile(path)
 			assert.Contains(t, string(content), "new-session-key")

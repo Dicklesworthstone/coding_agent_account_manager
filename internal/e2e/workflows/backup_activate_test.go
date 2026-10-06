@@ -40,9 +40,12 @@ func TestE2E_CompleteBackupActivateSwitchWorkflow(t *testing.T) {
 	}
 
 	// Create Claude auth files
+	claudeHome := filepath.Join(homeDir, ".claude")
 	claudeConfigDir := filepath.Join(xdgConfig, "claude-code")
-	if err := os.MkdirAll(claudeConfigDir, 0700); err != nil {
-		t.Fatalf("Failed to create claude config dir: %v", err)
+	for _, dir := range []string{claudeHome, claudeConfigDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("Failed to create claude auth dir: %v", err)
+		}
 	}
 
 	// Write initial Codex auth - account1
@@ -60,12 +63,13 @@ func TestE2E_CompleteBackupActivateSwitchWorkflow(t *testing.T) {
 	}
 
 	// Write initial Claude auth - personal account
-	claudeMainPath := filepath.Join(homeDir, ".claude.json")
+	claudeMainPath := filepath.Join(claudeHome, ".credentials.json")
 	claudePersonal := map[string]interface{}{
-		"session_token": "claude-personal-session-111",
-		"refresh_token": "claude-personal-refresh-222",
-		"expires_at":    time.Now().Add(24 * time.Hour).Format(time.RFC3339),
-		"account":       "personal",
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken":  "claude-personal-access-111",
+			"refreshToken": "claude-personal-refresh-222",
+			"expiresAt":    time.Now().Add(24 * time.Hour).UnixMilli(),
+		},
 	}
 	claudeMainJSON, _ := json.MarshalIndent(claudePersonal, "", "  ")
 	if err := os.WriteFile(claudeMainPath, claudeMainJSON, 0600); err != nil {
@@ -292,13 +296,14 @@ func TestE2E_CompleteBackupActivateSwitchWorkflow(t *testing.T) {
 
 	// Verify vault structure
 	expectedStructure := map[string]string{
-		"codex":                    "dir",
-		"codex/account1":           "dir",
-		"codex/account2":           "dir",
-		"codex/account1/auth.json": "file",
-		"codex/account2/auth.json": "file",
-		"claude":                   "dir",
-		"claude/personal":          "dir",
+		"codex":                             "dir",
+		"codex/account1":                    "dir",
+		"codex/account2":                    "dir",
+		"codex/account1/auth.json":          "file",
+		"codex/account2/auth.json":          "file",
+		"claude":                            "dir",
+		"claude/personal":                   "dir",
+		"claude/personal/.credentials.json": "file",
 	}
 
 	allMatch := true
@@ -444,10 +449,11 @@ func TestE2E_CrossProviderSwitching(t *testing.T) {
 
 	// Create directories
 	codexHome := filepath.Join(homeDir, ".codex")
+	claudeHome := filepath.Join(homeDir, ".claude")
 	claudeConfigDir := filepath.Join(xdgConfig, "claude-code")
 	geminiHome := filepath.Join(homeDir, ".gemini")
 
-	for _, dir := range []string{codexHome, claudeConfigDir, geminiHome} {
+	for _, dir := range []string{codexHome, claudeHome, claudeConfigDir, geminiHome} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			t.Fatalf("Failed to create dir %s: %v", dir, err)
 		}
@@ -455,9 +461,12 @@ func TestE2E_CrossProviderSwitching(t *testing.T) {
 
 	// Auth paths
 	codexAuthPath := filepath.Join(codexHome, "auth.json")
-	claudeMainPath := filepath.Join(homeDir, ".claude.json")
+	claudeMainPath := filepath.Join(claudeHome, ".credentials.json")
 	claudeConfigPath := filepath.Join(claudeConfigDir, "auth.json")
 	geminiPath := filepath.Join(geminiHome, "settings.json")
+	if err := os.WriteFile(claudeConfigPath, []byte(`{"access_token":"claude-work-token"}`), 0600); err != nil {
+		t.Fatalf("Failed to write Claude config auth: %v", err)
+	}
 
 	// File sets
 	codexFileSet := authfile.AuthFileSet{
@@ -498,8 +507,13 @@ func TestE2E_CrossProviderSwitching(t *testing.T) {
 		{
 			name:    "claude",
 			fileSet: claudeFileSet,
-			paths:   []string{claudeMainPath, claudeConfigPath},
-			content: map[string]interface{}{"session_token": "claude-work-session"},
+			paths:   []string{claudeMainPath},
+			content: map[string]interface{}{
+				"claudeAiOauth": map[string]interface{}{
+					"accessToken":  "claude-work-token",
+					"refreshToken": "claude-work-refresh",
+				},
+			},
 		},
 		{
 			name:    "gemini",

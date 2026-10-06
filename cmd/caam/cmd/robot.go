@@ -3,11 +3,13 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -297,16 +300,15 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 	includeCoords, _ := cmd.Flags().GetBool("include-coordinators")
 
 	// Determine which providers to check
-	providersToCheck := []string{"codex", "claude", "gemini", "opencode", "cursor"}
+	providersToCheck := supportedTools()
 	if len(args) > 0 {
 		providerFilter = strings.ToLower(args[0])
 	}
 	if providerFilter != "" {
-		validProviders := map[string]bool{"codex": true, "claude": true, "gemini": true, "opencode": true, "cursor": true}
-		if !validProviders[providerFilter] {
+		if _, ok := tools[providerFilter]; !ok {
 			return robotError(cmd, "status", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", providerFilter),
-				"valid providers: codex, claude, gemini, opencode, cursor",
+				"valid providers: "+supportedToolsList(),
 				[]string{"caam robot status claude", "caam robot status codex", "caam robot status gemini"})
 		}
 		providersToCheck = []string{providerFilter}
@@ -338,6 +340,9 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 			data.Summary.ActiveProfiles++
 		}
 		for _, p := range provInfo.Profiles {
+			if p.System {
+				continue
+			}
 			isHealthy := p.Health.Status == "healthy"
 			inCooldown := p.Cooldown != nil && p.Cooldown.Active
 
@@ -347,12 +352,10 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 			if inCooldown {
 				data.Summary.CooldownProfiles++
 			}
-			// A long-lead relogin warning does not prevent launching today.
-			// Prefer the credential signal over the composite health verdict.
-			usable := isHealthy && !inCooldown
-			if p.Health.LaunchUsable != nil {
-				usable = *p.Health.LaunchUsable && !inCooldown
-			}
+			// Unknown expiry on a real credential is not proof that the pool is
+			// blocked. Preserve its unknown signal while counting it as a
+			// possible launch candidate, as next and precheck do.
+			usable := !inCooldown && (p.Health.LaunchUsable == nil || *p.Health.LaunchUsable)
 			if usable {
 				usableProfiles++
 			}
@@ -470,11 +473,17 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 	// Get health info. For the active profile the live auth location is the
 	// profile's real credential, so its expiry supersedes any stale vault
 	// snapshot (PR #82).
-	ph, id := getProfileHealthWithIdentity(tool, profileName)
-	if pInfo.Active {
+	ph, credentialErr := readVaultProfileHealth(tool, profileName)
+	id := getVaultIdentity(tool, profileName)
+	applyIdentityToHealth(tool, profileName, ph, id)
+	applyActiveCooldown(tool, profileName, ph)
+	if pInfo.Active && credentialErr == nil {
 		applyLiveExpiry(tool, ph)
 	}
 	status := health.CalculateStatus(ph)
+	if credentialErr != nil {
+		status = health.StatusCritical
+	}
 
 	pInfo.Health = RobotHealthInfo{
 		Status:             status.String(),
@@ -500,6 +509,10 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 	// Compact output still carries the reason needed to act on its verdict.
 	if status == health.StatusWarning || status == health.StatusCritical {
 		pInfo.Health.Reason = getHealthReason(ph, status)
+	}
+	if credentialErr != nil {
+		pInfo.Health.Reason = credentialErr.Error()
+		pInfo.Health.Signals = invalidCredentialSignals()
 	}
 
 	// Get identity info
@@ -531,7 +544,11 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 
 	// Generate recommendation (unless compact)
 	if !compact {
-		pInfo.Recommendation = health.FormatRecommendation(tool, profileName, ph)
+		if credentialErr != nil {
+			pInfo.Recommendation = fmt.Sprintf("log in with %s, then run 'caam backup %s %s' to save the credentials", tool, tool, profileName)
+		} else {
+			pInfo.Recommendation = health.FormatRecommendation(tool, profileName, ph)
+		}
 		if pInfo.Recommendation == "" {
 			pInfo.Recommendation = generateRecommendation(pInfo)
 		}
@@ -747,7 +764,18 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 	now := time.Now()
 
 	for _, profileName := range profiles {
+		if authfile.IsSystemProfile(profileName) {
+			continue
+		}
 		pInfo := buildProfileInfo(provider, profileName, "", db, false)
+		// Including cooldowns must never admit an absent, expired, or rejected
+		// credential. Unknown expiry alone is not evidence of unusability.
+		if pInfo.Health.LoginRequired != nil && *pInfo.Health.LoginRequired {
+			continue
+		}
+		if !includeCooldown && pInfo.Health.LaunchUsable != nil && !*pInfo.Health.LaunchUsable {
+			continue
+		}
 
 		// Skip profiles in cooldown unless requested
 		if !includeCooldown && pInfo.Cooldown != nil && pInfo.Cooldown.Active {
@@ -919,6 +947,36 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 		result.Success = true
 		result.Message = fmt.Sprintf("activated %s/%s", provider, profile)
 
+	case "refresh":
+		if len(args) < 3 {
+			return robotError(cmd, "act", "MISSING_PROFILE",
+				"profile name required for refresh",
+				"usage: caam robot act refresh <provider> <profile>", nil)
+		}
+		profile := args[2]
+		result.Profile = profile
+		if err := ensureVaultProfileDir(provider, profile); err != nil {
+			return robotError(cmd, "act", "PROFILE_NOT_FOUND", "saved profile not found", err.Error(), nil)
+		}
+		if err := vault.ValidateProfileCredentials(tools[provider](), profile); err != nil {
+			return robotError(cmd, "act", "REFRESH_FAILED", "saved credential is not usable for refresh", err.Error(), nil)
+		}
+		if err := refresh.RefreshProfile(cmd.Context(), provider, profile, vault, healthStore); err != nil {
+			code := "REFRESH_FAILED"
+			switch {
+			case errors.Is(err, refresh.ErrUnsupported):
+				code = "REFRESH_UNSUPPORTED"
+			case refresh.IsSkipped(err):
+				code = "REFRESH_SKIPPED"
+			}
+			return robotError(cmd, "act", code,
+				fmt.Sprintf("credential was not refreshed for %s/%s", provider, profile),
+				err.Error(), []string{fmt.Sprintf("caam robot validate %s %s", provider, profile)})
+		}
+		syncVaultToIsolated(provider, profile)
+		result.Success = true
+		result.Message = fmt.Sprintf("refreshed %s/%s", provider, profile)
+
 	case "cooldown":
 		if len(args) < 3 {
 			return robotError(cmd, "act", "MISSING_PROFILE",
@@ -995,7 +1053,9 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 				nil)
 		}
 
-		profile := "backup-" + time.Now().Format("20060102-150405")
+		// An unnamed snapshot is a system backup, not another account eligible
+		// for routing or a new active-profile identity.
+		profile := "_backup_" + time.Now().Format("20060102_150405.000000000")
 		if len(args) >= 3 {
 			profile = args[2]
 		}
@@ -1014,11 +1074,12 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 	default:
 		return robotError(cmd, "act", "INVALID_ACTION",
 			fmt.Sprintf("unknown action: %s", action),
-			"valid actions: activate, cooldown, uncooldown, backup",
+			"valid actions: activate, cooldown, uncooldown, refresh, backup",
 			[]string{
 				"caam robot act activate <provider> <profile>",
 				"caam robot act cooldown <provider> <profile> [duration]",
 				"caam robot act uncooldown <provider> <profile>",
+				"caam robot act refresh <provider> <profile>",
 				"caam robot act backup <provider> [profile]",
 			})
 	}
@@ -1059,7 +1120,7 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check vault
-	vaultPath := authfile.DefaultVaultPath()
+	vaultPath := vault.BasePath()
 	if _, err := os.Stat(vaultPath); err == nil {
 		result.Checks = append(result.Checks, HealthCheck{
 			Name:   "vault",
@@ -1095,7 +1156,7 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check each provider
-	for _, tool := range []string{"codex", "claude", "gemini", "cursor"} {
+	for _, tool := range supportedTools() {
 		fileSetFn := tools[tool]
 		if fileSetFn == nil {
 			continue
@@ -1106,19 +1167,19 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 		}
 
 		healthyCount := 0
-		totalCount := len(profiles)
+		totalCount := 0
 		activeProfile, _ := vault.ActiveProfile(fileSetFn())
 
 		for _, profileName := range profiles {
-			ph, _ := getProfileHealthWithIdentity(tool, profileName)
-			if profileName == activeProfile {
-				applyLiveExpiry(tool, ph)
+			if authfile.IsSystemProfile(profileName) {
+				continue
 			}
-			status := health.CalculateStatus(ph)
-			if status == health.StatusHealthy {
+			totalCount++
+			pInfo := buildProfileInfo(tool, profileName, activeProfile, nil, false)
+			if pInfo.Health.Status == "healthy" {
 				healthyCount++
-			} else if recommendation := health.FormatRecommendation(tool, profileName, ph); recommendation != "" {
-				result.Suggestions = append(result.Suggestions, recommendation)
+			} else if pInfo.Recommendation != "" {
+				result.Suggestions = append(result.Suggestions, pInfo.Recommendation)
 			}
 		}
 
@@ -1210,7 +1271,7 @@ func runRobotWatch(cmd *cobra.Command, args []string) error {
 }
 
 func emitWatchStatus(cmd *cobra.Command, providerFilter string) error {
-	providersToCheck := []string{"codex", "claude", "gemini"}
+	providersToCheck := supportedTools()
 	if providerFilter != "" {
 		providersToCheck = []string{providerFilter}
 	}
@@ -1255,9 +1316,12 @@ caam robot act activate claude <profile>   # Switch profile
 caam robot act cooldown claude <profile> 1h  # Set cooldown
 caam robot act uncooldown claude <profile>   # Clear cooldown
 caam robot act backup claude [name]          # Backup current auth
-caam robot act delete claude <profile>       # Delete profile
-caam robot act refresh claude <profile>      # Refresh token
+caam robot act refresh codex <profile>       # Refresh a CAAM-managed token
 ` + "```" + `
+
+Claude and Grok renew through their own CLIs. A robot refresh request for an
+unsupported credential returns REFRESH_UNSUPPORTED and a nonzero exit status.
+Validation checks saved credentials locally; it does not probe the provider.
 
 ## Diagnostics
 ` + "```" + `
@@ -1294,6 +1358,10 @@ All commands return:
 - ALL_BLOCKED: All profiles in cooldown/unhealthy
 - MISSING_PROFILE: Profile name required
 - VAULT_ERROR: Cannot access profile storage
+- PROFILE_NOT_FOUND: The requested saved profile does not exist
+- REFRESH_UNSUPPORTED: Renewal belongs to the native CLI or requires a new login
+- REFRESH_SKIPPED: The saved credential cannot be safely refreshed
+- ACTIVE_VALIDATION_UNSUPPORTED: Provider probing is unavailable for saved profiles
 
 ## Typical Workflow
 1. ` + "`caam robot precheck claude`" + ` - Plan session
@@ -1536,6 +1604,7 @@ type RobotPrecheckData struct {
 	Provider    string                 `json:"provider"`
 	Recommended *RobotPrecheckProfile  `json:"recommended,omitempty"`
 	Backups     []RobotPrecheckProfile `json:"backups"`
+	Blocked     []RobotPrecheckProfile `json:"blocked"`
 	InCooldown  []RobotCooldownProfile `json:"in_cooldown"`
 	Alerts      []RobotPrecheckAlert   `json:"alerts,omitempty"`
 	Summary     RobotPrecheckSummary   `json:"summary"`
@@ -1617,6 +1686,7 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 	data := RobotPrecheckData{
 		Provider:   provider,
 		Backups:    make([]RobotPrecheckProfile, 0),
+		Blocked:    make([]RobotPrecheckProfile, 0),
 		InCooldown: make([]RobotCooldownProfile, 0),
 		Commands: RobotPrecheckCommands{
 			Next: fmt.Sprintf("caam robot next %s", provider),
@@ -1626,10 +1696,9 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 
 	now := time.Now()
 	var bestScore float64 = -9999
-	var bestProfile string
 
 	for _, profileName := range profiles {
-		if strings.HasPrefix(profileName, "_") {
+		if authfile.IsSystemProfile(profileName) {
 			continue
 		}
 
@@ -1651,39 +1720,48 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Get health
-		ph, _ := getProfileHealthWithIdentity(provider, profileName)
-		status := health.CalculateStatus(ph)
+		// Use the same checked credentials and launch signals as robot next.
+		pInfo := buildProfileInfo(provider, profileName, "", db, false)
 
 		rec := RobotPrecheckProfile{
 			Name:    profileName,
-			Health:  status.String(),
+			Health:  pInfo.Health.Status,
 			Reasons: []string{},
 		}
 
 		// Calculate score
-		switch status {
-		case health.StatusHealthy:
+		switch pInfo.Health.Status {
+		case "healthy":
 			rec.Score = 100
 			rec.Reasons = append(rec.Reasons, "+healthy status")
 			data.Summary.Healthy++
-		case health.StatusWarning:
+		case "warning":
 			rec.Score = 50
 			rec.Reasons = append(rec.Reasons, "-warning status")
 			data.Summary.Warning++
-		case health.StatusCritical:
+		case "critical":
 			rec.Score = 10
 			rec.Reasons = append(rec.Reasons, "-critical status")
 			data.Summary.Critical++
 		default:
 			rec.Score = 30
 		}
+		if pInfo.Health.Reason != "" {
+			rec.Reasons = append(rec.Reasons, pInfo.Health.Reason)
+		}
+		if (pInfo.Health.LoginRequired != nil && *pInfo.Health.LoginRequired) ||
+			(pInfo.Health.LaunchUsable != nil && !*pInfo.Health.LaunchUsable) {
+			data.Blocked = append(data.Blocked, rec)
+			continue
+		}
 
 		data.Summary.Ready++
 
 		if rec.Score > bestScore {
+			if data.Recommended != nil {
+				data.Backups = append(data.Backups, *data.Recommended)
+			}
 			bestScore = rec.Score
-			bestProfile = profileName
 			data.Recommended = &RobotPrecheckProfile{
 				Name:    rec.Name,
 				Score:   rec.Score,
@@ -1695,23 +1773,19 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Update recommended from backups if needed
-	if data.Recommended == nil && len(data.Backups) > 0 {
-		data.Recommended = &data.Backups[0]
-		data.Backups = data.Backups[1:]
-	}
+	sort.SliceStable(data.Backups, func(i, j int) bool { return data.Backups[i].Score > data.Backups[j].Score })
 
 	if data.Recommended != nil {
 		data.Commands.Activate = fmt.Sprintf("caam robot act activate %s %s", provider, data.Recommended.Name)
 	}
 
 	// Generate alerts
-	if data.Summary.Ready == 0 && data.Summary.InCooldown > 0 {
+	if data.Summary.Ready == 0 {
 		data.Alerts = append(data.Alerts, RobotPrecheckAlert{
 			Type:    "all_blocked",
-			Message: "all profiles are in cooldown",
+			Message: "no saved profile is ready to launch",
 			Urgency: "high",
-			Action:  "wait for cooldown to expire or add new profile",
+			Action:  "check credential validation and cooldowns, or save a new login",
 		})
 	}
 	if data.Summary.Critical > 0 {
@@ -1723,11 +1797,9 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	_ = bestProfile // Used above
-
 	duration := time.Since(start)
 	output := RobotOutput{
-		Success: true,
+		Success: data.Recommended != nil,
 		Command: "precheck",
 		Data:    data,
 		Timing: &RobotTiming{
@@ -1736,7 +1808,13 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	return robotOutput(cmd, output)
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if !output.Success {
+		return fmt.Errorf("no saved profile is ready to launch")
+	}
+	return nil
 }
 
 // RobotValidateData contains validation results.
@@ -1767,6 +1845,11 @@ type RobotValidateSummary struct {
 
 func runRobotValidate(cmd *cobra.Command, args []string) error {
 	start := time.Now()
+	if active, _ := cmd.Flags().GetBool("active"); active {
+		return robotError(cmd, "validate", "ACTIVE_VALIDATION_UNSUPPORTED",
+			"active validation is not supported for saved vault profiles",
+			"omit --active for passive credential checks; no provider request was made", nil)
+	}
 
 	var providersToCheck []string
 	var profileFilter string
@@ -1784,7 +1867,7 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 			profileFilter = args[1]
 		}
 	} else {
-		providersToCheck = []string{"codex", "claude", "gemini", "cursor"}
+		providersToCheck = supportedTools()
 	}
 
 	data := RobotValidateData{
@@ -1793,37 +1876,28 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, provider := range providersToCheck {
-		fileSetFn := tools[provider]
-		if fileSetFn == nil {
-			continue
-		}
 		profiles, err := vault.List(provider)
 		if err != nil {
-			continue
+			return robotError(cmd, "validate", "VAULT_ERROR", "failed to list profiles", err.Error(), nil)
 		}
-		activeProfile, _ := vault.ActiveProfile(fileSetFn())
 
 		for _, profileName := range profiles {
-			if strings.HasPrefix(profileName, "_") {
+			if authfile.IsSystemProfile(profileName) {
 				continue
 			}
 			if profileFilter != "" && profileName != profileFilter {
 				continue
 			}
 
+			validation, ph := validateVaultProfile(provider, profileName)
 			result := RobotValidateResult{
-				Provider: provider,
-				Profile:  profileName,
+				Provider:       provider,
+				Profile:        profileName,
+				Valid:          validation.Valid,
+				Error:          validation.Error,
+				Recommendation: validation.Recommendation,
+				Signals:        validation.Signals,
 			}
-
-			// Get health info for token expiry
-			ph, _ := getProfileHealthWithIdentity(provider, profileName)
-			if profileName == activeProfile {
-				applyLiveExpiry(provider, ph)
-			}
-			result.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
-			result.Recommendation = health.FormatRecommendation(provider, profileName, ph)
-			result.Valid = true
 			if !ph.TokenExpiresAt.IsZero() {
 				result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
 				remaining := time.Until(ph.TokenExpiresAt)
@@ -1831,15 +1905,7 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 					result.ExpiresIn = robotFormatDuration(remaining)
 				} else {
 					result.ExpiresIn = "expired"
-					if !ph.CredentialRenewable() {
-						result.Valid = false
-						result.Error = "token expired; log in again"
-					}
 				}
-			}
-			if ph.ProviderRejected() {
-				result.Valid = false
-				result.Error = "provider rejected credential; log in again"
 			}
 			if result.Valid {
 				data.Summary.Valid++
@@ -1850,6 +1916,10 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 			data.Summary.Total++
 			data.Profiles = append(data.Profiles, result)
 		}
+	}
+	if profileFilter != "" && data.Summary.Total == 0 {
+		return robotError(cmd, "validate", "PROFILE_NOT_FOUND", "saved profile not found",
+			fmt.Sprintf("no saved profile %s/%s", providersToCheck[0], profileFilter), nil)
 	}
 
 	duration := time.Since(start)
@@ -1863,7 +1933,13 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	return robotOutput(cmd, output)
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if !output.Success {
+		return fmt.Errorf("%d saved profile(s) failed passive validation", data.Summary.Invalid)
+	}
+	return nil
 }
 
 func runRobotDoctor(cmd *cobra.Command, args []string) error {

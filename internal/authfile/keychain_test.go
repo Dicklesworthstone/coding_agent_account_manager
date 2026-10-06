@@ -6,6 +6,7 @@ package authfile
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +131,31 @@ func TestBackupFailsWhenKeychainRefuses(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(f.vaultDir, "claude", "alice", ".credentials.json")); statErr == nil {
 		t.Fatal("Backup wrote a profile despite the keychain failure")
+	}
+}
+
+func TestRestoreRejectsCredentiallessProfileBeforeKeychainMirror(t *testing.T) {
+	f := newKeychainFixture(t)
+	f.storeToken(keychainCreds("live-access"))
+	const target = "identity-only"
+	profileDir := f.vault.ProfilePath("claude", target)
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(profileDir, ".claude.json"), keychainState("target@example.com"))
+	liveState := keychainState("live@example.com")
+	writeFixtureFile(t, f.statePath, liveState)
+	if err := f.vault.Restore(f.fileSet, target); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("Restore() = %v, want ErrNoCredentials", err)
+	}
+	if _, err := os.Stat(f.credPath); !os.IsNotExist(err) {
+		t.Fatalf("failed activation mirrored the keychain into live credentials: %v", err)
+	}
+	if got := readFixtureFile(t, f.statePath); got != liveState {
+		t.Fatal("failed activation changed live account identity")
+	}
+	if got, ok := f.storedToken(); !ok || got != keychainCreds("live-access") {
+		t.Fatal("failed activation changed the login keychain")
 	}
 }
 

@@ -38,6 +38,35 @@ caam status --json
 caam activate claude alice@gmail.com --json
 ```
 
+The `robot` commands emit JSON without a `--json` flag:
+
+```bash
+caam robot validate claude work        # Check saved credentials locally
+caam robot precheck claude             # Plan a session from usable profiles
+caam robot act activate claude work    # Install the selected credentials
+caam robot act refresh codex work      # Refresh through CAAM when supported
+```
+
+`validate` and `robot validate` share the same passive assessment. A Claude
+snapshot containing only account labels or ordinary settings is invalid;
+missing, incomplete, null, or malformed credentials cannot become valid merely
+because their expiry is unknown. Activation checks the snapshot before changing
+live credentials or settings. Genuine opaque credentials can have unknown expiry,
+and an expired access token remains eligible when its credential is renewable
+and has not been rejected by the provider.
+
+Robot `next` and `precheck` exclude unusable credentials and system snapshots.
+`--include-cooldown` only relaxes the cooldown filter. An unnamed robot backup
+creates an `_backup_*` snapshot without replacing a matching named account as
+the active profile. A failed validation or a precheck with no usable account
+returns `success: false` and a nonzero exit status.
+
+Passive validation does not prove provider acceptance. `--active` explicitly
+fails for saved vault profiles. Robot refresh reports `REFRESH_UNSUPPORTED`
+when renewal belongs to the native CLI or requires a new login, and
+`REFRESH_SKIPPED` when a stale snapshot cannot safely be refreshed. Neither
+outcome claims that credentials were renewed.
+
 ---
 
 ## The Problem

@@ -360,16 +360,17 @@ func TestCursorCredentialHealthAcrossCommands(t *testing.T) {
 	var validateBuf bytes.Buffer
 	validateCmd := &cobra.Command{}
 	validateCmd.SetOut(&validateBuf)
-	if err := runRobotValidate(validateCmd, nil); err != nil {
-		t.Fatal(err)
+	if err := runRobotValidate(validateCmd, nil); err == nil {
+		t.Fatal("robot validate must return an error for the expired session")
 	}
 	var validated struct {
-		Data RobotValidateData `json:"data"`
+		Success bool              `json:"success"`
+		Data    RobotValidateData `json:"data"`
 	}
 	if err := json.Unmarshal(validateBuf.Bytes(), &validated); err != nil {
 		t.Fatal(err)
 	}
-	if validated.Data.Summary.Total != len(cases) || validated.Data.Summary.Invalid != 1 {
+	if validated.Success || validated.Data.Summary.Total != len(cases) || validated.Data.Summary.Invalid != 1 {
 		t.Errorf("robot validate did not distinguish session expiry from cached API-key JWT expiry: %s", validateBuf.String())
 	}
 }

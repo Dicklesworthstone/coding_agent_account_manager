@@ -665,6 +665,59 @@ func TestParseGeminiExpiry_OAuthCredsFileWithoutSettingsReturnsNoExpiry(t *testi
 	}
 }
 
+func TestParseGeminiExpiry_LegacyOAuthSnapshot(t *testing.T) {
+	expiry := time.Date(2025, time.December, 18, 14, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		body        string
+		renewable   bool
+		currentBody string
+		wantErr     error
+	}{
+		{name: "expired access", body: `{"access_token":"synthetic-legacy","expiry":"2025-12-18T14:00:00Z"}`},
+		{name: "refreshable access", body: `{"access_token":"synthetic-legacy","refresh_token":"synthetic-refresh","expiry":"2025-12-18T14:00:00Z"}`, renewable: true},
+		{name: "unknown expiry stays distinct from missing file", body: `{"access_token":"synthetic-legacy"}`, wantErr: ErrNoExpiry},
+		{name: "current filename takes priority", body: `{"access_token":"synthetic-legacy","expiry":"2020-01-01T00:00:00Z"}`, currentBody: `{"access_token":"synthetic-current","expiry":"2025-12-18T14:00:00Z"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			legacyPath := filepath.Join(dir, "oauth_credentials.json")
+			if err := os.WriteFile(legacyPath, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			currentPath := filepath.Join(dir, "oauth_creds.json")
+			if tc.currentBody != "" {
+				if err := os.WriteFile(currentPath, []byte(tc.currentBody), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			info, err := ParseGeminiExpiry(dir)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ParseGeminiExpiry error = %v, want %v", err, tc.wantErr)
+			}
+			if err == nil {
+				wantSource := legacyPath
+				if tc.currentBody != "" {
+					wantSource = currentPath
+				}
+				if info.Source != wantSource || !info.ExpiresAt.Equal(expiry) || info.Renewable != tc.renewable || info.HasRefreshToken != tc.renewable {
+					t.Fatalf("unexpected expiry info: %+v", info)
+				}
+			}
+			if got, err := os.ReadFile(legacyPath); err != nil || string(got) != tc.body {
+				t.Fatalf("passive read changed legacy snapshot: %v", err)
+			}
+			if tc.currentBody == "" {
+				if _, err := os.Stat(currentPath); !os.IsNotExist(err) {
+					t.Fatalf("passive read migrated legacy snapshot: %v", err)
+				}
+			} else if got, err := os.ReadFile(currentPath); err != nil || string(got) != tc.currentBody {
+				t.Fatalf("passive read changed current snapshot: %v", err)
+			}
+		})
+	}
+}
+
 func TestErrNoAuthFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
