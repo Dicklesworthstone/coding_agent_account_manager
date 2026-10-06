@@ -7,12 +7,21 @@ import (
 
 // .claude.json is NOT settings.json: it also holds internal account/session
 // caches. Share only known workflow fields here, not arbitrary internal state.
-// User/project MCP registrations and trust/permission state live in this file.
-// Credential-bearing MCP/hooks can be opted into profile_keys (projects scopes
-// the complete per-project map, including nested MCP configurations).
+// Per-project policy is merged separately so history and session/usage caches
+// never cross accounts. profile_keys can keep a whole top-level field private;
+// "projects" opts the complete per-project map out of sharing.
 var legacySharedKeys = []string{
-	"mcpServers", "projects", "enabledMcpServers", "disabledMcpServers",
+	"mcpServers", "enabledMcpServers", "disabledMcpServers",
 	"permissions", "autoMode", "model", "effortLevel", "hooks", "enabledPlugins",
+	"theme", "editorMode", "preferredNotifChannel", "autoUpdates", "verbose",
+	"autoCompactEnabled", "diffTool", "parallelTasksCount", "todoFeatureEnabled",
+	"messageIdleNotifThresholdMs", "autoConnectIde", "shiftEnterKeyBindingInstalled",
+}
+
+var legacySharedProjectKeys = []string{
+	"allowedTools", "hasTrustDialogAccepted", "mcpServers", "mcpContextUris",
+	"enabledMcpjsonServers", "disabledMcpjsonServers",
+	"hasClaudeMdExternalIncludesApproved", "hasClaudeMdExternalIncludesWarningShown",
 }
 
 var legacyAuthKeys = []string{
@@ -21,6 +30,8 @@ var legacyAuthKeys = []string{
 
 // MergeLegacy preserves known live workflow fields in ~/.claude.json while
 // replacing all account/session state with the selected profile's snapshot.
+// Absence is authoritative for shared keys, including project approvals: a
+// deleted permission or MCP registration must not return on the next switch.
 func MergeLegacy(shared, account []byte, p Policy) ([]byte, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
@@ -46,12 +57,71 @@ func MergeLegacy(shared, account []byte, p Policy) ([]byte, error) {
 				target[key] = value
 			}
 		}
+		if !contains(p.ProfileKeys, "projects") {
+			if err := mergeLegacyProjects(live, target); err != nil {
+				return nil, err
+			}
+		}
 	}
 	data, err := json.MarshalIndent(target, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	return append(data, '\n'), nil
+}
+
+// legacyProjects validates every entry before the caller changes anything.
+// A missing map or null entry carries no workflow policy; other non-object
+// values are corruption, not a reason to silently discard existing approvals.
+func legacyProjects(obj map[string]json.RawMessage) (map[string]map[string]json.RawMessage, error) {
+	projects := make(map[string]map[string]json.RawMessage)
+	if raw, ok := obj["projects"]; ok {
+		if err := json.Unmarshal(raw, &projects); err != nil || projects == nil {
+			return nil, fmt.Errorf("projects must contain a JSON object with object entries")
+		}
+	}
+	return projects, nil
+}
+
+func mergeLegacyProjects(live, target map[string]json.RawMessage) error {
+	shared, err := legacyProjects(live)
+	if err != nil {
+		return fmt.Errorf("live .claude.json: %w", err)
+	}
+	private, err := legacyProjects(target)
+	if err != nil {
+		return fmt.Errorf("profile .claude.json: %w", err)
+	}
+
+	// Start with only the selected account's project-local state, stripping
+	// every previously shared field even for projects deleted in the real home.
+	for path, entry := range private {
+		for _, key := range legacySharedProjectKeys {
+			delete(entry, key)
+		}
+		if len(entry) == 0 {
+			delete(private, path)
+		}
+	}
+	for path, entry := range shared {
+		for _, key := range legacySharedProjectKeys {
+			if value, ok := entry[key]; ok {
+				if private[path] == nil {
+					private[path] = make(map[string]json.RawMessage)
+				}
+				private[path][key] = value
+			}
+		}
+	}
+	delete(target, "projects")
+	if len(private) > 0 {
+		raw, err := json.Marshal(private)
+		if err != nil {
+			return fmt.Errorf("encode profile projects: %w", err)
+		}
+		target["projects"] = raw
+	}
+	return nil
 }
 
 // LegacyIdentity excludes installation IDs and workflow state. A retained
