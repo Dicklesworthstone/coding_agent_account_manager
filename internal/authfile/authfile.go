@@ -1189,8 +1189,30 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	// (e.g., settings/session files) and should not break profile detection.
 	currentHashes := make(map[string]string)
 	optionalHashes := make(map[string]string)
+	matchingFiles := fileSet.Files
+	cursorAuthMissing := false
+	if fileSet.Tool == "cursor" {
+		for _, spec := range fileSet.Files {
+			if filepath.Base(spec.Path) != "auth.json" {
+				continue
+			}
+			if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
+				cursorAuthMissing = true
+			} else {
+				// File-backed Cursor credentials identify the login on their own.
+				// cli-config.json and settings.json change during normal CLI use
+				// and must not hide an otherwise matching active profile (#118).
+				// Require this file only for matching, preserving config-only
+				// keychain backups. An unreadable auth file must not fall back
+				// to matching shared settings.
+				spec.Required = true
+				matchingFiles = []AuthFileSpec{spec}
+			}
+			break
+		}
+	}
 	requiredFound := false
-	for _, spec := range fileSet.Files {
+	for _, spec := range matchingFiles {
 		// A Claude Desktop config with no token cache carries no identity; skip it
 		// so unrelated desktop settings never drive profile detection (PR #44).
 		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
@@ -1209,14 +1231,6 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 			continue
 		}
 		base := filepath.Base(spec.Path)
-		// Cursor rewrites config files on model changes. When file-backed
-		// auth exists, it alone identifies the active login; without it retain
-		// optional config matching for keychain-backed macOS logins.
-		if fileSet.Tool == "cursor" && base == "auth.json" {
-			requiredFound = true
-			currentHashes[base] = hash
-			continue
-		}
 		if spec.Required {
 			requiredFound = true
 			currentHashes[base] = hash
@@ -1244,6 +1258,14 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	var systemMatch string
 	for _, profile := range profiles {
 		profileDir := v.ProfilePath(fileSet.Tool, profile)
+		if cursorAuthMissing {
+			// A file-backed login is no longer active when its credentials
+			// disappear, even if its old cli-config.json still matches. Only
+			// config-only snapshots can use the keychain fallback.
+			if _, err := os.Stat(filepath.Join(profileDir, "auth.json")); !os.IsNotExist(err) {
+				continue
+			}
+		}
 		matches := true
 
 		for filename, currentHash := range currentHashes {

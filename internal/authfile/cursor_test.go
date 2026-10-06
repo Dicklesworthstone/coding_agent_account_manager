@@ -183,3 +183,142 @@ func TestCursorAuthFilesBackupRestoreUsesLiveCredentialPath(t *testing.T) {
 		t.Fatalf("live credential after restore = %s, want %s", got, accountA)
 	}
 }
+
+func TestCursorActiveProfileUsesAuthFile(t *testing.T) {
+	const authA = `{"accessToken":"account-a-session","refreshToken":"account-a-session"}`
+	const authB = `{"accessToken":"account-b-session","refreshToken":"account-b-session"}`
+	const config = `{"authInfo":{"email":"a@example.com"},"model":"old"}`
+	const changedConfig = `{"authInfo":{"email":"a@example.com"},"model":"new","lastUsedAt":42}`
+	const settings = `{"theme":"light"}`
+	const changedSettings = `{"theme":"dark"}`
+
+	tests := []struct {
+		name              string
+		liveAuth          string
+		savedAuth         string
+		liveConfig        string
+		savedConfig       string
+		liveSettings      string
+		savedSettings     string
+		liveAuthDirectory bool
+		want              string
+	}{
+		{
+			name:     "config and settings churn does not hide session",
+			liveAuth: authA, savedAuth: authA,
+			liveConfig: changedConfig, savedConfig: config,
+			liveSettings: changedSettings, savedSettings: settings,
+			want: "work",
+		},
+		{
+			name:     "new optional files do not hide session",
+			liveAuth: authA, savedAuth: authA,
+			liveConfig: config, liveSettings: settings,
+			want: "work",
+		},
+		{
+			name:     "missing optional files do not hide session",
+			liveAuth: authA, savedAuth: authA,
+			savedConfig: config, savedSettings: settings,
+			want: "work",
+		},
+		{
+			name:     "API key credentials ignore optional churn",
+			liveAuth: `{"apiKey":"synthetic-api-key"}`, savedAuth: `{"apiKey":"synthetic-api-key"}`,
+			liveConfig: changedConfig, savedConfig: config,
+			liveSettings: changedSettings, savedSettings: settings,
+			want: "work",
+		},
+		{
+			name:     "different credentials cannot match identical config",
+			liveAuth: authB, savedAuth: authA,
+			liveConfig: config, savedConfig: config,
+			liveSettings: settings, savedSettings: settings,
+		},
+		{
+			name:       "missing saved credentials cannot match identical config",
+			liveAuth:   authA,
+			liveConfig: config, savedConfig: config,
+			liveSettings: settings, savedSettings: settings,
+		},
+		{
+			name:       "missing live credentials cannot match file-backed snapshot",
+			savedAuth:  authA,
+			liveConfig: config, savedConfig: config,
+			liveSettings: settings, savedSettings: settings,
+		},
+		{
+			name:              "unreadable credentials cannot fall back to identical config",
+			liveAuthDirectory: true,
+			liveConfig:        config, savedConfig: config,
+			liveSettings: settings, savedSettings: settings,
+		},
+		{
+			name:       "config-only keychain snapshot remains detectable",
+			liveConfig: config, savedConfig: config,
+			liveSettings: settings, savedSettings: settings,
+			want: "work",
+		},
+		{
+			name:       "config-only different login does not match",
+			liveConfig: `{"authInfo":{"email":"b@example.com"},"model":"old"}`, savedConfig: config,
+		},
+		{
+			name:      "no live files cannot match saved session",
+			savedAuth: authA, savedConfig: config, savedSettings: settings,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+			t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(home, "separate-config"))
+			t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+
+			set := CursorAuthFiles()
+			paths := ResolveCursorPaths(home, runtime.GOOS, os.Getenv)
+			vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+			profileDir := vault.ProfilePath("cursor", "work")
+			if err := os.MkdirAll(profileDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			files := map[string]string{
+				paths.AuthFile: tc.liveAuth,
+				filepath.Join(paths.ConfigDir, "cli-config.json"): tc.liveConfig,
+				filepath.Join(home, ".cursor", "settings.json"):   tc.liveSettings,
+				filepath.Join(profileDir, "auth.json"):            tc.savedAuth,
+				filepath.Join(profileDir, "cli-config.json"):      tc.savedConfig,
+				filepath.Join(profileDir, "settings.json"):        tc.savedSettings,
+			}
+			for path, content := range files {
+				if content == "" {
+					continue
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.liveAuthDirectory {
+				// A directory is unreadable as a credential file even when tests
+				// run as root, unlike a file with permission bits cleared.
+				if err := os.MkdirAll(paths.AuthFile, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := vault.ActiveProfile(set)
+			if err != nil {
+				t.Fatalf("ActiveProfile: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ActiveProfile = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
