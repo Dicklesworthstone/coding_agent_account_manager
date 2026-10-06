@@ -121,34 +121,52 @@ User has 7+ Claude Max accounts and runs multiple Claude Code sessions on a remo
 ### Command
 
 ```bash
-caam watch [--daemon] [--providers claude,codex,gemini]
+caam watch --once                         # Capture existing native logins
+caam watch                                # Continue watching in the foreground
+caam watch --provider claude,codex,grok    # Restrict providers
+caam watch --poll-interval 1s --debounce 500ms
 ```
 
 ### Implementation
 
-Uses fsnotify to watch auth file changes:
-- `~/.claude/.credentials.json`
-- `~/.claude.json`
-- `~/.config/claude-code/auth.json`
-- `~/.codex/auth.json`
-- `~/.gemini/settings.json`
-- `~/.gemini/oauth_creds.json`
+The watcher covers Claude, Codex, Gemini, Antigravity (`agy`), Grok, OpenCode,
+and Cursor. It resolves each provider's credential paths once and keeps the
+provider attached to the full path, including when several providers have a
+file named `auth.json`. An explicit `CLAUDE_CONFIG_DIR` selects that directory's
+credentials, identity, and settings together.
 
-On file change:
-1. Debounce (wait 500ms for writes to settle)
-2. Parse file to extract account identity:
-   - Claude: JWT decode → extract email claim
-   - Codex: JSON parse → extract user info
-   - Gemini: JSON parse → extract account email
-3. Check if profile already exists in vault
-4. If new, create profile with email as name
-5. Log action: "Auto-discovered profile: claude/alice@gmail.com"
+Filesystem notifications trigger prompt checks. Content polling runs every
+two seconds by default and recovers missed events, atomic file or directory
+replacement, missing directories, and unavailable notification services.
+Starting the watcher does not create native configuration directories. Changes
+are coalesced per provider with a default 500ms settling interval. Credential
+alternatives such as Gemini's `.env` and OAuth cache are included; use
+`--watch-optional` to also react to settings that do not carry credentials.
+
+Both continuous watching and `--once` use the same capture operation:
+
+1. Read and validate the provider's credential state without modifying native
+   files. An identity record or settings file alone is not a login.
+2. Compare credential material with saved profiles, ignoring unrelated settings
+   changes. Identical credentials do not produce another profile.
+3. Update a saved grant only when ownership and a newer, complete credential
+   generation are proven. Preserve the profile's name, settings, and metadata.
+4. Publish other valid logins as complete new snapshots. A usable account label
+   can name a new profile; missing identity or a conflicting existing name uses
+   a unique `auto-...` name. Labels alone never authorize replacement.
+
+Malformed or incomplete credentials leave saved profiles intact. Continuous
+watching retries failed captures after the polling interval, including when a
+vault write failed and the native credential has not changed again. A one-time
+scan reports failures with a nonzero exit while retaining and displaying
+successful captures from other providers. Stopping the watcher waits for any
+capture and its callbacks to finish.
 
 ### Code Location
 
 - `cmd/caam/cmd/watch.go` - CLI command
-- `internal/discovery/watcher.go` - fsnotify watcher
-- `internal/identity/extractor.go` - Identity extraction (enhance existing)
+- `internal/discovery/watcher.go` - provider-aware notifications, polling, and scans
+- `internal/authfile/discovery.go` - validated capture, ownership, and snapshot publication
 
 ## Feature 2: Distributed Auth Recovery
 

@@ -3,9 +3,13 @@ package discovery
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
 
 func TestAllTools(t *testing.T) {
@@ -428,5 +432,159 @@ func TestScan(t *testing.T) {
 	if len(result.Found)+len(result.NotFound) != len(AllTools()) {
 		t.Errorf("Scan() found=%d + notFound=%d != allTools=%d",
 			len(result.Found), len(result.NotFound), len(AllTools()))
+	}
+}
+
+func TestWatchOnce_ReturnsSuccessfulCapturesAndProviderErrors(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+	t.Setenv("GROK_HOME", filepath.Join(home, "grok"))
+	badPath := authfile.CodexAuthFiles().Files[0].Path
+	goodPath := authfile.GrokAuthFiles().Files[0].Path
+	goodAuth := []byte(`{"https://auth.x.ai::synthetic-client":{"access_token":"synthetic-grok-access","refresh_token":"synthetic-grok-refresh","expires_at":4102444800,"email":"saved@example.com","user_id":"synthetic-account"}}`)
+	for path, data := range map[string][]byte{
+		badPath:  []byte(`{"tokens":{"access_token":`),
+		goodPath: goodAuth,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+	discovered, err := WatchOnce(vault, []string{"codex", "grok"}, nil)
+	if !errors.Is(err, authfile.ErrInvalidCredentials) {
+		t.Fatalf("malformed Codex credential must be reported, got %v", err)
+	}
+	if len(discovered) != 1 || discovered[0] != "grok/saved@example.com" {
+		t.Fatalf("successful provider capture was lost: %v", discovered)
+	}
+	if profiles, err := vault.List("codex"); err != nil || len(profiles) != 0 {
+		t.Fatalf("malformed credentials created a snapshot: %v, %v", profiles, err)
+	}
+	saved, err := os.ReadFile(vault.BackupPath("grok", "saved@example.com", "auth.json"))
+	if err != nil || string(saved) != string(goodAuth) {
+		t.Fatalf("valid credential was not captured intact: %v", err)
+	}
+	if err := vault.ValidateProfileCredentials(authfile.GrokAuthFiles(), "saved@example.com"); err != nil {
+		t.Fatalf("discovered profile cannot be used by account switching: %v", err)
+	}
+	if active, err := vault.CurrentProfile(authfile.GrokAuthFiles()); err != nil || active != "saved@example.com" {
+		t.Fatalf("discovered login has no matching saved owner: %q, %v", active, err)
+	}
+	for path, want := range map[string][]byte{badPath: []byte(`{"tokens":{"access_token":`), goodPath: goodAuth} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("discovery modified live credentials at %s: %v", path, err)
+		}
+	}
+}
+
+func TestWatchOnce_NoCredentialsDoesNotCreateNativeDirectories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for key, name := range map[string]string{
+		"CODEX_HOME": "codex", "GROK_HOME": "grok", "GEMINI_HOME": "gemini",
+		"CLAUDE_CONFIG_DIR": "claude-config", "CURSOR_CONFIG_DIR": "cursor-config",
+		"XDG_CONFIG_HOME": "config", "XDG_DATA_HOME": "data", "APPDATA": "appdata",
+	} {
+		t.Setenv(key, filepath.Join(home, name))
+	}
+	vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+	discovered, err := WatchOnce(vault, nil, nil)
+	if err != nil || len(discovered) != 0 {
+		t.Fatalf("empty homes should be a clean no-op: %v, %v", discovered, err)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("discovery created native state: %v, %v", entries, err)
+	}
+	if _, err := os.Stat(vault.BasePath()); !os.IsNotExist(err) {
+		t.Fatalf("empty discovery created a vault: %v", err)
+	}
+}
+
+func TestWatchOnce_ReportsVaultWriteFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	credential := []byte(`{"access_token":"synthetic-private-token","refresh_token":"synthetic-refresh","expires_at":4102444800,"email":"blocked@example.com","user_id":"blocked-account"}`)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), credential, 0600); err != nil {
+		t.Fatal(err)
+	}
+	vaultPath := filepath.Join(t.TempDir(), "blocked-vault")
+	if err := os.WriteFile(vaultPath, []byte("existing file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	discovered, err := WatchOnce(authfile.NewVault(vaultPath), []string{"grok"}, nil)
+	if err == nil || len(discovered) != 0 {
+		t.Fatalf("failed vault write must not look successful: %v, %v", discovered, err)
+	}
+	if strings.Contains(err.Error(), "synthetic-private-token") {
+		t.Fatal("credential material leaked through a capture error")
+	}
+	got, readErr := os.ReadFile(vaultPath)
+	if readErr != nil || string(got) != "existing file" {
+		t.Fatalf("capture replaced an existing vault-path file: %v", readErr)
+	}
+}
+
+func TestWatchOnce_UsesExplicitClaudeConfigAndItsPairedIdentity(t *testing.T) {
+	home := t.TempDir()
+	configured := filepath.Join(home, "isolated-claude")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	for dir, account := range map[string]string{
+		filepath.Join(home, ".claude"): "host",
+		configured:                     "configured",
+	} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		credential, err := json.Marshal(map[string]interface{}{
+			"claudeAiOauth": map[string]interface{}{
+				"accessToken": "synthetic-access-" + account, "refreshToken": "synthetic-refresh-" + account,
+				"expiresAt": int64(4102444800000), "accountId": account, "email": account + "@example.com",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), credential, 0600); err != nil {
+			t.Fatal(err)
+		}
+		paired, err := json.Marshal(map[string]interface{}{
+			"oauthAccount": map[string]string{"accountUuid": account, "emailAddress": account + "@example.com"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pairedPath := filepath.Join(dir, ".claude.json")
+		if account == "host" {
+			pairedPath = filepath.Join(home, ".claude.json")
+		}
+		if err := os.WriteFile(pairedPath, paired, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+	discovered, err := WatchOnce(vault, []string{"CLAUDE", "claude"}, nil)
+	if err != nil || len(discovered) != 1 || discovered[0] != "claude/configured@example.com" {
+		t.Fatalf("explicit config did not select its own credential and identity: %v, %v", discovered, err)
+	}
+	for _, name := range []string{".credentials.json", ".claude.json"} {
+		live, err := os.ReadFile(filepath.Join(configured, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved, err := os.ReadFile(vault.BackupPath("claude", "configured@example.com", name))
+		if err != nil || string(live) != string(saved) {
+			t.Fatalf("configured %s not captured intact: %v", name, err)
+		}
+	}
+	if profiles, err := vault.List("claude"); err != nil || len(profiles) != 1 {
+		t.Fatalf("host or duplicate provider was also captured: %v, %v", profiles, err)
 	}
 }

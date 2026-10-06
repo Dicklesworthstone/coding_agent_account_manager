@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -295,6 +296,12 @@ func sameSwitchFiles(a, b map[string][]byte) bool {
 
 // readSwitchState captures exact bytes without migrations or keychain mirrors.
 func readSwitchState(fileSet AuthFileSet, profileDir string) (switchState, error) {
+	return readSwitchStateLimited(fileSet, profileDir, 0)
+}
+
+// readSwitchStateLimited also bounds unattended discovery reads. A positive
+// limit is enforced on the opened file, including growth after the size check.
+func readSwitchStateLimited(fileSet AuthFileSet, profileDir string, maxFileBytes int64) (switchState, error) {
 	state := switchState{files: make(map[string][]byte)}
 	if profileDir != "" {
 		for _, dir := range []string{filepath.Dir(profileDir), profileDir} {
@@ -330,7 +337,7 @@ func readSwitchState(fileSet AuthFileSet, profileDir string) (switchState, error
 		if !info.Mode().IsRegular() {
 			return state, fmt.Errorf("auth source is not a regular file: %s", path)
 		}
-		data, err := os.ReadFile(path)
+		data, err := readSwitchSource(path, info, maxFileBytes)
 		if err != nil {
 			return state, fmt.Errorf("read auth file: %w", err)
 		}
@@ -342,6 +349,9 @@ func readSwitchState(fileSet AuthFileSet, profileDir string) (switchState, error
 	if profileDir == "" && claudeKeychainPath(fileSet) != "" {
 		data, err := keychain.ReadClaude()
 		if err == nil {
+			if maxFileBytes > 0 && int64(len(data)) > maxFileBytes {
+				return state, fmt.Errorf("%w: Claude keychain credential exceeds discovery size limit", ErrInvalidCredentials)
+			}
 			state.files[claudeCredentialsFile] = data
 		} else if !errors.Is(err, keychain.ErrNoKeychain) && !errors.Is(err, keychain.ErrNotFound) {
 			return state, fmt.Errorf("read outgoing Claude keychain: %w", err)
@@ -349,6 +359,28 @@ func readSwitchState(fileSet AuthFileSet, profileDir string) (switchState, error
 	}
 	state.identify(fileSet)
 	return state, nil
+}
+
+func readSwitchSource(path string, info os.FileInfo, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return os.ReadFile(path)
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("%w: auth file exceeds discovery size limit", ErrInvalidCredentials)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: auth file exceeds discovery size limit", ErrInvalidCredentials)
+	}
+	return data, nil
 }
 
 func (s *switchState) identify(fileSet AuthFileSet) {
@@ -545,6 +577,10 @@ func switchExpiry(raw interface{}, milliseconds bool) time.Time {
 }
 
 func (v *Vault) switchOwner(fileSet AuthFileSet, live switchState) (string, *switchState, error) {
+	return v.switchOwnerLimited(fileSet, live, 0)
+}
+
+func (v *Vault) switchOwnerLimited(fileSet AuthFileSet, live switchState, maxFileBytes int64) (string, *switchState, error) {
 	profiles, err := v.List(fileSet.Tool)
 	if err != nil {
 		return "", nil, err
@@ -562,7 +598,7 @@ func (v *Vault) switchOwner(fileSet AuthFileSet, live switchState) (string, *swi
 		if err != nil {
 			continue
 		}
-		candidate, err := readSwitchState(fileSet, dir)
+		candidate, err := readSwitchStateLimited(fileSet, dir, maxFileBytes)
 		if err != nil {
 			continue
 		}

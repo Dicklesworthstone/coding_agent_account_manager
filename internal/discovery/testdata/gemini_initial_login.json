@@ -1,5 +1,8 @@
 {
   "type": "authorized_user",
+  "access_token": "synthetic-gemini-discovery-access-token",
+  "refresh_token": "synthetic-gemini-discovery-refresh-token",
+  "expiry_date": 4102444800000,
   "email": "gemini-user@example.com",
   "project_id": "gemini-project-123",
   "quota_project_id": "gemini-quota-456"

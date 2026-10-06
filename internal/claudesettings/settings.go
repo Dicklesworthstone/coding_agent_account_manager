@@ -272,7 +272,12 @@ func prepare(accountPath, sharedPath, destination string, p Policy, merge func([
 		return nil, fmt.Errorf("read live settings: %w", err)
 	}
 	before := live
-	if destination != sharedPath {
+	if destination == accountPath {
+		// Refresh must compare against the same account snapshot it merges.
+		// Reading the destination again could bless a concurrent native login
+		// as the baseline, then overwrite it with the older account bytes.
+		before = account
+	} else if destination != sharedPath {
 		before, err = Read(destination)
 		if err != nil {
 			return nil, fmt.Errorf("read destination settings: %w", err)
