@@ -30,6 +30,25 @@ robot/API callers, the TUI, wrap and workspace switches. Shared workflow fields
 in `.claude.json`, including user/project MCP configuration and trust decisions,
 are also preserved without copying the outgoing account's identity/session state.
 
+### Project policy versus project session state
+
+A `.claude.json` project record is not a single shared setting. Only known
+workflow fields follow the live file: `allowedTools`, `hasTrustDialogAccepted`,
+`mcpServers`, `mcpContextUris`, `enabledMcpjsonServers`, `disabledMcpjsonServers`,
+`hasClaudeMdExternalIncludesApproved` and
+`hasClaudeMdExternalIncludesWarningShown`. The selected account keeps its own
+project history, session IDs, usage/cost records and unknown project caches.
+Switching profiles never imports those records from the outgoing account.
+
+Removing an approval, MCP registration or entire project from the canonical
+file removes that shared policy from the next activation, without removing the
+selected profile's private history. An empty or `null` projects map likewise
+carries no shared approvals. Malformed non-object project records stop a shared
+refresh before it writes configuration. Set `profile_keys: ["projects"]` in the
+JSON policy below when the entire project map, including nested MCP secrets,
+must remain account-specific. `profile_keys: ["mcpServers"]` alone scopes only
+the top-level MCP map, not registrations nested under `projects`.
+
 ## Configuration and account-specific exceptions
 
 Edit the **JSON** configuration at `$XDG_CONFIG_HOME/caam/config.json`, or
@@ -100,6 +119,14 @@ helpers or credential environment. Unknown links are rejected. Shared `.claude.j
 preferences and per-project approvals also follow deletions, including approvals
 for projects removed from the canonical file; private history and runtime state
 are retained.
+
+Vault, isolated and shallow refreshes use one `.claude.json` merge policy,
+including permissions, auto-mode, model/effort choices, hooks, MCP configuration
+and the account-specific exceptions above. Shallow refresh prepares both
+`settings.json` and `.claude.json` before writing either document. Changes to a
+destination after preparation are rejected, and a semantically unchanged legacy
+file is not reformatted on every spawn. Change reports identify keys rather than
+printing potentially credential-bearing values.
 
 `shallow-spawn --no-sync-config` skips policy refresh, but still requires a valid,
 private settings file and repairs recognized shared links. `shallow-spawn

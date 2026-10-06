@@ -28,6 +28,13 @@ var legacyAuthKeys = []string{
 	"oauthAccount", "oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey",
 }
 
+// LegacySharedPolicyKeys returns an independent copy of the legacy workflow
+// allowlist for callers checking enrollment invariants. MergeLegacy remains
+// the authority for applying policy, including configurable profile scopes.
+func LegacySharedPolicyKeys() []string {
+	return append([]string(nil), legacySharedKeys...)
+}
+
 // MergeLegacy preserves known live workflow fields in ~/.claude.json while
 // replacing all account/session state with the selected profile's snapshot.
 // Absence is authoritative for shared keys, including project approvals: a
@@ -71,14 +78,17 @@ func MergeLegacy(shared, account []byte, p Policy) ([]byte, error) {
 }
 
 // legacyProjects validates every entry before the caller changes anything.
-// A missing map or null entry carries no workflow policy; other non-object
+// A missing/null map or null entry carries no workflow policy; other non-object
 // values are corruption, not a reason to silently discard existing approvals.
 func legacyProjects(obj map[string]json.RawMessage) (map[string]map[string]json.RawMessage, error) {
 	projects := make(map[string]map[string]json.RawMessage)
 	if raw, ok := obj["projects"]; ok {
-		if err := json.Unmarshal(raw, &projects); err != nil || projects == nil {
+		if err := json.Unmarshal(raw, &projects); err != nil {
 			return nil, fmt.Errorf("projects must contain a JSON object with object entries")
 		}
+	}
+	if projects == nil {
+		projects = make(map[string]map[string]json.RawMessage)
 	}
 	return projects, nil
 }
@@ -150,7 +160,21 @@ func PrepareLegacyRestore(snapshotPath, livePath string, p Policy) (*Update, err
 }
 
 func PrepareLegacyRefresh(sharedPath, profilePath string, p Policy) (*Update, error) {
-	return PrepareLegacyImport(sharedPath, profilePath, profilePath, p)
+	update, err := PrepareLegacyImport(sharedPath, profilePath, profilePath, p)
+	if err != nil {
+		return nil, err
+	}
+	changed, err := update.ChangedKeys()
+	if err != nil {
+		return nil, err
+	}
+	if len(changed) == 0 && (update.before == nil) == (update.after == nil) {
+		// A refresh with no semantic changes must not reformat a private
+		// document on every launch, including per-profile mode. Apply still
+		// checks for intervening edits and detaches shared links when needed.
+		update.after = update.before
+	}
+	return update, nil
 }
 
 func PrepareLegacyImport(sharedPath, accountPath, destination string, p Policy) (*Update, error) {

@@ -43,7 +43,7 @@ func TestLegacyProjectPolicyDoesNotCopyAnotherAccountsSessions(t *testing.T) {
 
 func TestLegacyProjectPolicyRemovalAndProfileOverrides(t *testing.T) {
 	account := []byte(`{"oauthAccount":{"accountUuid":"bob"},"mcpServers":{"private":{}},"projects":{"/repo":{"allowedTools":["Bash"],"mcpServers":{"private":{}},"lastSessionId":"bob"}}}`)
-	for _, live := range []string{`{}`, `{"projects":{}}`, `{"projects":{"/repo":null}}`} {
+	for _, live := range []string{`{}`, `{"projects":{}}`, `{"projects":null}`, `{"projects":{"/repo":null}}`} {
 		got, err := MergeLegacy([]byte(live), account, Policy{})
 		if err != nil {
 			t.Fatal(err)
@@ -69,7 +69,7 @@ func TestLegacyProjectPolicyLogoutDoesNotRetainSessionCaches(t *testing.T) {
 }
 
 func TestLegacyProjectCorruptionFailsBeforeWriting(t *testing.T) {
-	for _, invalid := range []string{`{"projects":[]}`, `{"projects":null}`, `{"projects":{"/repo":5}}`} {
+	for _, invalid := range []string{`{"projects":[]}`, `{"projects":"invalid"}`, `{"projects":{"/repo":5}}`} {
 		for _, invalidLive := range []bool{false, true} {
 			dir := t.TempDir()
 			livePath, snapshotPath := filepath.Join(dir, "live"), filepath.Join(dir, "snapshot")
