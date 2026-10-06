@@ -435,7 +435,11 @@ environment key belonging to a different account.
 
 **Login Command:** `grok login` (browser OIDC via xAI accounts)
 
-**Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). Grok Build tokens expire after 7 days; run `grok login` to refresh — CAAM cannot refresh them.
+**Notes:** Respects `GROK_HOME` (config directory override, default `~/.grok`).
+The native Grok CLI renews its OAuth access token when needed. Use
+`caam keepalive grok` to run that renewal path for idle live logins; CAAM does
+not replay refresh tokens from saved vault copies. A rejected or missing
+refresh credential requires `grok login` in the live home.
 
 **Caveats:**
 - **`GROK_DEPLOYMENT_KEY` precedence:** in enterprise/deployment setups this environment variable takes precedence over `auth.json`, so a swapped profile is silently ignored while it is set.
@@ -498,6 +502,7 @@ carol@gmail.com
 | `caam clear <tool>` | Remove auth files (logout state) |
 | `caam alias <tool> <profile> <alias>` | Create a short alias for a profile |
 | `caam rename <tool> <old> <new>` | Copy profile to a new name (non-destructive) |
+| `caam keepalive [claude\|grok\|live-profile ...]` | Renew idle native logins in their owning homes; `--dry-run`, `--json`, `--print-systemd` |
 | `caam uninstall` | Restore originals from `_original` and remove caam data/config |
 
 **Aliases:** `caam switch` is the activation alias and works like `caam activate`. Note that `caam use <provider> <profile>` is a separate command that sets the *default* profile for a provider (it does not switch active auth files).
@@ -781,6 +786,102 @@ When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically fa
 
 When you have multiple accounts across multiple providers, manually tracking which account has headroom, which one just hit a limit, and which one you used recently becomes tedious. Smart Profile Management automates this decision-making so you can focus on coding instead of account juggling.
 
+### Keep idle native logins alive
+
+Claude and Grok renew their OAuth grants through their own CLIs. An idle
+account can otherwise lose its access token, fail a quota query, and stop
+receiving work from a usage-aware router. `caam keepalive` runs a minimal
+native operation in each account's live home and verifies the credential
+afterward.
+
+```bash
+# Inspect eligible homes without running CLIs, creating state, or copying files.
+caam keepalive --dry-run --json
+
+# Renew all discovered Claude and Grok live owners, or select one provider.
+caam keepalive
+caam keepalive grok
+
+# Select an exact live home; unambiguous live profile names also work.
+caam keepalive shallow:claude/alice
+caam keepalive isolated:grok/work
+caam keepalive host:grok --ttl 1h --min-gap 25m --timeout 2m
+```
+
+Discovery includes Claude host, shallow, and isolated homes, plus Grok host
+and isolated homes. It respects `CLAUDE_CONFIG_DIR`, `GROK_HOME`, and the
+same `--base` setting as shallow-profile commands. A known matching Claude
+shallow home owns its account in preference to the host copy. Conflicting
+live owners, unknown identities, malformed credentials, and unknown expiry
+are reported without running the CLI. File-based keepalive cannot verify a
+Claude login held in the macOS login keychain and reports it as blocked.
+
+The default threshold is **2 hours** until expiry. While the access token
+remains valid, attempts are at least **25 minutes** apart; expired tokens
+bypass this interval. `--min-gap 0` disables the interval. Each native call
+has a **2-minute** timeout, and an exclusive lock prevents overlapping
+manual and scheduled renewals of the same grant.
+
+Claude receives a one-word Haiku prompt with low effort, no tools, disabled
+user hooks, no MCP servers, and no session persistence in an empty working
+directory. This consumes a small amount of Claude usage. Grok runs
+`grok models`, which does not request a model turn. Authentication overrides
+are scrubbed so each CLI uses the selected live credential.
+
+| Result | Meaning |
+|--------|---------|
+| `rotated` | The CLI left a changed, unexpired credential for the same account. |
+| `still_valid` | The credential remains usable; the native CLI may defer rotation until closer to expiry. |
+| `skipped` | The token is outside the threshold, was attempted recently, or another reference owns the same grant. |
+| `dry_run` | This live grant would be attempted. |
+| `blocked` / `failed` | Ownership or credential checks failed, the CLI could not renew, or the resulting credential is expired, missing, or invalid. |
+
+The command returns nonzero if any selected grant cannot be renewed.
+`--json` includes an overall `success`, per-grant `success` and `attempted`,
+before/after expiry, and reasons. Native output and credential secrets are
+excluded. A zero exit from Grok alone is insufficient: keepalive detects
+the case where Grok removes rejected credentials while exiting successfully.
+
+After a successful native run, an existing user vault snapshot receives the
+live credential only if its account matches and its saved expiry is
+strictly older. Known account IDs take precedence; email is a fallback.
+Unknown age, conflicting identity, concurrent changes, and system snapshots
+such as `_original` or `_backup_*` prevent copying. Settings and metadata
+remain with their existing snapshot. Copy failures appear in the JSON
+`sync` results without misreporting a successfully renewed live grant.
+
+`caam keepalive vault:claude/alice` and names found only in the vault are
+refused with a matching live-home hint when one can be verified. A vault
+snapshot may hold a spent refresh token and must never be staged in a
+temporary HOME for renewal.
+
+#### Schedule a systemd user timer
+
+```bash
+caam keepalive --print-systemd
+# Or obtain each unit as a JSON string:
+caam keepalive --print-systemd --json
+```
+
+Save the printed service and timer sections as
+`~/.config/systemd/user/caam-keepalive.service` and
+`~/.config/systemd/user/caam-keepalive.timer`, then enable them:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now caam-keepalive.timer
+systemctl --user list-timers caam-keepalive.timer
+journalctl --user -u caam-keepalive.service
+```
+
+The timer uses `OnCalendar=*:0/30` and `Persistent=true`, so it has a calendar
+schedule and catches up after the user manager was inactive. Generated
+units preserve selected options, live-home locations, and `PATH`, while
+excluding authentication secrets. Generate them from the normal host
+environment where the native CLIs are installed. Printing units does not
+install or start them; regenerate them if the executable or home locations
+change.
+
 ### Profile Health Scoring
 
 Each profile displays a health indicator showing its current state at a glance:
@@ -812,9 +913,9 @@ reading `warning` in `caam ls` from an expiry months in the past.
 
 Two questions used to share one flag, and they have different answers:
 
-| Question | Consumer | Claude | Codex / Grok / Gemini (with a refresh token) |
-|----------|----------|--------|-----------------------------------------------|
-| "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — Claude Code renews itself and caam's Claude refresh is disabled | **yes** — caam has a refresher and runs off this signal |
+| Question | Consumer | Claude / Grok | Codex / Gemini (with a refresh token) |
+|----------|----------|---------------|---------------------------------------|
+| "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — the native CLI renews; `caam keepalive` can invoke it in its live home | **yes** — caam has a refresher and runs off this signal |
 | "Must a human log in again?" | `caam ls` status, rotation eligibility | no | **no** |
 
 `caam ls --json`, `caam status --json`, `caam verify --json`, and robot

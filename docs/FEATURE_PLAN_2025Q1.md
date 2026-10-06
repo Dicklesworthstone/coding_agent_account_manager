@@ -378,6 +378,32 @@ And doctor would report "pass" because files exist.
 - Test expiry checking logic
 - Test error handling for network failures
 
+#### 5.2 Native keepalive for idle live grants
+
+**Implemented for issue #119:** `caam keepalive` invokes Claude and Grok in
+the homes that own their native OAuth credentials. It closes the idle
+expiry cycle in which failed quota queries prevent an account from receiving
+the work that would otherwise cause its CLI to renew.
+
+- Discover host and isolated logins plus Claude shallow homes without
+  migrating files or reading a vault snapshot as an executable grant.
+- Resolve competing owners before selection; prefer a known Claude shallow
+  owner over its matching host copy and fail closed on ambiguous identities.
+- Apply a two-hour TTL threshold and a 25-minute minimum interval, with
+  expired credentials bypassing the interval.
+- Use bounded, minimal native calls with credential overrides scrubbed,
+  then verify the same live account has an unexpired credential.
+- Copy strictly newer credentials only to matching existing user snapshots
+  under the native credential lock, preserving settings and system backups.
+- Provide JSON outcomes, read-only dry runs, and generated systemd user
+  units using a persistent half-hour calendar timer.
+
+Focused tests use synthetic credentials and fake CLIs, including exit-zero
+credential deletion, competing owners, concurrent runs, cancellation,
+same-account vault synchronization, and read-only command paths. Claude
+keychain-only logins and Cursor session renewal remain outside this native
+file-based keepalive path.
+
 ---
 
 ## Dependency Graph
