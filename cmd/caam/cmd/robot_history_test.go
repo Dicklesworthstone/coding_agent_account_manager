@@ -510,6 +510,62 @@ func TestRobotCredentialActivateSwitchesUsableCredentials(t *testing.T) {
 	}
 }
 
+func TestRobotCredentialActivationPreservesOutgoingOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		liveAccount string
+		wantNamed   bool
+		wantBackup  bool
+	}{
+		{"rotated-owner", "smart", "work", true, false},
+		{"rotated-owner-without-system-backups", "never", "work", true, false},
+		{"unsaved-login", "smart", "unsaved", false, true},
+		{"explicitly-disabled-backups", "never", "unsaved", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := setupRobotCredentialEnv(t)
+			writeNativeTestCredential(t, filepath.Join(home, "caam", "config.yaml"),
+				fmt.Sprintf("version: 1\nsafety:\n  auto_backup_before_switch: %s\n  max_auto_backups: 5\n", tc.mode))
+			now := time.Now().UTC().Truncate(time.Second)
+			saved := codexSwitchTestCredential(t, "work", "SAVED-REFRESH", now.Add(-time.Hour))
+			live := codexSwitchTestCredential(t, tc.liveAccount, "LIVE-REFRESH", now)
+			target := codexSwitchTestCredential(t, "personal", "TARGET-REFRESH", now)
+			writeRobotCredentialProfile(t, "codex", "work", map[string]string{"auth.json": saved})
+			writeRobotCredentialProfile(t, "codex", "personal", map[string]string{"auth.json": target})
+			livePath := filepath.Join(home, ".codex", "auth.json")
+			writeNativeTestCredential(t, livePath, live)
+
+			out, err := runRobotCredentialCommand(t, robotActCmd, "activate", "codex", "personal")
+			if err != nil || !out.Success {
+				t.Fatalf("robot activation failed: %+v, %v", out, err)
+			}
+			var result RobotActResult
+			if err := json.Unmarshal(out.Data, &result); err != nil {
+				t.Fatal(err)
+			}
+			if !result.Success || (result.AutoBackup != "") != tc.wantBackup {
+				t.Fatalf("unexpected robot preservation result: %+v", result)
+			}
+			wantSaved := saved
+			if tc.wantNamed {
+				wantSaved = live
+				if result.ResnapshottedProfile != "work" || result.OldProfile != "work" {
+					t.Fatalf("robot did not report the saved outgoing owner: %+v", result)
+				}
+			} else if result.ResnapshottedProfile != "" {
+				t.Fatalf("robot attributed an unknown login to a saved account: %+v", result)
+			}
+			requireSwitchCredential(t, vault.BackupPath("codex", "work", "auth.json"), wantSaved)
+			requireSwitchCredential(t, vault.BackupPath("codex", "personal", "auth.json"), target)
+			requireSwitchCredential(t, livePath, target)
+			if tc.wantBackup {
+				requireSwitchCredential(t, vault.BackupPath("codex", result.AutoBackup, "auth.json"), live)
+			}
+		})
+	}
+}
+
 func TestRobotCredentialProviderRejectionBlocksRenewableAccount(t *testing.T) {
 	setupRobotCredentialEnv(t)
 	expiry := time.Now().Add(9 * 24 * time.Hour)

@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,97 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/spf13/cobra"
 )
+
+func TestActivateForcedRotationHonorsCooldownOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		profiles   map[string]string
+		auto       bool
+		force      bool
+		useDefault bool
+		want       string
+		wantErr    string
+	}{
+		{name: "auto sole cooling refused", profiles: map[string]string{"a": "a"}, auto: true, wantErr: "cooldown"},
+		{name: "auto sole cooling forced", profiles: map[string]string{"a": "a"}, auto: true, force: true, want: "a"},
+		{name: "auto cooling and system forced", profiles: map[string]string{"a": "a", "_backup_saved": "system"}, auto: true, force: true, want: "a"},
+		{name: "auto system only forced refused", profiles: map[string]string{"_backup_saved": "system"}, auto: true, force: true, wantErr: "no user profiles"},
+		{name: "cooling default rotates without force", profiles: map[string]string{"a": "a", "b": "b"}, useDefault: true, want: "b"},
+		{name: "forced cooling default is retained", profiles: map[string]string{"a": "a", "b": "b"}, useDefault: true, force: true, want: "a"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cleanup := setupNextTestEnv(t)
+			defer cleanup()
+			oldCfg, oldHealth, oldDB := cfg, healthStore, globalDB
+			cfg, healthStore, globalDB = config.DefaultConfig(), nil, nil
+			t.Cleanup(func() {
+				if globalDB != nil {
+					_ = globalDB.Close()
+				}
+				cfg, healthStore, globalDB = oldCfg, oldHealth, oldDB
+			})
+			if tc.useDefault {
+				cfg.SetDefault("codex", "a")
+			}
+			spmCfg := config.DefaultSPMConfig()
+			spmCfg.Project.Enabled = false
+			spmCfg.Stealth.Rotation.Enabled = true
+			spmCfg.Stealth.Rotation.Algorithm = "round_robin"
+			spmCfg.Stealth.Cooldown.Enabled = true
+			if err := spmCfg.Save(); err != nil {
+				t.Fatal(err)
+			}
+			createTestProfiles(t, tc.profiles)
+			authPath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+			live := []byte(`{"access_token":"synthetic-unsaved"}`)
+			if err := os.WriteFile(authPath, live, 0600); err != nil {
+				t.Fatal(err)
+			}
+			db, err := getDB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SetCooldown("codex", "a", time.Now().UTC(), time.Hour, "synthetic limit"); err != nil {
+				t.Fatal(err)
+			}
+			c := &cobra.Command{}
+			c.Flags().Bool("backup-current", false, "")
+			c.Flags().Bool("force", tc.force, "")
+			c.Flags().Bool("auto", tc.auto, "")
+			c.Flags().Bool("json", true, "")
+			c.Flags().Bool("reload-daemon", false, "")
+			var output bytes.Buffer
+			c.SetOut(&output)
+			err = runActivate(c, []string{"codex"})
+			var result activateOutput
+			if decodeErr := json.Unmarshal(output.Bytes(), &result); decodeErr != nil {
+				t.Fatalf("invalid activation result %q: %v", output.String(), decodeErr)
+			}
+			got, readErr := os.ReadFile(authPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || result.Success {
+					t.Fatalf("expected refusal containing %q: result=%+v, err=%v", tc.wantErr, result, err)
+				}
+				if !bytes.Equal(got, live) {
+					t.Fatal("refused automatic activation changed the live credential")
+				}
+				return
+			}
+			if err != nil || !result.Success || result.Profile != tc.want {
+				t.Fatalf("activation = %+v, %v; want %s", result, err, tc.want)
+			}
+			if string(got) != `{"access_token":"`+tc.want+`"}` {
+				t.Fatalf("activated incorrect credential: %s", got)
+			}
+			if tc.useDefault && tc.force && result.Rotation != nil {
+				t.Fatalf("explicitly forced default unexpectedly entered rotation: %+v", result)
+			}
+		})
+	}
+}
 
 func TestActivate_AutoSelect_ChoosesNonCooldownProfile(t *testing.T) {
 	tmpDir := t.TempDir()

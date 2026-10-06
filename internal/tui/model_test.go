@@ -1,11 +1,16 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
@@ -31,6 +36,117 @@ func TestNewWithProviders(t *testing.T) {
 	m := NewWithProviders(providers)
 	if len(m.providers) != 2 {
 		t.Errorf("expected 2 providers, got %d", len(m.providers))
+	}
+}
+
+func TestActivateCommandPreservesLiveLogin(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		owner      string
+		mode       string
+		malformed  bool
+		wantNamed  bool
+		wantBackup bool
+	}{
+		{name: "rotated named login", owner: "alice", wantNamed: true},
+		{name: "unmatched login", owner: "carol", wantBackup: true},
+		{name: "configured never", owner: "carol", mode: "never"},
+		{name: "configured always", owner: "alice", mode: "always", wantNamed: true, wantBackup: true},
+		{name: "malformed target", owner: "alice", malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			cfg := config.DefaultSPMConfig()
+			if tc.mode != "" {
+				cfg.Safety.AutoBackupBeforeSwitch = tc.mode
+			}
+			m := NewWithProvidersAndConfig([]string{"claude"}, cfg)
+			m.vaultPath = filepath.Join(root, "vault")
+			vault := authfile.NewVault(m.vaultPath)
+			credentials := func(token string, expiry int64) []byte {
+				return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, token, "refresh-"+token, expiry))
+			}
+			identity := func(account string) []byte {
+				return []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q,"emailAddress":%q},"userID":"shared-machine"}`, "id-"+account, account+"@example.com"))
+			}
+			oldAlice := credentials("alice-old", 2000000000000)
+			rotated := credentials(tc.owner+"-rotated", 2000003600000)
+			bob := credentials("bob", 2000007200000)
+			if tc.malformed {
+				bob = []byte(`{"claudeAiOauth":null}`)
+			}
+			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
+				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
+				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+			}
+			livePath := filepath.Join(home, ".claude", ".credentials.json")
+			writeTUIActivationFile(t, livePath, rotated)
+			writeTUIActivationFile(t, filepath.Join(home, ".claude.json"), identity(tc.owner))
+
+			msg, ok := m.doActivateProfile("claude", "bob")().(activateResultMsg)
+			if !ok {
+				t.Fatal("activation returned unexpected message")
+			}
+			if (msg.err != nil) != tc.malformed {
+				t.Fatalf("activation error = %v, malformed=%v", msg.err, tc.malformed)
+			}
+			wantLive := bob
+			if tc.malformed {
+				wantLive = rotated
+			}
+			assertTUIActivationFile(t, livePath, wantLive)
+			wantAlice := oldAlice
+			if tc.wantNamed {
+				wantAlice = rotated
+			}
+			assertTUIActivationFile(t, vault.BackupPath("claude", "alice", ".credentials.json"), wantAlice)
+			assertTUIActivationFile(t, vault.BackupPath("claude", "bob", ".credentials.json"), bob)
+			profiles, err := vault.List("claude")
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := 0
+			for _, name := range profiles {
+				if authfile.IsSystemProfile(name) {
+					backups++
+					assertTUIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), rotated)
+				}
+			}
+			if (backups == 1) != tc.wantBackup || backups > 1 {
+				t.Fatalf("backups = %d, want backup %v", backups, tc.wantBackup)
+			}
+			updated, _ := m.Update(msg)
+			if tc.malformed && strings.Contains(updated.(Model).statusMsg, "Activated") {
+				t.Fatal("failed activation was reported as successful")
+			}
+		})
+	}
+}
+
+func writeTUIActivationFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertTUIActivationFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("unexpected credential content at %s", path)
 	}
 }
 

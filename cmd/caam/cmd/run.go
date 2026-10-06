@@ -219,7 +219,10 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 	// Get active profile
 	fileSet := tools[tool]()
-	activeProfileName, _ := vault.ActiveProfile(fileSet)
+	activeProfileName, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		return fmt.Errorf("read current auth: %w", err)
+	}
 	if activeProfileName == "" {
 		// If no active profile, try to select one
 		profiles, err := vault.List(tool)
@@ -234,9 +237,12 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("no profile selected for %s", tool)
 		}
 		activeProfileName = res.Selected
-		// Restore it
-		if err := vault.Restore(fileSet, activeProfileName); err != nil {
+		switched, err := vault.Switch(fileSet, activeProfileName, switchOptionsFromConfig(spmCfg))
+		if err != nil {
 			return fmt.Errorf("activate profile: %w", err)
+		}
+		if !quiet {
+			printSwitchPreservation(os.Stderr, tool, switched)
 		}
 	}
 
@@ -322,7 +328,11 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 
 	// Get the currently active profile
 	fileSet := tools[tool]()
-	currentProfile, _ := vault.ActiveProfile(fileSet)
+	currentProfile, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read current %s auth: %v\n", tool, err)
+		return false
+	}
 	if currentProfile == "" {
 		return false // No active profile
 	}
@@ -439,16 +449,19 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	selector.SetUsageData(usageData)
 
 	result, err := selector.Select(tool, candidates, currentProfile)
-	if err != nil || result.Selected == currentProfile {
+	if err != nil || result == nil || result.Selected == "" || result.Selected == currentProfile {
 		return false // Couldn't find better alternative
 	}
 
 	// Switch to the better profile
-	if err := vault.Restore(fileSet, result.Selected); err != nil {
+	switched, err := vault.Switch(fileSet, result.Selected, switchOptionsFromConfig(spmCfg))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not switch %s to %s: %v\n", tool, result.Selected, err)
 		return false
 	}
 
 	if !quiet {
+		printSwitchPreservation(os.Stderr, tool, switched)
 		fmt.Fprintf(os.Stderr, "caam: precheck switched %s/%s -> %s/%s\n",
 			tool, currentProfile, tool, result.Selected)
 	}

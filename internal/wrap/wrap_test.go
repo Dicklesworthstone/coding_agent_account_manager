@@ -3,8 +3,11 @@ package wrap
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +133,154 @@ func TestWrapper_Run_WithProfile(t *testing.T) {
 	}
 	if len(result.ProfilesUsed) > 0 && result.ProfilesUsed[0] != "test@example.com" {
 		t.Errorf("ProfilesUsed[0] = %q, want test@example.com", result.ProfilesUsed[0])
+	}
+}
+
+func TestWrapperRateLimitPreservesLatestLiveCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		liveOwner string
+		malformed bool
+	}{
+		{name: "native rotation survives failover", liveOwner: "alice"},
+		{name: "external login is backed up under its own identity", liveOwner: "carol"},
+		{name: "malformed backup leaves running login intact", liveOwner: "alice", malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			credentials := func(token string, expiry int64) []byte {
+				return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, token, "refresh-"+token, expiry))
+			}
+			identity := func(name string) []byte {
+				return []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q,"emailAddress":%q}}`, "id-"+name, name+"@example.com"))
+			}
+			oldAlice := credentials("alice-old", 2000000000000)
+			rotated := credentials(tc.liveOwner+"-rotated", 2000003600000)
+			bob := credentials("bob", 2000007200000)
+			if tc.malformed {
+				bob = []byte(`{"claudeAiOauth":{"accessToken":null}}`)
+			}
+			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
+				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
+				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+			}
+			livePath := filepath.Join(home, ".claude", ".credentials.json")
+			identityPath := filepath.Join(home, ".claude.json")
+			writeWrapSwitchFile(t, livePath, oldAlice)
+			writeWrapSwitchFile(t, identityPath, identity("alice"))
+
+			calls := 0
+			originalExec := ExecCommand
+			t.Cleanup(func() { ExecCommand = originalExec })
+			ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				if name != "claude" {
+					t.Fatalf("unexpected executable: %s", name)
+				}
+				calls++
+				mode := "success"
+				if calls == 1 {
+					assertWrapSwitchFile(t, livePath, oldAlice)
+					// Simulate the native CLI rotating tokens, or another login
+					// replacing the account, before it reports the rate limit.
+					writeWrapSwitchFile(t, livePath, rotated)
+					writeWrapSwitchFile(t, identityPath, identity(tc.liveOwner))
+					mode = "limited"
+				} else {
+					assertWrapSwitchFile(t, livePath, bob)
+				}
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWrapSwitchProcess$", "--")
+				cmd.Env = append(os.Environ(), "CAAM_WRAP_SWITCH_PROCESS="+mode)
+				return cmd
+			}
+			cfg := DefaultConfig()
+			cfg.Provider = "claude"
+			cfg.Algorithm = rotation.AlgorithmRoundRobin
+			cfg.MaxRetries = 1
+			cfg.InitialDelay = 0
+			cfg.Jitter = false
+			cfg.NotifyOnSwitch = false
+			cfg.Stdout = &bytes.Buffer{}
+			cfg.Stderr = &bytes.Buffer{}
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if !result.RateLimitHit || strings.Join(result.ProfilesUsed, ",") != "alice,bob" {
+				t.Fatalf("failover was not exercised: %+v", result)
+			}
+			wantCalls := 2
+			wantLive := bob
+			if tc.malformed {
+				wantCalls = 1
+				wantLive = rotated
+				if result.Err == nil || result.ExitCode == 0 {
+					t.Fatalf("malformed target reported success: %+v", result)
+				}
+			} else if result.Err != nil || result.ExitCode != 0 {
+				t.Fatalf("failover failed: %+v", result)
+			}
+			if calls != wantCalls {
+				t.Fatalf("native executions = %d, want %d", calls, wantCalls)
+			}
+			assertWrapSwitchFile(t, livePath, wantLive)
+			wantAlice := oldAlice
+			if !tc.malformed && tc.liveOwner == "alice" {
+				wantAlice = rotated
+			}
+			assertWrapSwitchFile(t, vault.BackupPath("claude", "alice", ".credentials.json"), wantAlice)
+			assertWrapSwitchFile(t, vault.BackupPath("claude", "bob", ".credentials.json"), bob)
+			profiles, err := vault.List("claude")
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := 0
+			for _, name := range profiles {
+				if authfile.IsSystemProfile(name) {
+					backups++
+					assertWrapSwitchFile(t, vault.BackupPath("claude", name, ".credentials.json"), rotated)
+				}
+			}
+			wantBackup := tc.liveOwner == "carol" && !tc.malformed
+			if (backups == 1) != wantBackup || backups > 1 {
+				t.Errorf("recovery backups = %d, want backup %v", backups, wantBackup)
+			}
+		})
+	}
+}
+
+func TestWrapSwitchProcess(t *testing.T) {
+	switch os.Getenv("CAAM_WRAP_SWITCH_PROCESS") {
+	case "limited":
+		fmt.Fprintln(os.Stderr, "Error: rate limit exceeded")
+		os.Exit(1)
+	case "success":
+		fmt.Fprintln(os.Stdout, "request completed")
+		os.Exit(0)
+	}
+}
+
+func writeWrapSwitchFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertWrapSwitchFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("unexpected credential content at %s", path)
 	}
 }
 

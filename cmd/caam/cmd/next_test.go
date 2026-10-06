@@ -3,12 +3,15 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/spf13/cobra"
 )
 
@@ -215,6 +218,152 @@ func TestNext_SingleProfile_AlreadyActive(t *testing.T) {
 	// Should not error, just inform that only one profile is available
 	if err := runNext(c, []string{"codex"}); err != nil {
 		t.Fatalf("runNext() error = %v", err)
+	}
+}
+
+func TestNext_SoleUserEligibilityAndPreservation(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		profiles      map[string]string
+		cooling       bool
+		alreadyActive bool
+		force         bool
+		dryRun        bool
+		wantErr       string
+	}{
+		{name: "sole cooling user", profiles: map[string]string{"only": "only"}, cooling: true, wantErr: "cooldown"},
+		{name: "sole cooling active user", profiles: map[string]string{"only": "only"}, cooling: true, alreadyActive: true, wantErr: "cooldown"},
+		{name: "sole original snapshot", profiles: map[string]string{"_original": "recovery"}, wantErr: "no user profiles"},
+		{name: "sole auto snapshot", profiles: map[string]string{"_backup_20261006": "recovery"}, wantErr: "no user profiles"},
+		{name: "cooling user and backup", profiles: map[string]string{"only": "only", "_original": "recovery"}, cooling: true, wantErr: "cooldown"},
+		{name: "healthy sole user", profiles: map[string]string{"only": "only"}},
+		{name: "healthy user and backup", profiles: map[string]string{"only": "only", "_original": "recovery"}},
+		{name: "explicit forced cooldown", profiles: map[string]string{"only": "only"}, cooling: true, force: true},
+		{name: "force cannot choose snapshot", profiles: map[string]string{"_original": "recovery"}, force: true, wantErr: "no user profiles"},
+		{name: "healthy dry run", profiles: map[string]string{"only": "only"}, dryRun: true},
+		{name: "cooling dry run", profiles: map[string]string{"only": "only"}, cooling: true, dryRun: true, wantErr: "cooldown"},
+		{name: "forced cooling dry run", profiles: map[string]string{"only": "only"}, cooling: true, force: true, dryRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cleanup := setupNextTestEnv(t)
+			defer cleanup()
+			oldHealth := healthStore
+			healthStore = nil
+			t.Cleanup(func() { healthStore = oldHealth })
+			cfg := config.DefaultSPMConfig()
+			cfg.Stealth.Cooldown.Enabled = true
+			if err := cfg.Save(); err != nil {
+				t.Fatal(err)
+			}
+			createTestProfiles(t, tc.profiles)
+			beforeProfiles, err := vault.List("codex")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			authPath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+			live := `{"access_token":"live-unsaved"}`
+			if tc.alreadyActive {
+				live = `{"access_token":"only"}`
+			}
+			if err := os.WriteFile(authPath, []byte(live), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.cooling {
+				db, err := caamdb.Open()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, cooldownErr := db.SetCooldown("codex", "only", time.Now().UTC(), time.Hour, "synthetic limit")
+				closeErr := db.Close()
+				if cooldownErr != nil || closeErr != nil {
+					t.Fatalf("record cooldown: %v, close: %v", cooldownErr, closeErr)
+				}
+			}
+
+			c := &cobra.Command{}
+			c.Flags().Bool("dry-run", tc.dryRun, "")
+			c.Flags().Bool("quiet", true, "")
+			c.Flags().Bool("force", tc.force, "")
+			c.Flags().String("algorithm", "smart", "")
+			c.Flags().String("policy", "availability", "")
+			c.Flags().Bool("usage-aware", false, "")
+			c.Flags().Bool("reload-daemon", false, "")
+			err = runNext(c, []string{"codex"})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("runNext() = %v; want refusal containing %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("runNext() = %v", err)
+			}
+
+			got, err := os.ReadFile(authPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterProfiles, err := vault.List("codex")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantErr != "" || tc.dryRun {
+				if string(got) != live || !reflect.DeepEqual(afterProfiles, beforeProfiles) {
+					t.Fatalf("refused/dry-run switch changed credentials: live=%q, profiles=%v (before %v)", got, afterProfiles, beforeProfiles)
+				}
+				return
+			}
+			if string(got) != `{"access_token":"only"}` {
+				t.Fatalf("did not activate sole eligible user: %s", got)
+			}
+			preserved := false
+			for _, name := range afterProfiles {
+				if !authfile.IsSystemProfile(name) {
+					continue
+				}
+				data, err := os.ReadFile(filepath.Join(vault.ProfilePath("codex", name), "auth.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				preserved = preserved || string(data) == live
+			}
+			if !preserved {
+				t.Fatal("switch to sole user discarded the unnamed outgoing credential")
+			}
+		})
+	}
+}
+
+func TestNextSelectionForcePreservesNativeQuotaEligibility(t *testing.T) {
+	oldHealth := healthStore
+	healthStore = nil
+	t.Cleanup(func() { healthStore = oldHealth })
+	for _, provider := range []string{"grok", "cursor"} {
+		for _, force := range []bool{false, true} {
+			for _, tc := range []struct {
+				name  string
+				usage *rotation.UsageInfo
+				ok    bool
+			}{
+				{name: "unmeasured"},
+				{name: "failed measurement", usage: &rotation.UsageInfo{Error: "unmeasured"}},
+				{name: "exhausted", usage: &rotation.UsageInfo{PrimaryPercent: 100}},
+				{name: "measured reset zero", usage: &rotation.UsageInfo{AvailScore: 100}, ok: true},
+			} {
+				for _, policy := range []string{"availability", "drain"} {
+					cfg := config.DefaultSPMConfig()
+					cfg.Stealth.Rotation.Policy = policy
+					data := map[string]*rotation.UsageInfo{"only": tc.usage}
+					selected, err := selectProfileWithRotationAndUsage(provider, []string{"only"}, "", cfg, nil, data, force)
+					if tc.ok {
+						if err != nil || selected == nil || selected.Selected != "only" {
+							t.Errorf("%s/%s/%s force=%v rejected measured zero: %+v, %v", provider, policy, tc.name, force, selected, err)
+						}
+					} else if err == nil || selected != nil {
+						t.Errorf("%s/%s/%s force=%v bypassed quota eligibility: %+v, %v", provider, policy, tc.name, force, selected, err)
+					}
+				}
+			}
+		}
 	}
 }
 

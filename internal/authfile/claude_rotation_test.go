@@ -375,6 +375,81 @@ func TestRestoreReplacesOtherAccountEvenIfFresher(t *testing.T) {
 	}
 }
 
+func TestClaudeRestoreFreshnessRequiresConsistentAccount(t *testing.T) {
+	withIdentity := func(creds, accountID, email string) string {
+		var root map[string]interface{}
+		if err := json.Unmarshal([]byte(creds), &root); err != nil {
+			t.Fatal(err)
+		}
+		oauth := root["claudeAiOauth"].(map[string]interface{})
+		oauth["accountId"], oauth["email"] = accountID, email
+		data, err := json.Marshal(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	bobNewer := claudeRotationCreds("sk-ant-oat01-bob-gen9", "sk-ant-ort01-bob-gen9", 9999)
+	for _, tc := range []struct {
+		name         string
+		snapshot     string
+		live         string
+		liveSettings string
+		wantKeepLive bool
+	}{
+		{
+			name:         "matching embedded and paired account keeps newer live tokens",
+			snapshot:     withIdentity(aliceGen1, rotAliceUUID, rotAliceEmail),
+			live:         withIdentity(aliceGen2, rotAliceUUID, rotAliceEmail),
+			liveSettings: aliceSettings(9),
+			wantKeepLive: true,
+		},
+		{
+			name:         "shared email does not override different paired account UUID",
+			snapshot:     aliceGen1,
+			live:         bobNewer,
+			liveSettings: claudeRotationSettings(rotBobUUID, rotAliceEmail, rotAliceUser, 9),
+		},
+		{
+			name:         "live embedded account conflicts with stale paired settings",
+			snapshot:     aliceGen1,
+			live:         withIdentity(bobNewer, rotBobUUID, rotAliceEmail),
+			liveSettings: aliceSettings(9),
+		},
+		{
+			name:         "snapshot embedded account conflicts with its paired settings",
+			snapshot:     withIdentity(bobGen1, rotBobUUID, rotAliceEmail),
+			live:         aliceGen2,
+			liveSettings: aliceSettings(9),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newClaudeRotationFixture(t)
+			f.writeProfile("alice", tc.snapshot, aliceSettings(1))
+			f.writeLive(tc.live, tc.liveSettings)
+			snapshotPath := f.profileFile("alice", ".credentials.json")
+
+			if got := f.vault.claudeLiveIsNewer(claudeLiveIdentityKeys(f.fileSet),
+				f.vault.ProfilePath("claude", "alice"), f.liveCreds, snapshotPath); got != tc.wantKeepLive {
+				t.Errorf("claudeLiveIsNewer() = %v, want %v", got, tc.wantKeepLive)
+			}
+			if err := f.vault.Restore(f.fileSet, "alice"); err != nil {
+				t.Fatalf("Restore: %v", err)
+			}
+			want := tc.snapshot
+			if tc.wantKeepLive {
+				want = tc.live
+			}
+			if got := readFixtureFile(t, f.liveCreds); got != want {
+				t.Fatal("Restore retained the wrong account or token generation")
+			}
+			if got := readFixtureFile(t, snapshotPath); got != tc.snapshot {
+				t.Fatal("Restore changed the saved profile")
+			}
+		})
+	}
+}
+
 func TestRestoreIgnoresFailedRefreshResidue(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))

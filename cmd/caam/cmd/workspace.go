@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -296,36 +298,38 @@ func switchWorkspace(cfg *config.Config, workspaceName string) error {
 
 	// Activate each profile in the workspace
 	var activated []string
+	var failures []error
+	options := loadSwitchOptions()
+	options.PreserveOriginal = true
 	for _, tool := range sortedTools {
 		profile := profiles[tool]
 		getFileSet, ok := tools[tool]
 		if !ok {
-			fmt.Printf("  Warning: unknown tool '%s', skipping\n", tool)
+			failures = append(failures, fmt.Errorf("unknown tool %q", tool))
 			continue
 		}
 
 		fileSet := getFileSet()
 
-		// Backup original on first use
-		if did, err := vault.BackupOriginal(fileSet); err != nil {
-			fmt.Printf("  Warning: could not backup original %s auth: %v\n", tool, err)
-		} else if did {
-			fmt.Printf("  Backed up original %s auth\n", tool)
-		}
-
-		// Restore profile
-		if err := vault.Restore(fileSet, profile); err != nil {
-			fmt.Printf("  Error activating %s/%s: %v\n", tool, profile, err)
+		switched, err := vault.Switch(fileSet, profile, options)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("activate %s/%s: %w", tool, profile, err))
 			continue
 		}
+		printSwitchPreservation(os.Stdout, tool, switched)
 
 		activated = append(activated, fmt.Sprintf("%s: %s", tool, profile))
 	}
+	if len(failures) > 0 {
+		return fmt.Errorf("workspace %q was not fully activated (completed: %s): %w", workspaceName, strings.Join(activated, ", "), errors.Join(failures...))
+	}
 
 	// Update current workspace in config
+	previousWorkspace := cfg.GetCurrentWorkspace()
 	cfg.SetCurrentWorkspace(workspaceName)
 	if err := cfg.Save(); err != nil {
-		fmt.Printf("Warning: could not save current workspace: %v\n", err)
+		cfg.SetCurrentWorkspace(previousWorkspace)
+		return fmt.Errorf("profiles activated, but could not save current workspace: %w", err)
 	}
 
 	fmt.Println()

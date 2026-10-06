@@ -1,13 +1,19 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/spf13/cobra"
 )
 
 func TestActivate_AutoBackupsOriginalOnFirstSwitch(t *testing.T) {
@@ -189,5 +195,169 @@ func TestActivate_AutoBackupsUnsavedStateBeforeSwitch(t *testing.T) {
 	}
 	if string(gotBackup) != string(unsaved) {
 		t.Fatalf("auto-backup auth mismatch: got %q want %q", gotBackup, unsaved)
+	}
+}
+
+func codexSwitchTestCredential(t *testing.T, account, token string, refreshed time.Time) string {
+	t.Helper()
+	claims, err := json.Marshal(map[string]any{
+		"sub": account, "email": account + "@example.invalid",
+		"iat": refreshed.Unix(), "exp": refreshed.Add(24 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".SYNTHETIC"
+	return fmt.Sprintf(`{"tokens":{"account_id":%q,"id_token":%q,"access_token":%q,"refresh_token":%q},"last_refresh":%q}`,
+		account, jwt, jwt, "SYNTHETIC-"+token, refreshed.Format(time.RFC3339))
+}
+
+func runActivateJSONCommand(t *testing.T, tool, target string, flags ...string) (activateOutput, error) {
+	t.Helper()
+	command := &cobra.Command{
+		Use: activateCmd.Use, Args: activateCmd.Args, RunE: runActivate,
+		SilenceUsage: true, SilenceErrors: true,
+	}
+	command.Flags().Bool("json", true, "")
+	command.Flags().Bool("auto", false, "")
+	command.Flags().Bool("force", false, "")
+	command.Flags().Bool("backup-current", false, "")
+	command.Flags().Bool("reload-daemon", false, "")
+	command.SetArgs(append([]string{tool, target}, flags...))
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	err := command.Execute()
+	if strings.Contains(stdout.String()+stderr.String(), "SYNTHETIC-") {
+		t.Fatal("activation output exposed credential material")
+	}
+	var output activateOutput
+	decoder := json.NewDecoder(&stdout)
+	if decodeErr := decoder.Decode(&output); decodeErr != nil {
+		t.Fatalf("activation did not return JSON: %v (command error: %v)", decodeErr, err)
+	}
+	if decodeErr := decoder.Decode(new(any)); decodeErr != io.EOF {
+		t.Fatalf("activation returned extra output: %v", decodeErr)
+	}
+	return output, err
+}
+
+func requireSwitchCredential(t *testing.T, path, expected string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != expected {
+		t.Fatalf("unexpected credential contents at %s", path)
+	}
+}
+
+func TestActivateSwitchPreservesRotatedOutgoingCredential(t *testing.T) {
+	home := setupRobotCredentialEnv(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	old := codexSwitchTestCredential(t, "work", "SPENT-REFRESH", now.Add(-time.Hour))
+	live := codexSwitchTestCredential(t, "work", "LIVE-REFRESH", now)
+	target := codexSwitchTestCredential(t, "personal", "TARGET-REFRESH", now)
+	writeRobotCredentialProfile(t, "codex", "work", map[string]string{"auth.json": old})
+	writeRobotCredentialProfile(t, "codex", "personal", map[string]string{"auth.json": target})
+	livePath := filepath.Join(home, ".codex", "auth.json")
+	writeNativeTestCredential(t, livePath, live)
+
+	output, err := runActivateJSONCommand(t, "codex", "personal")
+	if err != nil || !output.Success || output.ResnapshottedProfile != "work" || output.PreviousProfile != "work" {
+		t.Fatalf("switch did not report preserving the outgoing owner: %+v, %v", output, err)
+	}
+	requireSwitchCredential(t, vault.BackupPath("codex", "work", "auth.json"), live)
+	requireSwitchCredential(t, livePath, target)
+}
+
+func TestActivateSwitchKeepsNewerLiveCredential(t *testing.T) {
+	home := setupRobotCredentialEnv(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	saved := codexSwitchTestCredential(t, "work", "SPENT-REFRESH", now.Add(-time.Hour))
+	live := codexSwitchTestCredential(t, "work", "LIVE-REFRESH", now)
+	writeRobotCredentialProfile(t, "codex", "work", map[string]string{"auth.json": saved})
+	livePath := filepath.Join(home, ".codex", "auth.json")
+	writeNativeTestCredential(t, livePath, live)
+
+	output, err := runActivateJSONCommand(t, "codex", "work")
+	if err != nil || !output.Success || !output.KeptLive || output.AutoBackup != "" {
+		t.Fatalf("same-account activation did not retain newer credentials: %+v, %v", output, err)
+	}
+	requireSwitchCredential(t, livePath, live)
+	profiles, err := vault.List("codex")
+	if err != nil || len(profiles) != 1 || profiles[0] != "work" {
+		t.Fatalf("same-account no-op unexpectedly changed profile membership: %v, %v", profiles, err)
+	}
+}
+
+func TestActivateSwitchRejectsInvalidTargetBeforePreservation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"missing-credential", nil},
+		{"malformed-json", map[string]string{"auth.json": `{"access_token":`}},
+		{"null-json", map[string]string{"auth.json": `null`}},
+		{"array-json", map[string]string{"auth.json": `[]`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := setupRobotCredentialEnv(t)
+			livePath := filepath.Join(home, ".codex", "auth.json")
+			live := `{"access_token":"SYNTHETIC-UNSAVED-LOGIN"}`
+			writeNativeTestCredential(t, livePath, live)
+			writeRobotCredentialProfile(t, "codex", "target", tc.files)
+			output, err := runActivateJSONCommand(t, "codex", "target")
+			if err == nil || output.Success {
+				t.Fatalf("invalid target was accepted: %+v, %v", output, err)
+			}
+			requireSwitchCredential(t, livePath, live)
+			profiles, listErr := vault.List("codex")
+			if listErr != nil || len(profiles) != 1 || profiles[0] != "target" {
+				t.Fatalf("invalid target created recovery profiles: %v, %v", profiles, listErr)
+			}
+			for name, content := range tc.files {
+				requireSwitchCredential(t, vault.BackupPath("codex", "target", name), content)
+			}
+		})
+	}
+}
+
+func TestActivateSwitchBackupPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		mode        string
+		forceBackup bool
+		wantBackup  bool
+	}{
+		{"smart", false, true},
+		{"always", false, true},
+		{"never", false, false},
+		{"never", true, true},
+	} {
+		t.Run(fmt.Sprintf("%s/override=%t", tc.mode, tc.forceBackup), func(t *testing.T) {
+			home := setupRobotCredentialEnv(t)
+			writeNativeTestCredential(t, filepath.Join(home, "caam", "config.yaml"),
+				fmt.Sprintf("version: 1\nsafety:\n  auto_backup_before_switch: %s\n  max_auto_backups: 5\n", tc.mode))
+			// A previous first-activation backup exists; test the configured policy.
+			writeRobotCredentialProfile(t, "codex", "_original", map[string]string{"auth.json": `{"access_token":"SYNTHETIC-ORIGINAL"}`})
+			live := `{"access_token":"SYNTHETIC-UNSAVED"}`
+			target := `{"access_token":"SYNTHETIC-TARGET"}`
+			livePath := filepath.Join(home, ".codex", "auth.json")
+			writeNativeTestCredential(t, livePath, live)
+			writeRobotCredentialProfile(t, "codex", "target", map[string]string{"auth.json": target})
+			var flags []string
+			if tc.forceBackup {
+				flags = append(flags, "--backup-current")
+			}
+			output, err := runActivateJSONCommand(t, "codex", "target", flags...)
+			if err != nil || !output.Success || (output.AutoBackup != "") != tc.wantBackup {
+				t.Fatalf("unexpected backup policy result: %+v, %v", output, err)
+			}
+			requireSwitchCredential(t, livePath, target)
+			if tc.wantBackup {
+				requireSwitchCredential(t, vault.BackupPath("codex", output.AutoBackup, "auth.json"), live)
+			}
+		})
 	}
 }

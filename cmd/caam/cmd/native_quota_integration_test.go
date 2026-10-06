@@ -133,7 +133,7 @@ func TestGrokResetZeroReachesUsageAwareCallers(t *testing.T) {
 				cfg := config.DefaultSPMConfig()
 				cfg.Stealth.Rotation.Algorithm = algorithm
 				cfg.Stealth.Rotation.Policy = policy
-				selected, err := selectProfileWithRotationAndUsage("grok", profiles, "spent", cfg, nil, data)
+				selected, err := selectProfileWithRotationAndUsage("grok", profiles, "spent", cfg, nil, data, false)
 				if err != nil || selected == nil || selected.Selected != "fresh" {
 					t.Fatalf("usage-aware selection rejected reset zero: %+v, %v", selected, err)
 				}
@@ -180,7 +180,7 @@ func TestNativeSelectionRejectsUnknownBeforeEveryAlgorithm(t *testing.T) {
 					PrimaryWindow: &usage.UsageWindow{}}
 				data := map[string]*rotation.UsageInfo{"unknown": toRotationUsageInfo("unknown", unknown, "")}
 				for _, profiles := range [][]string{{"unknown"}, {"missing", "unknown"}} {
-					if selected, err := selectProfileWithRotationAndUsage(provider, profiles, "", cfg, nil, data); err == nil || selected != nil {
+					if selected, err := selectProfileWithRotationAndUsage(provider, profiles, "", cfg, nil, data, false); err == nil || selected != nil {
 						t.Errorf("%s/%s/%s selected unmeasured quota: %+v, %v", provider, algorithm, policy, selected, err)
 					}
 				}

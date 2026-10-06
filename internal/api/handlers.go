@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
@@ -112,10 +113,15 @@ type ActivateRequest struct {
 
 // ActivateResponse is the response for POST /actions/activate.
 type ActivateResponse struct {
-	Success bool   `json:"success"`
-	Tool    string `json:"tool"`
-	Profile string `json:"profile"`
-	Message string `json:"message,omitempty"`
+	Success              bool     `json:"success"`
+	Tool                 string   `json:"tool"`
+	Profile              string   `json:"profile"`
+	Message              string   `json:"message,omitempty"`
+	KeptLive             bool     `json:"kept_live,omitempty"`
+	PreviousProfile      string   `json:"previous_profile,omitempty"`
+	AutoBackup           string   `json:"auto_backup,omitempty"`
+	ResnapshottedProfile string   `json:"resnapshotted_profile,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
 }
 
 // BackupRequest is the request for POST /actions/backup.
@@ -383,16 +389,32 @@ func (h *Handlers) Activate(req ActivateRequest) (*ActivateResponse, error) {
 		}
 	}
 
-	// Restore the profile (activating it)
-	if err := h.vault.Restore(fileSet, req.Profile); err != nil {
+	spmConfig, err := config.LoadSPMConfig()
+	if err != nil {
+		return nil, fmt.Errorf("load activation safety settings: %w", err)
+	}
+	result, err := h.vault.Switch(fileSet, req.Profile, authfile.SwitchOptions{
+		BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
+	})
+	if err != nil {
 		return nil, fmt.Errorf("activate failed: %w", err)
+	}
+	message := fmt.Sprintf("activated %s/%s", req.Tool, req.Profile)
+	if result.KeptLive {
+		message = fmt.Sprintf("kept live credentials for %s/%s", req.Tool, req.Profile)
 	}
 
 	return &ActivateResponse{
-		Success: true,
-		Tool:    req.Tool,
-		Profile: req.Profile,
-		Message: fmt.Sprintf("activated %s/%s", req.Tool, req.Profile),
+		Success:              true,
+		Tool:                 req.Tool,
+		Profile:              req.Profile,
+		Message:              message,
+		KeptLive:             result.KeptLive,
+		PreviousProfile:      result.PreviousProfile,
+		AutoBackup:           result.AutoBackup,
+		ResnapshottedProfile: result.ResnapshottedProfile,
+		Warnings:             result.Warnings,
 	}, nil
 }
 

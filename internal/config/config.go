@@ -333,7 +333,7 @@ func Load() (*Config, error) {
 
 // Save writes the configuration to disk.
 func (c *Config) Save() error {
-	if err := c.CludeSettings.Validate(); err != nil {
+	if err := c.ClaudeSettings.Validate(); err != nil {
 		return err
 	}
 	configPath := ConfigPath()

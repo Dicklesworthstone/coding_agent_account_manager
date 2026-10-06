@@ -772,6 +772,12 @@ func (v *Vault) ResnapshotOutgoing(fileSet AuthFileSet, outgoing, target string)
 // Backups are sorted by timestamp (oldest first) and oldest are deleted.
 // A maxBackups of 0 means unlimited (no rotation).
 func (v *Vault) RotateAutoBackups(tool string, maxBackups int) error {
+	return v.rotateAutoBackups(tool, maxBackups, "")
+}
+
+// keep protects the recovery copy needed by an in-progress switch or its
+// rollback, even when existing filenames carry future wall-clock timestamps.
+func (v *Vault) rotateAutoBackups(tool string, maxBackups int, keep string) error {
 	if maxBackups <= 0 {
 		return nil // Unlimited
 	}
@@ -800,10 +806,18 @@ func (v *Vault) RotateAutoBackups(tool string, maxBackups int) error {
 
 	// Delete oldest until we're within limit
 	toDelete := len(backups) - maxBackups
-	for i := 0; i < toDelete; i++ {
-		if err := v.DeleteForce(tool, backups[i]); err != nil {
-			return fmt.Errorf("delete old backup %s: %w", backups[i], err)
+	deleted := 0
+	for _, name := range backups {
+		if deleted >= toDelete {
+			break
 		}
+		if name == keep {
+			continue
+		}
+		if err := v.DeleteForce(tool, name); err != nil {
+			return fmt.Errorf("delete old backup %s: %w", name, err)
+		}
+		deleted++
 	}
 
 	return nil
@@ -2406,13 +2420,11 @@ func CodexLiveIsNewer(livePath, snapshotPath string) bool {
 
 	// Only guard when it is unambiguously the SAME account. A different identity
 	// is a genuine switch and must overwrite.
-	var liveAuth, snapAuth map[string]interface{}
-	if json.Unmarshal(liveData, &liveAuth) != nil || json.Unmarshal(snapData, &snapAuth) != nil {
-		return false
-	}
-	liveID := extractCodexIdentity(liveAuth)
-	snapID := extractCodexIdentity(snapAuth)
-	if liveID == "" || snapID == "" || liveID != snapID {
+	live := switchState{files: map[string][]byte{"auth.json": liveData}}
+	snapshot := switchState{files: map[string][]byte{"auth.json": snapData}}
+	live.identify(AuthFileSet{Tool: "codex"})
+	snapshot.identify(AuthFileSet{Tool: "codex"})
+	if !live.sameAccount(snapshot) {
 		return false
 	}
 
@@ -2681,7 +2693,9 @@ func (v *Vault) claudeLiveIsNewer(liveKeys []string, profileDir, livePath, snaps
 	}
 
 	// Only guard when it is unambiguously the SAME account.
-	if !identityKeysIntersect(liveKeys, v.claudeProfileIdentityKeys(profileDir)) {
+	liveAccount, liveIdentityOK := claudeSwitchAccount(liveOAuth, liveKeys)
+	snapshotAccount, snapshotIdentityOK := claudeSwitchAccount(snapOAuth, v.claudeProfileIdentityKeys(profileDir))
+	if !liveIdentityOK || !snapshotIdentityOK || !liveAccount.matches(snapshotAccount) {
 		return false
 	}
 

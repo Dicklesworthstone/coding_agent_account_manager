@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -242,6 +243,9 @@ func TestSelectFiltersSystemProfiles(t *testing.T) {
 
 func TestSelectSingleProfile(t *testing.T) {
 	s := NewSelector(AlgorithmSmart, nil, nil)
+	s.SetUsageData(map[string]*UsageInfo{
+		"only-one": {PrimaryPercent: 87, AvailScore: 13},
+	})
 
 	profiles := []string{"only-one"}
 	result, err := s.Select("claude", profiles, "")
@@ -253,12 +257,13 @@ func TestSelectSingleProfile(t *testing.T) {
 		t.Errorf("expected 'only-one', got %q", result.Selected)
 	}
 
-	// Should have a reason indicating it's the only profile
+	// A lone candidate must receive real scoring, including its quota, rather
+	// than being presented as unconditionally healthy with a fabricated score.
 	found := false
 	for _, alt := range result.Alternatives {
 		if alt.Name == "only-one" {
 			for _, r := range alt.Reasons {
-				if strings.Contains(r.Text, "Only available") {
+				if strings.Contains(r.Text, "Primary limit 87% used") {
 					found = true
 					break
 				}
@@ -266,7 +271,84 @@ func TestSelectSingleProfile(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected 'only available profile' reason")
+		t.Error("single-profile selection omitted its quota assessment")
+	}
+}
+
+func TestSelectSoleUserEligibility(t *testing.T) {
+	db, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.SetCooldown("codex", "cooling", time.Now().UTC(), time.Hour, "synthetic limit"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			for _, tc := range []struct {
+				name     string
+				profiles []string
+				force    bool
+				want     string
+				wantErr  string
+			}{
+				{name: "cooling", profiles: []string{"cooling"}, wantErr: "cooldown"},
+				{name: "cooling with backup", profiles: []string{"_backup_20261006", "cooling"}, wantErr: "cooldown"},
+				{name: "system only", profiles: []string{"_original"}, wantErr: "no user profiles"},
+				{name: "system only forced", profiles: []string{"_original"}, force: true, wantErr: "no user profiles"},
+				{name: "healthy", profiles: []string{"healthy"}, want: "healthy"},
+				{name: "healthy with backup", profiles: []string{"_original", "healthy"}, want: "healthy"},
+				{name: "cooling forced", profiles: []string{"_original", "cooling"}, force: true, want: "cooling"},
+			} {
+				t.Run(string(algorithm)+"/"+string(policy)+"/"+tc.name, func(t *testing.T) {
+					s := NewSelector(algorithm, nil, db)
+					s.SetPolicy(policy)
+					s.SetIgnoreCooldown(tc.force)
+					result, err := s.Select("codex", tc.profiles, "")
+					if tc.wantErr != "" {
+						if err == nil || !strings.Contains(err.Error(), tc.wantErr) || result != nil {
+							t.Fatalf("Select() = %+v, %v; want refusal containing %q", result, err, tc.wantErr)
+						}
+						return
+					}
+					if err != nil || result == nil || result.Selected != tc.want {
+						t.Fatalf("Select() = %+v, %v; want %s", result, err, tc.want)
+					}
+					if len(result.Alternatives) != 1 || result.Alternatives[0].Name != tc.want {
+						t.Fatalf("system snapshot entered candidate results: %+v", result.Alternatives)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSelectSingleProfileDrainPolicy(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		name string
+		used int
+		want string
+	}{
+		{name: "usable quota", used: 90, want: "90% used"},
+		{name: "above ceiling", used: 96, want: "no drain-eligible profile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSelector(AlgorithmSmart, nil, nil)
+			s.SetPolicy(PolicyDrain)
+			s.SetUsageData(map[string]*UsageInfo{
+				"only": {PrimaryPercent: tc.used, AvailScore: 100 - tc.used, ResetsAt: &reset},
+			})
+			result, err := s.Select("codex", []string{"only"}, "only")
+			if err != nil || result == nil || result.Selected != "only" {
+				t.Fatalf("Select() = %+v, %v", result, err)
+			}
+			if !strings.Contains(result.Explanation, tc.want) {
+				t.Fatalf("single candidate bypassed drain policy: explanation %q, want %q", result.Explanation, tc.want)
+			}
+		})
 	}
 }
 

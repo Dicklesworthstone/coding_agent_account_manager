@@ -761,6 +761,52 @@ When `stealth.cooldown.enabled` is true in config, `caam activate` warns if the 
 
 When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically falls back to rotation if the default profile is in cooldown.
 
+### Preserving Credentials During Account Switches
+
+Account switching uses the same preservation operation from `activate`, `next`,
+`robot act activate`, workspaces, `run` prechecks and automatic handoff, the API,
+and the TUI. It checks the incoming snapshot before changing live authentication
+or creating recovery files. If a required preservation step fails, the switch
+stops and reports the error.
+
+When a native CLI rotates a token, CAAM saves the complete newer credential back
+to its named profile only after matching the account identity and comparing
+freshness. An uncertain, incomplete, or older live credential cannot overwrite a
+saved account. Activating an older snapshot of the current account keeps the
+newer live credential and reports `kept_live` in JSON output.
+
+The `safety` section of the SPM configuration controls additional recovery copies:
+
+```yaml
+safety:
+  auto_backup_before_switch: smart
+  max_auto_backups: 5
+```
+
+- `smart` saves live state that is not fully preserved in the vault to a unique
+  `_backup_*` snapshot, including an unsaved login or auxiliary credential files.
+- `always` creates a recovery snapshot before a switch even when the outgoing
+  named account can also be updated. `activate --backup-current` selects this
+  behavior for one invocation.
+- `never` disables automatic `_backup_*` copies. Proven newer credentials are
+  still saved to their named account. Explicit activation and workspace switching
+  retain the first-use `_original` backup.
+
+Recovery copies are immutable. Retention runs after a successful switch;
+`max_auto_backups: 0` keeps all copies. JSON activation results identify the
+outgoing profile, any automatic backup, and any profile updated with live tokens.
+An incomplete workspace switch returns an error and keeps the previously recorded
+workspace name. Automatic handoff rolls back through the same preservation
+operation, so tokens rotated during a failed login are saved before returning to
+the previous account.
+
+Rotation applies cooldown and policy checks even when only one user profile
+exists. System snapshots are never automatic rotation candidates. `next --force`
+and `activate --auto --force` can explicitly override cooldown filtering; they do
+not admit system backups. With `next --usage-aware`, force also retains the
+requirement for measured, available Grok or Cursor quota. `next --dry-run`
+performs selection without switching or saving credentials.
+
 ### Uninstall Notes
 
 `caam uninstall` restores auth from any available `_original` backups first, then removes caam’s data/config. Useful flags:

@@ -108,15 +108,16 @@ func scopedQuotaLabel(u *UsageInfo) string {
 
 // Selector performs profile selection based on configured algorithm.
 type Selector struct {
-	mu           sync.RWMutex
-	algorithm    Algorithm
-	healthStore  *health.Storage
-	db           *caamdb.DB
-	rng          *rand.Rand
-	avoidRecent  time.Duration         // Don't select profiles used within this duration
-	usageData    map[string]*UsageInfo // Real-time usage data by profile name
-	policy       Policy                // Selection policy (default: availability)
-	drainCeiling int                   // Headroom ceiling (percent used) for the drain policy
+	mu             sync.RWMutex
+	algorithm      Algorithm
+	healthStore    *health.Storage
+	db             *caamdb.DB
+	rng            *rand.Rand
+	avoidRecent    time.Duration         // Don't select profiles used within this duration
+	usageData      map[string]*UsageInfo // Real-time usage data by profile name
+	policy         Policy                // Selection policy (default: availability)
+	drainCeiling   int                   // Headroom ceiling (percent used) for the drain policy
+	ignoreCooldown bool                  // Explicit user override; leaves scoring and quota policy intact
 }
 
 // NewSelector creates a new profile selector.
@@ -167,6 +168,14 @@ func (s *Selector) SetAvoidRecent(d time.Duration) {
 	s.avoidRecent = d
 }
 
+// SetIgnoreCooldown controls an explicit override of recorded cooldowns.
+// Other selection policy and scoring still apply.
+func (s *Selector) SetIgnoreCooldown(ignore bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ignoreCooldown = ignore
+}
+
 // SetUsageData sets real-time usage data for consideration in smart selection.
 func (s *Selector) SetUsageData(usage map[string]*UsageInfo) {
 	s.mu.Lock()
@@ -194,19 +203,6 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 
 	if len(available) == 0 {
 		return nil, fmt.Errorf("no user profiles available for %s (only system profiles found)", tool)
-	}
-
-	// If only one profile, return it
-	if len(available) == 1 {
-		return &Result{
-			Selected:  available[0],
-			Algorithm: s.algorithm,
-			Alternatives: []ProfileScore{{
-				Name:    available[0],
-				Score:   100,
-				Reasons: []Reason{{Text: "Only available profile", Positive: true}},
-			}},
-		}, nil
 	}
 
 	// Opt-in drain policy overrides algorithm scoring (issue #81):
@@ -685,7 +681,7 @@ func planBonus(planType string) float64 {
 
 // isInCooldown checks if a profile is currently in cooldown.
 func (s *Selector) isInCooldown(tool, profile string, now time.Time) bool {
-	if s.db == nil {
+	if s.db == nil || s.ignoreCooldown {
 		return false
 	}
 

@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 )
 
@@ -157,71 +155,67 @@ func TestWorkspaceValidation(t *testing.T) {
 }
 
 func TestSwitchWorkspace(t *testing.T) {
-	// Create temp directories
-	tmpDir := t.TempDir()
-	vaultPath := filepath.Join(tmpDir, "vault")
-	configPath := filepath.Join(tmpDir, "config.json")
-
-	// Set up environment
-	oldXDGConfig := os.Getenv("XDG_CONFIG_HOME")
-	os.Setenv("XDG_CONFIG_HOME", tmpDir)
-	defer os.Setenv("XDG_CONFIG_HOME", oldXDGConfig)
-
-	// Create vault with test profiles
-	testVault := authfile.NewVault(vaultPath)
-
-	// Create claude profile
-	claudeProfileDir := filepath.Join(vaultPath, "claude", "work-claude")
-	if err := os.MkdirAll(claudeProfileDir, 0700); err != nil {
-		t.Fatalf("mkdir claude: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(claudeProfileDir, ".claude.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatalf("write claude: %v", err)
-	}
-
-	// Create codex profile
-	codexProfileDir := filepath.Join(vaultPath, "codex", "work-codex")
-	if err := os.MkdirAll(codexProfileDir, 0700); err != nil {
-		t.Fatalf("mkdir codex: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(codexProfileDir, "credentials.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatalf("write codex: %v", err)
-	}
-
-	// Create config with workspace
+	home := setupRobotCredentialEnv(t)
+	claudeLive := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-ORIGINAL-CLAUDE"}}`
+	claudeTarget := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-WORK-CLAUDE"}}`
+	codexLive := `{"access_token":"SYNTHETIC-ORIGINAL-CODEX"}`
+	codexTarget := `{"access_token":"SYNTHETIC-WORK-CODEX"}`
+	claudePath := filepath.Join(home, ".claude", ".credentials.json")
+	codexPath := filepath.Join(home, ".codex", "auth.json")
+	writeNativeTestCredential(t, claudePath, claudeLive)
+	writeNativeTestCredential(t, codexPath, codexLive)
+	writeRobotCredentialProfile(t, "claude", "work-claude", map[string]string{".credentials.json": claudeTarget})
+	writeRobotCredentialProfile(t, "codex", "work-codex", map[string]string{"auth.json": codexTarget})
 	cfg := config.DefaultConfig()
 	cfg.CreateWorkspace("work", map[string]string{
 		"claude": "work-claude",
 		"codex":  "work-codex",
 	})
 
-	// Save config
-	if err := os.MkdirAll(filepath.Join(tmpDir, "caam"), 0700); err != nil {
-		t.Fatalf("mkdir config dir: %v", err)
-	}
-	configData := []byte(`{
-		"workspaces": {
-			"work": {"claude": "work-claude", "codex": "work-codex"}
-		}
-	}`)
-	if err := os.WriteFile(configPath, configData, 0600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	// Set global vault for the test
-	oldVault := vault
-	vault = testVault
-	defer func() { vault = oldVault }()
-
-	// Test switchWorkspace
 	err := switchWorkspace(cfg, "work")
 	if err != nil {
-		t.Errorf("switchWorkspace failed: %v", err)
+		t.Fatalf("switchWorkspace failed: %v", err)
 	}
-
-	// Verify current workspace is set
 	if cfg.GetCurrentWorkspace() != "work" {
 		t.Errorf("Expected current workspace 'work', got %q", cfg.GetCurrentWorkspace())
+	}
+	requireSwitchCredential(t, claudePath, claudeTarget)
+	requireSwitchCredential(t, codexPath, codexTarget)
+	requireSwitchCredential(t, vault.BackupPath("claude", "_original", ".credentials.json"), claudeLive)
+	requireSwitchCredential(t, vault.BackupPath("codex", "_original", "auth.json"), codexLive)
+	saved, err := config.Load()
+	if err != nil || saved.GetCurrentWorkspace() != "work" {
+		t.Fatalf("completed workspace was not persisted: %v", err)
+	}
+}
+
+func TestSwitchWorkspaceFailureKeepsPreviousWorkspace(t *testing.T) {
+	home := setupRobotCredentialEnv(t)
+	live := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-CURRENT"}}`
+	livePath := filepath.Join(home, ".claude", ".credentials.json")
+	writeNativeTestCredential(t, livePath, live)
+	writeRobotCredentialProfile(t, "claude", "invalid", map[string]string{".claude.json": `{"theme":"dark"}`})
+	writeRobotCredentialProfile(t, "codex", "work", map[string]string{"auth.json": `{"access_token":"SYNTHETIC-CODEX-WORK"}`})
+	cfg := config.DefaultConfig()
+	cfg.CreateWorkspace("work", map[string]string{"claude": "invalid", "codex": "work"})
+	cfg.SetCurrentWorkspace("previous")
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := switchWorkspace(cfg, "work"); err == nil {
+		t.Fatal("partially activated workspace falsely reported success")
+	}
+	if cfg.GetCurrentWorkspace() != "previous" {
+		t.Fatal("failed workspace activation replaced the previous workspace")
+	}
+	saved, err := config.Load()
+	if err != nil || saved.GetCurrentWorkspace() != "previous" {
+		t.Fatalf("failed workspace activation changed persisted workspace: %v", err)
+	}
+	requireSwitchCredential(t, livePath, live)
+	profiles, err := vault.List("claude")
+	if err != nil || len(profiles) != 1 || profiles[0] != "invalid" {
+		t.Fatalf("invalid workspace target changed the vault: %v, %v", profiles, err)
 	}
 }
 

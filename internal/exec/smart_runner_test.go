@@ -1,17 +1,25 @@
 package exec
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/handoff"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
 
@@ -250,6 +258,173 @@ func TestSmartRunner_WithRotation(t *testing.T) {
 
 	if sr.rotation != selector {
 		t.Error("rotation selector not set correctly")
+	}
+}
+
+func TestSmartRunnerHandoffPreservesActualCredentialOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		liveOwner       string
+		malformedTarget bool
+		loginFails      bool
+		corruptRollback bool
+		backupMode      string
+	}{
+		{name: "rotated named login", liveOwner: "alice"},
+		{name: "external login does not overwrite startup profile", liveOwner: "carol"},
+		{name: "malformed target does not trigger backup or rollback", liveOwner: "alice", malformedTarget: true},
+		{name: "rollback preserves tokens rotated during failed login", liveOwner: "alice", loginFails: true},
+		{name: "rollback restores actual external login", liveOwner: "carol", loginFails: true},
+		{name: "failed rollback remains failed", liveOwner: "alice", loginFails: true, corruptRollback: true},
+		{name: "disabled unnamed backup cannot claim rollback", liveOwner: "carol", loginFails: true, backupMode: "never"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+			codexHome := filepath.Join(root, "codex")
+			t.Setenv("CODEX_HOME", codexHome)
+			if tc.backupMode != "" {
+				cfg := config.DefaultSPMConfig()
+				cfg.Safety.AutoBackupBeforeSwitch = tc.backupMode
+				if err := cfg.Save(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			base := time.Date(2033, 1, 1, 0, 0, 0, 0, time.UTC)
+			alice := smartSwitchCredentials("alice", base)
+			live := smartSwitchCredentials(tc.liveOwner, base.Add(time.Hour))
+			bob := smartSwitchCredentials("bob", base.Add(2*time.Hour))
+			rotatedBob := smartSwitchCredentials("bob", base.Add(3*time.Hour))
+			if tc.malformedTarget {
+				bob = []byte(`{"tokens":`)
+			}
+			alicePath := vault.BackupPath("codex", "alice", "auth.json")
+			bobPath := vault.BackupPath("codex", "bob", "auth.json")
+			livePath := filepath.Join(codexHome, "auth.json")
+			writeSmartSwitchFile(t, alicePath, alice)
+			writeSmartSwitchFile(t, bobPath, bob)
+			writeSmartSwitchFile(t, livePath, live)
+
+			notifier := &mockNotifier{}
+			sr := NewSmartRunner(&Runner{}, SmartRunnerOptions{
+				Vault:    vault,
+				Rotation: rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil),
+				Notifier: notifier,
+			})
+			sr.currentProfile = "alice"
+			var err error
+			sr.detector, err = ratelimit.NewDetector(ratelimit.ProviderCodex, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			loginCalls := 0
+			sr.loginHandler = &smartSwitchLoginHandler{
+				LoginHandler: handoff.GetHandler("codex"),
+				trigger: func() error {
+					loginCalls++
+					assertSmartSwitchFile(t, livePath, bob)
+					if tc.loginFails {
+						writeSmartSwitchFile(t, livePath, rotatedBob)
+						if tc.corruptRollback {
+							writeSmartSwitchFile(t, alicePath, []byte(`{"tokens":`))
+						}
+						return fmt.Errorf("synthetic login failure after token rotation")
+					}
+					sr.loginDone <- loginResult{success: true}
+					return nil
+				},
+			}
+			sr.handleRateLimit(context.Background())
+
+			if tc.malformedTarget {
+				if loginCalls != 0 || sr.getState() != HandoffFailed || sr.currentProfile != "alice" {
+					t.Fatalf("malformed target advanced handoff: calls=%d state=%s current=%s", loginCalls, sr.getState(), sr.currentProfile)
+				}
+				assertSmartSwitchFile(t, livePath, live)
+				assertSmartSwitchFile(t, alicePath, alice)
+				profiles, err := vault.List("codex")
+				if err != nil || len(profiles) != 2 {
+					t.Fatalf("malformed target changed vault: profiles=%v err=%v", profiles, err)
+				}
+				return
+			}
+			if loginCalls != 1 {
+				t.Fatalf("login calls = %d, want 1", loginCalls)
+			}
+			wantAlice := alice
+			if tc.liveOwner == "alice" {
+				wantAlice = live
+			}
+			if !tc.corruptRollback {
+				assertSmartSwitchFile(t, alicePath, wantAlice)
+			}
+			if !tc.loginFails {
+				assertSmartSwitchFile(t, livePath, bob)
+				if sr.currentProfile != "bob" || sr.handoffCount != 1 || sr.getState() != Running {
+					t.Fatalf("successful handoff state: current=%s count=%d state=%s", sr.currentProfile, sr.handoffCount, sr.getState())
+				}
+			} else if tc.corruptRollback || tc.backupMode == "never" {
+				assertSmartSwitchFile(t, livePath, rotatedBob)
+				if sr.currentProfile != "bob" || sr.getState() != HandoffFailed {
+					t.Fatalf("failed rollback reported recovery: current=%s state=%s", sr.currentProfile, sr.getState())
+				}
+			} else {
+				assertSmartSwitchFile(t, livePath, live)
+				assertSmartSwitchFile(t, bobPath, rotatedBob)
+				if sr.getState() != Running || sr.handoffCount != 0 {
+					t.Fatalf("rollback state: state=%s count=%d", sr.getState(), sr.handoffCount)
+				}
+				if tc.liveOwner == "alice" && sr.currentProfile != "alice" {
+					t.Fatalf("rollback target = %s, want alice", sr.currentProfile)
+				}
+				if tc.liveOwner == "carol" && !authfile.IsSystemProfile(sr.currentProfile) {
+					t.Fatalf("external login rollback used startup profile: %s", sr.currentProfile)
+				}
+			}
+			if tc.liveOwner == "carol" && tc.backupMode != "never" {
+				if !authfile.IsSystemProfile(sr.previousProfile) {
+					t.Fatalf("external login was not saved for recovery: %q", sr.previousProfile)
+				}
+				assertSmartSwitchFile(t, vault.BackupPath("codex", sr.previousProfile, "auth.json"), live)
+			}
+		})
+	}
+}
+
+type smartSwitchLoginHandler struct {
+	handoff.LoginHandler
+	trigger func() error
+}
+
+func (h *smartSwitchLoginHandler) TriggerLogin(pty.Controller) error { return h.trigger() }
+
+func smartSwitchCredentials(account string, refreshed time.Time) []byte {
+	claims := fmt.Sprintf(`{"sub":%q,"email":%q,"iat":%d,"https://api.openai.com/auth":{"chatgpt_account_id":%q}}`,
+		"user-"+account, account+"@example.com", refreshed.Unix(), account)
+	token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".synthetic"
+	return []byte(fmt.Sprintf(`{"tokens":{"id_token":%q,"access_token":%q,"refresh_token":%q,"account_id":%q},"last_refresh":%q}`,
+		token, token, "refresh-"+account+refreshed.Format("150405"), account, refreshed.Format(time.RFC3339)))
+}
+
+func writeSmartSwitchFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertSmartSwitchFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("unexpected credential content at %s", path)
 	}
 }
 

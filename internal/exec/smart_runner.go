@@ -367,20 +367,18 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		return
 	}
 
-	// 1. Save current state for rollback
-	r.previousProfile = r.currentProfile
-	if err := r.vault.Backup(fileSet, r.currentProfile); err != nil {
-		r.failWithManual("failed to backup current profile: %v", err)
+	spmConfig, err := config.LoadSPMConfig()
+	if err != nil {
+		r.failWithManual("load activation safety settings: %v", err)
 		return
 	}
+	switchOptions := authfile.SwitchOptions{
+		BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
+	}
+	r.previousProfile = ""
 
-	defer func() {
-		if r.getState() == HandoffFailed {
-			r.rollback(fileSet)
-		}
-	}()
-
-	// 2. Select best backup profile
+	// Select and validate a target before preserving or changing live auth.
 	r.setState(SelectingBackup)
 
 	// Get all profiles
@@ -417,22 +415,32 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		r.db.SetCooldown(r.loginHandler.Provider(), r.currentProfile, time.Now(), cooldownDuration, "auto-detected via SmartRunner")
 	}
 
-	// 4. Swap auth files
+	// 4. Preserve the verified live owner and swap auth files. The profile
+	// label recorded at process startup may no longer own the live login.
 	r.setState(SwappingAuth)
-	// Re-snapshot the outgoing profile's (possibly rotated) tokens before we
-	// clobber the live auth file. Codex/ChatGPT rotate refresh tokens in place
-	// while a profile is active; skipping this leaves the vault copy stale and a
-	// later restore would replay a consumed refresh_token, bricking the account.
-	// Non-fatal.
-	if r.currentProfile != "" && r.currentProfile != nextProfile {
-		if err := r.vault.ResnapshotOutgoing(fileSet, r.currentProfile, nextProfile); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not re-snapshot outgoing profile %s: %v\n", r.currentProfile, err)
+	switchResult, err := r.vault.Switch(fileSet, nextProfile, switchOptions)
+	if switchResult != nil {
+		r.previousProfile = switchResult.AutoBackup
+		if r.previousProfile == "" {
+			r.previousProfile = switchResult.ResnapshottedProfile
+		}
+		if r.previousProfile == "" {
+			r.previousProfile = switchResult.PreviousProfile
+		}
+		for _, warning := range switchResult.Warnings {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 		}
 	}
-	if err := r.vault.Restore(fileSet, nextProfile); err != nil {
+	defer func() {
+		if r.getState() == HandoffFailed && switchResult != nil && switchResult.RestoreStarted {
+			r.rollback(fileSet, switchOptions)
+		}
+	}()
+	if err != nil {
 		r.failWithManual("auth swap failed: %v", err)
 		return
 	}
+	r.currentProfile = nextProfile
 
 	// 5. Inject login command
 	r.drainLoginDone()
@@ -481,10 +489,19 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.setState(Running)
 }
 
-func (r *SmartRunner) rollback(fileSet authfile.AuthFileSet) {
+func (r *SmartRunner) rollback(fileSet authfile.AuthFileSet, opts authfile.SwitchOptions) {
+	if r.previousProfile == "" {
+		r.failWithManual("no preserved outgoing login is available for rollback")
+		return
+	}
 	fmt.Fprintf(os.Stderr, "Rolling back to %s...\n", r.previousProfile)
-	if err := r.vault.Restore(fileSet, r.previousProfile); err != nil {
-		fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
+	result, err := r.vault.Switch(fileSet, r.previousProfile, opts)
+	if err != nil {
+		r.failWithManual("rollback failed: %v", err)
+		return
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
 	r.currentProfile = r.previousProfile
 	r.detector.Reset()

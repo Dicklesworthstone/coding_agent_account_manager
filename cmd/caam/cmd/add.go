@@ -208,9 +208,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	// Step 7: Optionally activate
 	if !noActivate {
 		fmt.Printf("Activating %s/%s...\n", tool, profileName)
-		if err := vault.Restore(fileSet, profileName); err != nil {
+		switched, err := vault.Switch(fileSet, profileName, loadSwitchOptions())
+		if err != nil {
 			return fmt.Errorf("activate profile: %w", err)
 		}
+		printSwitchPreservation(cmd.OutOrStdout(), tool, switched)
 		fmt.Printf("  Activated %s/%s\n", tool, profileName)
 	}
 

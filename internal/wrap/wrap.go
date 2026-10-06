@@ -329,9 +329,19 @@ func (w *Wrapper) runOnce(ctx context.Context, profile string) (int, bool, error
 		return 1, false, fmt.Errorf("unknown provider: %s", w.config.Provider)
 	}
 
-	// Activate the profile (restore auth files)
-	if err := w.vault.Restore(fileSet, profile); err != nil {
+	spmConfig, err := config.LoadSPMConfig()
+	if err != nil {
+		return 1, false, fmt.Errorf("load activation safety settings: %w", err)
+	}
+	result, err := w.vault.Switch(fileSet, profile, authfile.SwitchOptions{
+		BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
+	})
+	if err != nil {
 		return 1, false, fmt.Errorf("activate profile %s: %w", profile, err)
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(w.config.Stderr, "Warning: %s\n", warning)
 	}
 
 	// Create rate limit detector

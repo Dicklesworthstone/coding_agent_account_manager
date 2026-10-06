@@ -165,12 +165,16 @@ type RobotNextProfile struct {
 
 // RobotActResult is the result of an action.
 type RobotActResult struct {
-	Action     string `json:"action"`
-	Provider   string `json:"provider"`
-	Profile    string `json:"profile"`
-	OldProfile string `json:"old_profile,omitempty"`
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
+	Action               string   `json:"action"`
+	Provider             string   `json:"provider"`
+	Profile              string   `json:"profile"`
+	OldProfile           string   `json:"old_profile,omitempty"`
+	AutoBackup           string   `json:"auto_backup,omitempty"`
+	ResnapshottedProfile string   `json:"resnapshotted_profile,omitempty"`
+	KeptLive             bool     `json:"kept_live,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
+	Success              bool     `json:"success"`
+	Message              string   `json:"message"`
 }
 
 var robotCmd = &cobra.Command{
@@ -930,22 +934,25 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 		profile := args[2]
 		result.Profile = profile
 
-		// Get current active profile
 		fileSet := tools[provider]()
-		if oldProfile, err := vault.ActiveProfile(fileSet); err == nil {
-			result.OldProfile = oldProfile
-		}
-
-		// Activate the profile
-		if err := vault.Restore(fileSet, profile); err != nil {
+		switched, err := vault.Switch(fileSet, profile, loadSwitchOptions())
+		if err != nil {
 			return robotError(cmd, "act", "ACTIVATE_FAILED",
 				fmt.Sprintf("failed to activate %s/%s", provider, profile),
 				err.Error(),
 				[]string{fmt.Sprintf("caam robot status %s", provider)})
 		}
+		result.OldProfile = switched.PreviousProfile
+		result.AutoBackup = switched.AutoBackup
+		result.ResnapshottedProfile = switched.ResnapshottedProfile
+		result.KeptLive = switched.KeptLive
+		result.Warnings = switched.Warnings
 
 		result.Success = true
 		result.Message = fmt.Sprintf("activated %s/%s", provider, profile)
+		if switched.KeptLive {
+			result.Message = fmt.Sprintf("kept live credentials for %s/%s", provider, profile)
+		}
 
 	case "refresh":
 		if len(args) < 3 {

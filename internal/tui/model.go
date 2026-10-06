@@ -159,6 +159,7 @@ type Model struct {
 
 	// Runtime configuration
 	runtime config.RuntimeConfig
+	safety  config.SafetyConfig
 
 	// Project context
 	cwd            string
@@ -243,12 +244,16 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 		profilesPanel.SetProvider(providers[0])
 	}
 
-	// Use runtime config from SPM config if provided
+	// Keep execution settings from the same configuration as the TUI.
 	var runtime config.RuntimeConfig
+	var safety config.SafetyConfig
 	if cfg != nil {
 		runtime = cfg.Runtime
+		safety = cfg.Safety
 	} else {
-		runtime = config.DefaultSPMConfig().Runtime
+		defaults := config.DefaultSPMConfig()
+		runtime = defaults.Runtime
+		safety = defaults.Safety
 	}
 
 	return Model{
@@ -267,6 +272,7 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 		vaultPath:       authfile.DefaultVaultPath(),
 		badges:          make(map[string]profileBadge),
 		runtime:         runtime,
+		safety:          safety,
 		cwd:             cwd,
 		profileStore:    profile.NewStore(profile.DefaultStorePath()),
 		profileMeta:     make(map[string]map[string]*profile.Profile),
@@ -522,6 +528,7 @@ type activateResultMsg struct {
 	provider string
 	profile  string
 	err      error
+	warnings []string
 }
 
 // toastTickMsg is sent to check for expired toasts.
@@ -851,6 +858,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.showActivateSuccess(msg.provider, msg.profile)
+		if len(msg.warnings) > 0 {
+			m.statusMsg += "; " + strings.Join(msg.warnings, "; ")
+		}
 		// Refresh profiles to update active state
 		ctx := refreshContext{
 			provider:        msg.provider,
@@ -1525,7 +1535,11 @@ func (m Model) doActivateProfile(provider, profile string) tea.Cmd {
 		}
 
 		vault := authfile.NewVault(m.vaultPath)
-		if err := vault.Restore(fileSet, profile); err != nil {
+		result, err := vault.Switch(fileSet, profile, authfile.SwitchOptions{
+			BackupMode:     m.safety.AutoBackupBeforeSwitch,
+			MaxAutoBackups: m.safety.MaxAutoBackups,
+		})
+		if err != nil {
 			return activateResultMsg{
 				provider: provider,
 				profile:  profile,
@@ -1536,7 +1550,7 @@ func (m Model) doActivateProfile(provider, profile string) tea.Cmd {
 		return activateResultMsg{
 			provider: provider,
 			profile:  profile,
-			err:      nil,
+			warnings: result.Warnings,
 		}
 	}
 }

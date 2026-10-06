@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,16 +23,19 @@ import (
 
 // activateOutput is the JSON output structure for activate command.
 type activateOutput struct {
-	Success         bool                    `json:"success"`
-	Tool            string                  `json:"tool"`
-	Profile         string                  `json:"profile"`
-	PreviousProfile string                  `json:"previous_profile,omitempty"`
-	Source          string                  `json:"source,omitempty"`
-	AutoBackup      string                  `json:"auto_backup,omitempty"`
-	Refreshed       bool                    `json:"refreshed,omitempty"`
-	Rotation        *activateRotationResult `json:"rotation,omitempty"`
-	CodexDaemon     *codexDaemonWarning     `json:"codex_daemon,omitempty"`
-	Error           string                  `json:"error,omitempty"`
+	Success              bool                    `json:"success"`
+	Tool                 string                  `json:"tool"`
+	Profile              string                  `json:"profile"`
+	PreviousProfile      string                  `json:"previous_profile,omitempty"`
+	Source               string                  `json:"source,omitempty"`
+	AutoBackup           string                  `json:"auto_backup,omitempty"`
+	ResnapshottedProfile string                  `json:"resnapshotted_profile,omitempty"`
+	KeptLive             bool                    `json:"kept_live,omitempty"`
+	Warnings             []string                `json:"warnings,omitempty"`
+	Refreshed            bool                    `json:"refreshed,omitempty"`
+	Rotation             *activateRotationResult `json:"rotation,omitempty"`
+	CodexDaemon          *codexDaemonWarning     `json:"codex_daemon,omitempty"`
+	Error                string                  `json:"error,omitempty"`
 }
 
 type activateRotationResult struct {
@@ -90,6 +94,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	tool := strings.ToLower(args[0])
 	autoSelect, _ := cmd.Flags().GetBool("auto")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
+	force, _ := cmd.Flags().GetBool("force")
 
 	// Track output for JSON mode
 	output := activateOutput{
@@ -131,15 +136,11 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	}
 
 	fileSet := getFileSet()
-	previousProfile, _ := vault.ActiveProfile(fileSet)
-	output.PreviousProfile = previousProfile
-
-	// Safety: on first activate, preserve the user's pre-caam auth state.
-	if did, err := vault.BackupOriginal(fileSet); err != nil {
-		return emitJSONError(fmt.Errorf("backup original auth: %w", err))
-	} else if did && !jsonOutput {
-		fmt.Printf("Backed up original %s auth to %s\n", tool, "_original")
+	previousProfile, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		return emitJSONError(fmt.Errorf("read current auth: %w", err))
 	}
+	output.PreviousProfile = previousProfile
 
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
@@ -181,7 +182,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 					return emitJSONError(err)
 				}
 				autoSelect = true
-			} else if spmCfg.Stealth.Rotation.Enabled && db != nil {
+			} else if spmCfg.Stealth.Rotation.Enabled && db != nil && !force {
 				// If the resolved default is in cooldown, automatically pick another profile.
 				now := time.Now().UTC()
 				if ev, err := db.ActiveCooldown(tool, profileName, now); err == nil && ev != nil {
@@ -197,7 +198,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 				return emitJSONError(fmt.Errorf("list profiles: %w", err))
 			}
 
-			selection, err = selectProfileWithRotation(tool, profiles, previousProfile, spmCfg, db)
+			selection, err = selectProfileWithRotation(tool, profiles, previousProfile, spmCfg, db, force)
 			if err != nil {
 				return emitJSONError(err)
 			}
@@ -234,8 +235,6 @@ func runActivate(cmd *cobra.Command, args []string) error {
 
 	// Stealth: enforce per-profile cooldowns (opt-in).
 	if spmCfg.Stealth.Cooldown.Enabled {
-		force, _ := cmd.Flags().GetBool("force")
-
 		if db == nil {
 			if !jsonOutput {
 				fmt.Printf("Warning: cooldown enforcement enabled but database is unavailable\n")
@@ -284,72 +283,18 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 1: Refresh if needed
+	if err := vault.ValidateProfileCredentials(fileSet, profileName); err != nil {
+		return emitJSONError(fmt.Errorf("activate failed: %w", err))
+	}
 	refreshed := refreshIfNeeded(cmd.Context(), tool, profileName, jsonOutput)
 	output.Refreshed = refreshed
 
-	// Smart auto-backup before switch (based on safety config)
-	backupMode := strings.TrimSpace(spmCfg.Safety.AutoBackupBeforeSwitch)
-	if backupMode == "" {
-		backupMode = "smart" // Default
-	}
-
-	// Check if --backup-current flag overrides config
+	// The shared switch validates the target before preserving live credentials.
+	switchOptions := switchOptionsFromConfig(spmCfg)
+	switchOptions.PreserveOriginal = true
 	backupFirst, _ := cmd.Flags().GetBool("backup-current")
 	if backupFirst {
-		backupMode = "always"
-	}
-
-	if backupMode != "never" {
-		shouldBackup := false
-		currentProfile, _ := vault.ActiveProfile(fileSet)
-
-		switch backupMode {
-		case "always":
-			// Always backup if there are auth files and we're switching to a different profile
-			shouldBackup = currentProfile != profileName
-		case "smart":
-			// Backup only if current state doesn't match any vault profile (would be lost)
-			shouldBackup = currentProfile == "" && authfile.HasAuthFiles(fileSet)
-		}
-
-		if shouldBackup {
-			backupName, err := vault.BackupCurrent(fileSet)
-			if err != nil {
-				if !jsonOutput {
-					fmt.Printf("Warning: could not auto-backup current state: %v\n", err)
-				}
-			} else if backupName != "" {
-				output.AutoBackup = backupName
-				if !jsonOutput {
-					fmt.Printf("Auto-backed up current state to %s\n", backupName)
-				}
-
-				// Rotate old backups if limit is set
-				if spmCfg.Safety.MaxAutoBackups > 0 {
-					if err := vault.RotateAutoBackups(tool, spmCfg.Safety.MaxAutoBackups); err != nil {
-						if !jsonOutput {
-							fmt.Printf("Warning: could not rotate old backups: %v\n", err)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Re-snapshot the OUTGOING profile's (possibly rotated) tokens back into its
-	// own vault dir before we clobber the live file. Codex/ChatGPT rotate OAuth
-	// refresh tokens in place while a profile is active; without this, the
-	// vault copy of the outgoing profile goes stale and a later restore replays
-	// an already-consumed refresh_token, tripping reuse detection and bricking
-	// the account. Non-fatal: a failure here must never block the switch.
-	if outgoing, _ := vault.ActiveProfile(fileSet); outgoing != "" && outgoing != profileName {
-		if err := vault.ResnapshotOutgoing(fileSet, outgoing, profileName); err != nil {
-			if !jsonOutput {
-				fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", outgoing, err)
-			}
-		} else if !jsonOutput {
-			fmt.Printf("Re-snapshotted outgoing profile %s (token rotation safety)\n", outgoing)
-		}
+		switchOptions.BackupMode = "always"
 	}
 
 	// Stealth: optional delay before the actual switch happens.
@@ -393,9 +338,18 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Restore from vault
-	if err := vault.Restore(fileSet, profileName); err != nil {
+	switched, err := vault.Switch(fileSet, profileName, switchOptions)
+	if err != nil {
 		return emitJSONError(fmt.Errorf("activate failed: %w", err))
+	}
+	previousProfile = switched.PreviousProfile
+	output.PreviousProfile = switched.PreviousProfile
+	output.AutoBackup = switched.AutoBackup
+	output.ResnapshottedProfile = switched.ResnapshottedProfile
+	output.KeptLive = switched.KeptLive
+	output.Warnings = switched.Warnings
+	if !jsonOutput {
+		printSwitchPreservation(cmd.OutOrStdout(), tool, switched)
 	}
 
 	// Codex daemon check: swapping auth.json on disk does not affect a running
@@ -409,7 +363,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		output.CodexDaemon = &dw
 	}
 
-	if spmCfg.Analytics.Enabled && db != nil {
+	if spmCfg.Analytics.Enabled && db != nil && !switched.KeptLive {
 		logProfileSwitch(db, tool, previousProfile, profileName, map[string]any{
 			"previous_profile": previousProfile,
 			"selection_source": source,
@@ -429,6 +383,42 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Run '%s' to start using this account\n", tool)
 	printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 	return nil
+}
+
+func switchOptionsFromConfig(cfg *config.SPMConfig) authfile.SwitchOptions {
+	if cfg == nil {
+		cfg = config.DefaultSPMConfig()
+	}
+	return authfile.SwitchOptions{
+		BackupMode:     cfg.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: cfg.Safety.MaxAutoBackups,
+	}
+}
+
+func loadSwitchOptions() authfile.SwitchOptions {
+	cfg, err := config.LoadSPMConfig()
+	if err != nil {
+		cfg = config.DefaultSPMConfig()
+	}
+	return switchOptionsFromConfig(cfg)
+}
+
+func printSwitchPreservation(w io.Writer, tool string, result *authfile.SwitchResult) {
+	if result.OriginalBackup {
+		fmt.Fprintf(w, "Backed up original %s auth to _original\n", tool)
+	}
+	if result.AutoBackup != "" {
+		fmt.Fprintf(w, "Auto-backed up current %s state to %s\n", tool, result.AutoBackup)
+	}
+	if result.ResnapshottedProfile != "" {
+		fmt.Fprintf(w, "Saved live credentials to %s/%s\n", tool, result.ResnapshottedProfile)
+	}
+	if result.KeptLive {
+		fmt.Fprintf(w, "Kept live %s credentials for the selected account\n", tool)
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(w, "Warning: %s\n", warning)
+	}
 }
 
 // logProfileSwitch records analytics events for a profile switch. When moving
@@ -552,7 +542,7 @@ func refreshIfNeeded(ctx context.Context, provider, profile string, quiet bool) 
 	return true
 }
 
-func selectProfileWithRotation(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB) (*rotation.Result, error) {
+func selectProfileWithRotation(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, force bool) (*rotation.Result, error) {
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
@@ -567,6 +557,7 @@ func selectProfileWithRotation(tool string, profiles []string, currentProfile st
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	selector.SetIgnoreCooldown(force)
 	result, err := selector.Select(tool, profiles, currentProfile)
 	if err != nil {
 		return nil, fmt.Errorf("rotation select: %w", err)

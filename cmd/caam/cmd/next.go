@@ -77,7 +77,10 @@ func runNext(cmd *cobra.Command, args []string) error {
 	}
 
 	fileSet := getFileSet()
-	currentProfile, _ := vault.ActiveProfile(fileSet)
+	currentProfile, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		return fmt.Errorf("read current auth: %w", err)
+	}
 
 	// List available profiles
 	profiles, err := vault.List(tool)
@@ -89,41 +92,17 @@ func runNext(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
 
-	// Native usage-aware selection must validate even a sole candidate.
-	if len(profiles) == 1 && !(usageAware && (tool == "grok" || tool == "cursor")) {
-		if currentProfile == profiles[0] {
-			fmt.Printf("Only one profile available for %s (%s), already active\n", tool, profiles[0])
-			return nil
+	// System snapshots are recovery material, never rotation candidates. Filter
+	// before counting or fetching quota so a backup cannot create a shortcut.
+	var userProfiles []string
+	for _, name := range profiles {
+		if !authfile.IsSystemProfile(name) {
+			userProfiles = append(userProfiles, name)
 		}
-		// Single profile case: just activate it
-		if !dryRun {
-			// Re-snapshot outgoing profile's rotated tokens first (see activate.go).
-			if currentProfile != "" && currentProfile != profiles[0] {
-				if err := vault.ResnapshotOutgoing(fileSet, currentProfile, profiles[0]); err != nil && !quiet {
-					fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
-				}
-			}
-			if err := vault.Restore(fileSet, profiles[0]); err != nil {
-				return fmt.Errorf("activate failed: %w", err)
-			}
-		}
-		if !quiet {
-			if dryRun {
-				fmt.Printf("Would switch to: %s/%s\n", tool, profiles[0])
-			} else {
-				fmt.Printf("Activated %s profile '%s'\n", tool, profiles[0])
-			}
-		}
-		// Codex daemon check (see issue #21): a running codex app-server caches
-		// auth in-process, so the on-disk swap won't apply to it. Skip on
-		// dry-run (nothing was actually switched).
-		if !dryRun {
-			daemonWarn := checkCodexDaemon(tool, reloadDaemon)
-			if !quiet {
-				printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
-			}
-		}
-		return nil
+	}
+	profiles = userProfiles
+	if len(profiles) == 0 {
+		return fmt.Errorf("no user profiles available for %s (only system profiles found)", tool)
 	}
 
 	// Load config for rotation algorithm
@@ -165,7 +144,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	}
 
 	// Select next profile using rotation
-	selection, err := selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
+	selection, err := selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData, force)
 	if err != nil {
 		return err
 	}
@@ -178,7 +157,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	if selection.Selected == currentProfile && len(profiles) > 1 &&
 		spmCfg.Stealth.Rotation.Policy != "drain" {
 		spmCfg.Stealth.Rotation.Algorithm = "round_robin"
-		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
+		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData, force)
 		if err != nil {
 			return err
 		}
@@ -216,17 +195,26 @@ func runNext(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Re-snapshot outgoing profile's rotated tokens before clobbering the live
-	// file (refresh-token rotation safety; see activate.go / ResnapshotOutgoing).
-	if currentProfile != "" && currentProfile != selection.Selected {
-		if err := vault.ResnapshotOutgoing(fileSet, currentProfile, selection.Selected); err != nil && !quiet {
-			fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
+	// Preserve the live grant before switching, including unnamed credentials
+	// and tokens rotated since the outgoing profile's last snapshot.
+	switched, err := vault.Switch(fileSet, selection.Selected, authfile.SwitchOptions{
+		BackupMode:     spmCfg.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmCfg.Safety.MaxAutoBackups,
+	})
+	if err != nil {
+		return fmt.Errorf("activate failed: %w", err)
+	}
+	currentProfile = switched.PreviousProfile
+	if !quiet {
+		for _, warning := range switched.Warnings {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", warning)
 		}
 	}
-
-	// Activate selected profile
-	if err := vault.Restore(fileSet, selection.Selected); err != nil {
-		return fmt.Errorf("activate failed: %w", err)
+	if switched.KeptLive {
+		if !quiet {
+			fmt.Printf("Profile %s/%s is already active; kept live credentials\n", tool, selection.Selected)
+		}
+		return nil
 	}
 
 	// Log event. logProfileSwitch also emits a duration-bearing deactivate event
@@ -324,12 +312,12 @@ func nativeRotationCredentials(tool string, profiles []string) map[string]string
 }
 
 // selectProfileWithRotationAndUsage selects a profile using rotation with optional usage data.
-func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo) (*rotation.Result, error) {
+func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo, ignoreCooldown bool) (*rotation.Result, error) {
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
-	// Apply eligibility before every algorithm, including the single-profile
-	// shortcut and runNext's forced round-robin retry. Scoring penalties alone
+	// Apply eligibility before every algorithm, including sole candidates and
+	// runNext's forced round-robin retry. Scoring penalties alone
 	// do not stop an unknown account from being selected.
 	var err error
 	profiles, err = rotation.NativeQuotaCandidates(tool, profiles, usageData)
@@ -347,6 +335,7 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	selector.SetIgnoreCooldown(ignoreCooldown)
 	applyRotationPolicy(selector, spmCfg, "")
 
 	// Set usage data if available
