@@ -83,7 +83,7 @@ type ExpiryInfo struct {
 
 	// Fingerprint identifies the credential that was parsed (see
 	// CodexCredentialFingerprint). Cursor uses it to warn once per login.
-	// Empty for providers that do not need credential identity here.
+	// It is derived from credential material, never unrelated configuration.
 	Fingerprint string
 
 	// Source describes where the expiry was parsed from.
@@ -264,6 +264,7 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 	oauth := creds.ClaudeAiOauth
 	info := &ExpiryInfo{
 		HasRefreshToken: strings.TrimSpace(oauth.RefreshToken) != "",
+		Fingerprint:     credentialFingerprint(oauth.RefreshToken, oauth.AccessToken),
 	}
 
 	// Parse expiresAt (Unix milliseconds)
@@ -595,31 +596,43 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		authDir = geminiHome
 	}
 
-	// Try settings.json
+	// The current credential cache is authoritative. Settings can contain
+	// unrelated policy or an older access token; never combine that token's
+	// expiry with a different cache's refresh token. A present but invalid
+	// cache must not resurrect a superseded login from a fallback file.
+	oauthPath := filepath.Join(authDir, "oauth_creds.json")
+	// Older vault snapshots used this filename. Passive readers must inspect
+	// it in place rather than migrate the snapshot just to learn its expiry.
+	legacyOAuthPath := filepath.Join(authDir, "oauth_credentials.json")
+	for _, path := range []string{oauthPath, legacyOAuthPath} {
+		fi, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			fi, err = os.Stat(path)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("gemini credential source is not a regular file")
+		}
+		info, err := parseOAuthFile(path)
+		if err != nil {
+			return nil, err
+		}
+		info.Renewable = info.HasRefreshToken
+		info.Source = path
+		return info, nil
+	}
+
+	// Settings-only OAuth profiles predate the separate credential cache.
 	settingsPath := filepath.Join(authDir, "settings.json")
 	info, err := parseOAuthFile(settingsPath)
 	if err == nil {
 		info.Renewable = info.HasRefreshToken
 		info.Source = settingsPath
-		return info, nil
-	}
-
-	// Try oauth_creds.json
-	oauthPath := filepath.Join(authDir, "oauth_creds.json")
-	info, err = parseOAuthFile(oauthPath)
-	if err == nil {
-		info.Renewable = info.HasRefreshToken
-		info.Source = oauthPath
-		return info, nil
-	}
-
-	// Older vault snapshots used this filename. Passive readers must inspect
-	// it in place rather than migrate the snapshot just to learn its expiry.
-	legacyOAuthPath := filepath.Join(authDir, "oauth_credentials.json")
-	info, err = parseOAuthFile(legacyOAuthPath)
-	if err == nil {
-		info.Renewable = info.HasRefreshToken
-		info.Source = legacyOAuthPath
 		return info, nil
 	}
 
@@ -689,6 +702,7 @@ type oauthJSON struct {
 
 	// Other common fields
 	Expiry     string `json:"expiry"`
+	Key        string `json:"key"` // Grok dynamic credential entries
 	TokenType  string `json:"token_type"`
 	IssuedAt   any    `json:"issued_at"`
 	IssuedTime any    `json:"issuedTime"`
@@ -712,7 +726,8 @@ func parseOAuthJSON(data []byte) (*ExpiryInfo, error) {
 	}
 
 	info := &ExpiryInfo{
-		HasRefreshToken: oauth.RefreshToken != "" || oauth.RefreshTokenCamel != "",
+		HasRefreshToken: strings.TrimSpace(oauth.RefreshToken) != "" || strings.TrimSpace(oauth.RefreshTokenCamel) != "",
+		Fingerprint:     credentialFingerprint(oauth.RefreshToken, oauth.RefreshTokenCamel, oauth.AccessToken, oauth.AccessTokenCamel, oauth.Key),
 	}
 
 	// Try to extract expiry from various fields

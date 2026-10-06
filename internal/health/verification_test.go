@@ -119,7 +119,11 @@ func TestRecordProviderVerificationRoundTrip(t *testing.T) {
 	if err != nil || h == nil {
 		t.Fatalf("GetProfile: %v, %v", h, err)
 	}
-	if h.TokenExpiresAt.IsZero() {
+	stored, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Profiles["codex/work"].TokenExpiresAt.IsZero() {
 		t.Error("recording a verdict dropped the stored expiry")
 	}
 	if h.ProviderRejectedAt.IsZero() || h.RejectedFingerprint != "fp" {

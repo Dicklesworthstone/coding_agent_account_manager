@@ -12,6 +12,7 @@ package rotation
 import (
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -111,6 +112,7 @@ type Selector struct {
 	mu             sync.RWMutex
 	algorithm      Algorithm
 	healthStore    *health.Storage
+	profileHealth  map[string]*health.ProfileHealth // Optional authoritative snapshots for isolated candidates
 	db             *caamdb.DB
 	rng            *rand.Rand
 	avoidRecent    time.Duration         // Don't select profiles used within this duration
@@ -183,6 +185,47 @@ func (s *Selector) SetUsageData(usage map[string]*UsageInfo) {
 	s.usageData = usage
 }
 
+// SetVaultPath binds credential hydration to the vault this selector will use.
+// A selector without a health store reads metadata next to that vault.
+func (s *Selector) SetVaultPath(root string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.healthStore == nil {
+		s.healthStore = health.NewStorage(filepath.Join(filepath.Dir(root), "health.json"))
+	}
+	s.healthStore.SetVaultPath(root)
+}
+
+// SetProfileHealth supplies authoritative health for the next selections,
+// keyed by candidate name. A non-nil map disables vault health lookup entirely:
+// an absent or nil snapshot means unknown, never a same-named vault account.
+// Pass nil to resume reading the health store. Values are copied on assignment.
+func (s *Selector) SetProfileHealth(profiles map[string]*health.ProfileHealth) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.profileHealth = nil
+	if profiles != nil {
+		s.profileHealth = make(map[string]*health.ProfileHealth, len(profiles))
+		for name, h := range profiles {
+			if h != nil {
+				copy := *h
+				s.profileHealth[name] = &copy
+			}
+		}
+	}
+}
+
+func (s *Selector) healthFor(tool, name string) *health.ProfileHealth {
+	if s.profileHealth != nil {
+		return s.profileHealth[name]
+	}
+	if s.healthStore != nil {
+		h, _ := s.healthStore.GetProfile(tool, name)
+		return h
+	}
+	return nil
+}
+
 // Select chooses a profile from the given list using the configured algorithm.
 // Returns an error if no profiles are available or all are in cooldown.
 func (s *Selector) Select(tool string, profiles []string, currentProfile string) (*Result, error) {
@@ -205,20 +248,50 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 		return nil, fmt.Errorf("no user profiles available for %s (only system profiles found)", tool)
 	}
 
-	// Opt-in drain policy overrides algorithm scoring (issue #81):
-	// drain quota that resets soonest before it expires unused.
-	if s.policy == PolicyDrain {
-		return s.selectDrain(tool, available)
+	// Credential eligibility is independent of ranking, quota policy and a
+	// cooldown override. A rejected or hard-expired non-renewable credential
+	// cannot become a usable backup just because it is the only candidate.
+	eligible := make([]string, 0, len(available))
+	var blocked []ProfileScore
+	var blockedNames []string
+	for _, name := range available {
+		h := s.healthFor(tool, name)
+		signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+		if signals.LoginRequired != nil && *signals.LoginRequired {
+			reason := "Login required: credential expired and cannot be renewed"
+			if h.ProviderRejected() {
+				reason = "Login required: provider rejected this credential"
+			}
+			blocked = append(blocked, ProfileScore{Name: name, Score: -10000, Reasons: []Reason{{Text: reason}}})
+			blockedNames = append(blockedNames, name)
+			continue
+		}
+		eligible = append(eligible, name)
+	}
+	if len(eligible) == 0 {
+		return nil, fmt.Errorf("no launchable profiles for %s: login required for %s; log in again and save the replacement credentials before rotating", tool, strings.Join(blockedNames, ", "))
 	}
 
-	switch s.algorithm {
-	case AlgorithmRandom:
-		return s.selectRandom(tool, available)
-	case AlgorithmRoundRobin:
-		return s.selectRoundRobin(tool, available, currentProfile)
-	default:
-		return s.selectSmart(tool, available)
+	// Opt-in drain policy overrides algorithm scoring (issue #81):
+	// drain quota that resets soonest before it expires unused.
+	var result *Result
+	var err error
+	if s.policy == PolicyDrain {
+		result, err = s.selectDrain(tool, eligible)
+	} else {
+		switch s.algorithm {
+		case AlgorithmRandom:
+			result, err = s.selectRandom(tool, eligible)
+		case AlgorithmRoundRobin:
+			result, err = s.selectRoundRobin(tool, eligible, currentProfile)
+		default:
+			result, err = s.selectSmart(tool, eligible)
+		}
 	}
+	if result != nil {
+		result.Alternatives = append(result.Alternatives, blocked...)
+	}
+	return result, err
 }
 
 // selectDrain implements the opt-in drain-before-reset policy (issue #81).
@@ -491,9 +564,9 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 		}
 
 		// Factor 2: Health status
-		if s.healthStore != nil {
-			h, err := s.healthStore.GetProfile(tool, p)
-			if err == nil && h != nil {
+		if s.healthStore != nil || s.profileHealth != nil {
+			h := s.healthFor(tool, p)
+			if h != nil {
 				status := health.CalculateStatus(h)
 				switch status {
 				case health.StatusHealthy:

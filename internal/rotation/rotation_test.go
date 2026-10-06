@@ -80,6 +80,97 @@ func TestNewSelector(t *testing.T) {
 	}
 }
 
+func TestCredentialEligibilityPrecedesEveryAlgorithmAndPolicy(t *testing.T) {
+	now := time.Now()
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			t.Run(string(algorithm)+"/"+string(policy), func(t *testing.T) {
+				s := NewSelector(algorithm, nil, nil)
+				s.SetPolicy(policy)
+				s.SetIgnoreCooldown(true)
+				s.SetProfileHealth(map[string]*health.ProfileHealth{
+					"expired": {TokenExpiresAt: now.Add(-time.Second)},
+					"rejected": {TokenExpiresAt: now.Add(time.Hour), SelfRefreshing: true,
+						ProviderRejectedAt: now, RejectedFingerprint: "rejected", CredentialFingerprint: "rejected"},
+					"usable": {TokenExpiresAt: now.Add(time.Hour)},
+				})
+				soon, later := now.Add(time.Minute), now.Add(time.Hour)
+				s.SetUsageData(map[string]*UsageInfo{
+					"expired":  {AvailScore: 100, ResetsAt: &soon},
+					"rejected": {AvailScore: 100, ResetsAt: &soon},
+					"usable":   {AvailScore: 1, ResetsAt: &later},
+				})
+				result, err := s.Select("cursor", []string{"expired", "rejected", "usable"}, "usable")
+				if err != nil || result.Selected != "usable" {
+					t.Fatalf("unusable credential won selection: %+v, %v", result, err)
+				}
+				blocked := 0
+				for _, alt := range result.Alternatives {
+					if alt.Name == "expired" || alt.Name == "rejected" {
+						blocked++
+						if alt.Score > -9000 || len(alt.Reasons) != 1 || !strings.Contains(alt.Reasons[0].Text, "Login required") {
+							t.Fatalf("blocked account advertised as a ready backup: %+v", alt)
+						}
+					}
+				}
+				if blocked != 2 {
+					t.Fatalf("selection omitted blocked-account explanations: %+v", result)
+				}
+				for _, name := range []string{"expired", "rejected"} {
+					if result, err := s.Select("cursor", []string{name}, ""); err == nil || !strings.Contains(err.Error(), "login required") || !strings.Contains(err.Error(), name) {
+						t.Fatalf("sole unusable account accepted: %+v, %v", result, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialEligibilityRetainsRenewableAndUnknown(t *testing.T) {
+	now := time.Now()
+	for name, h := range map[string]*health.ProfileHealth{
+		"unknown":           nil,
+		"opaque":            {},
+		"renewable_expired": {TokenExpiresAt: now.Add(-time.Hour), TokenRenewable: true},
+		"native_renewal":    {TokenExpiresAt: now.Add(-time.Hour), SelfRefreshing: true},
+		"api_key_only":      {SelfRefreshing: true, TokenRenewable: true},
+	} {
+		for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+			for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+				t.Run(name+"/"+string(algorithm)+"/"+string(policy), func(t *testing.T) {
+					s := NewSelector(algorithm, nil, nil)
+					s.SetPolicy(policy)
+					s.SetProfileHealth(map[string]*health.ProfileHealth{name: h})
+					result, err := s.Select("cursor", []string{name}, "")
+					if err != nil || result.Selected != name {
+						t.Fatalf("renewable/unknown credential became login-required: %+v, %v", result, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProfileHealthSnapshotsDoNotBorrowAnotherStore(t *testing.T) {
+	store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	if err := store.SetTokenExpiry("cursor", "same-name", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSelector(AlgorithmSmart, store, nil)
+	// An explicit empty snapshot describes an unknown isolated account.
+	// Its name does not authorize the selector to borrow a vault deadline.
+	s.SetProfileHealth(map[string]*health.ProfileHealth{})
+	if result, err := s.Select("cursor", []string{"same-name"}, ""); err != nil || result.Selected != "same-name" {
+		t.Fatalf("isolated account inherited vault health: %+v, %v", result, err)
+	}
+	h := &health.ProfileHealth{TokenExpiresAt: time.Now().Add(-time.Hour)}
+	s.SetProfileHealth(map[string]*health.ProfileHealth{"same-name": h})
+	h.TokenExpiresAt = time.Now().Add(time.Hour)
+	if _, err := s.Select("cursor", []string{"same-name"}, ""); err == nil {
+		t.Fatal("caller mutation changed a selector's copied health snapshot")
+	}
+}
+
 func TestSelectRandom(t *testing.T) {
 	s := NewSelector(AlgorithmRandom, nil, nil)
 	s.SetRNG(rand.New(rand.NewSource(42))) // Fixed seed for determinism

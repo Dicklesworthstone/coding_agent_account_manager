@@ -240,6 +240,7 @@ func TestPreflightGeminiReadsConfigurationWithoutMigration(t *testing.T) {
 		{name: "missing ADC", unsupported: true},
 		{name: "incomplete ADC", files: map[string]string{"oauth_creds.json": `{"refresh_token":"SYNTHETIC-REFRESH"}`}, unsupported: true},
 		{name: "incomplete current does not use superseded legacy", files: map[string]string{"oauth_creds.json": `{}`, "oauth_credentials.json": complete}, unsupported: true},
+		{name: "incomplete current does not use settings login", files: map[string]string{"oauth_creds.json": `{}`, "settings.json": complete}, unsupported: true},
 		{name: "malformed current does not fall back", files: map[string]string{"oauth_creds.json": `{`, "settings.json": complete}, malformed: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -274,6 +275,61 @@ func TestPreflightGeminiReadsConfigurationWithoutMigration(t *testing.T) {
 				if data, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(data, []byte(body)) {
 					t.Errorf("Preflight changed %s: %v", name, err)
 				}
+			}
+		})
+	}
+}
+
+func TestGeminiRefreshKeepsSelectedGrantAndHydratesCurrentHealth(t *testing.T) {
+	for _, settings := range []string{
+		`{"theme":"synthetic-policy","security":{"auth":{"selectedType":"oauth-personal"}}}`,
+		`{"access_token":"synthetic-other-access","refresh_token":"synthetic-other-refresh","expiry":"2030-01-01T00:00:00Z"}`,
+	} {
+		t.Run(settings, func(t *testing.T) {
+			root := t.TempDir()
+			vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+			dir := vault.ProfilePath("gemini", "work")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			settingsPath := filepath.Join(dir, "settings.json")
+			writePreflightAuth(t, settingsPath, []byte(settings))
+			credentialPath := filepath.Join(dir, "oauth_creds.json")
+			writePreflightAuth(t, credentialPath, []byte(`{"client_id":"synthetic-id","client_secret":"synthetic-secret","refresh_token":"synthetic-current-refresh","access_token":"synthetic-expired-access","expiry":"2020-01-01T00:00:00Z"}`))
+			store := health.NewStorage(filepath.Join(root, "metadata", "health.json"))
+			if err := os.MkdirAll(filepath.Dir(store.Path()), 0700); err != nil {
+				t.Fatal(err)
+			}
+			store.SetVaultPath(vault.BasePath())
+			before, err := store.GetProfile("gemini", "work")
+			if err != nil || before == nil || !before.TokenRenewable || !before.TokenExpiresAt.Before(time.Now()) {
+				t.Fatalf("canonical expired renewable grant not selected: %+v, %v", before, err)
+			}
+			oldRefresh := RefreshGeminiToken
+			t.Cleanup(func() { RefreshGeminiToken = oldRefresh })
+			RefreshGeminiToken = func(_ context.Context, clientID, clientSecret, refreshToken string) (*GoogleTokenResponse, error) {
+				if clientID != "synthetic-id" || clientSecret != "synthetic-secret" || refreshToken != "synthetic-current-refresh" {
+					t.Fatal("refresh selected another grant")
+				}
+				return &GoogleTokenResponse{AccessToken: "synthetic-new-access", ExpiresIn: 3600}, nil
+			}
+			if err := Preflight("gemini", "work", vault); err != nil {
+				t.Fatal(err)
+			}
+			if err := refreshGemini(context.Background(), "gemini", "work", store, dir); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.ReadFile(settingsPath); err != nil || string(got) != settings {
+				t.Fatalf("refresh modified unrelated settings: %v", err)
+			}
+			if got, err := os.ReadFile(credentialPath); err != nil || !bytes.Contains(got, []byte("synthetic-new-access")) {
+				t.Fatalf("selected source did not receive refreshed token: %v", err)
+			}
+			reloaded := health.NewStorage(store.Path())
+			reloaded.SetVaultPath(vault.BasePath())
+			after, err := reloaded.GetProfile("gemini", "work")
+			if err != nil || after == nil || !after.TokenRenewable || time.Until(after.TokenExpiresAt) < 59*time.Minute || after.CredentialFingerprint != before.CredentialFingerprint {
+				t.Fatalf("successful refresh lost current expiry or grant identity after reload: %+v, %v", after, err)
 			}
 		})
 	}

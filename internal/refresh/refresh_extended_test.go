@@ -66,19 +66,19 @@ func TestRefreshProfile_Codex_Extended(t *testing.T) {
 	rootDir := h.TempDir
 	vaultDir := filepath.Join(rootDir, "vault")
 	vault := authfile.NewVault(vaultDir)
-	
+
 	// Create Codex profile
 	profileDir := filepath.Join(vaultDir, "codex", "test")
 	require.NoError(t, os.MkdirAll(profileDir, 0755))
-	
+
 	authPath := filepath.Join(profileDir, "auth.json")
 	initialContent := `{"refresh_token": "old-codex-refresh", "access_token": "old-codex-access"}`
 	require.NoError(t, os.WriteFile(authPath, []byte(initialContent), 0600))
-	
+
 	// Mock RefreshCodexToken
 	originalRefresh := RefreshCodexToken
 	defer func() { RefreshCodexToken = originalRefresh }()
-	
+
 	RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenResponse, error) {
 		assert.Equal(t, "old-codex-refresh", refreshToken)
 		return &TokenResponse{
@@ -87,15 +87,15 @@ func TestRefreshProfile_Codex_Extended(t *testing.T) {
 			ExpiresIn:    3600,
 		}, nil
 	}
-	
+
 	h.EndStep("Setup")
-	
+
 	// 2. Refresh
 	h.StartStep("Refresh", "Call RefreshProfile")
 	err := RefreshProfile(context.Background(), "codex", "test", vault, nil)
 	require.NoError(t, err)
 	h.EndStep("Refresh")
-	
+
 	// 3. Verify
 	h.StartStep("Verify", "Check updated auth file")
 	content, err := os.ReadFile(authPath)
@@ -114,24 +114,24 @@ func TestRefreshProfile_Gemini_Extended(t *testing.T) {
 	rootDir := h.TempDir
 	vaultDir := filepath.Join(rootDir, "vault")
 	vault := authfile.NewVault(vaultDir)
-	
+
 	// Create Gemini profile
 	profileDir := filepath.Join(vaultDir, "gemini", "test")
 	require.NoError(t, os.MkdirAll(profileDir, 0755))
-	
+
 	settingsPath := filepath.Join(profileDir, "settings.json")
 	initialSettings := `{"accessToken": "old-gemini-access"}`
 	require.NoError(t, os.WriteFile(settingsPath, []byte(initialSettings), 0600))
-	
+
 	// Gemini needs oauth_creds.json for client info
 	credsPath := filepath.Join(profileDir, "oauth_creds.json")
 	credsContent := `{"client_id": "test-id", "client_secret": "test-secret", "refresh_token": "gemini-refresh"}`
 	require.NoError(t, os.WriteFile(credsPath, []byte(credsContent), 0600))
-	
+
 	// Mock RefreshGeminiToken
 	originalRefresh := RefreshGeminiToken
 	defer func() { RefreshGeminiToken = originalRefresh }()
-	
+
 	RefreshGeminiToken = func(ctx context.Context, clientID, clientSecret, refreshToken string) (*GoogleTokenResponse, error) {
 		assert.Equal(t, "test-id", clientID)
 		assert.Equal(t, "test-secret", clientSecret)
@@ -141,20 +141,23 @@ func TestRefreshProfile_Gemini_Extended(t *testing.T) {
 			ExpiresIn:   3600,
 		}, nil
 	}
-	
+
 	h.EndStep("Setup")
-	
+
 	// 2. Refresh
 	h.StartStep("Refresh", "Call RefreshProfile")
 	err := RefreshProfile(context.Background(), "gemini", "test", vault, nil)
 	require.NoError(t, err)
 	h.EndStep("Refresh")
-	
+
 	// 3. Verify
 	h.StartStep("Verify", "Check updated auth file")
-	content, err := os.ReadFile(settingsPath)
+	content, err := os.ReadFile(credsPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(content), "new-gemini-access")
+	settings, err := os.ReadFile(settingsPath)
+	require.NoError(t, err)
+	assert.Equal(t, initialSettings, string(settings), "refresh must not overwrite an unrelated settings credential")
 	// Verify it contains updated expiry if possible (ExpiresIn was set)
 	// UpdateGeminiAuth sets expires_at/expiry etc.
 	h.EndStep("Verify")

@@ -348,16 +348,25 @@ func TestRecordCodexUsageVerdicts(t *testing.T) {
 	if h := get("rejected"); h == nil || h.ProviderRejectedAt.IsZero() || h.RejectedFingerprint != health.CodexCredentialFingerprint(rejected) {
 		t.Errorf("rejected: rejection not recorded against its credential: %+v", h)
 	}
-	if h := get("lapsed"); h != nil {
+	persisted, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, exists := persisted.Profiles["codex/lapsed"]; exists {
 		t.Errorf("lapsed: a 401 for an expired access token was recorded: %+v", h)
 	}
-	if h := get("edge403"); h != nil {
+	if h, exists := persisted.Profiles["codex/edge403"]; exists {
 		t.Errorf("edge403: a 403 was recorded as a rejection: %+v", h)
 	}
-	if h := get("offline"); h != nil {
+	if h, exists := persisted.Profiles["codex/offline"]; exists {
 		t.Errorf("offline: a transport error was recorded: %+v", h)
 	}
-	if h, _ := store.GetProfile("claude", "ok"); h != nil {
+	for _, name := range []string{"lapsed", "edge403", "offline"} {
+		if h := get(name); h == nil || h.ProviderRejected() || !h.ProviderRejectedAt.IsZero() || !h.LastVerifiedAt.IsZero() {
+			t.Errorf("%s: current credentials should remain unverified without a persisted verdict: %+v", name, h)
+		}
+	}
+	if h, exists := persisted.Profiles["claude/ok"]; exists {
 		t.Errorf("claude row recorded: %+v", h)
 	}
 }

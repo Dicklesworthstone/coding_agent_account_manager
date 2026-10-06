@@ -358,6 +358,25 @@ func discoveryMaterial(tool, name string, data []byte) ([]byte, error) {
 		}
 		return nil, err
 	}
+	if tool == "cursor" {
+		ok, err := CursorCredentialMaterial(data)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("credential source has no access credential")
+		}
+		// Native Cursor can leave either optional slot null or empty. A
+		// stored API key still authenticates without a cached access token.
+		// Normalize only the comparison material; capture saves original bytes.
+		for _, key := range []string{"accessToken", "apiKey"} {
+			var value string
+			_ = json.Unmarshal(obj[key], &value) // Types were checked above.
+			if strings.TrimSpace(value) == "" {
+				delete(obj, key)
+			}
+		}
+	}
 	if tool == "claude" {
 		ok, err := claudeCredentialMaterial(data, name)
 		if err != nil {

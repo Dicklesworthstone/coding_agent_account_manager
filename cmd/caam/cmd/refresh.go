@@ -340,7 +340,8 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 }
 
 func refreshedTTL(tool, profile string) string {
-	// Gemini refresh updates health metadata, not files.
+	// Gemini refresh updates its selected credential file and health metadata.
+	// Report the current credential's expiry from the hydrated snapshot.
 	if tool == "gemini" && healthStore != nil {
 		h, err := healthStore.GetProfile(tool, profile)
 		if err == nil && h != nil && !h.TokenExpiresAt.IsZero() {

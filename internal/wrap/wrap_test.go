@@ -3,6 +3,7 @@ package wrap
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,59 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
+
+func TestWrapperRejectsExpiredCursorSessionBeforeChangingAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(root, "cursor-config"))
+	vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(-time.Hour).Unix())))
+	expired := []byte(fmt.Sprintf(`{"accessToken":%q}`, "e30."+payload+".synthetic"))
+	authPath := vault.BackupPath("cursor", "expired", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath, expired, 0600); err != nil {
+		t.Fatal(err)
+	}
+	livePath := authfile.CursorAuthFiles().Files[0].Path
+	for _, f := range authfile.CursorAuthFiles().Files {
+		if filepath.Base(f.Path) == "auth.json" {
+			livePath = f.Path
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(livePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	live := []byte(`{"apiKey":"synthetic-live-owner"}`)
+	if err := os.WriteFile(livePath, live, 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldExec := ExecCommand
+	called := false
+	ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		called = true
+		return exec.CommandContext(ctx, "caam-test-must-not-launch")
+	}
+	t.Cleanup(func() { ExecCommand = oldExec })
+	cfg := DefaultConfig()
+	cfg.Provider = "cursor"
+	cfg.Stdout = &bytes.Buffer{}
+	cfg.Stderr = &bytes.Buffer{}
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err == nil || result.ExitCode == 0 || len(result.ProfilesUsed) != 0 || called {
+		t.Fatalf("expired session reached execution: result=%+v called=%v", result, called)
+	}
+	after, err := os.ReadFile(livePath)
+	if err != nil || !bytes.Equal(after, live) {
+		t.Fatalf("failed selection changed live login: %v", err)
+	}
+	profiles, err := vault.List("cursor")
+	if err != nil || len(profiles) != 1 || profiles[0] != "expired" {
+		t.Fatalf("failed selection changed vault: profiles=%v err=%v", profiles, err)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()

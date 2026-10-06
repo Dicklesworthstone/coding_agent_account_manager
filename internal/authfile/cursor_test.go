@@ -1,6 +1,7 @@
 package authfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,6 +45,9 @@ func TestCursorActiveProfileIgnoresConfigChurn(t *testing.T) {
 	}
 
 	// A config-only/keychain profile still matches optional config files.
+	if err := os.WriteFile(config, []byte(`{"authInfo":{"email":"keychain@example.invalid"},"changed":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	configOnly := AuthFileSet{Tool: "cursor", AllowOptionalOnly: true, Files: []AuthFileSpec{{Path: config}, {Path: settings}}}
 	if err := vault.Backup(configOnly, "keychain"); err != nil {
 		t.Fatal(err)
@@ -56,6 +60,88 @@ func TestCursorActiveProfileIgnoresConfigChurn(t *testing.T) {
 	}
 	if got, err := vault.ActiveProfile(configOnly); err != nil || got != "" {
 		t.Fatalf("config-only churn = %q, %v", got, err)
+	}
+}
+
+func TestCursorCredentialValidationAndVaultRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name, auth, config string
+		valid              bool
+	}{
+		{"access", `{"accessToken":"SYNTHETIC-ACCESS"}`, `{"model":"irrelevant"}`, true},
+		{"api_key", `{"apiKey":"SYNTHETIC-KEY"}`, "", true},
+		{"keychain_metadata", "", `{"authInfo":{"email":"native@example.invalid"}}`, true},
+		{"empty", `{}`, `{"authInfo":{"email":"stale@example.invalid"}}`, false},
+		{"empty_token", `{"accessToken":" "}`, `{"authInfo":{"email":"stale@example.invalid"}}`, false},
+		{"refresh_only", `{"refreshToken":"SYNTHETIC-ALIAS"}`, `{"authInfo":{"email":"stale@example.invalid"}}`, false},
+		{"malformed", `{"accessToken":`, `{"authInfo":{"email":"stale@example.invalid"}}`, false},
+		{"null", `null`, "", false},
+		{"wrong_type", `{"apiKey":42}`, "", false},
+		{"workflow_only", "", `{"model":"synthetic","permissions":{"allow":[]}}`, false},
+		{"empty_auth_info", "", `{"authInfo":{}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := t.TempDir()
+			set := AuthFileSet{Tool: "cursor", AllowOptionalOnly: true, Files: []AuthFileSpec{
+				{Path: filepath.Join(live, "cli-config.json")}, {Path: filepath.Join(live, "auth.json")}, {Path: filepath.Join(live, "settings.json")},
+			}}
+			vault := NewVault(t.TempDir())
+			for _, dir := range []string{live, vault.ProfilePath("cursor", "candidate")} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				for name, data := range map[string]string{"auth.json": tc.auth, "cli-config.json": tc.config, "settings.json": `{"theme":"keep"}`} {
+					if data != "" {
+						if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			if got := HasAuthFiles(set); got != tc.valid {
+				t.Fatalf("HasAuthFiles = %v, want %v", got, tc.valid)
+			}
+			if err := vault.ValidateProfileCredentials(set, "candidate"); (err == nil) != tc.valid {
+				t.Fatalf("vault credential validation = %v, want valid=%v", err, tc.valid)
+			}
+			if err := vault.Backup(set, "backup"); (err == nil) != tc.valid {
+				t.Fatalf("Backup = %v, want valid=%v", err, tc.valid)
+			}
+			if tc.valid {
+				return
+			}
+			if _, err := os.Stat(vault.ProfilePath("cursor", "backup")); !os.IsNotExist(err) {
+				t.Fatalf("rejected backup created a snapshot: %v", err)
+			}
+			const existing = `{"accessToken":"SYNTHETIC-LIVE-ACCOUNT"}`
+			if err := os.WriteFile(filepath.Join(live, "auth.json"), []byte(existing), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := vault.Restore(set, "candidate"); err == nil {
+				t.Fatal("authless candidate was restored")
+			}
+			data, err := os.ReadFile(filepath.Join(live, "auth.json"))
+			if err != nil || string(data) != existing {
+				t.Fatalf("refused restore changed live credentials: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateCursorAuthFileDistinguishesMissingFromInvalid(t *testing.T) {
+	root := t.TempDir()
+	if err := ValidateCursorAuthFile(filepath.Join(root, "missing")); !os.IsNotExist(err) {
+		t.Fatalf("missing source = %v", err)
+	}
+	if err := ValidateCursorAuthFile(root); !errors.Is(err, ErrInvalidCredentials) || os.IsNotExist(err) {
+		t.Fatalf("directory source = %v", err)
+	}
+	path := filepath.Join(root, "auth.json")
+	if err := os.WriteFile(path, []byte(`{"refreshToken":"SYNTHETIC-ALIAS"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCursorAuthFile(path); !errors.Is(err, ErrNoCredentials) || os.IsNotExist(err) {
+		t.Fatalf("authless source = %v", err)
 	}
 }
 

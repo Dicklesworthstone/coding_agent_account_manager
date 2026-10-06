@@ -59,6 +59,11 @@ func TestCaptureDiscoveryRecognizesCompleteNativeSources(t *testing.T) {
 		{"OpenCode OAuth", "opencode", "auth.json", `{"anthropic":{"type":"oauth","access":"synthetic-access","refresh":"synthetic-refresh","expires":1893456000000}}`, "auto-"},
 		{"OpenCode API key", "opencode", "auth.json", `{"openai":{"type":"api","key":"synthetic-key"}}`, "auto-"},
 		{"Cursor access", "cursor", "auth.json", `{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}`, "auto-"},
+		{"Cursor API key", "cursor", "auth.json", `{"apiKey":"synthetic-api-key"}`, "auto-"},
+		{"Cursor API key null access", "cursor", "auth.json", `{"apiKey":"synthetic-api-key","accessToken":null}`, "auto-"},
+		{"Cursor API key empty access", "cursor", "auth.json", `{"apiKey":"synthetic-api-key","accessToken":""}`, "auto-"},
+		{"Cursor API key blank access", "cursor", "auth.json", `{"apiKey":"synthetic-api-key","accessToken":"  "}`, "auto-"},
+		{"Cursor access null API key", "cursor", "auth.json", `{"accessToken":"synthetic-access","apiKey":null}`, "auto-"},
 		{"agy opaque", "agy", "antigravity-oauth-token", "synthetic-native-agy-token", "auto-"},
 		{"agy JSON", "agy", "antigravity-oauth-token", agyFakeToken, "auto-"},
 	} {
@@ -134,6 +139,10 @@ func TestCaptureDiscoveryRejectsIncompleteAndMalformedSources(t *testing.T) {
 		{"Cursor conflicting refresh aliases", "cursor", map[string]string{"auth.json": `{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh-one","refresh_token":"synthetic-refresh-two"}`}, ErrInvalidCredentials},
 		{"OpenCode incomplete entry", "opencode", map[string]string{"auth.json": `{"anthropic":{"type":"oauth","refresh":"synthetic-refresh"}}`}, ErrInvalidCredentials},
 		{"Cursor empty auth", "cursor", map[string]string{"auth.json": `{}`, "cli-config.json": `{"authInfo":{"email":"label@example.com"}}`}, ErrInvalidCredentials},
+		{"Cursor null slots", "cursor", map[string]string{"auth.json": `{"accessToken":null,"apiKey":null}`, "cli-config.json": `{"authInfo":{"email":"label@example.com"}}`}, ErrInvalidCredentials},
+		{"Cursor refresh alias only", "cursor", map[string]string{"auth.json": `{"refreshToken":"synthetic-session-alias"}`, "cli-config.json": `{"authInfo":{"email":"label@example.com"}}`}, ErrInvalidCredentials},
+		{"Cursor malformed access with API key", "cursor", map[string]string{"auth.json": `{"accessToken":{},"apiKey":"synthetic-api-key"}`, "cli-config.json": `{"authInfo":{"email":"label@example.com"}}`}, ErrInvalidCredentials},
+		{"Cursor malformed API key with access", "cursor", map[string]string{"auth.json": `{"accessToken":"synthetic-access","apiKey":false}`, "cli-config.json": `{"authInfo":{"email":"label@example.com"}}`}, ErrInvalidCredentials},
 		{"agy empty token", "agy", map[string]string{"antigravity-oauth-token": "  "}, ErrInvalidCredentials},
 		{"agy incomplete JSON", "agy", map[string]string{"antigravity-oauth-token": `{"token":`}, ErrInvalidCredentials},
 	} {

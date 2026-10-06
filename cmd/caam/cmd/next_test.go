@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/spf13/cobra"
 )
@@ -364,6 +366,108 @@ func TestNextSelectionForcePreservesNativeQuotaEligibility(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestAutomaticRotationRefusesUnusableCursorWithoutMutation(t *testing.T) {
+	for _, command := range []string{"auto", "next"} {
+		for _, rejected := range []bool{false, true} {
+			for _, force := range []bool{false, true} {
+				name := fmt.Sprintf("%s/rejected=%t/force=%t", command, rejected, force)
+				t.Run(name, func(t *testing.T) {
+					paths := setupCursorHealthVault(t)
+					defaultVault := vault
+					vault = authfile.NewVault(filepath.Join(t.TempDir(), "custom-vault"))
+					now := time.Now().Truncate(time.Second)
+					body := cursorHealthCredential(t, now.Add(-time.Hour), false)
+					if rejected {
+						body = cursorHealthCredential(t, now.Add(time.Hour), true)
+					}
+					credentialPath := filepath.Join(vault.ProfilePath("cursor", "only"), "auth.json")
+					writeNativeTestCredential(t, credentialPath, string(body))
+					// A healthy same-named default-vault account must not supply
+					// eligibility for the different vault being activated.
+					writeNativeTestCredential(t, filepath.Join(defaultVault.ProfilePath("cursor", "only"), "auth.json"), string(cursorHealthCredential(t, now.Add(24*time.Hour), true)))
+					if rejected {
+						info, err := health.ParseCursorExpiry(credentialPath)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := healthStore.RecordProviderVerification("cursor", "only", health.ProviderVerification{Reason: "access_token_rejected", Fingerprint: info.Fingerprint}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					live := `{"apiKey":"SYNTHETIC-UNSAVED-LIVE-KEY"}`
+					writeNativeTestCredential(t, paths.AuthFile, live)
+					c := &cobra.Command{}
+					c.Flags().Bool("force", force, "")
+					var err error
+					if command == "auto" {
+						c.Flags().Bool("auto", true, "")
+						c.Flags().Bool("json", false, "")
+						err = runActivate(c, []string{"cursor"})
+					} else {
+						c.Flags().Bool("quiet", true, "")
+						c.Flags().Bool("dry-run", false, "")
+						c.Flags().String("algorithm", "round_robin", "")
+						c.Flags().String("policy", "availability", "")
+						c.Flags().Bool("usage-aware", false, "")
+						err = runNext(c, []string{"cursor"})
+					}
+					if err == nil || !strings.Contains(err.Error(), "login required") {
+						t.Fatalf("automatic rotation accepted unusable account: %v", err)
+					}
+					requireSwitchCredential(t, paths.AuthFile, live)
+					requireSwitchCredential(t, credentialPath, string(body))
+					profiles, listErr := vault.List("cursor")
+					if listErr != nil || !reflect.DeepEqual(profiles, []string{"only"}) {
+						t.Fatalf("failed selection created backups or changed vault: %v, %v", profiles, listErr)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestNextSelectionKeepsRenewableCursorAfterSessionReplacement(t *testing.T) {
+	setupCursorHealthVault(t)
+	vault = authfile.NewVault(filepath.Join(t.TempDir(), "custom-vault"))
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "only"), "auth.json"), string(cursorHealthCredential(t, time.Time{}, true)))
+	if err := healthStore.SetTokenExpiry("cursor", "only", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, algorithm := range []string{"smart", "round_robin", "random"} {
+		cfg := config.DefaultSPMConfig()
+		cfg.Stealth.Rotation.Algorithm = algorithm
+		cfg.Stealth.Rotation.Policy = "drain"
+		result, err := selectProfileWithRotationAndUsage("cursor", []string{"only"}, "", cfg, nil, nil, true)
+		if err != nil || result.Selected != "only" {
+			t.Fatalf("API key inherited old session deadline under %s: %+v, %v", algorithm, result, err)
+		}
+	}
+}
+
+func TestNextRoundRobinRetryCannotChooseExpiredBackup(t *testing.T) {
+	paths := setupCursorHealthVault(t)
+	current := string(cursorHealthCredential(t, time.Time{}, true))
+	writeNativeTestCredential(t, paths.AuthFile, current)
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "current"), "auth.json"), current)
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "expired"), "auth.json"), string(cursorHealthCredential(t, time.Now().Add(-time.Hour), false)))
+	c := &cobra.Command{}
+	c.Flags().Bool("force", true, "")
+	c.Flags().Bool("quiet", true, "")
+	c.Flags().Bool("dry-run", false, "")
+	c.Flags().String("algorithm", "smart", "")
+	c.Flags().String("policy", "availability", "")
+	c.Flags().Bool("usage-aware", false, "")
+	// Smart picks the current usable key. runNext then retries round-robin
+	// because two profiles exist; the retry must not revive the expired one.
+	if err := runNext(c, []string{"cursor"}); err != nil {
+		t.Fatal(err)
+	}
+	requireSwitchCredential(t, paths.AuthFile, current)
+	if active, err := vault.ActiveProfile(authfile.CursorAuthFiles()); err != nil || active != "current" {
+		t.Fatalf("fallback activated an unusable backup: active=%q, error=%v", active, err)
 	}
 }
 

@@ -99,6 +99,9 @@ func NewMonitor(opts ...MonitorOption) *Monitor {
 	for _, opt := range opts {
 		opt(m)
 	}
+	if m.vault != nil && m.health != nil {
+		m.health.SetVaultPath(m.vault.BasePath())
+	}
 
 	if m.state == nil {
 		m.state = &MonitorState{Profiles: make(map[string]*ProfileState)}

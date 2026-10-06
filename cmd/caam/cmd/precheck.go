@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -159,8 +160,15 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize dependencies
-	vaultInst := authfile.NewVault(authfile.DefaultVaultPath())
-	healthStoreInst := health.NewStorage(health.DefaultHealthPath())
+	vaultInst := vault
+	if vaultInst == nil {
+		vaultInst = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	healthStoreInst := healthStore
+	if healthStoreInst == nil {
+		healthStoreInst = health.NewStorage(filepath.Join(filepath.Dir(vaultInst.BasePath()), "health.json"))
+	}
+	healthStoreInst.SetVaultPath(vaultInst.BasePath())
 
 	// List profiles
 	profiles, err := vaultInst.List(provider)
@@ -212,7 +220,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	var usageMap map[string]*usage.UsageInfo
 
 	if !noFetch && (provider == "claude" || provider == "codex") {
-		credentials, err := usage.LoadProfileCredentials(authfile.DefaultVaultPath(), provider)
+		credentials, err := usage.LoadProfileCredentials(vaultInst.BasePath(), provider)
 		if err == nil && len(credentials) > 0 {
 			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -236,6 +244,7 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStoreInst, db)
+	selector.SetVaultPath(vaultInst.BasePath())
 	applyRotationPolicy(selector, spmCfg, policyOverride)
 
 	// Set usage data for smart selection
@@ -360,6 +369,15 @@ func buildPrecheckResult(
 					} else {
 						rec.TokenExpiry = "expired"
 					}
+				}
+				signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+				if signals.LoginRequired != nil && *signals.LoginRequired {
+					result.Alerts = append(result.Alerts, PrecheckAlert{
+						Type: "login_required", Profile: profileName, Urgency: "critical",
+						Message: "Credential requires a new login before it can be used",
+						Action:  health.FormatRecommendation(provider, profileName, h),
+					})
+					continue // Never advertise an unusable account as a ready backup.
 				}
 			}
 		}

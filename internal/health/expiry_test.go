@@ -665,6 +665,44 @@ func TestParseGeminiExpiry_OAuthCredsFileWithoutSettingsReturnsNoExpiry(t *testi
 	}
 }
 
+func TestParseGeminiExpiryCurrentCacheIsAuthoritative(t *testing.T) {
+	for _, tc := range []struct {
+		name, current string
+		wantErr       bool
+	}{
+		{"refreshable current", `{"refresh_token":"synthetic-current-refresh","access_token":"synthetic-current-access","expiry":"2025-12-18T14:00:00Z"}`, false},
+		{"access only current", `{"access_token":"synthetic-current-access","expiry":"2025-12-18T14:00:00Z"}`, false},
+		{"empty current", `{}`, true},
+		{"malformed current", `{`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, file := range []string{"settings.json", "oauth_credentials.json"} {
+				if err := os.WriteFile(filepath.Join(dir, file), []byte(`{"refresh_token":"synthetic-other-refresh","expiry":"2030-01-01T00:00:00Z"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentPath := filepath.Join(dir, "oauth_creds.json")
+			if err := os.WriteFile(currentPath, []byte(tc.current), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := ParseGeminiExpiry(dir)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("invalid current source fell back to a stale login: %+v", info)
+				}
+				return
+			}
+			if err != nil || info == nil || info.Source != currentPath || info.ExpiresAt.Year() != 2025 {
+				t.Fatalf("current source not selected: %+v, %v", info, err)
+			}
+			if info.Renewable != (tc.name == "refreshable current") {
+				t.Fatalf("borrowed renewability from another file: %+v", info)
+			}
+		})
+	}
+}
+
 func TestParseGeminiExpiry_LegacyOAuthSnapshot(t *testing.T) {
 	expiry := time.Date(2025, time.December, 18, 14, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

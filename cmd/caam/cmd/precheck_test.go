@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,6 +33,58 @@ func TestPrecheckCommandHelp(t *testing.T) {
 	assert.Contains(t, output, "--format")
 	assert.Contains(t, output, "--no-fetch")
 	assert.Contains(t, output, "precheck")
+}
+
+func TestPrecheckDoesNotCountExpiredSessionAsReadyBackup(t *testing.T) {
+	setupCursorHealthVault(t)
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "expired"), "auth.json"), string(cursorHealthCredential(t, time.Now().Add(-time.Hour), false)))
+	writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("cursor", "renewable"), "auth.json"), string(cursorHealthCredential(t, time.Time{}, true)))
+	healthStore.SetVaultPath(vault.BasePath())
+	// Even when selection has no result (for example every usable account
+	// is capped), the planner must not turn a default score into readiness.
+	result := buildPrecheckResult("cursor", []string{"expired", "renewable"}, nil, nil, nil, healthStore, nil, "smart", "")
+	if result.Recommended != nil || result.Summary.ReadyProfiles != 1 || len(result.Backups) != 1 || result.Backups[0].Name != "renewable" {
+		t.Fatalf("planner advertised a hard-expired session as ready: %+v", result)
+	}
+	found := false
+	for _, alert := range result.Alerts {
+		if alert.Profile == "expired" && alert.Type == "login_required" {
+			found = true
+			if !strings.Contains(alert.Action, "cursor-agent login") || strings.Contains(alert.Action, "caam refresh") {
+				t.Fatalf("planner omitted native relogin guidance: %+v", alert)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("planner omitted login-required alert")
+	}
+}
+
+func TestPrecheckUsesActualVaultAndRejectionStore(t *testing.T) {
+	setupCursorHealthVault(t)
+	vault = authfile.NewVault(filepath.Join(t.TempDir(), "custom-vault"))
+	path := filepath.Join(vault.ProfilePath("cursor", "rejected"), "auth.json")
+	writeNativeTestCredential(t, path, string(cursorHealthCredential(t, time.Time{}, true)))
+	info, err := health.ParseCursorExpiry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := healthStore.RecordProviderVerification("cursor", "rejected", health.ProviderVerification{Reason: "access_token_rejected", Fingerprint: info.Fingerprint}); err != nil {
+		t.Fatal(err)
+	}
+	c := &cobra.Command{}
+	c.Flags().String("format", "json", "")
+	c.Flags().Bool("no-fetch", true, "")
+	c.Flags().Duration("timeout", time.Second, "")
+	c.Flags().String("algorithm", "random", "")
+	c.Flags().String("policy", "drain", "")
+	c.Flags().String("model", "", "")
+	var output bytes.Buffer
+	c.SetOut(&output)
+	c.SetErr(&output)
+	if err := runPrecheckCmd(c, []string{"cursor"}); err == nil || !strings.Contains(err.Error(), "login required") {
+		t.Fatalf("planner ignored selected-vault rejection metadata: %v, output=%s", err, output.String())
+	}
 }
 
 func TestPrecheckUnknownProvider(t *testing.T) {
@@ -177,14 +232,14 @@ func TestPrecheckResult_Table(t *testing.T) {
 	result := &PrecheckResult{
 		Provider: "claude",
 		Recommended: &ProfileRecommendation{
-			Name:           "work",
-			Score:          150.5,
-			UsagePercent:   45,
-			AvailScore:     77,
-			HealthStatus:   "healthy",
-			TokenExpiry:    "3h",
+			Name:            "work",
+			Score:           150.5,
+			UsagePercent:    45,
+			AvailScore:      77,
+			HealthStatus:    "healthy",
+			TokenExpiry:     "3h",
 			TimeToDepletion: "2h 15m",
-			Reasons:        []string{"+ Healthy token (expires in 3h)"},
+			Reasons:         []string{"+ Healthy token (expires in 3h)"},
 		},
 		Backups: []ProfileRecommendation{
 			{Name: "personal", HealthStatus: "warning", UsagePercent: 60},

@@ -51,7 +51,6 @@ func (p *Provider) PrepareRun(ctx context.Context, prof *profile.Profile) error 
 	if err != nil {
 		return err
 	}
-	updates = append(updates, legacy)
 	// CLAUDE_CONFIG_DIR makes native session state live inside the selected
 	// config directory. Only a legacy-only profile may seed it from its old
 	// home-level state; an XDG login must not borrow another store's account.
@@ -69,7 +68,11 @@ func (p *Provider) PrepareRun(ctx context.Context, prof *profile.Profile) error 
 	if err != nil {
 		return fmt.Errorf("prepare Claude native session state: %w", err)
 	}
-	updates = append(updates, nativeState)
+	// A legacy-only profile may use profileLegacy as nativeState's captured
+	// account source. Consume that snapshot before refreshing it in place;
+	// otherwise our own earlier write trips the source-change protection.
+	// Both updates still preflight together and recheck their inputs on apply.
+	updates = append(updates, nativeState, legacy)
 	if err := ctx.Err(); err != nil {
 		return err
 	}

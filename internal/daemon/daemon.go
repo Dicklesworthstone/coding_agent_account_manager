@@ -141,6 +141,9 @@ func (d *Daemon) isVerbose() bool {
 
 // New creates a new daemon instance.
 func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemon {
+	if vault != nil && healthStore != nil {
+		healthStore.SetVaultPath(vault.BasePath())
+	}
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}

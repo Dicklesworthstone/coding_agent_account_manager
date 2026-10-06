@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +13,82 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
+
+func TestCursorAPIHealthReadsCurrentCustomVault(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+	healthPath := filepath.Join(root, "metadata", "health.json")
+	if err := os.MkdirAll(filepath.Dir(healthPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	store := health.NewStorage(healthPath)
+	if err := store.UpdateProfile("cursor", "work", &health.ProfileHealth{TokenExpiresAt: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(healthPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A same-named snapshot beside health.json must not supply the answer.
+	writeAPIActivationFile(t, filepath.Join(root, "metadata", "vault", "cursor", "work", "auth.json"), []byte(`{"apiKey":"synthetic-decoy"}`))
+	h := NewHandlers(vault, store, nil)
+	for _, tc := range []struct {
+		name          string
+		ttl           time.Duration
+		apiKey        string
+		body          string
+		wantStatus    string
+		wantRenewable bool
+		wantLogin     *bool
+		wantAdvice    bool
+	}{
+		{name: "long lead session", ttl: 5 * 24 * time.Hour, wantStatus: "warning", wantLogin: apiBool(false), wantAdvice: true},
+		{name: "expired session", ttl: -time.Hour, wantStatus: "critical", wantLogin: apiBool(true), wantAdvice: true},
+		{name: "renewable expired access", ttl: -time.Hour, apiKey: "synthetic-api-key", wantStatus: "healthy", wantRenewable: true, wantLogin: apiBool(false)},
+		{name: "new distant session", ttl: 30 * 24 * time.Hour, wantStatus: "healthy", wantLogin: apiBool(false)},
+		{name: "opaque replacement", body: `{"accessToken":"opaque-synthetic"}`, wantStatus: "warning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			if body == "" {
+				payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(tc.ttl).Unix())))
+				body = fmt.Sprintf(`{"accessToken":%q,"apiKey":%q}`, "e30."+payload+".synthetic", tc.apiKey)
+			}
+			writeAPIActivationFile(t, vault.BackupPath("cursor", "work", "auth.json"), []byte(body))
+			result, err := h.GetProfile("cursor", "work")
+			if err != nil || result == nil || result.Health == nil {
+				t.Fatalf("GetProfile: result=%+v err=%v", result, err)
+			}
+			got := result.Health
+			if got.Status != tc.wantStatus || got.Renewable != tc.wantRenewable {
+				t.Errorf("health = %+v, want status=%s renewable=%v", got, tc.wantStatus, tc.wantRenewable)
+			}
+			if tc.wantLogin == nil {
+				if got.LoginRequired != nil || got.LaunchUsable != nil || got.ExpiresAt != "" {
+					t.Errorf("unknown credential retained previous facts: %+v", got)
+				}
+			} else if got.LoginRequired == nil || *got.LoginRequired != *tc.wantLogin ||
+				got.LaunchUsable == nil || *got.LaunchUsable == *tc.wantLogin || got.RefreshDue == nil || *got.RefreshDue {
+				t.Errorf("incorrect launch/login/refresh signals: %+v", got)
+			}
+			if (got.Recommendation != "") != tc.wantAdvice || strings.Contains(got.Recommendation, "caam refresh") {
+				t.Errorf("incorrect recommendation: %q", got.Recommendation)
+			}
+			encoded, err := json.Marshal(result)
+			if err != nil || !bytes.Contains(encoded, []byte(`"launch_usable":`)) {
+				t.Fatalf("health signals missing from API JSON: %s, err=%v", encoded, err)
+			}
+		})
+	}
+	after, err := os.ReadFile(healthPath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("read-only health changed stored metadata: err=%v", err)
+	}
+}
+
+func apiBool(value bool) *bool { return &value }
 
 func TestFormatDuration(t *testing.T) {
 	tests := []struct {

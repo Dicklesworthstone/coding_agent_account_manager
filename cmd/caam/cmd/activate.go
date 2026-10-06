@@ -557,6 +557,7 @@ func selectProfileWithRotation(tool string, profiles []string, currentProfile st
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	selector.SetIgnoreCooldown(force)
 	result, err := selector.Select(tool, profiles, currentProfile)
 	if err != nil {
@@ -564,6 +565,16 @@ func selectProfileWithRotation(tool string, profiles []string, currentProfile st
 	}
 
 	return result, nil
+}
+
+// Bind selectors to the same vault that activation will restore, including
+// caller-supplied vaults whose credentials are not beside the default health file.
+func bindRotationVault(selector *rotation.Selector) {
+	if vault != nil {
+		selector.SetVaultPath(vault.BasePath())
+	} else {
+		selector.SetVaultPath(authfile.DefaultVaultPath())
+	}
 }
 
 // resolveProfileName resolves a profile name from user input.

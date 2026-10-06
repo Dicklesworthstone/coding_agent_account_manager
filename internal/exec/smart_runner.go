@@ -88,6 +88,9 @@ func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
 	if notifier == nil {
 		notifier = &notify.TerminalNotifier{}
 	}
+	if opts.Vault != nil && opts.Rotation != nil {
+		opts.Rotation.SetVaultPath(opts.Vault.BasePath())
+	}
 
 	return &SmartRunner{
 		Runner:           runner,

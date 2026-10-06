@@ -17,10 +17,11 @@ func TestCursorReloginStateIsNotPersisted(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := storage.GetProfile("cursor", "work")
+	store, err := storage.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
+	loaded := store.Profiles["cursor/work"]
 	if loaded == nil || !loaded.TokenExpiresAt.Equal(expiry) {
 		t.Fatalf("stored expiry did not survive: %+v", loaded)
 	}
@@ -203,10 +204,11 @@ func TestStorage_SetTokenExpiry(t *testing.T) {
 		t.Fatalf("SetTokenExpiry failed: %v", err)
 	}
 
-	profile, err := storage.GetProfile("gemini", "personal")
+	stored, err := storage.Load()
 	if err != nil {
-		t.Fatalf("GetProfile failed: %v", err)
+		t.Fatalf("Load failed: %v", err)
 	}
+	profile := stored.Profiles["gemini/personal"]
 	if !profile.TokenExpiresAt.Equal(expiry) {
 		t.Errorf("expiry time mismatch")
 	}
@@ -487,6 +489,9 @@ func TestStorage_GetStatus(t *testing.T) {
 	if err := storage.UpdateProfile("claude", "healthy", health); err != nil {
 		t.Fatalf("UpdateProfile failed: %v", err)
 	}
+	writeHealthVaultJSON(t, filepath.Join(tmpDir, "vault"), "claude", "healthy", ".credentials.json", map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "expiresAt": health.TokenExpiresAt.UnixMilli()},
+	})
 
 	status, err = storage.GetStatus("claude", "healthy")
 	if err != nil {
@@ -503,6 +508,9 @@ func TestStorage_GetStatus(t *testing.T) {
 	if err := storage.UpdateProfile("claude", "expired", health); err != nil {
 		t.Fatalf("UpdateProfile failed: %v", err)
 	}
+	writeHealthVaultJSON(t, filepath.Join(tmpDir, "vault"), "claude", "expired", ".credentials.json", map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "expiresAt": health.TokenExpiresAt.UnixMilli()},
+	})
 
 	status, err = storage.GetStatus("claude", "expired")
 	if err != nil {

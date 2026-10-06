@@ -275,7 +275,7 @@ func TestRefreshSingle_SkipsWhenUnsupported(t *testing.T) {
 	}
 }
 
-func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
+func TestRefreshSingle_GeminiUpdatesSelectedOAuthSource(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	oldVault := vault
@@ -310,6 +310,8 @@ func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
 		"client_id":     "test-client",
 		"client_secret": "test-secret",
 		"refresh_token": "test-refresh",
+		"access_token":  "old-selected-access",
+		"expiry":        time.Now().Add(2 * time.Minute).UTC().Format(time.RFC3339),
 		"type":          "authorized_user",
 	}
 	adcRaw, err := json.MarshalIndent(adc, "", "  ")
@@ -321,7 +323,17 @@ func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
+	var calls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse refresh request: %v", err)
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+		if r.Form.Get("refresh_token") != "test-refresh" || r.Form.Get("client_id") != "test-client" {
+			t.Error("refresh request did not use the selected OAuth grant")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"new-access","expires_in":3600,"token_type":"Bearer"}`))
 	}))
@@ -335,7 +347,14 @@ func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
 		t.Fatalf("refreshSingle() error = %v", err)
 	}
 
-	updatedRaw, err := os.ReadFile(settingsPath)
+	if calls.Load() != 1 {
+		t.Fatalf("refresh requests = %d, want 1", calls.Load())
+	}
+	unchangedSettings, err := os.ReadFile(settingsPath)
+	if err != nil || !bytes.Equal(unchangedSettings, settingsRaw) {
+		t.Fatalf("refresh changed unrelated settings: %v", err)
+	}
+	updatedRaw, err := os.ReadFile(oauthCredPath)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
@@ -346,8 +365,23 @@ func TestRefreshSingle_GeminiUpdatesSettings(t *testing.T) {
 	if got := updated["access_token"]; got != "new-access" {
 		t.Fatalf("access_token = %v, want %v", got, "new-access")
 	}
-	if got := updated["expiry"]; got == "" {
-		t.Fatalf("expiry is empty")
+	if got := updated["refresh_token"]; got != "test-refresh" {
+		t.Fatalf("refresh_token = %v, want original selected grant", got)
+	}
+	expiryText, ok := updated["expiry"].(string)
+	if !ok {
+		t.Fatal("selected OAuth source has no expiry string")
+	}
+	expiry, err := time.Parse(time.RFC3339, expiryText)
+	if err != nil || time.Until(expiry) < 59*time.Minute || time.Until(expiry) > time.Hour {
+		t.Fatalf("refreshed expiry = %q, want about one hour: %v", expiryText, err)
+	}
+	h, err := healthStore.GetProfile("gemini", "main")
+	if err != nil || h == nil || !h.TokenRenewable || !h.TokenExpiresAt.Equal(expiry) {
+		t.Fatalf("health did not resolve the refreshed grant: %+v, %v", h, err)
+	}
+	if got, want := refreshedTTL("gemini", "main"), health.FormatTimeRemaining(expiry); got != want {
+		t.Fatalf("refreshed TTL = %q, want %q", got, want)
 	}
 }
 

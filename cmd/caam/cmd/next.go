@@ -335,6 +335,7 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	selector.SetIgnoreCooldown(ignoreCooldown)
 	applyRotationPolicy(selector, spmCfg, "")
 

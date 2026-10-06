@@ -816,6 +816,14 @@ copied behind your back is how two lanes end up invalidating each other.
 
 Rotation policies decide which profile `caam` *switches the host to*. To rank seats for a new session without switching anything, use [`caam limits --rank`](#picking-a-seat-for-new-work-caam-limits---rank) instead — it is a read, and it ranks on the weekly allowance rather than the soonest window.
 
+Every automatic selection checks credential eligibility before ranking, including
+random, round-robin, drain, precheck, wrapper startup, and handoff. A known
+expired session without renewal credentials, or a credential the provider has
+rejected, cannot become the fallback merely because it is the only account.
+Selection fails before changing live auth when every candidate needs a new
+login. Cooldown overrides do not bypass this check. Renewable access tokens
+remain eligible after their cached expiry; unknown expiry remains unknown.
+
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile
 - `--backup-current` — Backup current auth before switching
@@ -1093,6 +1101,20 @@ or `settings.json` no longer hide the matching active profile. A keychain-only
 login or unreadable JWT still has unknown expiry; caam does not invent a
 deadline. `ls`, `status`, `doctor`, `verify`, robot health, warnings, and the
 daemon all use these session-versus-API-key rules.
+
+The TUI, monitor, local API, and automatic selection also read the current
+credential when reporting health. Saved expiry metadata alone cannot preserve
+an old session deadline after a new login or make an API-key-backed account
+look expired after restart. The reader uses the configured vault, so a
+same-named profile in another vault cannot supply its credential state.
+
+For isolated Cursor profiles, `caam profile status` and `caam doctor --validate`
+apply the same expiry and credential checks. A present `auth.json` takes
+precedence over metadata in `cli-config.json`: malformed JSON, empty
+credentials, and a lone `refreshToken` do not count as a login. Metadata-only
+native-keychain compatibility applies when the credential file is absent;
+it supplies no expiry or proof that the provider still accepts the login.
+Passive checks make no provider request.
 
 #### Provider verification
 

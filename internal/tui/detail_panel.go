@@ -11,22 +11,25 @@ import (
 
 // DetailInfo represents the detailed information for a profile.
 type DetailInfo struct {
-	Name         string
-	Provider     string
-	AuthMode     string
-	LoggedIn     bool
-	Locked       bool
-	Path         string
-	CreatedAt    time.Time
-	LastUsedAt   time.Time
-	Account      string
-	Description  string // Free-form notes about this profile's purpose
-	BrowserCmd   string
-	BrowserProf  string
-	HealthStatus health.HealthStatus
-	TokenExpiry  time.Time
-	ErrorCount   int
-	Penalty      float64
+	Name               string
+	Provider           string
+	AuthMode           string
+	LoggedIn           bool
+	Locked             bool
+	Path               string
+	CreatedAt          time.Time
+	LastUsedAt         time.Time
+	Account            string
+	Description        string // Free-form notes about this profile's purpose
+	BrowserCmd         string
+	BrowserProf        string
+	HealthStatus       health.HealthStatus
+	TokenExpiry        time.Time
+	TokenRenewable     bool
+	LoginRequired      bool
+	ReloginWarningLead time.Duration
+	ErrorCount         int
+	Penalty            float64
 }
 
 // DetailPanel renders the right panel showing profile details and available actions.
@@ -39,22 +42,22 @@ type DetailPanel struct {
 
 // DetailPanelStyles holds the styles for the detail panel.
 type DetailPanelStyles struct {
-	Border        lipgloss.Style
-	Title         lipgloss.Style
-	Label         lipgloss.Style
-	Value         lipgloss.Style
-	ValueNumeric  lipgloss.Style // Right-aligned numeric values
-	StatusOK      lipgloss.Style
-	StatusWarn    lipgloss.Style
-	StatusBad     lipgloss.Style
-	StatusMuted   lipgloss.Style
-	LockIcon      lipgloss.Style
-	Divider       lipgloss.Style
-	ActionHeader  lipgloss.Style
-	ActionKey     lipgloss.Style
-	ActionDesc    lipgloss.Style
-	Empty         lipgloss.Style
-	SectionHeader lipgloss.Style // Header for grouped sections
+	Border         lipgloss.Style
+	Title          lipgloss.Style
+	Label          lipgloss.Style
+	Value          lipgloss.Style
+	ValueNumeric   lipgloss.Style // Right-aligned numeric values
+	StatusOK       lipgloss.Style
+	StatusWarn     lipgloss.Style
+	StatusBad      lipgloss.Style
+	StatusMuted    lipgloss.Style
+	LockIcon       lipgloss.Style
+	Divider        lipgloss.Style
+	ActionHeader   lipgloss.Style
+	ActionKey      lipgloss.Style
+	ActionDesc     lipgloss.Style
+	Empty          lipgloss.Style
+	SectionHeader  lipgloss.Style // Header for grouped sections
 	SectionDivider lipgloss.Style // Subtle divider between sections
 }
 
@@ -204,6 +207,9 @@ func (p *DetailPanel) View() string {
 
 	// Status with icon and text
 	statusText := prof.HealthStatus.Icon() + " " + prof.HealthStatus.String()
+	if prof.LoginRequired {
+		statusText = prof.HealthStatus.Icon() + " login required"
+	}
 	var statusStyle lipgloss.Style
 	switch prof.HealthStatus {
 	case health.StatusHealthy:
@@ -221,12 +227,19 @@ func (p *DetailPanel) View() string {
 	if !prof.TokenExpiry.IsZero() {
 		ttl := time.Until(prof.TokenExpiry)
 		expiryStr := ""
-		if ttl < 0 {
+		switch {
+		case ttl <= 0 && prof.TokenRenewable:
+			expiryStr = "Auto-refresh"
+		case ttl <= 0:
 			expiryStr = p.styles.StatusBad.Render("Expired")
-		} else {
+		default:
 			expiryStr = fmt.Sprintf("Expires in %s", formatDurationFull(ttl))
 		}
 		authRows = append(authRows, p.renderRow("Token", expiryStr))
+	}
+	if prof.Provider == "cursor" && !prof.TokenRenewable &&
+		(prof.LoginRequired || (!prof.TokenExpiry.IsZero() && time.Until(prof.TokenExpiry) <= prof.ReloginWarningLead)) {
+		authRows = append(authRows, p.renderRow("Action", "Log in again to replace this session"))
 	}
 
 	// Lock status
@@ -330,6 +343,11 @@ func (p *DetailPanel) View() string {
 		{"o", "Open in browser"},
 		{"d", "Delete profile"},
 		{"/", "Search profiles"},
+	}
+	if prof.Provider == "cursor" && !prof.TokenRenewable {
+		actions[1].desc = "Login instructions"
+	} else if prof.Provider == "cursor" {
+		actions[1].desc = "Renewal information"
 	}
 
 	var actionRows []string

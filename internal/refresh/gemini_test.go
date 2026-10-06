@@ -105,8 +105,13 @@ func TestUpdateGeminiHealth(t *testing.T) {
 		t.Fatalf("UpdateGeminiHealth failed: %v", err)
 	}
 
-	// Verify
-	h, _ := store.GetProfile("gemini", "default")
+	// This helper persists metadata; no on-disk grant exists in this fixture
+	// for report-time hydration to resolve.
+	stored, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := stored.Profiles["gemini/default"]
 	if h == nil {
 		t.Fatal("health profile not created")
 	}

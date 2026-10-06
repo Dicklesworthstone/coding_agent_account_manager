@@ -16,7 +16,6 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
@@ -140,9 +139,6 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		db = nil
 	}
 
-	// Initialize health storage
-	healthStore := health.NewStorage("")
-
 	// Load global config
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
@@ -185,6 +181,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 	// Initialize Rotation Selector
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	applyRotationPolicy(selector, spmCfg, "")
 
 	// Initialize Runner
@@ -325,6 +322,9 @@ func runWrap(cmd *cobra.Command, args []string) error {
 func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
 	// Get current profile's access token
 	vaultDir := authfile.DefaultVaultPath()
+	if vault != nil {
+		vaultDir = vault.BasePath()
+	}
 
 	// Get the currently active profile
 	fileSet := tools[tool]()
@@ -342,9 +342,6 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	// exhaustion even without a percentage. Their credentials are read from
 	// the same vault the switch will restore from.
 	native := tool == "grok" || tool == "cursor"
-	if native && vault != nil {
-		vaultDir = vault.BasePath()
-	}
 
 	// Load credentials for current profile
 	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
@@ -444,7 +441,8 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	}
 
 	// Use rotation selector with usage data
-	selector := rotation.NewSelector(algorithm, nil, db)
+	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	applyRotationPolicy(selector, spmCfg, "")
 	selector.SetUsageData(usageData)
 

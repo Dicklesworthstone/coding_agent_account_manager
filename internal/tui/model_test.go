@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,12 +12,82 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
+
+func TestCursorTUIHealthUsesCurrentCredential(t *testing.T) {
+	root := t.TempDir()
+	m := NewWithProviders([]string{"cursor"})
+	m.vaultPath = filepath.Join(root, "custom-vault")
+	m.healthStorage = health.NewStorage(filepath.Join(root, "metadata", "health.json"))
+	m.profiles["cursor"] = []Profile{{Name: "work"}}
+	m.detailPanel.SetSize(100, 50)
+	authPath := filepath.Join(m.vaultPath, "cursor", "work", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		ttl        time.Duration
+		apiKey     string
+		wantStatus health.HealthStatus
+		wantText   string
+		wantLogin  bool
+	}{
+		{name: "long lead session", ttl: 5 * 24 * time.Hour, wantStatus: health.StatusWarning, wantText: "Login soon"},
+		{name: "expired session", ttl: -time.Hour, wantStatus: health.StatusCritical, wantText: "Login required", wantLogin: true},
+		{name: "API key replacement", ttl: -time.Hour, apiKey: "synthetic-key", wantStatus: health.StatusHealthy, wantText: "Auto-refresh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(tc.ttl).Unix())))
+			data := []byte(fmt.Sprintf(`{"accessToken":%q,"apiKey":%q}`, "e30."+payload+".synthetic", tc.apiKey))
+			if err := os.WriteFile(authPath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			info := m.buildProfileInfo("cursor", Profile{Name: "work"}, "")
+			if info.HealthStatus != tc.wantStatus || info.LoginRequired != tc.wantLogin || info.TokenRenewable != (tc.apiKey != "") {
+				t.Fatalf("profile info=%+v", info)
+			}
+			if got := formatTUIStatus(&info); !strings.Contains(got, tc.wantText) {
+				t.Errorf("status=%q, want %q", got, tc.wantText)
+			}
+			m.profilesPanel.SetProfiles([]ProfileInfo{info})
+			m.syncDetailPanel()
+			detail := m.detailPanel.profile
+			if detail == nil || detail.TokenRenewable != info.TokenRenewable || detail.LoginRequired != info.LoginRequired || detail.ReloginWarningLead != info.ReloginWarningLead {
+				t.Fatalf("detail lost credential semantics: %+v", detail)
+			}
+			view := ansi.Strip(m.detailPanel.View())
+			if tc.apiKey != "" {
+				if !strings.Contains(view, "Auto-refresh") || strings.Contains(view, "Expired") || strings.Contains(view, "Log in again") {
+					t.Errorf("renewable credential shown as expired: %s", view)
+				}
+			} else if !strings.Contains(view, "Log in again") || strings.Contains(view, "Login/refresh") {
+				t.Errorf("session advice missing or recommends refresh: %s", view)
+			}
+			updated, cmd := m.handleLoginProfile()
+			if cmd != nil {
+				t.Fatal("Cursor login advice scheduled an unsupported refresh")
+			}
+			message := updated.(Model).statusMsg
+			if tc.apiKey == "" && !strings.Contains(message, "cursor-agent login") {
+				t.Errorf("missing native login instructions: %q", message)
+			}
+			after, err := os.ReadFile(authPath)
+			if err != nil || !bytes.Equal(after, data) {
+				t.Fatalf("TUI health/action changed credentials: %v", err)
+			}
+		})
+	}
+	if _, err := os.Stat(m.healthStorage.Path()); !os.IsNotExist(err) {
+		t.Errorf("TUI health read created metadata: %v", err)
+	}
+}
 
 func TestNew(t *testing.T) {
 	m := New()

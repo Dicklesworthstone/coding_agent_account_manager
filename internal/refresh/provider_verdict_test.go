@@ -131,8 +131,15 @@ func TestRefreshProfile_RecordsProviderVerdict(t *testing.T) {
 			return nil, errors.New("codex refresh error 503: busy")
 		})
 		_ = RefreshProfile(context.Background(), "codex", "work", vault, store)
-		if h, _ := store.GetProfile("codex", "work"); h != nil {
-			t.Errorf("a transient failure was recorded as a verdict: %+v", h)
+		stored, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h := stored.Profiles["codex/work"]; h != nil {
+			t.Errorf("a transient failure persisted health metadata: %+v", h)
+		}
+		if h, err := store.GetProfile("codex", "work"); err != nil || h == nil || h.ProviderRejected() || !h.ProviderVerifiedAt().IsZero() {
+			t.Errorf("passive vault health should exist without a provider verdict: %+v, %v", h, err)
 		}
 	})
 

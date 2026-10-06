@@ -20,6 +20,9 @@ type Handlers struct {
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(vault *authfile.Vault, healthStore *health.Storage, db *caamdb.DB) *Handlers {
+	if vault != nil && healthStore != nil {
+		healthStore.SetVaultPath(vault.BasePath())
+	}
 	return &Handlers{
 		vault:       vault,
 		healthStore: healthStore,
@@ -52,10 +55,13 @@ type ToolStatus struct {
 
 // HealthStatus represents profile health.
 type HealthStatus struct {
+	health.Signals
 	Status            string `json:"status"`
 	ExpiresAt         string `json:"expires_at,omitempty"`
 	ErrorCount        int    `json:"error_count"`
 	CooldownRemaining string `json:"cooldown_remaining,omitempty"`
+	Renewable         bool   `json:"renewable"`
+	Recommendation    string `json:"recommendation,omitempty"`
 }
 
 // ProfilesResponse is the response for GET /profiles.
@@ -144,6 +150,7 @@ var tools = map[string]func() authfile.AuthFileSet{
 	"codex":  authfile.CodexAuthFiles,
 	"claude": authfile.ClaudeAuthFiles,
 	"gemini": authfile.GeminiAuthFiles,
+	"cursor": authfile.CursorAuthFiles,
 }
 
 // GetStatus returns overall caam status.
@@ -466,10 +473,9 @@ func (h *Handlers) getProfileHealth(tool, name string) *HealthStatus {
 		return nil
 	}
 
-	status := health.CalculateStatus(ph)
 	hs := &HealthStatus{
-		Status:     status.String(),
 		ErrorCount: ph.ErrorCount1h,
+		Renewable:  ph.CredentialRenewable(),
 	}
 
 	if !ph.TokenExpiresAt.IsZero() {
@@ -484,8 +490,15 @@ func (h *Handlers) getProfileHealth(tool, name string) *HealthStatus {
 			remaining := cooldown.CooldownUntil.Sub(now)
 			if remaining > 0 {
 				hs.CooldownRemaining = formatDuration(remaining)
+				ph.RateLimitedUntil = cooldown.CooldownUntil
 			}
 		}
+	}
+	hs.Status = health.CalculateStatus(ph).String()
+	hs.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
+	if tool == "cursor" && !ph.CredentialRenewable() &&
+		(ph.ProviderRejected() || (!ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead)) {
+		hs.Recommendation = health.CursorReloginInstructions(name)
 	}
 
 	return hs

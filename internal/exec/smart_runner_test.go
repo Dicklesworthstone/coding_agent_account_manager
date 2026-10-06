@@ -261,6 +261,42 @@ func TestSmartRunner_WithRotation(t *testing.T) {
 	}
 }
 
+func TestSmartRunnerRejectsExpiredHandoffBeforeChangingAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(-time.Hour).Unix())))
+	expired := []byte(fmt.Sprintf(`{"tokens":{"access_token":%q}}`, "e30."+payload+".synthetic"))
+	writeSmartSwitchFile(t, vault.BackupPath("codex", "expired", "auth.json"), expired)
+	livePath := filepath.Join(root, "codex", "auth.json")
+	live := smartSwitchCredentials("live", time.Now().Add(time.Hour))
+	writeSmartSwitchFile(t, livePath, live)
+	sr := NewSmartRunner(&Runner{}, SmartRunnerOptions{
+		Vault:    vault,
+		Rotation: rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil),
+		Notifier: &mockNotifier{},
+	})
+	sr.currentProfile = "live"
+	called := false
+	sr.loginHandler = &smartSwitchLoginHandler{
+		LoginHandler: handoff.GetHandler("codex"),
+		trigger: func() error {
+			called = true
+			return nil
+		},
+	}
+	sr.handleRateLimit(context.Background())
+	if called || sr.getState() != HandoffFailed || sr.currentProfile != "live" {
+		t.Fatalf("expired credential advanced handoff: called=%v state=%s current=%s", called, sr.getState(), sr.currentProfile)
+	}
+	assertSmartSwitchFile(t, livePath, live)
+	profiles, err := vault.List("codex")
+	if err != nil || len(profiles) != 1 || profiles[0] != "expired" {
+		t.Fatalf("failed selection changed vault: profiles=%v err=%v", profiles, err)
+	}
+}
+
 func TestSmartRunnerHandoffPreservesActualCredentialOwner(t *testing.T) {
 	for _, tc := range []struct {
 		name            string

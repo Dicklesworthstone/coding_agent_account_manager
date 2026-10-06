@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
@@ -1368,6 +1369,7 @@ func checkTokenValidation() []CheckResult {
 	reg := provider.NewRegistry()
 	reg.Register(claude.New())
 	reg.Register(codex.New())
+	reg.Register(cursor.New())
 	reg.Register(gemini.New())
 
 	// Get all profiles and validate tokens
@@ -1413,6 +1415,14 @@ func checkTokenValidation() []CheckResult {
 			}
 
 			if result.Valid {
+				if providerID == "cursor" && !result.ExpiresAt.IsZero() && time.Until(result.ExpiresAt) <= health.CursorReloginLead {
+					results = append(results, CheckResult{
+						Name: name, Status: "warn",
+						Message: fmt.Sprintf("session expires %s; cannot auto-refresh", formatExpiryDuration(result.ExpiresAt)),
+						Details: fmt.Sprintf("Log in again with 'caam login cursor %s' before this isolated session expires.", prof.Name),
+					})
+					continue
+				}
 				msg := "valid"
 				if !result.ExpiresAt.IsZero() {
 					msg = fmt.Sprintf("valid (expires %s)", formatExpiryDuration(result.ExpiresAt))

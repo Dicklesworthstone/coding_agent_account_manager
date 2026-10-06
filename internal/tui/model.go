@@ -1495,6 +1495,14 @@ func (m Model) handleLoginProfile() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	provider := m.currentProvider()
+	if provider == "cursor" {
+		if info.TokenRenewable {
+			m.statusMsg = "Cursor renews access tokens from the saved API key automatically."
+		} else {
+			m.statusMsg = health.CursorReloginInstructions(info.Name)
+		}
+		return m, nil
+	}
 
 	m.statusMsg = fmt.Sprintf("Checking refresh eligibility for %s...", info.Name)
 
@@ -2143,31 +2151,41 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 	errorCount := 0
 	penalty := float64(0)
 	var tokenExpiry time.Time
+	var tokenRenewable, loginRequired bool
+	var reloginWarningLead time.Duration
 
 	if m.healthStorage != nil {
+		m.healthStorage.SetVaultPath(m.vaultPath)
 		if h, err := m.healthStorage.GetProfile(provider, p.Name); err == nil && h != nil {
 			healthStatus = health.CalculateStatus(h)
 			errorCount = h.ErrorCount1h
 			penalty = h.Penalty
 			tokenExpiry = h.TokenExpiresAt
+			tokenRenewable = h.CredentialRenewable()
+			reloginWarningLead = h.ReloginWarningLead
+			signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+			loginRequired = signals.LoginRequired != nil && *signals.LoginRequired
 		}
 	}
 
 	return ProfileInfo{
-		Name:           p.Name,
-		Badge:          m.badgeFor(provider, p.Name),
-		ProjectDefault: projectDefault != "" && p.Name == projectDefault,
-		AuthMode:       authMode,
-		LoggedIn:       true,
-		Locked:         locked,
-		LastUsed:       lastUsed,
-		Account:        account,
-		Description:    description,
-		IsActive:       p.IsActive,
-		HealthStatus:   healthStatus,
-		TokenExpiry:    tokenExpiry,
-		ErrorCount:     errorCount,
-		Penalty:        penalty,
+		Name:               p.Name,
+		Badge:              m.badgeFor(provider, p.Name),
+		ProjectDefault:     projectDefault != "" && p.Name == projectDefault,
+		AuthMode:           authMode,
+		LoggedIn:           !loginRequired,
+		Locked:             locked,
+		LastUsed:           lastUsed,
+		Account:            account,
+		Description:        description,
+		IsActive:           p.IsActive,
+		HealthStatus:       healthStatus,
+		TokenExpiry:        tokenExpiry,
+		TokenRenewable:     tokenRenewable,
+		LoginRequired:      loginRequired,
+		ReloginWarningLead: reloginWarningLead,
+		ErrorCount:         errorCount,
+		Penalty:            penalty,
 	}
 }
 
@@ -2254,14 +2272,21 @@ func (m Model) syncDetailPanel() {
 	errorCount := 0
 	penalty := float64(0)
 	var tokenExpiry time.Time
+	var tokenRenewable, loginRequired bool
+	var reloginWarningLead time.Duration
 
 	// Fetch real health data if available
 	if m.healthStorage != nil {
+		m.healthStorage.SetVaultPath(m.vaultPath)
 		if h, err := m.healthStorage.GetProfile(provider, profileName); err == nil && h != nil {
 			healthStatus = health.CalculateStatus(h)
 			errorCount = h.ErrorCount1h
 			penalty = h.Penalty
 			tokenExpiry = h.TokenExpiresAt
+			tokenRenewable = h.CredentialRenewable()
+			reloginWarningLead = h.ReloginWarningLead
+			signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+			loginRequired = signals.LoginRequired != nil && *signals.LoginRequired
 		}
 	}
 
@@ -2308,22 +2333,25 @@ func (m Model) syncDetailPanel() {
 	}
 
 	detail := &DetailInfo{
-		Name:         profileName,
-		Provider:     provider,
-		AuthMode:     authMode,
-		LoggedIn:     true,
-		Locked:       locked,
-		Path:         path,
-		CreatedAt:    createdAt,
-		LastUsedAt:   lastUsedAt,
-		Account:      account,
-		Description:  description,
-		BrowserCmd:   browserCmd,
-		BrowserProf:  browserProf,
-		HealthStatus: healthStatus,
-		TokenExpiry:  tokenExpiry,
-		ErrorCount:   errorCount,
-		Penalty:      penalty,
+		Name:               profileName,
+		Provider:           provider,
+		AuthMode:           authMode,
+		LoggedIn:           !loginRequired,
+		Locked:             locked,
+		Path:               path,
+		CreatedAt:          createdAt,
+		LastUsedAt:         lastUsedAt,
+		Account:            account,
+		Description:        description,
+		BrowserCmd:         browserCmd,
+		BrowserProf:        browserProf,
+		HealthStatus:       healthStatus,
+		TokenExpiry:        tokenExpiry,
+		TokenRenewable:     tokenRenewable,
+		LoginRequired:      loginRequired,
+		ReloginWarningLead: reloginWarningLead,
+		ErrorCount:         errorCount,
+		Penalty:            penalty,
 	}
 	m.detailPanel.SetProfile(detail)
 }

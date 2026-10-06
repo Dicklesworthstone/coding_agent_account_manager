@@ -230,6 +230,7 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 
 	// Create selector
 	selector := rotation.NewSelector(w.config.Algorithm, w.healthStore, w.db)
+	selector.SetVaultPath(w.vault.BasePath())
 
 	// Select initial profile
 	currentProfile := ""

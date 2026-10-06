@@ -74,7 +74,7 @@ func Preflight(provider, profile string, vault *authfile.Vault) error {
 			}
 		}
 	case "gemini":
-		_, err := readGeminiADC(vaultPath)
+		_, _, err := readGeminiADC(vaultPath)
 		return err
 	case "cursor":
 		info, err := health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
@@ -90,6 +90,9 @@ func Preflight(provider, profile string, vault *authfile.Vault) error {
 func RefreshProfile(ctx context.Context, provider, profile string, vault *authfile.Vault, store *health.Storage) error {
 	if err := Preflight(provider, profile, vault); err != nil {
 		return err
+	}
+	if store != nil {
+		store.SetVaultPath(vault.BasePath())
 	}
 
 	// Check if this profile is currently active before we modify the vault
@@ -228,12 +231,7 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 	// Migrate legacy vault filename before reading.
 	_ = authfile.MigrateGeminiVaultDir(vaultPath)
 
-	info, err := health.ParseGeminiExpiry(vaultPath)
-	if err != nil {
-		return fmt.Errorf("parse gemini auth: %w", err)
-	}
-
-	adc, err := readGeminiADC(vaultPath)
+	adc, target, err := readGeminiADC(vaultPath)
 	if err != nil {
 		return err
 	}
@@ -243,18 +241,10 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 		return fmt.Errorf("refresh api: %w", err)
 	}
 
-	target := filepath.Join(vaultPath, "settings.json")
-	if _, err := os.Stat(target); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("stat gemini settings: %w", err)
-		}
-		target = info.Source
-	}
-
-	if target != "" {
-		if err := UpdateGeminiAuth(target, resp); err != nil {
-			return fmt.Errorf("update auth: %w", err)
-		}
+	// Update the grant we actually renewed. settings.json may be policy-only
+	// or hold an unrelated older login; neither should receive this token.
+	if err := UpdateGeminiAuth(target, resp); err != nil {
+		return fmt.Errorf("update auth: %w", err)
 	}
 
 	if store != nil {
@@ -269,22 +259,32 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 // readGeminiADC uses the same credential precedence before and after migration.
 // Reading the legacy filename when the current one is absent keeps Preflight
 // side-effect-free without rejecting a profile that refreshGemini can migrate.
-func readGeminiADC(vaultPath string) (*ADC, error) {
-	oauthPath := filepath.Join(vaultPath, "oauth_creds.json")
-	if _, err := os.Stat(oauthPath); errors.Is(err, os.ErrNotExist) {
-		oauthPath = filepath.Join(vaultPath, "oauth_credentials.json")
-	}
-	for _, candidate := range []string{oauthPath, filepath.Join(vaultPath, "settings.json")} {
-		adc, err := ReadADC(candidate)
-		if err == nil {
-			return adc, nil
-		}
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrADCIncomplete) {
+func readGeminiADC(vaultPath string) (*ADC, string, error) {
+	for _, name := range []string{"oauth_creds.json", "oauth_credentials.json", "settings.json"} {
+		candidate := filepath.Join(vaultPath, name)
+		fi, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		return nil, fmt.Errorf("read oauth credentials: %w", err)
+		if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			fi, err = os.Stat(candidate)
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("stat oauth credentials: %w", err)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, "", fmt.Errorf("oauth credential source is not a regular file")
+		}
+		adc, err := ReadADC(candidate)
+		if err == nil {
+			return adc, candidate, nil
+		}
+		if errors.Is(err, ErrADCIncomplete) {
+			break
+		}
+		return nil, "", fmt.Errorf("read oauth credentials: %w", err)
 	}
-	return nil, &UnsupportedError{Provider: "gemini", Reason: "missing oauth client credentials (expected oauth_creds.json with client_id/client_secret/refresh_token)"}
+	return nil, "", &UnsupportedError{Provider: "gemini", Reason: "missing oauth client credentials (expected oauth_creds.json with client_id/client_secret/refresh_token)"}
 }
 
 // getRefreshTokenFromJSON reads a JSON file and extracts the refresh_token field.

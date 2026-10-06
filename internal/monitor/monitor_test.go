@@ -2,14 +2,51 @@ package monitor
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
+
+func TestMonitorCursorHealthTracksCredentialReplacement(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+	store := health.NewStorage(filepath.Join(root, "other-metadata", "health.json"))
+	mon := NewMonitor(WithVault(vault), WithHealthStore(store), WithProviders([]string{"cursor"}), WithFetcher(&fakeFetcher{}))
+	for _, tc := range []struct {
+		name   string
+		ttl    time.Duration
+		apiKey string
+		want   health.HealthStatus
+	}{
+		{name: "session warning", ttl: 5 * 24 * time.Hour, want: health.StatusWarning},
+		{name: "session expired", ttl: -time.Hour, want: health.StatusCritical},
+		{name: "replaced with API key", ttl: -time.Hour, apiKey: "synthetic-key", want: health.StatusHealthy},
+		{name: "new session", ttl: 30 * 24 * time.Hour, want: health.StatusHealthy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(tc.ttl).Unix())))
+			body := fmt.Sprintf(`{"accessToken":%q,"apiKey":%q}`, "e30."+payload+".synthetic", tc.apiKey)
+			writeProfileFile(t, vault, "cursor", "work", "auth.json", body)
+			if err := mon.Refresh(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			state := mon.GetProfile("cursor", "work")
+			if state == nil || state.Health != tc.want {
+				t.Fatalf("monitor health=%+v, want %s", state, tc.want)
+			}
+		})
+	}
+	if _, err := os.Stat(store.Path()); !os.IsNotExist(err) {
+		t.Errorf("monitor health read created metadata: %v", err)
+	}
+}
 
 type fakeFetcher struct {
 	usages map[string]*usage.UsageInfo

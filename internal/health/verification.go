@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -194,31 +192,6 @@ func AccessTokenRejectionIsEvidence(expiresAt, now time.Time) bool {
 	return !expiresAt.IsZero() && expiresAt.After(now.Add(accessTokenRejectionSkew))
 }
 
-// bindCredentialFingerprint fills in CredentialFingerprint for a stored
-// Codex profile that carries a provider verdict, from the vault copy of its
-// credential (the vault sits beside health.json in caam's data directory).
-// Without it every reader that works from stored health alone (rotation,
-// the TUI, monitor, API, precheck) would keep treating a rejection as
-// current after the operator logged in again, because an unknown current
-// credential keeps a rejection applying. Callers that know better (ls and
-// status prefer the live credential) overwrite it. Best-effort.
-func (s *Storage) bindCredentialFingerprint(provider, name string, h *ProfileHealth) {
-	if s == nil || h == nil || provider != "codex" || h.CredentialFingerprint != "" {
-		return
-	}
-	if h.RejectedFingerprint == "" && h.VerifiedFingerprint == "" {
-		return
-	}
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
-		return
-	}
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(s.path), "vault", provider, name, "auth.json"))
-	if err != nil {
-		return
-	}
-	h.CredentialFingerprint = CodexCredentialFingerprint(data)
-}
-
 // sanitizeRejectionReason keeps a rejection reason to a short code made of
 // safe characters, so provider text can never carry a credential into
 // health.json or command output.
@@ -258,8 +231,14 @@ func CodexCredentialFingerprint(data []byte) string {
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return ""
 	}
-	for _, secret := range []string{auth.Tokens.RefreshToken, auth.RefreshToken, auth.Tokens.AccessToken, auth.AccessToken} {
-		if secret != "" {
+	return credentialFingerprint(auth.Tokens.RefreshToken, auth.RefreshToken, auth.Tokens.AccessToken, auth.AccessToken)
+}
+
+// credentialFingerprint prefers a renewal credential over the access token
+// it rotates. Configuration churn cannot clear a provider rejection.
+func credentialFingerprint(secrets ...string) string {
+	for _, secret := range secrets {
+		if strings.TrimSpace(secret) != "" {
 			sum := sha256.Sum256([]byte("caam-credential-fingerprint:" + secret))
 			return hex.EncodeToString(sum[:8])
 		}

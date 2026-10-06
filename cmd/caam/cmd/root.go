@@ -2018,6 +2018,17 @@ var profileStatusCmd = &cobra.Command{
 		fmt.Printf("  Auth mode: %s\n", prof.AuthMode)
 		fmt.Printf("  Logged in: %v\n", status.LoggedIn)
 		fmt.Printf("  Locked: %v\n", status.HasLockFile)
+		if status.ExpiresAt != "" {
+			fmt.Printf("  Expires: %s\n", status.ExpiresAt)
+			if tool == "cursor" && status.LoggedIn {
+				if expiry, err := time.Parse(time.RFC3339, status.ExpiresAt); err == nil && time.Until(expiry) <= health.CursorReloginLead {
+					fmt.Printf("  Action: Log in again with 'caam login cursor %s' before this session expires.\n", name)
+				}
+			}
+		}
+		if status.Error != "" {
+			fmt.Printf("  Auth: %s\n", status.Error)
+		}
 		if prof.AccountLabel != "" {
 			fmt.Printf("  Account: %s\n", prof.AccountLabel)
 		}

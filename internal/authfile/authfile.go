@@ -514,9 +514,9 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	if err := pullClaudeKeychain(fileSet); err != nil {
 		return err
 	}
-	if fileSet.Tool == "claude" {
+	if fileSet.Tool == "claude" || fileSet.Tool == "cursor" {
 		if err := validateCredentialFiles(fileSet, ""); err != nil {
-			return fmt.Errorf("cannot back up claude/%s: %w", profile, err)
+			return fmt.Errorf("cannot back up %s/%s: %w", fileSet.Tool, profile, err)
 		}
 	}
 
@@ -930,6 +930,9 @@ func (v *Vault) ValidateProfileCredentials(fileSet AuthFileSet, profile string) 
 // explicitly handled any keychain mirror). Other providers keep their existing
 // file formats; Claude's mixed settings/identity files require content checks.
 func validateCredentialFiles(fileSet AuthFileSet, profileDir string) error {
+	if fileSet.Tool == "cursor" {
+		return validateCursorCredentialFiles(fileSet, profileDir)
+	}
 	required, optional := false, false
 	var missingRequired string
 	for _, spec := range fileSet.Files {
@@ -991,6 +994,120 @@ func validateCredentialFiles(fileSet AuthFileSet, profileDir string) error {
 		return fmt.Errorf("%w: no complete %s auth source", ErrNoCredentials, fileSet.Tool)
 	}
 	return nil
+}
+
+// CursorCredentialMaterial checks the file-backed Cursor credential shape.
+// Its refreshToken is a session alias, not an independent login source. Opaque
+// access tokens are accepted without claiming a known expiry or provider proof.
+func CursorCredentialMaterial(data []byte) (bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil || root == nil {
+		return false, fmt.Errorf("expected a JSON object")
+	}
+	// Optional credential slots may be null in native JSON. They carry no
+	// credential but must not invalidate the other nonempty slot.
+	for _, key := range []string{"accessToken", "apiKey"} {
+		if strings.TrimSpace(string(root[key])) == "null" {
+			delete(root, key)
+		}
+	}
+	return nonemptyCredentialString(root, "accessToken", "apiKey")
+}
+
+// CursorConfigAuthInfo recognizes Cursor's metadata-only native-keychain
+// layout. It is a fallback only when the credential file is genuinely absent;
+// settings, model selections, and empty authInfo objects are not login evidence.
+func CursorConfigAuthInfo(data []byte) (bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil || root == nil {
+		return false, fmt.Errorf("expected a JSON object")
+	}
+	raw, exists := root["authInfo"]
+	if !exists {
+		return false, nil
+	}
+	var info map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return false, fmt.Errorf("authInfo must be an object")
+	}
+	return len(info) > 0, nil
+}
+
+// ValidateCursorAuthFile validates a canonical credential without consulting
+// metadata or another account. Only a genuinely absent path returns a filesystem
+// not-exist error; a dangling symlink, unreadable file, or nonregular source is
+// invalid and must not trigger fallback. Regular adoption symlinks are supported.
+func ValidateCursorAuthFile(path string) error {
+	data, err := readCursorAuthSource(path)
+	if err != nil {
+		return err
+	}
+	hasAuth, err := CursorCredentialMaterial(data)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrInvalidCredentials, path, err)
+	}
+	if !hasAuth {
+		return fmt.Errorf("%w: %s contains no accessToken or apiKey", ErrNoCredentials, path)
+	}
+	return nil
+}
+
+func readCursorAuthSource(path string) ([]byte, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: inspect %s: %v", ErrInvalidCredentials, path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: inspect %s: %v", ErrInvalidCredentials, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file", ErrInvalidCredentials, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read %s: %v", ErrInvalidCredentials, path, err)
+	}
+	return data, nil
+}
+
+func validateCursorCredentialFiles(fileSet AuthFileSet, profileDir string) error {
+	pathFor := func(spec AuthFileSpec) string {
+		if profileDir != "" {
+			return filepath.Join(profileDir, filepath.Base(spec.Path))
+		}
+		return spec.Path
+	}
+	// auth.json is authoritative even when stale cli-config metadata exists.
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) == "auth.json" {
+			if err := ValidateCursorAuthFile(pathFor(spec)); !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) != "cli-config.json" {
+			continue
+		}
+		data, err := readCursorAuthSource(pathFor(spec))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		hasAuth, err := CursorConfigAuthInfo(data)
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrInvalidCredentials, pathFor(spec), err)
+		}
+		if hasAuth {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: no complete Cursor auth source", ErrNoCredentials)
 }
 
 // claudeCredentialMaterial distinguishes an installed authentication source
@@ -1383,7 +1500,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	// mirror the hash comparison below has nothing to compare (issue #98).
 	// A refused keychain leaves detection where it was before the bridge.
 	_ = pullClaudeKeychain(fileSet)
-	if fileSet.Tool == "claude" && validateCredentialFiles(fileSet, "") != nil {
+	if (fileSet.Tool == "claude" || fileSet.Tool == "cursor") && validateCredentialFiles(fileSet, "") != nil {
 		return "", nil
 	}
 
@@ -1466,7 +1583,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	var systemMatch string
 	for _, profile := range profiles {
 		profileDir := v.ProfilePath(fileSet.Tool, profile)
-		if fileSet.Tool == "claude" && v.ValidateProfileCredentials(fileSet, profile) != nil {
+		if (fileSet.Tool == "claude" || fileSet.Tool == "cursor") && v.ValidateProfileCredentials(fileSet, profile) != nil {
 			continue
 		}
 		if cursorAuthMissing {
@@ -1525,7 +1642,7 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 	// reporting "not logged in" for it would send callers down the login path
 	// (issue #98).
 	_ = pullClaudeKeychain(fileSet)
-	if fileSet.Tool == "claude" {
+	if fileSet.Tool == "claude" || fileSet.Tool == "cursor" {
 		return validateCredentialFiles(fileSet, "") == nil
 	}
 

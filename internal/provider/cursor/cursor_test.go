@@ -2,9 +2,15 @@ package cursor
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
@@ -171,5 +177,161 @@ func TestEnvPinsAPPDATAOnWindows(t *testing.T) {
 	}
 	if got := profilePaths(prof).AuthFile; got != filepath.Join(want, "Cursor", "auth.json") {
 		t.Fatalf("profile credential path = %q, want it under the pinned APPDATA", got)
+	}
+}
+
+func cursorSession(expiry time.Time, apiKey bool) string {
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, expiry.Unix()))) + ".SYNTHETIC"
+	key := ""
+	if apiKey {
+		key = "SYNTHETIC-API-KEY"
+	}
+	return fmt.Sprintf(`{"accessToken":%q,"refreshToken":%q,"apiKey":%q}`, jwt, jwt, key)
+}
+
+func TestCursorStatusAndValidationUseAuthoritativeCredential(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	for _, platform := range []string{"linux", "darwin", "windows"} {
+		t.Run(platform, func(t *testing.T) {
+			withGOOS(t, platform)
+			for _, tc := range []struct {
+				name, auth string
+				valid      bool
+				expires    bool
+			}{
+				{"future_session", cursorSession(now.Add(3*24*time.Hour), false), true, true},
+				{"expired_session", cursorSession(now.Add(-time.Hour), false), false, true},
+				{"expiry_boundary", cursorSession(now, false), false, true},
+				{"renewable_lapsed_token", cursorSession(now.Add(-time.Hour), true), true, false},
+				{"api_key_only", `{"apiKey":"SYNTHETIC-KEY"}`, true, false},
+				{"opaque_access", `{"accessToken":"SYNTHETIC-OPAQUE"}`, true, false},
+				{"null_optional_key", `{"accessToken":"SYNTHETIC-OPAQUE","apiKey":null}`, true, false},
+				{"null_optional_access", `{"accessToken":null,"apiKey":"SYNTHETIC-KEY"}`, true, false},
+				{"empty_object", `{}`, false, false},
+				{"empty_access", `{"accessToken":"  "}`, false, false},
+				{"refresh_alias_only", `{"refreshToken":"SYNTHETIC-SESSION"}`, false, false},
+				{"null", `null`, false, false},
+				{"malformed", `{"accessToken":`, false, false},
+				{"invalid_access_type", `{"accessToken":42}`, false, false},
+				{"invalid_key_type", `{"accessToken":"SYNTHETIC","apiKey":{}}`, false, false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					prof := newProfile(t)
+					paths := profilePaths(prof)
+					writeFile(t, filepath.Join(paths.ConfigDir, "cli-config.json"), `{"authInfo":{"email":"stale@example.invalid"}}`)
+					if legacyAuthPath(prof) != paths.AuthFile {
+						writeFile(t, legacyAuthPath(prof), cursorSession(now.Add(30*24*time.Hour), true))
+					}
+					writeFile(t, paths.AuthFile, tc.auth)
+					p := New()
+					result, err := p.ValidateToken(context.Background(), prof, true)
+					if err != nil || result.Valid != tc.valid || result.ExpiresAt.IsZero() == tc.expires {
+						t.Fatalf("validation = %+v, %v; want valid=%v known expiry=%v", result, err, tc.valid, tc.expires)
+					}
+					status, err := p.Status(context.Background(), prof)
+					if err != nil || status.LoggedIn != tc.valid || (status.ExpiresAt != "") != tc.expires {
+						t.Fatalf("status = %+v, %v", status, err)
+					}
+					if !tc.valid && result.Error == "" {
+						t.Fatal("invalid credential has no diagnostic")
+					}
+					if tc.expires && !tc.valid && (!strings.Contains(result.Error, "log in again") || strings.Contains(result.Error, "caam refresh")) {
+						t.Fatalf("expired session advice = %q", result.Error)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCursorMetadataFallbackRequiresAbsentCredential(t *testing.T) {
+	withGOOS(t, "linux")
+	for _, tc := range []struct {
+		name, config string
+		nonregular   bool
+		valid        bool
+	}{
+		{"keychain_metadata", `{"authInfo":{"email":"native@example.invalid"}}`, false, true},
+		{"workflow_only", `{"model":"synthetic","permissions":{"allow":[]}}`, false, false},
+		{"empty_metadata", `{"authInfo":{}}`, false, false},
+		{"nonregular_canonical", `{"authInfo":{"email":"native@example.invalid"}}`, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			prof := newProfile(t)
+			paths := profilePaths(prof)
+			writeFile(t, filepath.Join(paths.ConfigDir, "cli-config.json"), tc.config)
+			if tc.nonregular {
+				if err := os.MkdirAll(paths.AuthFile, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := New().ValidateToken(context.Background(), prof, true)
+			if err != nil || result.Valid != tc.valid {
+				t.Fatalf("validation = %+v, %v; want %v", result, err, tc.valid)
+			}
+		})
+	}
+}
+
+func TestCursorDetectionPrefersCanonicalCredentials(t *testing.T) {
+	withGOOS(t, "linux")
+	for _, auth := range []string{`{"accessToken":"SYNTHETIC"}`, `{}`, `{"accessToken":`} {
+		t.Run(auth, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+			t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(home, "config"))
+			paths := userPaths()
+			writeFile(t, filepath.Join(paths.ConfigDir, "cli-config.json"), `{"authInfo":{"email":"stale@example.invalid"}}`)
+			writeFile(t, paths.AuthFile, auth)
+			detection, err := New().DetectExistingAuth()
+			valid := strings.Contains(auth, "SYNTHETIC")
+			if err != nil || detection.Found != valid || (valid && (detection.Primary == nil || detection.Primary.Path != paths.AuthFile)) || (!valid && detection.Primary != nil) {
+				t.Fatalf("detection = %+v, %v", detection, err)
+			}
+		})
+	}
+}
+
+func TestCursorLogoutClearsMetadataAndPreservesWorkflow(t *testing.T) {
+	withGOOS(t, "linux")
+	prof := newProfile(t)
+	paths := profilePaths(prof)
+	configPath := filepath.Join(paths.ConfigDir, "cli-config.json")
+	writeFile(t, configPath, `{"authInfo":{"email":"native@example.invalid"},"model":"synthetic-model","permissions":{"allow":["Read"]}}`)
+	writeFile(t, paths.AuthFile, `{"accessToken":"SYNTHETIC-ACCESS"}`)
+	settingsPath := filepath.Join(prof.HomePath(), ".cursor", "settings.json")
+	const settings = `{"theme":"unchanged"}`
+	writeFile(t, settingsPath, settings)
+	p := New()
+	if err := p.Logout(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	status, err := p.Status(context.Background(), prof)
+	if err != nil || status.LoggedIn {
+		t.Fatalf("logged out profile = %+v, %v", status, err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := config["authInfo"]; exists || config["model"] != "synthetic-model" {
+		t.Fatalf("logout retained metadata or lost model setting: %s", data)
+	}
+	allow := config["permissions"].(map[string]any)["allow"].([]any)
+	if len(allow) != 1 || allow[0] != "Read" {
+		t.Fatalf("logout changed permissions: %s", data)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
+		t.Fatalf("logout config is not private: %v, %v", info, err)
+	}
+	data, err = os.ReadFile(settingsPath)
+	if err != nil || string(data) != settings {
+		t.Fatalf("logout changed unrelated settings: %q, %v", data, err)
 	}
 }

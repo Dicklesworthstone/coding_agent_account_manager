@@ -32,6 +32,31 @@ func writeClaudeVaultProfile(t *testing.T, name string, expiresIn time.Duration,
 	}
 }
 
+func TestValidateCursorRejectsAuthlessCanonicalFiles(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"accessToken":" "}`, `{"refreshToken":"SYNTHETIC-ALIAS"}`} {
+		t.Run(body, func(t *testing.T) {
+			setupCursorHealthVault(t)
+			writeNativeTestCredential(t, vault.BackupPath("cursor", "work", "auth.json"), body)
+			writeNativeTestCredential(t, vault.BackupPath("cursor", "work", "cli-config.json"), `{"authInfo":{"email":"stale@example.invalid"}}`)
+			results, err := runValidateJSON(t, "cursor")
+			if err == nil || len(results) != 1 || results[0].Valid || results[0].LaunchUsable == nil || *results[0].LaunchUsable {
+				t.Fatalf("validate accepted authless Cursor snapshot: %+v, %v", results, err)
+			}
+			output, err := runRobotCredentialCommand(t, robotValidateCmd, "cursor", "work")
+			if err == nil || output.Success {
+				t.Fatalf("robot validate accepted authless Cursor snapshot: %+v, %v", output, err)
+			}
+			var data RobotValidateData
+			if err := json.Unmarshal(output.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if len(data.Profiles) != 1 || data.Profiles[0].Valid || data.Summary.Invalid != 1 {
+				t.Fatalf("robot validity = %+v", data)
+			}
+		})
+	}
+}
+
 // runValidateJSON invokes validate for the given tool and returns the parsed
 // results plus the error returned to the caller.
 func runValidateJSON(t *testing.T, tool string) ([]ValidationOutput, error) {
