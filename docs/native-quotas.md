@@ -42,10 +42,23 @@ have deadlines and bounded response bodies, including with injected clients.
 
 ## Measured quota versus metadata
 
-`quota_status` is `ok`, `degraded`, or `unavailable`. Missing or malformed
-numbers do not become measured zeroes. Native rows require a valid measured
-primary window and valid reported additional windows before they can be used
-for routing. A genuine measured 0% remains usable.
+`quota_status` is `ok`, `degraded`, or `unavailable`. Native rows require a
+valid measured primary window and valid reported additional windows before
+they can be used for routing. A genuine measured 0% remains usable.
+
+Grok's proto3 billing response can omit zero-valued usage scalars after a
+period resets. CAAM infers a measured 0% only when `creditUsagePercent`,
+`credit_usage_percent`, `used`, `monthlyLimit`, and `monthly_limit` are all
+absent and a complete, valid billing period contains the fetch time. The
+start is inclusive and the end is exclusive. Every supplied period bound
+must parse and agree, including alternate field names; fallback dates cannot
+repair an incomplete or malformed current period. The measured window retains
+the period's reset time and duration for usage-aware selection.
+
+Present usage fields, including nulls and incomplete used/limit pairs, cannot
+trigger this zero inference. Missing, malformed, conflicting, future,
+inverted, or expired period bounds also leave omitted usage unmeasured.
+Existing valid explicit percentages and used/limit ratios remain measured.
 
 Cursor grant amounts, model restrictions, and expiry times are retained as
 metadata, not summed into an account-wide utilization percentage. A reported
@@ -85,19 +98,17 @@ Regression coverage includes numeric parsing, transport isolation, private
 Grok staging, cancellation, credential source selection, batch failure
 propagation, monitor output, ranking, and usage-aware eligibility.
 
-The implementation was exercised in an offline Go 1.23.2 focused harness:
-23 tests passed with `-race`, and `go vet` passed. The harness uses unchanged
-native production source files and selected complete declarations. Non-native
-provider and log dependencies are substitutes that panic if executed. It is
-not a full repository build: the repository requires Go 1.26.8, and the local
-runner has neither that toolchain nor dependency network access. Full command
-and monitor integration tests were added to the repository but were not run
-in that harness. No live provider account was queried.
+Grok reset-zero regressions exercise the ACP reader, batch fetching, ranking,
+the `next --usage-aware` rotation adapter, and an actual precheck switch from
+an exhausted profile to a freshly reset one. Synthetic CLI responses keep
+these tests independent of live provider accounts. Malformed usage and ACP
+errors remain ineligible for quota-based selection.
 
-With the pinned toolchain and dependencies available, run:
+Run these checks with the repository's pinned Go 1.26.8 toolchain:
 
 ```sh
 go test ./internal/usage ./internal/rotation ./internal/monitor ./cmd/caam/cmd
+go test -race ./internal/usage ./internal/rotation ./internal/monitor ./cmd/caam/cmd
 go test ./internal/authfile ./internal/profile ./internal/provider/cursor
 go vet ./internal/usage ./internal/rotation ./internal/monitor ./cmd/caam/cmd
 ```

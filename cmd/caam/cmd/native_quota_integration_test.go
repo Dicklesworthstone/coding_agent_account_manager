@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
@@ -21,6 +24,121 @@ func writeNativeTestCredential(t *testing.T, path, data string) {
 	}
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Exercise the native ACP reader with a fresh billing period, an exhausted
+// account, and a malformed control. All credentials and executable responses
+// are synthetic; the real Grok CLI and network are never used.
+func setupGrokResetProfiles(t *testing.T) (map[string]string, time.Time) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	t.Setenv("CAAM_HOME", t.TempDir())
+	t.Setenv("GROK_HOME", t.TempDir())
+	oldVault, oldHealthStore := vault, healthStore
+	vault = authfile.NewVault(t.TempDir())
+	healthStore = nil
+	t.Cleanup(func() { vault, healthStore = oldVault, oldHealthStore })
+	for name, key := range map[string]string{
+		"fresh": "SYNTHETIC-FRESH", "spent": "SYNTHETIC-SPENT", "malformed": "SYNTHETIC-MALFORMED",
+	} {
+		writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("grok", name), "auth.json"),
+			fmt.Sprintf(`{"key":%q,"email":%q}`, key, name+"@example.com"))
+	}
+	now := time.Now().UTC()
+	reset := now.Add(7 * 24 * time.Hour)
+	period := fmt.Sprintf(`"currentPeriod":{"type":"WEEKLY","start":%q,"end":%q}`,
+		now.Add(-time.Hour).Format(time.RFC3339Nano), reset.Format(time.RFC3339Nano))
+	t.Setenv("CAAM_TEST_GROK_FRESH", `{"subscriptionTier":"SuperGrok","config":{`+period+`}}`)
+	t.Setenv("CAAM_TEST_GROK_SPENT", `{"config":{`+period+`,"creditUsagePercent":100}}`)
+	t.Setenv("CAAM_TEST_GROK_MALFORMED", `{"config":{`+period+`,"creditUsagePercent":null}}`)
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+case "$(cat "$GROK_HOME/auth.json")" in
+  *SYNTHETIC-FRESH*) billing=$CAAM_TEST_GROK_FRESH ;;
+  *SYNTHETIC-SPENT*) billing=$CAAM_TEST_GROK_SPENT ;;
+  *SYNTHETIC-MALFORMED*) billing=$CAAM_TEST_GROK_MALFORMED ;;
+  *) exit 1 ;;
+esac
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  case "$method" in
+    _x.ai/billing)
+      printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$billing"
+      exit 0
+      ;;
+    initialize|authenticate|session/new)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic"}}\n' "$id"
+      ;;
+    *) exit 1 ;;
+  esac
+done
+`
+	if err := os.WriteFile(filepath.Join(binDir, "grok"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	credentials := nativeRotationCredentials("grok", []string{"fresh", "spent", "malformed"})
+	if len(credentials) != 3 {
+		t.Fatalf("missing synthetic native credentials: %v", credentials)
+	}
+	return credentials, reset
+}
+
+func TestGrokResetZeroReachesUsageAwareCallers(t *testing.T) {
+	credentials, reset := setupGrokResetProfiles(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fetcher := usage.NewMultiProfileFetcher()
+	results := fetcher.FetchAllProfiles(ctx, "grok", credentials)
+	if len(results) != 3 || results[0].ProfileName != "fresh" {
+		t.Fatalf("fresh reset account did not rank first: %+v", results)
+	}
+	fresh := results[0].Usage
+	if fresh == nil || fresh.QuotaStatus != usage.QuotaOK || !fresh.NumericQuotaKnown() || fresh.Error != "" || fresh.QuotaNote != "" {
+		t.Fatalf("fresh reset account was not measured successfully: %+v", fresh)
+	}
+	window := fresh.PrimaryWindow
+	if window == nil || window.Unmeasured || window.UsedPercent != 0 || window.Utilization != 0 ||
+		window.Kind != "billing" || !window.ResetsAt.Equal(reset) {
+		t.Fatalf("fresh reset did not preserve a measured zero billing window: %+v", window)
+	}
+	if near, measured := precheckNearLimit("grok", fresh, 0.8, ""); near || !measured {
+		t.Fatalf("precheck rejected reset zero: near=%v measured=%v", near, measured)
+	}
+	if best := fetcher.GetBestProfile(ctx, "grok", credentials); best == nil || best.ProfileName != "fresh" {
+		t.Fatalf("best-profile selection rejected reset zero: %+v", best)
+	}
+	if available := fetcher.GetProfilesAboveThreshold(ctx, "grok", credentials, 0.8); len(available) != 1 || available[0].ProfileName != "fresh" {
+		t.Fatalf("threshold selection did not retain only the measured reset account: %+v", available)
+	}
+
+	// This is the same fetch-and-adapt path used by `caam next --usage-aware`.
+	profiles := []string{"malformed", "spent", "fresh"}
+	data := fetchUsageDataForProfiles("grok", profiles)
+	adapted := data["fresh"]
+	if adapted == nil || adapted.Error != "" || adapted.PrimaryPercent != 0 || adapted.AvailScore <= 0 ||
+		adapted.ResetsAt == nil || !adapted.ResetsAt.Equal(reset) {
+		t.Fatalf("rotation adapter lost measured reset zero: %+v", adapted)
+	}
+	if bad := data["malformed"]; bad == nil || bad.Error == "" {
+		t.Fatalf("null usage was allowed through the rotation adapter: %+v", bad)
+	}
+	for _, algorithm := range []string{"smart", "random", "round_robin"} {
+		for _, policy := range []string{"availability", "drain"} {
+			t.Run(algorithm+"/"+policy, func(t *testing.T) {
+				cfg := config.DefaultSPMConfig()
+				cfg.Stealth.Rotation.Algorithm = algorithm
+				cfg.Stealth.Rotation.Policy = policy
+				selected, err := selectProfileWithRotationAndUsage("grok", profiles, "spent", cfg, nil, data)
+				if err != nil || selected == nil || selected.Selected != "fresh" {
+					t.Fatalf("usage-aware selection rejected reset zero: %+v, %v", selected, err)
+				}
+			})
+		}
 	}
 }
 

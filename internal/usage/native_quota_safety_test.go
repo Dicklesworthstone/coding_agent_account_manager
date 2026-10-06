@@ -94,8 +94,13 @@ func TestGrokBillingOmittedZeroRequiresActivePeriod(t *testing.T) {
 		{"expired", `"currentPeriod":{"start":"2026-09-28T21:44:41Z","end":"2026-10-05T21:44:41Z"}`, false, 0},
 		{"end exclusive", `"currentPeriod":{"start":"2026-09-29T08:00:00Z","end":"2026-10-06T08:00:00Z"}`, false, 0},
 		{"used without limit", active + `,"used":0`, false, 0},
+		{"empty Cent used without limit", active + `,"used":{}`, false, 0},
 		{"limit without used", active + `,"monthlyLimit":100`, false, 0},
 		{"snake limit without used", active + `,"monthly_limit":100`, false, 0},
+		{"zero limit without used", active + `,"monthlyLimit":0`, false, 0},
+		{"empty Cent limit without used", active + `,"monthlyLimit":{}`, false, 0},
+		{"zero snake limit without used", active + `,"monthly_limit":0`, false, 0},
+		{"empty Cent snake limit without used", active + `,"monthly_limit":{}`, false, 0},
 	}
 	for _, key := range []string{"creditUsagePercent", "credit_usage_percent", "used", "monthlyLimit", "monthly_limit"} {
 		for _, raw := range []string{`null`, `"12junk"`, `true`, `[]`, `-1`, `101`, `1e999`} {
@@ -115,6 +120,7 @@ func TestGrokBillingOmittedZeroRequiresActivePeriod(t *testing.T) {
 			if tc.known {
 				w := info.PrimaryWindow
 				if info.QuotaStatus != QuotaOK || info.Error != "" || info.QuotaNote != "" || w == nil || w.Unmeasured ||
+					w.Kind != "billing" || w.Label != "included" ||
 					w.UsedPercent != tc.percent || w.Utilization != float64(tc.percent)/100 || w.WindowDuration != 7*24*time.Hour || !w.ResetsAt.After(now) {
 					t.Fatalf("unexpected measured window: %+v / %+v", info, w)
 				}
@@ -135,6 +141,56 @@ func TestGrokBillingOmittedZeroRequiresActivePeriod(t *testing.T) {
 			t.Errorf("missing config became quota: %s: %+v", raw, info)
 		}
 	}
+	t.Run("precise bounds preserve metadata", func(t *testing.T) {
+		start := now.Add(100 * time.Nanosecond)
+		end := start.Add(7*24*time.Hour + 800*time.Nanosecond)
+		zone := time.FixedZone("provider", -4*60*60)
+		startText, endText := start.In(zone).Format(time.RFC3339Nano), end.In(zone).Format(time.RFC3339Nano)
+		raw := []byte(fmt.Sprintf(`{"subscriptionTier":"pro","onDemandEnabled":true,"config":{`+
+			`"currentPeriod":{"type":"WEEKLY","start":%q,"end":%q},"billing_period_start":%q,"billingPeriodEnd":%q,`+
+			`"onDemandCap":{"val":"2500"},"onDemandUsed":{},"prepaidBalance":{"val":"800"},"isUnifiedBillingUser":false}}`,
+			startText, endText, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)))
+		for _, tc := range []struct {
+			name      string
+			fetchedAt time.Time
+			known     bool
+		}{
+			{"before start", start.Add(-time.Nanosecond), false},
+			{"at start", start, true},
+			{"before end", end.Add(-time.Nanosecond), true},
+			{"at end", end, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				info := parseGrokBilling(raw, tc.fetchedAt)
+				if info.NumericQuotaKnown() != tc.known || info.Error != "" ||
+					(tc.known && (info.QuotaStatus != QuotaOK || info.QuotaNote != "" || info.AvailabilityScore() != 100)) ||
+					(!tc.known && (info.QuotaStatus != QuotaDegraded || info.QuotaNote == "" || info.AvailabilityScore() != 0)) {
+					t.Fatalf("incorrect quota at nanosecond boundary: %+v", info)
+				}
+				if w := info.PrimaryWindow; w == nil || w.Unmeasured == tc.known || w.UsedPercent != 0 || w.Utilization != 0 ||
+					w.Kind != "billing" || w.Label != "included" || !w.ResetsAt.Equal(end) || w.WindowDuration != end.Sub(start) {
+					t.Fatalf("lost exact billing window: %+v", w)
+				}
+				bill := info.Billing
+				if info.Provider != "grok" || info.Source != SourceAPI || info.PlanType != "pro" || !info.FetchedAt.Equal(tc.fetchedAt) ||
+					bill == nil || bill.PeriodType != "WEEKLY" || bill.PeriodStart != startText || bill.PeriodEnd != endText ||
+					bill.OnDemandCapCents == nil || *bill.OnDemandCapCents != 2500 || bill.OnDemandUsedCents == nil || *bill.OnDemandUsedCents != 0 ||
+					bill.PrepaidBalanceCents == nil || *bill.PrepaidBalanceCents != 800 || bill.OnDemandEnabled == nil || !*bill.OnDemandEnabled ||
+					bill.Unified == nil || *bill.Unified || info.Credits == nil || !info.Credits.HasCredits {
+					t.Fatalf("lost source or billing metadata: info=%+v billing=%+v", info, bill)
+				}
+			})
+		}
+	})
+	t.Run("zero clock uses actual fetch time", func(t *testing.T) {
+		before := time.Now()
+		start, end := before.Add(-time.Hour), before.Add(time.Hour)
+		raw := []byte(fmt.Sprintf(`{"config":{"currentPeriod":{"start":%q,"end":%q}}}`, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)))
+		info := parseGrokBilling(raw, time.Time{})
+		if !info.NumericQuotaKnown() || info.QuotaStatus != QuotaOK || info.FetchedAt.Before(before) || info.FetchedAt.After(time.Now()) {
+			t.Fatalf("zero clock did not validate against actual fetch time: %+v", info)
+		}
+	})
 }
 
 func TestGrokResetZeroIsEligibleForUsageAwareRouting(t *testing.T) {
@@ -432,6 +488,7 @@ func TestGrokBillingOnlyUsesReadProtocolAndLeavesCredentialUnchanged(t *testing.
 	}
 	log := filepath.Join(t.TempDir(), "methods")
 	t.Setenv("CAAM_GROK_METHODS", log)
+	t.Setenv("CAAM_GROK_BILLING_ERROR", "0")
 	bin := filepath.Join(t.TempDir(), "grok")
 	script := `#!/bin/sh
 while IFS= read -r line; do
@@ -440,7 +497,11 @@ while IFS= read -r line; do
   printf '%s\n' "$method" >> "$CAAM_GROK_METHODS"
   case "$method" in
     _x.ai/billing)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"config":{"creditUsagePercent":42.5}}}\n' "$id"
+      if [ "$CAAM_GROK_BILLING_ERROR" = "1" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"SYNTHETIC-PROVIDER-SECRET"}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"config":{"creditUsagePercent":42.5}}}\n' "$id"
+      fi
       exit 0
       ;;
     initialize|authenticate|session/new)
@@ -465,4 +526,19 @@ done
 	if err != nil || string(got) != auth {
 		t.Fatal("source credential was modified")
 	}
+	t.Run("billing protocol error remains unavailable", func(t *testing.T) {
+		t.Setenv("CAAM_GROK_BILLING_ERROR", "1")
+		info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+		if err != nil || info.QuotaStatus != QuotaUnavailable || info.Error == "" || info.QuotaNote == "" ||
+			info.NumericQuotaKnown() || info.AvailabilityScore() != 0 || info.PrimaryWindow != nil {
+			t.Fatalf("billing protocol failure became quota: %+v, err=%v", info, err)
+		}
+		if strings.Contains(info.Error, "SYNTHETIC") || strings.Contains(info.QuotaNote, "SYNTHETIC") {
+			t.Fatal("billing protocol failure echoed provider secrets")
+		}
+		got, err := os.ReadFile(filepath.Join(home, "auth.json"))
+		if err != nil || string(got) != auth {
+			t.Fatal("billing protocol failure modified the source credential")
+		}
+	})
 }

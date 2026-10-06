@@ -3,8 +3,28 @@ package cmd
 import (
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
+
+func TestGrokPrecheckSwitchesToResetZero(t *testing.T) {
+	setupGrokResetProfiles(t)
+	files := authfile.GrokAuthFiles()
+	if err := vault.Restore(files, "spent"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := vault.ActiveProfile(files); err != nil || active != "spent" {
+		t.Fatalf("could not establish spent profile as active: %q, %v", active, err)
+	}
+	if switched := runPrecheck("grok", 0.8, true, nil, rotation.AlgorithmSmart, config.DefaultSPMConfig(), ""); !switched {
+		t.Fatal("precheck did not switch from spent quota to the reset-zero account")
+	}
+	if active, err := vault.ActiveProfile(files); err != nil || active != "fresh" {
+		t.Fatalf("precheck did not activate the measured reset account: %q, %v", active, err)
+	}
+}
 
 // Issue #79: `caam run grok|cursor --precheck` uses the native quota readers.
 // They are fail-closed, so the precheck must tell "near the limit", "fine"
