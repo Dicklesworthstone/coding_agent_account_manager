@@ -116,6 +116,9 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 	if err != nil {
 		return syncSkipped("source_unavailable", "live credential disappeared or became invalid before the copy"), nil
 	}
+	if !live.HasRefreshToken {
+		return syncSkipped("source_not_renewable", "live credential has no refresh token; saved credentials were left unchanged"), nil
+	}
 	if !SameAccount(grant.Identity, live.Identity) || !SameAccount(observed.Identity, live.Identity) {
 		return syncSkipped("source_owner_changed", "live account changed after renewal; saved credentials were left unchanged"), nil
 	}

@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ func discoveryFixture(t *testing.T) DiscoverOptions {
 	t.Setenv("HOME", opts.Home)
 	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("GROK_HOME", "")
 	return opts
 }
@@ -195,6 +198,7 @@ func TestDiscoverNativeEnvironmentsAndNoMutation(t *testing.T) {
 	}
 	shallowGrant := findDiscoveryGrant(t, grants, "shallow:claude/parallel")
 	wantEnv, wantScrub := shallow.SpawnEnv("claude", shallowGrant.Home, "parallel", false, false)
+	wantScrub = append(wantScrub, "XDG_CONFIG_HOME")
 	if !maps.Equal(shallowGrant.Env, wantEnv) || !reflect.DeepEqual(shallowGrant.Scrub, wantScrub) {
 		t.Fatalf("keepalive shallow environment differs from shallow-spawn: %+v", shallowGrant)
 	}
@@ -556,5 +560,266 @@ func TestSameAccountAuthority(t *testing.T) {
 				t.Fatal("wrong account comparison")
 			}
 		})
+	}
+}
+
+func TestDiscoverClaudePathAndNativeEnvironmentAgree(t *testing.T) {
+	for _, kind := range []string{"host legacy", "host default XDG", "host explicit XDG", "shallow legacy", "isolated legacy"} {
+		t.Run(kind, func(t *testing.T) {
+			opts := discoveryFixture(t)
+			opts.Provider = "claude"
+			ref, home := "host:claude", opts.Home
+			configured := ""
+			switch kind {
+			case "host default XDG", "host explicit XDG":
+				xdg := filepath.Join(home, ".config")
+				if kind == "host explicit XDG" {
+					xdg = filepath.Join(filepath.Dir(home), "custom-xdg")
+					t.Setenv("XDG_CONFIG_HOME", xdg)
+				}
+				configured = filepath.Join(xdg, "claude-code")
+				writeDiscoveryFile(t, filepath.Join(configured, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"native-access","refreshToken":"native-refresh","expiresAt":1791324000000}}`)
+				writeDiscoveryFile(t, filepath.Join(configured, ".claude.json"), `{"oauthAccount":{"accountUuid":"owner","emailAddress":"owner@example.test"}}`)
+			case "shallow legacy":
+				ref = "shallow:claude/work"
+				home = filepath.Join(opts.ShallowBase, "work")
+				writeDiscoveryShallow(t, opts, "work", "owner", "owner@example.test", "native-refresh")
+			case "isolated legacy":
+				ref = "isolated:claude/work"
+				prof := &profile.Profile{Provider: "claude", Name: "work", AuthMode: "oauth", BasePath: filepath.Join(opts.ProfilesPath, "claude", "work")}
+				data, err := json.Marshal(prof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeDiscoveryFile(t, filepath.Join(prof.BasePath, "profile.json"), string(data))
+				home = prof.HomePath()
+				writeDiscoveryClaude(t, home, "owner", "owner@example.test", "native-refresh")
+			default:
+				writeDiscoveryClaude(t, home, "owner", "owner@example.test", "native-refresh")
+			}
+			before := discoveryTree(t, filepath.Dir(opts.Home))
+			grants, err := Discover(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant := findDiscoveryGrant(t, grants, ref)
+			if grant.BlockedReason != "" || grant.Identity.AccountID != "owner" {
+				t.Fatalf("selected source is unusable: %+v", grant)
+			}
+			inherited := []string{"HOME=caller", "CLAUDE_CONFIG_DIR=caller-config", "XDG_CONFIG_HOME=caller-xdg", "PATH=keep-path"}
+			env := discoveryEnvMap(nativeEnvForOS(grant, inherited, "linux"))
+			wantAuth, wantIdentity := filepath.Join(home, ".claude", ".credentials.json"), filepath.Join(home, ".claude.json")
+			if configured != "" {
+				wantAuth, wantIdentity = filepath.Join(configured, ".credentials.json"), filepath.Join(configured, ".claude.json")
+				if env["CLAUDE_CONFIG_DIR"] != configured || env["XDG_CONFIG_HOME"] != filepath.Dir(configured) {
+					t.Fatalf("XDG source is not pinned: %+v", env)
+				}
+			} else if env["CLAUDE_CONFIG_DIR"] != "" || env["XDG_CONFIG_HOME"] != "" {
+				t.Fatalf("legacy source inherited a competing config directory: %+v", env)
+			}
+			if grant.AuthPath != wantAuth || grant.IdentityPath != wantIdentity || env["HOME"] != home || env["PATH"] != "keep-path" {
+				t.Fatalf("native environment disagrees with selected source: %+v, %+v", grant, env)
+			}
+			if after := discoveryTree(t, filepath.Dir(opts.Home)); !reflect.DeepEqual(before, after) {
+				t.Fatal("discovery or environment construction changed caller or profile files")
+			}
+		})
+	}
+}
+
+func discoveryEnvMap(entries []string) map[string]string {
+	values := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func TestNativeEnvScrubsAuthenticationAndWindowsHomeAliases(t *testing.T) {
+	for _, goos := range []string{"linux", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			grant := Grant{Provider: "claude", Env: map[string]string{"HOME": "selected-home", "GROK_HOME": "selected-grok"},
+				Scrub: []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"}}
+			inherited := []string{"PATH=keep-path", "HOME=caller-home", "GROK_HOME=caller-grok", "CLAUDE_CONFIG_DIR=caller-config", "XDG_CONFIG_HOME=caller-xdg"}
+			dropped := []string{"CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_PLUGIN_DIRS", "CLAUDE_CODE_RETRY_WATCHDOG",
+				"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_BASE_URL",
+				"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
+				"GROK_API_KEY", "GROK_AUTH_PATH", "GROK_BASE_URL", "XAI_BASE_URL"}
+			for _, key := range dropped {
+				inherited = append(inherited, key+"=ambient-override")
+				if goos == "windows" {
+					inherited = append(inherited, strings.ToLower(key)+"=mixed-case-override")
+				}
+			}
+			if goos == "windows" {
+				inherited = append(inherited, "Home=caller-alias", "Grok_Home=caller-alias", "UserProfile=caller-user", "HomeDrive=C:", "HomePath=caller-path", "Claude_Config_Dir=caller-config", "Xdg_Config_Home=caller-xdg")
+			}
+			env := discoveryEnvMap(nativeEnvForOS(grant, inherited, goos))
+			for _, key := range dropped {
+				if _, ok := env[key]; ok {
+					t.Errorf("native environment kept %s", key)
+				}
+			}
+			if env["HOME"] != "selected-home" || env["GROK_HOME"] != "selected-grok" || env["PATH"] != "keep-path" || env["CLAUDE_CONFIG_DIR"] != "" || env["XDG_CONFIG_HOME"] != "" {
+				t.Fatalf("source environment was redirected: %+v", env)
+			}
+			if goos == "windows" {
+				if env["USERPROFILE"] != "selected-home" || env["HOMEDRIVE"] != "" || env["HOMEPATH"] != "" {
+					t.Fatalf("Windows home escaped selected source: %+v", env)
+				}
+				for key := range env {
+					if key != strings.ToUpper(key) {
+						t.Errorf("mixed-case Windows alias survived: %s", key)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestDiscoverRefusesCompetingNativeClaudePaths(t *testing.T) {
+	opts := discoveryFixture(t)
+	opts.Provider = "claude"
+	writeDiscoveryClaude(t, opts.Home, "legacy", "legacy@example.test", "legacy-refresh")
+	xdg := filepath.Join(opts.Home, ".config", "claude-code")
+	writeDiscoveryFile(t, filepath.Join(xdg, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"xdg-access","refreshToken":"xdg-refresh","expiresAt":1791324000000,"accountId":"xdg"}}`)
+	grants, err := Discover(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := findDiscoveryGrant(t, grants, "host:claude").BlockedReason; !strings.Contains(reason, "both legacy and XDG") {
+		t.Fatalf("competing native paths were silently selected: %q", reason)
+	}
+}
+
+func TestDiscoverInvalidCredentialRetainsKnownOwnership(t *testing.T) {
+	for _, providerID := range []string{"claude", "grok"} {
+		for _, invalid := range []string{"expiry", "refresh"} {
+			t.Run(providerID+"/"+invalid, func(t *testing.T) {
+				opts := discoveryFixture(t)
+				opts.Provider = providerID
+				prof := &profile.Profile{Provider: providerID, Name: "duplicate", AuthMode: "oauth", BasePath: filepath.Join(opts.ProfilesPath, providerID, "duplicate")}
+				data, err := json.Marshal(prof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeDiscoveryFile(t, filepath.Join(prof.BasePath, "profile.json"), string(data))
+				expires, refresh := `1791324000000`, `"old-refresh"`
+				if invalid == "expiry" {
+					expires = `"unreadable"`
+				} else {
+					refresh = `17`
+				}
+				if providerID == "claude" {
+					writeDiscoveryClaude(t, opts.Home, "same-account", "same@example.test", "host-refresh")
+					writeDiscoveryFile(t, filepath.Join(prof.HomePath(), ".claude", ".credentials.json"), `{"claudeAiOauth":{"accessToken":"old-access","refreshToken":`+refresh+`,"expiresAt":`+expires+`}}`)
+					writeDiscoveryFile(t, filepath.Join(prof.HomePath(), ".claude.json"), `{"oauthAccount":{"accountUuid":"same-account","emailAddress":"same@example.test"}}`)
+				} else {
+					writeDiscoveryGrok(t, filepath.Join(opts.Home, ".grok"), "same-account", "same@example.test", "host-refresh")
+					writeDiscoveryFile(t, filepath.Join(prof.HomePath(), ".grok", "auth.json"), `{"access_token":"old-access","refresh_token":`+refresh+`,"expires_at":`+expires+`,"user_id":"same-account","email":"same@example.test"}`)
+				}
+				grants, err := Discover(context.Background(), opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, ref := range []string{"host:" + providerID, "isolated:" + providerID + "/duplicate"} {
+					grant := findDiscoveryGrant(t, grants, ref)
+					if grant.Identity.AccountID != "same-account" || !strings.Contains(grant.BlockedReason, "ambiguous live grant owners") {
+						t.Fatalf("malformed duplicate hid its owner: %+v", grant)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDiscoverInvalidHostStillYieldsToUniqueShallowOwner(t *testing.T) {
+	opts := discoveryFixture(t)
+	opts.Provider = "claude"
+	writeDiscoveryClaude(t, opts.Home, "owner", "owner@example.test", "old-refresh")
+	writeDiscoveryFile(t, filepath.Join(opts.Home, ".claude", ".credentials.json"), `{"claudeAiOauth":{"accessToken":"old-access","refreshToken":null,"expiresAt":"unreadable"}}`)
+	writeDiscoveryShallow(t, opts, "work", "owner", "owner@example.test", "current-refresh")
+	grants, err := Discover(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host := findDiscoveryGrant(t, grants, "host:claude"); host.Owner != "shallow:claude/work" || host.Identity.AccountID != "owner" {
+		t.Fatalf("invalid host did not retain its known shallow owner: %+v", host)
+	}
+	if work := findDiscoveryGrant(t, grants, "shallow:claude/work"); work.BlockedReason != "" {
+		t.Fatalf("unique valid shallow owner was blocked: %+v", work)
+	}
+}
+
+func TestClaudeKeychainDetectionDoesNotTrustDisabledBridge(t *testing.T) {
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	for _, name := range []string{"login.keychain-db", "login.keychain"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			if hasClaudeKeychainForOS(home, "darwin") {
+				t.Fatal("an empty file-backed home was treated as keychain-owned")
+			}
+			writeDiscoveryFile(t, filepath.Join(home, "Library", "Keychains", name), "synthetic keychain metadata only")
+			if !hasClaudeKeychainForOS(home, "darwin") {
+				t.Fatal("disabling CAAM's bridge hid Claude's native login keychain")
+			}
+			if hasClaudeKeychainForOS(home, "linux") {
+				t.Fatal("non-macOS home was treated as a native keychain owner")
+			}
+		})
+	}
+}
+
+func TestReadRegularRejectsFIFOWithoutOpeningIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX FIFO regression")
+	}
+	bin, err := exec.LookPath("mkfifo")
+	if err != nil {
+		t.Skip("mkfifo is unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "paired-state.json")
+	if err := exec.Command(bin, path).Run(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := readRegular(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("special credential input accepted: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readRegular opened a FIFO and blocked before validating its type")
+	}
+}
+
+func TestRunRechecksNewDuplicateOwnerAfterDiscovery(t *testing.T) {
+	opts := discoveryFixture(t)
+	opts.Provider = "claude"
+	writeDiscoveryShallow(t, opts, "work", "owner", "owner@example.test", "current-refresh")
+	grants, err := Discover(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := findDiscoveryGrant(t, grants, "shallow:claude/work")
+	if work.BlockedReason != "" {
+		t.Fatalf("initial grant blocked: %+v", work)
+	}
+	writeDiscoveryShallow(t, opts, "later-copy", "owner", "owner@example.test", "old-refresh")
+	marker := filepath.Join(t.TempDir(), "native-started")
+	t.Setenv("KEEPALIVE_TEST_MARKER", marker)
+	result := runEngine(t, work, engineOptions(t, "claude", engineCLI(t, `printf started > "$KEEPALIVE_TEST_MARKER"`)))
+	if result.Success || result.Attempted || result.Status != "blocked" || !strings.Contains(result.Reason, "ownership") {
+		t.Fatalf("new duplicate owner was not rechecked under the grant lock: %+v", result)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("native command ran despite the new duplicate: %v", err)
 	}
 }

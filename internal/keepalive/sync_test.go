@@ -308,6 +308,40 @@ func TestSyncVaultRefusesChangedOrUnusableLiveCredential(t *testing.T) {
 	}
 }
 
+func TestSyncVaultRefusesLiveCredentialWithoutRefreshToken(t *testing.T) {
+	for _, provider := range []string{"claude", "grok"} {
+		for _, rereadObserved := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/observedWithoutRefresh=%t", provider, rereadObserved), func(t *testing.T) {
+				grant, observed, vault := syncFixture(t, provider)
+				path := filepath.Join(vault.ProfilePath(provider, "alice"), filepath.Base(grant.AuthPath))
+				old := syncCredentialJSON(t, provider, "renewable-saved", observed.Identity, observed.ExpiresAt.Add(-time.Hour))
+				writeSyncFile(t, path, old)
+				var replacement []byte
+				if provider == "claude" {
+					replacement = []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"access-only","accountId":"account-a","expiresAt":%d}}`, observed.ExpiresAt.Add(time.Hour).UnixMilli()))
+				} else {
+					replacement = []byte(fmt.Sprintf(`{"key":"access-only","user_id":"account-a","expires_at":%q}`, observed.ExpiresAt.Add(time.Hour).Format(time.RFC3339Nano)))
+				}
+				writeSyncFile(t, grant.AuthPath, replacement)
+				if rereadObserved {
+					var err error
+					observed, err = ReadCredential(grant)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				results, err := SyncVault(context.Background(), grant, observed, vault)
+				if err != nil || len(results) != 1 || results[0].Status != "skipped" || results[0].Code != "source_not_renewable" {
+					t.Fatalf("non-renewable live grant was accepted: %+v, %v", results, err)
+				}
+				if !bytes.Equal(readSyncFile(t, path), old) {
+					t.Fatal("access-only live credential replaced a renewable saved snapshot")
+				}
+			})
+		}
+	}
+}
+
 func TestSnapshotIdentityIsReadOnlyAndRejectsUnsafePaths(t *testing.T) {
 	grant, observed, vault := syncFixture(t, "claude")
 	dir := vault.ProfilePath("claude", "alice")

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -37,9 +38,10 @@ type Options struct {
 	ClaudeBin     string
 	GrokBin       string
 
-	// AfterRenew runs under the keepalive lock, after the native CLI exits and
-	// the live credential has been checked. It may acquire the native lock to
-	// copy a stable, newer credential to matching vault snapshots.
+	// AfterRenew runs under the keepalive lock after a live credential is
+	// verified, including valid grants skipped by TTL or minimum gap. It may
+	// acquire the native lock to repair older matching vault snapshots without
+	// another native request. Its context is bounded by Timeout.
 	AfterRenew func(context.Context, Grant, CredentialSnapshot) ([]SyncResult, error)
 }
 
@@ -62,11 +64,15 @@ type Result struct {
 	Sync           []SyncResult `json:"sync,omitempty"`
 }
 
-var errLockBusy = errors.New("keepalive already running for this live grant")
+var (
+	errLockBusy      = errors.New("keepalive already running for this live grant")
+	errNativeCleanup = errors.New("native process cleanup could not be confirmed")
+)
 
 type attemptState struct {
 	Version     int       `json:"version"`
 	LastAttempt time.Time `json:"last_attempt"`
+	AccountKey  string    `json:"account_key,omitempty"`
 }
 
 // Run processes live grants independently, retaining a result for every grant.
@@ -146,12 +152,12 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		result.Status, result.Reason = "blocked", "expiry_unknown"
 		return result
 	}
-	if before.ExpiresAt.Sub(opts.Now()) > opts.TTL {
-		result.Status, result.Reason, result.Success = "skipped", "outside_ttl", true
-		return result
-	}
 	if !before.HasRefreshToken {
 		result.Status, result.Reason = "blocked", "refresh_credential_missing"
+		return result
+	}
+	if before.ExpiresAt.Sub(opts.Now()) > opts.TTL && (opts.DryRun || opts.AfterRenew == nil) {
+		result.Status, result.Reason, result.Success = "skipped", "outside_ttl", true
 		return result
 	}
 
@@ -171,7 +177,12 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 	}
 	// Keep the lock with the grant, independently of CAAM_HOME/StateDir. A
 	// manual call and a timer using different state roots still share it.
-	lock, err := os.OpenFile(grant.AuthPath+".caam-keepalive.lock", os.O_CREATE|os.O_RDWR, 0600)
+	lockPath := grant.AuthPath + ".caam-keepalive.lock"
+	if info, err := os.Lstat(lockPath); (err != nil && !errors.Is(err, os.ErrNotExist)) || (err == nil && !info.Mode().IsRegular()) {
+		result.Status, result.Reason = "failed", "lock_unavailable"
+		return result
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		result.Status, result.Reason = "failed", "lock_unavailable"
 		return result
@@ -186,6 +197,14 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	defer unlockFile(lock)
+	if !credentialLockIsCurrent(lock, lockPath) {
+		result.Status, result.Reason = "failed", "lock_changed"
+		return result
+	}
+	if err := recheckGrantOwnership(ctx, grant); err != nil {
+		result.Status, result.Reason = "blocked", err.Error()
+		return result
+	}
 
 	// A different keepalive may have rotated this grant while this caller was
 	// discovering it. Re-read instead of executing from the old snapshot.
@@ -203,15 +222,18 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		result.Status, result.Reason = "blocked", "expiry_unknown"
 		return result
 	}
-	if before.ExpiresAt.Sub(opts.Now()) > opts.TTL {
-		result.Status, result.Reason, result.Success = "skipped", "outside_ttl", true
-		return result
-	}
 	if !before.HasRefreshToken {
 		result.Status, result.Reason = "blocked", "refresh_credential_missing"
 		return result
 	}
+	if before.ExpiresAt.Sub(opts.Now()) > opts.TTL {
+		result.Status, result.Reason, result.Success = "skipped", "outside_ttl", true
+		return synchronizeResult(ctx, grant, before, opts, result)
+	}
 	if applyMinGap(&result, before, statePath, opts) {
+		if result.Success {
+			return synchronizeResult(ctx, grant, before, opts, result)
+		}
 		return result
 	}
 	if err := ctx.Err(); err != nil {
@@ -230,7 +252,7 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	defer os.RemoveAll(workDir)
-	if err := writeAttemptState(statePath, opts.Now()); err != nil {
+	if err := writeAttemptState(statePath, opts.Now(), before.Identity); err != nil {
 		result.Status, result.Reason = "failed", "state_write_failed"
 		return result
 	}
@@ -238,16 +260,23 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 	cctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, bin, args...)
-	configureNativeProcess(cmd)
 	cmd.Dir = workDir
 	cmd.Env = nativeEnv(grant, os.Environ())
 	// Provider errors can contain opaque credentials. Discard both streams
-	// entirely instead of retaining a buffer that might leak through JSON or
-	// logs. WaitDelay also bounds descendants retaining these stream pipes.
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-	cmd.WaitDelay = 100 * time.Millisecond
+	// without copy pipes that a native wrapper's descendants could retain.
+	output, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		result.Status, result.Reason = "failed", "native_output_unavailable"
+		return result
+	}
+	defer output.Close()
+	cmd.Stdout, cmd.Stderr = output, output
 	result.Attempted = true
-	runErr := cmd.Run()
+	runErr := runNativeCommand(cctx, cmd)
+	if errors.Is(runErr, errNativeCleanup) {
+		result.Status, result.Reason = "failed", "native_cleanup_failed"
+		return result
+	}
 	// Always inspect the file, including nonzero exit and timeout. Grok can
 	// delete a rejected auth.json yet return exit status zero.
 	after, readErr := ReadCredential(grant)
@@ -264,12 +293,21 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		result.Status, result.Reason = "failed", "expiry_unknown"
 		return result
 	}
+	if !after.HasRefreshToken {
+		result.Status, result.Reason = "failed", "refresh_credential_missing"
+		return result
+	}
+	if after.ExpiresAt.Before(before.ExpiresAt) {
+		result.Status, result.Reason = "failed", "expiry_regressed"
+		return result
+	}
 	if !after.ExpiresAt.After(opts.Now()) {
 		result.Status, result.Reason = "failed", "still_expired"
 		return result
 	}
-	rotated := after.Fingerprint != before.Fingerprint
-	renewed := rotated && after.ExpiresAt.After(before.ExpiresAt)
+	// Formatting, metadata, or token changes without an extended lifetime are
+	// not proof of renewal. The native CLI may legitimately defer renewal.
+	renewed := after.ExpiresAt.After(before.ExpiresAt)
 	if runErr != nil && !renewed {
 		result.Status, result.Reason = "failed", "native_cli_failed"
 		if cctx.Err() != nil {
@@ -281,7 +319,7 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	result.Status, result.Success = "still_valid", true
-	if rotated {
+	if renewed {
 		result.Status = "rotated"
 	}
 	if runErr != nil {
@@ -290,8 +328,15 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		// proves that renewal succeeded independently of that request.
 		result.Reason = "native_cli_failed_after_rotation"
 	}
-	if opts.AfterRenew != nil {
-		result.Sync, err = opts.AfterRenew(ctx, grant, after)
+	return synchronizeResult(ctx, grant, after, opts, result)
+}
+
+func synchronizeResult(ctx context.Context, grant Grant, current CredentialSnapshot, opts Options, result Result) Result {
+	if opts.AfterRenew != nil && !opts.DryRun {
+		syncCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		defer cancel()
+		var err error
+		result.Sync, err = opts.AfterRenew(syncCtx, grant, current)
 		for _, syncResult := range result.Sync {
 			if syncResult.Status == "synced" {
 				result.SyncedProfiles = append(result.SyncedProfiles, syncResult.Profile)
@@ -319,7 +364,7 @@ func applyMinGap(result *Result, snapshot CredentialSnapshot, statePath string, 
 		result.Status, result.Reason = "failed", "state_invalid"
 		return true
 	}
-	if state.LastAttempt.IsZero() {
+	if state.LastAttempt.IsZero() || state.AccountKey != accountStateKey(snapshot.Identity) {
 		return false
 	}
 	next := state.LastAttempt.Add(opts.MinGap)
@@ -350,6 +395,18 @@ func grantKey(grant Grant) string {
 
 func readAttemptState(path string) (attemptState, error) {
 	var state attemptState
+	// Reject special files before opening: opening a FIFO for reading could
+	// block before the native timeout or the later descriptor check applies.
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	if !info.Mode().IsRegular() {
+		return state, errors.New("invalid keepalive state")
+	}
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, nil
@@ -358,7 +415,7 @@ func readAttemptState(path string) (attemptState, error) {
 		return state, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
+	info, err = f.Stat()
 	if err != nil {
 		return state, err
 	}
@@ -380,8 +437,17 @@ func readAttemptState(path string) (attemptState, error) {
 	return state, nil
 }
 
-func writeAttemptState(path string, now time.Time) error {
-	data, err := json.Marshal(attemptState{Version: 1, LastAttempt: now.UTC()})
+func accountStateKey(identity AccountIdentity) string {
+	key := "id:" + identity.AccountID
+	if identity.AccountID == "" {
+		key = "email:" + strings.ToLower(identity.Email)
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func writeAttemptState(path string, now time.Time, identity AccountIdentity) error {
+	data, err := json.Marshal(attemptState{Version: 1, LastAttempt: now.UTC(), AccountKey: accountStateKey(identity)})
 	if err != nil {
 		return err
 	}
@@ -411,8 +477,10 @@ func nativeCommand(provider string, opts Options) (string, []string, error) {
 	case "claude":
 		bin = opts.ClaudeBin
 		args = []string{"-p", "ping", "--model", "haiku", "--effort", "low",
+			"--safe-mode", "--max-turns", "1",
 			"--no-session-persistence", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`,
-			"--setting-sources", "project", "--settings", `{"disableAllHooks":true}`,
+			"--setting-sources", "project", "--settings", `{"disableAllHooks":true,"disableClaudeAiConnectors":true}`,
+			"--disallowedTools", "mcp__*",
 			"--tools", "", "--disable-slash-commands", "--system-prompt", "Reply with one word."}
 	case "grok":
 		bin = opts.GrokBin
@@ -435,17 +503,35 @@ func nativeCommand(provider string, opts Options) (string, []string, error) {
 }
 
 func nativeEnv(grant Grant, inherited []string) []string {
+	return nativeEnvForOS(grant, inherited, runtime.GOOS)
+}
+
+func nativeEnvForOS(grant Grant, inherited []string, goos string) []string {
+	normalize := func(key string) string {
+		if goos == "windows" {
+			return strings.ToUpper(key)
+		}
+		return key
+	}
 	values := make(map[string]string, len(inherited)+len(grant.Env))
 	drop := map[string]bool{
 		"GROK_AUTH": true, "GROK_AUTH_PATH": true, "GROK_API_KEY": true,
 		"GROK_DEPLOYMENT_KEY": true, "XAI_API_KEY": true, "XAI_API_TOKEN": true,
+		"GROK_BASE_URL": true, "GROK_API_BASE_URL": true, "XAI_BASE_URL": true,
 		"CLAUDE_CODE_SESSION_ACCESS_TOKEN": true, "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR": true,
+		"CLAUDE_CODE_SIMPLE": true, "CLAUDE_CODE_PLUGIN_DIRS": true, "CLAUDE_CODE_RETRY_WATCHDOG": true,
+	}
+	if goos == "windows" {
+		// Windows environment keys are case insensitive. Remove host-home
+		// aliases before pinning USERPROFILE, which Node's os.homedir uses.
+		drop["USERPROFILE"], drop["HOMEDRIVE"], drop["HOMEPATH"] = true, true, true
 	}
 	for _, key := range grant.Scrub {
-		drop[key] = true
+		drop[normalize(key)] = true
 	}
 	for _, entry := range inherited {
 		key, value, ok := strings.Cut(entry, "=")
+		key = normalize(key)
 		if !ok || drop[key] || strings.HasPrefix(key, "ANTHROPIC_") ||
 			strings.HasPrefix(key, "CLAUDE_CODE_OAUTH_TOKEN") || strings.HasPrefix(key, "CLAUDE_CODE_USE_") {
 			continue
@@ -453,7 +539,10 @@ func nativeEnv(grant Grant, inherited []string) []string {
 		values[key] = value
 	}
 	for key, value := range grant.Env {
-		values[key] = value
+		values[normalize(key)] = value
+	}
+	if goos == "windows" {
+		values["USERPROFILE"] = values["HOME"]
 	}
 	if grant.Provider == "claude" {
 		values["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"

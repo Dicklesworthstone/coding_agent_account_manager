@@ -80,6 +80,7 @@ type grantSource struct {
 	env                                                map[string]string
 	scrub                                              []string
 	vaultPaths                                         []string
+	discovery                                          *DiscoverOptions
 }
 
 // CredentialSnapshot is a read of one exact native file. Secret material is
@@ -130,6 +131,7 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Grant, error) {
 	if opts.ProfilesPath == "" {
 		opts.ProfilesPath = profile.DefaultStorePath()
 	}
+	opts.Home = home
 	vaultPaths := []string{authfile.DefaultVaultPath()}
 	if opts.VaultPath != "" {
 		vaultPaths = append(vaultPaths, opts.VaultPath)
@@ -140,6 +142,7 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Grant, error) {
 		authPath := filepath.Join(home, ".claude", ".credentials.json")
 		identityPath := filepath.Join(home, ".claude.json")
 		env := map[string]string{"HOME": home}
+		blockedReason := ""
 		if cfg != "" {
 			cfg, err = filepath.Abs(cfg)
 			if err != nil {
@@ -148,15 +151,40 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Grant, error) {
 			env["CLAUDE_CONFIG_DIR"] = cfg
 			authPath = filepath.Join(cfg, ".credentials.json")
 			identityPath = filepath.Join(cfg, ".claude.json")
+		} else {
+			xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME"))
+			if xdg == "" {
+				xdg = filepath.Join(home, ".config")
+			}
+			xdg, err = filepath.Abs(xdg)
+			if err != nil {
+				return nil, fmt.Errorf("resolve XDG_CONFIG_HOME: %w", err)
+			}
+			xdgConfig := filepath.Join(xdg, "claude-code")
+			xdgAuth := filepath.Join(xdgConfig, ".credentials.json")
+			_, legacyErr := os.Lstat(authPath)
+			_, xdgErr := os.Lstat(xdgAuth)
+			if !errors.Is(xdgErr, os.ErrNotExist) {
+				if !errors.Is(legacyErr, os.ErrNotExist) && !samePhysicalFile(authPath, xdgAuth) {
+					blockedReason = "both legacy and XDG Claude credential files exist; set CLAUDE_CONFIG_DIR to choose the live owner before keepalive"
+				} else {
+					// Pin the discovered XDG source even if the caller's
+					// environment changes before the native command starts.
+					env["XDG_CONFIG_HOME"], env["CLAUDE_CONFIG_DIR"] = xdg, xdgConfig
+					authPath, identityPath = xdgAuth, filepath.Join(xdgConfig, ".claude.json")
+				}
+			}
 		}
 		if _, statErr := os.Lstat(authPath); !errors.Is(statErr, os.ErrNotExist) || cfg != "" || hasClaudeKeychain(home) {
 			grants = append(grants, inspectGrant(Grant{Provider: "claude", Kind: "host", Home: home,
-				AuthPath: authPath, IdentityPath: identityPath, Env: env, Scrub: []string{"CLAUDE_CONFIG_DIR"}}, vaultPaths))
+				AuthPath: authPath, IdentityPath: identityPath, Env: env, Scrub: []string{"CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME"},
+				BlockedReason: blockedReason}, vaultPaths))
 		}
 		mgr, err := shallow.NewManager(opts.ShallowBase, home)
 		if err != nil {
 			return nil, err
 		}
+		opts.ShallowBase = mgr.BaseDir()
 		profiles, err := mgr.List()
 		if err != nil {
 			return nil, err
@@ -182,6 +210,9 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Grant, error) {
 				return nil, err
 			}
 			env, scrub := shallow.SpawnEnv(providerID, prof.Path, prof.Name, false, false)
+			// Shallow Claude owns the legacy HOME source. An ambient XDG
+			// override must not redirect this bounded native invocation.
+			scrub = append(scrub, "XDG_CONFIG_HOME")
 			grants = append(grants, inspectGrant(Grant{Provider: "claude", Name: prof.Name, Kind: "shallow",
 				Home: prof.Path, AuthPath: authPath, IdentityPath: filepath.Join(prof.Path, ".claude.json"),
 				Env: env, Scrub: scrub}, vaultPaths))
@@ -215,6 +246,10 @@ func Discover(ctx context.Context, opts DiscoverOptions) ([]Grant, error) {
 	resolveOwners(grants)
 	for i := range grants {
 		freezeGrant(&grants[i])
+		if grants[i].source != nil {
+			bound := opts
+			grants[i].source.discovery = &bound
+		}
 	}
 	sort.Slice(grants, func(i, j int) bool { return grants[i].Ref() < grants[j].Ref() })
 	return grants, nil
@@ -263,10 +298,13 @@ func discoverIsolated(ctx context.Context, basePath, providerID string, vaultPat
 			g.IdentityPath = filepath.Join(g.Env["CLAUDE_CONFIG_DIR"], ".claude.json")
 			legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
 			if _, statErr := os.Lstat(g.AuthPath); errors.Is(statErr, os.ErrNotExist) {
-				// Older Claude builds ignore CLAUDE_CONFIG_DIR. Keep the exact
-				// provider environment while checking the file that build owns.
+				// Legacy credentials must run with legacy path semantics, not
+				// a pinned, empty XDG directory that could create another grant.
 				g.AuthPath = legacy
 				g.IdentityPath = filepath.Join(prof.HomePath(), ".claude.json")
+				delete(g.Env, "CLAUDE_CONFIG_DIR")
+				delete(g.Env, "XDG_CONFIG_HOME")
+				g.Scrub = append(g.Scrub, "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME")
 			} else if legacyInfo, legacyErr := os.Stat(legacy); legacyErr == nil {
 				if currentInfo, currentErr := os.Stat(g.AuthPath); currentErr == nil && !os.SameFile(legacyInfo, currentInfo) {
 					g.BlockedReason = "both legacy and configured Claude credential files exist; choose one live owner before keepalive"
@@ -290,11 +328,15 @@ func inspectGrant(g Grant, vaultPaths []string) Grant {
 		canonicalIdentity: canonicalPath(g.IdentityPath), blockedReason: g.BlockedReason, identity: g.Identity,
 		env: maps.Clone(g.Env), scrub: slices.Clone(g.Scrub), vaultPaths: slices.Clone(vaultPaths)}
 	if g.Provider == "claude" && hasClaudeKeychain(g.Home) {
-		g.BlockedReason = "Claude uses this home's login keychain; file-based keepalive cannot verify its live grant"
+		g.BlockedReason = "Claude uses this home's login keychain; use a file-backed shallow or isolated home so keepalive can verify its live grant"
 		freezeGrant(&g)
 		return g
 	}
 	snapshot, err := ReadCredential(g)
+	// A malformed expiry or refresh field does not erase a verified account.
+	// Its unusable copy must still participate in duplicate-owner checks.
+	g.Identity, g.ExpiresAt = snapshot.Identity, snapshot.ExpiresAt
+	g.CredentialFingerprint, g.RefreshFingerprint = snapshot.Fingerprint, snapshot.RefreshFingerprint
 	if err != nil {
 		if g.BlockedReason == "" {
 			g.BlockedReason = err.Error()
@@ -302,8 +344,6 @@ func inspectGrant(g Grant, vaultPaths []string) Grant {
 		freezeGrant(&g)
 		return g
 	}
-	g.Identity, g.ExpiresAt = snapshot.Identity, snapshot.ExpiresAt
-	g.CredentialFingerprint, g.RefreshFingerprint = snapshot.Fingerprint, snapshot.RefreshFingerprint
 	if g.Identity.AccountID == "" && g.Identity.Email == "" && g.BlockedReason == "" {
 		g.BlockedReason = "live account identity is unavailable; sign in inside this live home before keepalive"
 	}
@@ -312,17 +352,59 @@ func inspectGrant(g Grant, vaultPaths []string) Grant {
 }
 
 func hasClaudeKeychain(home string) bool {
-	if runtime.GOOS != "darwin" {
+	return hasClaudeKeychainForOS(home, runtime.GOOS)
+}
+
+func hasClaudeKeychainForOS(home, goos string) bool {
+	if goos != "darwin" {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(home, "Library", "Keychains", "login.keychain-db"))
-	return err == nil
+	// CAAM_KEYCHAIN=0 disables CAAM's bridge, not Claude's native keychain
+	// lookup. Never trust a file mirror when this home's keychain may own it.
+	for _, name := range []string{"login.keychain-db", "login.keychain"} {
+		if _, err := os.Stat(filepath.Join(home, "Library", "Keychains", name)); !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 func freezeGrant(g *Grant) {
 	if g.source != nil {
 		g.source.blockedReason, g.source.owner, g.source.identity = g.BlockedReason, g.Owner, g.Identity
 	}
+}
+
+// recheckGrantOwnership runs under the per-grant keepalive lock immediately
+// before reading or invoking its native CLI. Earlier commands may have taken
+// minutes, and a newly created or switched home can now share this account.
+func recheckGrantOwnership(ctx context.Context, grant Grant) error {
+	if err := validateGrantSource(grant); err != nil {
+		return err
+	}
+	if grant.source.discovery == nil {
+		// Package-internal fixtures can bind a single exact native source;
+		// every grant returned by Discover records its full discovery scope.
+		return nil
+	}
+	grants, err := Discover(ctx, *grant.source.discovery)
+	if err != nil {
+		return fmt.Errorf("cannot revalidate all live grant owners")
+	}
+	for _, current := range grants {
+		if current.Ref() != grant.Ref() {
+			continue
+		}
+		if current.BlockedReason != "" || current.Owner != "" {
+			return fmt.Errorf("live account ownership is no longer unambiguous; run caam keepalive --dry-run to inspect owners")
+		}
+		if current.Home != grant.Home || current.AuthPath != grant.AuthPath || current.IdentityPath != grant.IdentityPath ||
+			!maps.Equal(current.Env, grant.Env) || !slices.Equal(current.Scrub, grant.Scrub) || !SameAccount(current.Identity, grant.Identity) {
+			return fmt.Errorf("live credential source or account changed since discovery")
+		}
+		return nil
+	}
+	return fmt.Errorf("live grant no longer appears in discovery")
 }
 
 // ReadCredential revalidates the discovery binding and rereads the exact live
@@ -333,13 +415,10 @@ func ReadCredential(g Grant) (CredentialSnapshot, error) {
 		return CredentialSnapshot{}, err
 	}
 	snapshot, err := readCredentialFiles(g.Provider, g.AuthPath, g.IdentityPath)
-	if err != nil {
-		return CredentialSnapshot{}, err
-	}
 	if err := validateGrantSource(g); err != nil {
 		return CredentialSnapshot{}, err
 	}
-	return snapshot, nil
+	return snapshot, err
 }
 
 func validateGrantSource(g Grant) error {
@@ -351,6 +430,9 @@ func validateGrantSource(g Grant) error {
 	}
 	if canonicalPath(g.AuthPath) != s.canonicalAuth || canonicalPath(g.IdentityPath) != s.canonicalIdentity {
 		return fmt.Errorf("live credential source changed its filesystem target")
+	}
+	if g.Provider == "claude" && hasClaudeKeychain(g.Home) {
+		return fmt.Errorf("Claude login keychain owns this home; use a file-backed shallow or isolated home")
 	}
 	for _, root := range s.vaultPaths {
 		if pathWithin(root, g.AuthPath) || pathWithin(root, g.Home) || (g.IdentityPath != "" && pathWithin(root, g.IdentityPath)) {
@@ -434,18 +516,6 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 		if json.Unmarshal(root["claudeAiOauth"], &oauth) != nil || oauth == nil {
 			return CredentialSnapshot{}, fmt.Errorf("Claude credential has no OAuth grant")
 		}
-		access, err := credentialString(oauth, "accessToken")
-		if err != nil || access == "" {
-			return CredentialSnapshot{}, fmt.Errorf("Claude access token is missing or malformed")
-		}
-		refresh, err = credentialString(oauth, "refreshToken")
-		if err != nil {
-			return CredentialSnapshot{}, err
-		}
-		snapshot.ExpiresAt, err = credentialExpiry(oauth, "expiresAt")
-		if err != nil {
-			return CredentialSnapshot{}, err
-		}
 		snapshot.Identity, err = identityFields(oauth, "accountId", "email")
 		if err != nil {
 			return CredentialSnapshot{}, err
@@ -479,6 +549,22 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 				snapshot.IdentityFingerprint = fingerprint(identityData)
 			}
 		}
+		access, err := credentialString(oauth, "accessToken")
+		if err != nil || access == "" {
+			return snapshot, fmt.Errorf("Claude access token is missing or malformed")
+		}
+		refresh, err = credentialString(oauth, "refreshToken")
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.HasRefreshToken = refresh != ""
+		if refresh != "" {
+			snapshot.RefreshFingerprint = fingerprint([]byte(refresh))
+		}
+		snapshot.ExpiresAt, err = credentialExpiry(oauth, "expiresAt")
+		if err != nil {
+			return snapshot, err
+		}
 	case "grok":
 		var entries []map[string]json.RawMessage
 		if hasGrokCredential(root) {
@@ -494,28 +580,28 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 			return CredentialSnapshot{}, fmt.Errorf("Grok credential must contain exactly one unambiguous OAuth grant")
 		}
 		entry := entries[0]
-		access, err := credentialString(entry, "key", "access_token", "accessToken", "token")
-		if err != nil || access == "" {
-			return CredentialSnapshot{}, fmt.Errorf("Grok access token is missing or malformed")
-		}
-		refresh, err = credentialString(entry, "refresh_token", "refreshToken")
-		if err != nil {
-			return CredentialSnapshot{}, err
-		}
-		snapshot.ExpiresAt, err = credentialExpiry(entry, "expires_at", "expiresAt", "expiry")
-		if err != nil {
-			return CredentialSnapshot{}, err
-		}
 		snapshot.Identity, err = identityFields(entry, "user_id", "email")
 		if err != nil {
 			return CredentialSnapshot{}, err
 		}
+		access, err := credentialString(entry, "key", "access_token", "accessToken", "token")
+		if err != nil || access == "" {
+			return snapshot, fmt.Errorf("Grok access token is missing or malformed")
+		}
+		refresh, err = credentialString(entry, "refresh_token", "refreshToken")
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.HasRefreshToken = refresh != ""
+		if refresh != "" {
+			snapshot.RefreshFingerprint = fingerprint([]byte(refresh))
+		}
+		snapshot.ExpiresAt, err = credentialExpiry(entry, "expires_at", "expiresAt", "expiry")
+		if err != nil {
+			return snapshot, err
+		}
 	default:
 		return CredentialSnapshot{}, fmt.Errorf("unsupported keepalive provider")
-	}
-	snapshot.HasRefreshToken = refresh != ""
-	if refresh != "" {
-		snapshot.RefreshFingerprint = fingerprint([]byte(refresh))
 	}
 	return snapshot, nil
 }
@@ -605,12 +691,21 @@ func hasGrokCredential(fields map[string]json.RawMessage) bool {
 func knownIdentity(id AccountIdentity) bool { return id.AccountID != "" || id.Email != "" }
 
 func readRegular(path string) ([]byte, error) {
+	// Inspect before opening: opening a FIFO can block indefinitely before
+	// the bounded read below gets a chance to reject its file mode.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 8<<20 {
+		return nil, fmt.Errorf("credential source must be a regular file smaller than 8 MiB")
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
+	info, err = f.Stat()
 	if err != nil {
 		return nil, err
 	}

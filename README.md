@@ -820,17 +820,21 @@ The default threshold is **2 hours** until expiry. While the access token
 remains valid, attempts are at least **25 minutes** apart; expired tokens
 bypass this interval. `--min-gap 0` disables the interval. Each native call
 has a **2-minute** timeout, and an exclusive lock prevents overlapping
-manual and scheduled renewals of the same grant.
+manual and scheduled renewals of the same grant. The minimum gap belongs
+to the account, so switching accounts in the same home does not inherit the
+previous login's throttle. Native child processes are stopped before the
+grant lock is released, and vault synchronization also has a bounded wait.
 
-Claude receives a one-word Haiku prompt with low effort, no tools, disabled
-user hooks, no MCP servers, and no session persistence in an empty working
-directory. This consumes a small amount of Claude usage. Grok runs
+Claude receives a one-word Haiku prompt in safe mode, with low effort, a
+one-turn limit, no tools, disabled user hooks and connectors, no MCP servers,
+and no session persistence in an empty working directory. This consumes a
+small amount of Claude usage; deployment-managed policies still apply. Grok runs
 `grok models`, which does not request a model turn. Authentication overrides
 are scrubbed so each CLI uses the selected live credential.
 
 | Result | Meaning |
 |--------|---------|
-| `rotated` | The CLI left a changed, unexpired credential for the same account. |
+| `rotated` | The CLI left a renewable, unexpired credential for the same account with a strictly later expiry. |
 | `still_valid` | The credential remains usable; the native CLI may defer rotation until closer to expiry. |
 | `skipped` | The token is outside the threshold, was attempted recently, or another reference owns the same grant. |
 | `dry_run` | This live grant would be attempted. |
@@ -841,6 +845,8 @@ The command returns nonzero if any selected grant cannot be renewed.
 before/after expiry, and reasons. Native output and credential secrets are
 excluded. A zero exit from Grok alone is insufficient: keepalive detects
 the case where Grok removes rejected credentials while exiting successfully.
+It also rejects a backwards expiry or a missing refresh credential. Metadata
+or formatting changes alone do not count as renewal.
 
 After a successful native run, an existing user vault snapshot receives the
 live credential only if its account matches and its saved expiry is
@@ -849,6 +855,12 @@ Unknown age, conflicting identity, concurrent changes, and system snapshots
 such as `_original` or `_backup_*` prevent copying. Settings and metadata
 remain with their existing snapshot. Copy failures appear in the JSON
 `sync` results without misreporting a successfully renewed live grant.
+
+Valid grants skipped by the TTL threshold or minimum gap can still repair
+older matching vault snapshots, without another native request. A missed
+snapshot update can therefore recover on the next scheduled check. Ownership
+is checked again under the grant lock, so a second live home created after
+initial discovery prevents a stale owner from running.
 
 `caam keepalive vault:claude/alice` and names found only in the vault are
 refused with a matching live-home hint when one can be verified. A vault

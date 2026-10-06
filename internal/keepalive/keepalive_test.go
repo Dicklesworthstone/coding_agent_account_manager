@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
 
 var engineNow = time.Date(2026, 10, 6, 20, 0, 0, 0, time.UTC)
@@ -134,8 +136,10 @@ cp "$CAAM_KEEPALIVE_NEXT" "$GROK_HOME/auth.json"`
 			expectedArgs := []string{"models"}
 			if provider == "claude" {
 				expectedArgs = []string{"-p", "ping", "--model", "haiku", "--effort", "low",
+					"--safe-mode", "--max-turns", "1",
 					"--no-session-persistence", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`,
-					"--setting-sources", "project", "--settings", `{"disableAllHooks":true}`,
+					"--setting-sources", "project", "--settings", `{"disableAllHooks":true,"disableClaudeAiConnectors":true}`,
+					"--disallowedTools", "mcp__*",
 					"--tools", "", "--disable-slash-commands", "--system-prompt", "Reply with one word."}
 			}
 			if !reflect.DeepEqual(lines[2:], expectedArgs) {
@@ -163,6 +167,10 @@ func TestRunChecksCredentialsAfterNativeExit(t *testing.T) {
 		{"malformed with zero exit", `printf 'invalid json' > "$GROK_HOME/auth.json"`, "failed", "credential_invalid", false, false},
 		{"unchanged expired with zero exit", `exit 0`, "failed", "still_expired", false, false},
 		{"unchanged valid with zero exit", `exit 0`, "still_valid", "", true, true},
+		{"formatting change is not renewal", `printf '\n' >> "$GROK_HOME/auth.json"`, "still_valid", "", true, true},
+		{"token change without longer lifetime", `printf '%s' '{"key":"changed-access","refresh_token":"new-refresh","expires_at":"2026-10-06T21:00:00Z","user_id":"test-account"}' > "$GROK_HOME/auth.json"`, "still_valid", "", true, true},
+		{"expiry moved backwards", `printf '%s' '{"key":"changed-access","refresh_token":"new-refresh","expires_at":"2026-10-06T20:30:00Z","user_id":"test-account"}' > "$GROK_HOME/auth.json"`, "failed", "expiry_regressed", true, false},
+		{"refresh credential removed", `printf '%s' '{"key":"changed-access","expires_at":"2026-10-07T20:00:00Z","user_id":"test-account"}' > "$GROK_HOME/auth.json"`, "failed", "refresh_credential_missing", true, false},
 		{"unchanged valid with nonzero exit", `printf 'test-secret' >&2; exit 17`, "failed", "native_cli_failed", true, false},
 		{"renewed before model failure", `printf '%s' '{"key":"new-access","refresh_token":"new-refresh","expires_at":"2026-10-07T20:00:00Z","user_id":"test-account"}' > "$GROK_HOME/auth.json"; exit 17`, "rotated", "native_cli_failed_after_rotation", false, true},
 		{"different account", `printf '%s' '{"key":"other","refresh_token":"other-refresh","expires_at":"2026-10-07T20:00:00Z","user_id":"different-account"}' > "$GROK_HOME/auth.json"`, "failed", "account_changed", false, false},
@@ -219,6 +227,90 @@ func TestRunMinGapAndExpiredBypass(t *testing.T) {
 	state, err := os.ReadFile(filepath.Join(opts.StateDir, grantKey(grant)+".json"))
 	if err != nil || strings.Contains(string(state), "test-access") || strings.Contains(string(state), "test-refresh") {
 		t.Fatalf("unsafe or unreadable state: %q, error %v", state, err)
+	}
+}
+
+func TestRunNewAccountDoesNotInheritPreviousAccountMinimumGap(t *testing.T) {
+	grant := engineGrant(t, "grok", engineNow.Add(time.Hour))
+	opts := engineOptions(t, "grok", engineCLI(t, `exit 0`))
+	if result := runEngine(t, grant, opts); !result.Success || !result.Attempted {
+		t.Fatalf("initial account was not checked: %+v", result)
+	}
+	changed := strings.ReplaceAll(string(engineAuth("grok", engineNow.Add(time.Hour), "other-access")), "test-account", "other-account")
+	if err := os.WriteFile(grant.AuthPath, []byte(changed), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Rediscovery observes the native account switch in the same physical home.
+	grant = inspectGrant(Grant{Provider: "grok", Kind: "host", Home: grant.Home, AuthPath: grant.AuthPath, Env: grant.Env}, nil)
+	if result := runEngine(t, grant, opts); !result.Success || !result.Attempted {
+		t.Fatalf("a new account inherited the previous account's throttle: %+v", result)
+	}
+	state, err := os.ReadFile(filepath.Join(opts.StateDir, grantKey(grant)+".json"))
+	if err != nil || strings.Contains(string(state), "other-account") || strings.Contains(string(state), "other-access") {
+		t.Fatalf("account history stored readable identity or credentials: %v", err)
+	}
+}
+
+func TestRunSkippedValidGrantsRepairStaleVaultWithoutNativeRequest(t *testing.T) {
+	for _, reason := range []string{"outside_ttl", "min_gap"} {
+		t.Run(reason, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			expiry := now.Add(6 * time.Hour)
+			if reason == "min_gap" {
+				expiry = now.Add(time.Hour)
+			}
+			grant := engineGrant(t, "grok", expiry)
+			opts := engineOptions(t, "grok", engineCLI(t, `exit 0`))
+			opts.Now = func() time.Time { return now }
+			if reason == "min_gap" {
+				if result := runEngine(t, grant, opts); !result.Attempted || !result.Success {
+					t.Fatalf("could not establish recent native check: %+v", result)
+				}
+			}
+			vault := authfile.NewVault(t.TempDir())
+			saved := filepath.Join(vault.ProfilePath("grok", "saved-account"), "auth.json")
+			if err := os.MkdirAll(filepath.Dir(saved), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(saved, engineAuth("grok", now.Add(-24*time.Hour), "stale-access"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			opts.GrokBin = filepath.Join(t.TempDir(), "must-not-run")
+			opts.AfterRenew = func(ctx context.Context, live Grant, current CredentialSnapshot) ([]SyncResult, error) {
+				return SyncVault(ctx, live, current, vault)
+			}
+			result := runEngine(t, grant, opts)
+			if !result.Success || result.Attempted || result.Reason != reason || !reflect.DeepEqual(result.SyncedProfiles, []string{"saved-account"}) {
+				t.Fatalf("skipped native check did not repair the vault: %+v", result)
+			}
+			live, _ := os.ReadFile(grant.AuthPath)
+			stored, err := os.ReadFile(saved)
+			if err != nil || string(stored) != string(live) {
+				t.Fatalf("vault did not receive the current live credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunVaultSynchronizationIsBounded(t *testing.T) {
+	grant := engineGrant(t, "grok", engineNow.Add(6*time.Hour))
+	opts := engineOptions(t, "grok", filepath.Join(t.TempDir(), "must-not-run"))
+	opts.Timeout = 40 * time.Millisecond
+	opts.AfterRenew = func(ctx context.Context, _ Grant, _ CredentialSnapshot) ([]SyncResult, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("vault synchronization received an unbounded context")
+			return nil, errors.New("missing synchronization deadline")
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	start := time.Now()
+	result := runEngine(t, grant, opts)
+	if !result.Success || result.Attempted || result.Reason != "vault_sync_failed" || len(result.Sync) == 0 {
+		t.Fatalf("bounded sync lost the live health or failure diagnostic: %+v", result)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("vault synchronization did not respect the timeout")
 	}
 }
 
