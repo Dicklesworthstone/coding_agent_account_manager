@@ -89,6 +89,10 @@ type Daemon struct {
 	// live aliases. It is protected by mu; replacement logins have new fingerprints.
 	reloginWarnings map[string]string
 
+	// refreshSkips suppresses repeated notices, never refresh eligibility checks.
+	// It is protected by mu; a changed reason is reported on the next check.
+	refreshSkips map[string]string
+
 	configMu sync.RWMutex // Protects config access during runtime reloads
 }
 
@@ -216,11 +220,16 @@ func (d *Daemon) initAuthPool() {
 		RefreshThreshold: d.config.RefreshThreshold,
 		MaxConcurrent:    maxConcurrent,
 		OnRefreshStart: func(provider, profile string) {
-			if d.isVerbose() {
-				d.logger.Printf("Pool: starting refresh for %s/%s", provider, profile)
-			}
+			d.logger.Printf("Pool: starting refresh for %s/%s", provider, profile)
+		},
+		OnRefreshSkipped: func(provider, profile string, err error) {
+			d.logRefreshSkip(provider, profile, err)
 		},
 		OnRefreshComplete: func(provider, profile string, newExpiry time.Time, err error) {
+			if refresh.IsSkipped(err) {
+				d.logger.Printf("Pool: %s/%s refresh skipped: %v", provider, profile, err)
+				return
+			}
 			d.mu.Lock()
 			if err != nil {
 				d.stats.RefreshErrors++
@@ -229,10 +238,8 @@ func (d *Daemon) initAuthPool() {
 			} else {
 				d.stats.RefreshCount++
 				d.mu.Unlock()
-				if d.isVerbose() {
-					d.logger.Printf("Pool: %s/%s refreshed, expires %v",
-						provider, profile, newExpiry.Format(time.RFC3339))
-				}
+				d.logger.Printf("Pool: %s/%s refreshed, expires %v",
+					provider, profile, newExpiry.Format(time.RFC3339))
 			}
 		},
 	}
@@ -614,7 +621,7 @@ func (d *Daemon) checkAndRefresh() {
 		d.logger.Println("Checking profiles for refresh...")
 	}
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	providers := []string{"claude", "codex", "gemini", "grok", "cursor"}
 	var totalChecked int64
 
 	// Use a semaphore to limit concurrency
@@ -665,10 +672,31 @@ func (d *Daemon) checkProfile(provider, profile string) {
 		return
 	}
 	if provider == "cursor" {
+		if err := refresh.Preflight(provider, profile, d.vault); refresh.IsSkipped(err) {
+			d.logRefreshSkip(provider, profile, err)
+		}
 		d.warnCursorSession(profile, ph, time.Now())
 		return
 	}
+
+	// Decide from the current credential before announcing any attempt. Repeat
+	// this on every check so a backup can make a previously stale token usable.
+	if err := refresh.Preflight(provider, profile, d.vault); err != nil {
+		if refresh.IsSkipped(err) {
+			d.logRefreshSkip(provider, profile, err)
+		} else {
+			d.mu.Lock()
+			d.stats.RefreshErrors++
+			d.mu.Unlock()
+			d.logger.Printf("%s/%s: refresh preflight failed: %v", provider, profile, err)
+		}
+		return
+	}
 	if ph.SelfRefreshing {
+		d.logRefreshSkip(provider, profile, &refresh.UnsupportedError{
+			Provider: provider,
+			Reason:   fmt.Sprintf("the %s CLI renews this credential when it runs", provider),
+		})
 		return
 	}
 
@@ -676,7 +704,11 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	if !refresh.ShouldRefresh(ph, d.getRefreshThreshold()) {
 		if d.isVerbose() && !ph.TokenExpiresAt.IsZero() {
 			ttl := time.Until(ph.TokenExpiresAt)
-			d.logger.Printf("%s/%s: token OK (expires in %v)", provider, profile, ttl.Round(time.Minute))
+			if ttl > 0 {
+				d.logger.Printf("%s/%s: token OK (expires in %v)", provider, profile, ttl.Round(time.Minute))
+			} else {
+				d.logger.Printf("%s/%s: token expired (%v ago)", provider, profile, (-ttl).Round(time.Minute))
+			}
 		}
 		return
 	}
@@ -688,26 +720,46 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	defer cancel()
 
 	err := refresh.RefreshProfile(ctx, provider, profile, d.vault, d.healthStore)
+	if refresh.IsSkipped(err) {
+		// Credentials may change after preflight. Always finish an announced
+		// attempt with its outcome, even when the result is a safe skip.
+		d.logger.Printf("%s/%s: refresh skipped: %v", provider, profile, err)
+		return
+	}
 
 	d.mu.Lock()
 	if err != nil {
 		d.stats.RefreshErrors++
 		d.mu.Unlock()
 
-		// Don't log unsupported errors as failures
-		var unsupErr *refresh.UnsupportedError
-		if ok := isUnsupportedError(err, &unsupErr); ok {
-			if d.isVerbose() {
-				d.logger.Printf("%s/%s: refresh not supported (%s)", provider, profile, unsupErr.Reason)
-			}
-		} else {
-			d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
-		}
+		d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
 	} else {
 		d.stats.RefreshCount++
 		d.mu.Unlock()
-		d.logger.Printf("%s/%s: token refreshed successfully", provider, profile)
+		if updated := d.getProfileHealth(provider, profile); updated != nil && !updated.TokenExpiresAt.IsZero() {
+			d.logger.Printf("%s/%s: token refreshed successfully (new expiry %s)", provider, profile, updated.TokenExpiresAt.Format(time.RFC3339))
+		} else {
+			d.logger.Printf("%s/%s: token refreshed successfully (new expiry unavailable)", provider, profile)
+		}
 	}
+}
+
+// logRefreshSkip reports a reason once per profile without suppressing future
+// preflight checks or treating a non-attempt as a refresh error.
+func (d *Daemon) logRefreshSkip(provider, profile string, err error) {
+	key := provider + "/" + profile
+	reason := err.Error()
+	d.mu.Lock()
+	if d.refreshSkips == nil {
+		d.refreshSkips = make(map[string]string)
+	}
+	if d.refreshSkips[key] == reason {
+		d.mu.Unlock()
+		return
+	}
+	d.refreshSkips[key] = reason
+	d.mu.Unlock()
+	d.logger.Printf("%s: not refreshed by caam (%s)", key, reason)
 }
 
 // getProfileHealth returns the health data for a profile.
@@ -715,15 +767,10 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	var ph *health.ProfileHealth
 	if d.healthStore != nil {
 		ph, _ = d.healthStore.GetProfile(provider, profile)
-		// Cursor renewability and the login fingerprint are derived from
-		// the current credential, never persisted. A cached timestamp must
-		// not conceal a new login or carry a session warning onto an API key.
-		if provider != "cursor" && ph != nil && !ph.TokenExpiresAt.IsZero() {
-			return ph
-		}
 	}
 
-	// Fall back to parsing the auth files directly
+	// Expiry and renewal policy come from the current credential. Cached health
+	// retains account statistics but cannot make an absent or replaced login valid.
 	vaultPath := d.vault.ProfilePath(provider, profile)
 	var expiryInfo *health.ExpiryInfo
 	var err error
@@ -739,8 +786,9 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
 	case "cursor":
 		expiryInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
-	case "opencode", "grok":
-		// No token expiry parsing for these providers yet
+	case "grok":
+		expiryInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	default:
 		return nil
 	}
 

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 // Refresher is the interface for token refresh implementations.
@@ -12,6 +14,12 @@ type Refresher interface {
 	// Refresh refreshes the token for a profile.
 	// Returns the new token expiry time on success.
 	Refresh(ctx context.Context, provider, profile string) (time.Time, error)
+}
+
+// Preflighter lets a refresher reject unsafe or unsupported work before the
+// monitor changes pool state or announces a refresh attempt.
+type Preflighter interface {
+	Preflight(provider, profile string) error
 }
 
 // MonitorConfig configures the background monitor loop.
@@ -33,6 +41,9 @@ type MonitorConfig struct {
 
 	// OnRefreshComplete is called when a refresh completes.
 	OnRefreshComplete func(provider, profile string, newExpiry time.Time, err error)
+
+	// OnRefreshSkipped reports a non-attempt. It does not change error counters.
+	OnRefreshSkipped func(provider, profile string, err error)
 }
 
 // DefaultMonitorConfig returns the default monitor configuration.
@@ -181,13 +192,13 @@ func (m *Monitor) checkAndRefresh(ctx context.Context) {
 			profile.Status == PoolStatusError
 
 		if needsRefresh {
-			m.triggerRefresh(ctx, profile.Provider, profile.ProfileName, profile.Status)
+			m.triggerRefresh(ctx, profile.Provider, profile.ProfileName)
 		}
 	}
 }
 
 // triggerRefresh starts a refresh operation for a profile.
-func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, prevStatus PoolStatus) {
+func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string) {
 	if provider == "cursor" {
 		return
 	}
@@ -200,8 +211,13 @@ func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, 
 		// No slots available, skip this refresh cycle
 		return
 	}
+	if err := m.preflight(provider, profile); err != nil {
+		<-m.semaphore
+		return
+	}
 
-	if !m.pool.TryMarkRefreshing(provider, profile) {
+	prevStatus, reserved := m.pool.TryMarkRefreshing(provider, profile)
+	if !reserved {
 		<-m.semaphore
 		return
 	}
@@ -216,7 +232,7 @@ func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, 
 		m.mu.Unlock()
 		// Revert the optimistic status change so the pool doesn't stay stuck.
 		if prevStatus != PoolStatusRefreshing {
-			_ = m.pool.SetStatus(provider, profile, prevStatus)
+			m.pool.restoreRefreshStatus(provider, profile, prevStatus)
 		}
 		<-m.semaphore
 		return
@@ -228,15 +244,40 @@ func (m *Monitor) triggerRefresh(ctx context.Context, provider, profile string, 
 		defer m.refreshWg.Done()
 		defer func() { <-m.semaphore }()
 
-		m.doRefresh(ctx, provider, profile)
+		_ = m.doRefresh(ctx, provider, profile, prevStatus)
 	}()
 }
 
+// preflight checks the current credential on every request. Skips preserve the
+// pool entry so a later backup can make the profile refreshable again.
+func (m *Monitor) preflight(provider, profile string) error {
+	var err error
+	if m.refresher == nil {
+		err = fmt.Errorf("no refresher configured")
+	} else if checker, ok := m.refresher.(Preflighter); ok {
+		err = checker.Preflight(provider, profile)
+	}
+	if err != nil {
+		if refresh.IsSkipped(err) {
+			if m.config.OnRefreshSkipped != nil {
+				m.config.OnRefreshSkipped(provider, profile, err)
+			}
+		} else {
+			m.pool.SetError(provider, profile, err)
+			if m.config.OnRefreshComplete != nil {
+				m.config.OnRefreshComplete(provider, profile, time.Time{}, err)
+			}
+		}
+	}
+	return err
+}
+
 // doRefresh performs the actual refresh operation.
-func (m *Monitor) doRefresh(ctx context.Context, provider, profile string) {
-	// Mark as refreshing
-	if err := m.pool.SetStatus(provider, profile, PoolStatusRefreshing); err != nil {
-		return // Profile may have been removed
+func (m *Monitor) doRefresh(ctx context.Context, provider, profile string, prevStatus PoolStatus) error {
+	// The caller reserved the profile already. Do not overwrite a cooldown
+	// recorded after reservation while this goroutine was waiting to run.
+	if m.pool.GetProfile(provider, profile) == nil {
+		return fmt.Errorf("profile %s/%s not found", provider, profile)
 	}
 
 	// Call start callback
@@ -244,24 +285,22 @@ func (m *Monitor) doRefresh(ctx context.Context, provider, profile string) {
 		m.config.OnRefreshStart(provider, profile)
 	}
 
-	// Check if refresher is available
-	if m.refresher == nil {
-		m.pool.SetError(provider, profile, fmt.Errorf("no refresher configured"))
-		if m.config.OnRefreshComplete != nil {
-			m.config.OnRefreshComplete(provider, profile, time.Time{}, fmt.Errorf("no refresher configured"))
-		}
-		return
-	}
-
 	// Perform refresh
 	newExpiry, err := m.refresher.Refresh(ctx, provider, profile)
 
 	if err != nil {
+		m.pool.restoreRefreshStatus(provider, profile, prevStatus)
+		if refresh.IsSkipped(err) {
+			if m.config.OnRefreshComplete != nil {
+				m.config.OnRefreshComplete(provider, profile, time.Time{}, err)
+			}
+			return err
+		}
 		m.pool.SetError(provider, profile, err)
 		if m.config.OnRefreshComplete != nil {
 			m.config.OnRefreshComplete(provider, profile, time.Time{}, err)
 		}
-		return
+		return err
 	}
 
 	// Success - update pool state
@@ -270,6 +309,7 @@ func (m *Monitor) doRefresh(ctx context.Context, provider, profile string) {
 	if m.config.OnRefreshComplete != nil {
 		m.config.OnRefreshComplete(provider, profile, newExpiry, nil)
 	}
+	return nil
 }
 
 // ForceRefresh triggers an immediate refresh for a specific profile.
@@ -297,12 +337,16 @@ func (m *Monitor) ForceRefresh(ctx context.Context, provider, profile string) er
 	m.refreshWg.Add(1)
 	m.mu.Unlock()
 	defer m.refreshWg.Done()
+	if err := m.preflight(provider, profile); err != nil {
+		return err
+	}
 
 	// Try to mark as refreshing. This checks existence AND current status atomically.
 	// We do this AFTER acquiring the semaphore to ensure we don't hold the lock
 	// while waiting for the semaphore, but also to prevent races where another
 	// routine starts refreshing while we wait.
-	if !m.pool.TryMarkRefreshing(provider, profile) {
+	previous, reserved := m.pool.TryMarkRefreshing(provider, profile)
+	if !reserved {
 		// Need to distinguish "not found" vs "already refreshing"
 		p := m.pool.GetProfile(provider, profile)
 		if p == nil {
@@ -312,15 +356,7 @@ func (m *Monitor) ForceRefresh(ctx context.Context, provider, profile string) er
 	}
 
 	// Perform refresh (synchronous)
-	m.doRefresh(ctx, provider, profile)
-
-	// Check result
-	p := m.pool.GetProfile(provider, profile)
-	if p != nil && p.Status == PoolStatusError {
-		return fmt.Errorf("refresh failed: %s", p.ErrorMessage)
-	}
-
-	return nil
+	return m.doRefresh(ctx, provider, profile, previous)
 }
 
 // RefreshAll triggers refresh for all profiles that need it.

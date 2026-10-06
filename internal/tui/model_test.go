@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -634,6 +635,48 @@ func TestShowRefreshSuccess(t *testing.T) {
 	m.showRefreshSuccess("work@company.com", expiry)
 	if !strings.Contains(m.statusMsg, "Mar 15") || !strings.Contains(m.statusMsg, "14:30") {
 		t.Errorf("expected expiry time in status, got %q", m.statusMsg)
+	}
+}
+
+func TestRefreshResultDistinguishesSkipsFromFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		severity StatusSeverity
+		skipped  bool
+	}{
+		{
+			name:     "native managed credential",
+			err:      &refresh.UnsupportedError{Provider: "cursor", Reason: "session logins cannot refresh; use cursor-agent login"},
+			severity: StatusInfo,
+			skipped:  true,
+		},
+		{
+			name:     "newer live credential",
+			err:      &refresh.StaleCredentialError{Provider: "codex", Profile: "work"},
+			severity: StatusInfo,
+			skipped:  true,
+		},
+		{
+			name:     "provider failure",
+			err:      fmt.Errorf("refresh failed: token endpoint returned 503"),
+			severity: StatusError,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New()
+			result, command := m.Update(refreshResultMsg{provider: "codex", profile: "work", err: tc.err})
+			updated := result.(Model)
+			if command != nil {
+				t.Fatal("an unsuccessful refresh scheduled a success reload")
+			}
+			if got := updated.statusMessageSeverity(); got != tc.severity {
+				t.Errorf("status severity = %v, want %v; message = %q", got, tc.severity, updated.statusMsg)
+			}
+			if strings.HasPrefix(updated.statusMsg, "Refresh skipped:") != tc.skipped || !strings.Contains(updated.statusMsg, tc.err.Error()) {
+				t.Errorf("status = %q, want original reason with skipped=%v", updated.statusMsg, tc.skipped)
+			}
+		})
 	}
 }
 

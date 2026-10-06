@@ -985,7 +985,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		// identity / missing live file / older-or-equal live / unparseable
 		// timestamps all fall through to the normal verbatim copy, so genuine
 		// cross-account switches and non-codex restores are never blocked.
-		if fileSet.Tool == "codex" && codexLiveIsNewer(spec.Path, srcPath) {
+		if fileSet.Tool == "codex" && CodexLiveIsNewer(spec.Path, srcPath) {
 			restored++
 			if spec.Required {
 				requiredFound = true
@@ -2191,18 +2191,19 @@ func jwtIssuedAt(token string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// codexLiveIsNewer reports whether the LIVE codex auth file at livePath holds
+// CodexLiveIsNewer reports whether the live Codex auth file at livePath holds
 // the same OpenAI identity as the incoming vault snapshot AND was refreshed
-// strictly more recently. When true, the restore path must NOT clobber the live
-// file: doing so would replay an already-rotated (consumed) refresh_token and
-// trip the IdP's reuse detection, revoking the whole token family.
+// strictly more recently. When true, callers must neither overwrite the live
+// file nor refresh the snapshot: either action could replay a consumed refresh
+// token and trigger reuse detection, revoking the whole token family.
 //
 // Conservative by construction: any uncertainty (missing/unreadable live file,
 // different identity, equal-or-older live timestamp, or an unparseable
-// timestamp on either side) returns false so the normal verbatim copy proceeds.
+// timestamp on either side) returns false. It does not prove an unknown token
+// is safe, and does not coordinate concurrent refreshes with the native CLI.
 // Real cross-account switches (different identity) and first-time restores
 // (no live file) are therefore never blocked.
-func codexLiveIsNewer(livePath, snapshotPath string) bool {
+func CodexLiveIsNewer(livePath, snapshotPath string) bool {
 	liveData, err := os.ReadFile(livePath)
 	if err != nil {
 		return false // no live file (or unreadable) -> safe to copy

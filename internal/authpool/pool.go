@@ -71,9 +71,9 @@ func WithOnStateChange(fn func(profile *PooledProfile, oldStatus, newStatus Pool
 func NewAuthPool(opts ...PoolOption) *AuthPool {
 	p := &AuthPool{
 		profiles:         make(map[string]*PooledProfile),
-		refreshThreshold: 5 * time.Minute,   // Default: refresh 5 min before expiry
-		cooldownDuration: 5 * time.Minute,   // Default: 5 min cooldown
-		maxRetries:       3,                 // Default: 3 retries
+		refreshThreshold: 5 * time.Minute, // Default: refresh 5 min before expiry
+		cooldownDuration: 5 * time.Minute, // Default: 5 min cooldown
+		maxRetries:       3,               // Default: 3 retries
 	}
 
 	for _, opt := range opts {
@@ -182,24 +182,36 @@ func (p *AuthPool) SetStatus(provider, name string, status PoolStatus) error {
 }
 
 // TryMarkRefreshing marks a profile as refreshing if it is not already.
-// Returns true if the status was updated, false if the profile does not exist
-// or is already refreshing.
-func (p *AuthPool) TryMarkRefreshing(provider, name string) bool {
+// Returns the previous status and true if reserved, or false if the profile
+// does not exist or is already refreshing. Capture the status under the same
+// lock so a skipped refresh can restore it without using an older snapshot.
+func (p *AuthPool) TryMarkRefreshing(provider, name string) (PoolStatus, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	key := profileKey(provider, name)
 	profile, ok := p.profiles[key]
 	if !ok {
-		return false
+		return PoolStatusUnknown, false
 	}
 	if profile.Status == PoolStatusRefreshing {
-		return false
+		return profile.Status, false
 	}
 
+	previous := profile.Status
 	profile.Status = PoolStatusRefreshing
 	profile.LastCheck = time.Now()
-	return true
+	return previous, true
+}
+
+// restoreRefreshStatus releases an in-flight refresh without clearing errors
+// or overwriting a concurrent cooldown or other externally updated status.
+func (p *AuthPool) restoreRefreshStatus(provider, name string, previous PoolStatus) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if profile := p.profiles[profileKey(provider, name)]; profile != nil && profile.Status == PoolStatusRefreshing {
+		profile.Status = previous
+	}
 }
 
 // SetError records an error for a profile.

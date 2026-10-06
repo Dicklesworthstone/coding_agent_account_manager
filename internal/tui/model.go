@@ -860,6 +860,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshResultMsg:
 		if msg.err != nil {
+			if refresh.IsSkipped(msg.err) {
+				m.statusMsg = fmt.Sprintf("Refresh skipped: %v", msg.err)
+				return m, nil
+			}
 			m.showError(msg.err, "Refresh")
 			return m, nil
 		}
@@ -1482,7 +1486,7 @@ func (m Model) handleLoginProfile() (tea.Model, tea.Cmd) {
 	}
 	provider := m.currentProvider()
 
-	m.statusMsg = fmt.Sprintf("Refreshing %s token...", info.Name)
+	m.statusMsg = fmt.Sprintf("Checking refresh eligibility for %s...", info.Name)
 
 	// Return a command that performs the async refresh
 	return m, m.doRefreshProfile(provider, info.Name)
@@ -3132,6 +3136,9 @@ func (m Model) statusCenterMessage() string {
 func statusSeverityFromMessage(msg string) StatusSeverity {
 	msg = strings.TrimSpace(strings.ToLower(msg))
 	if msg == "" {
+		return StatusInfo
+	}
+	if strings.HasPrefix(msg, "refresh skipped:") {
 		return StatusInfo
 	}
 

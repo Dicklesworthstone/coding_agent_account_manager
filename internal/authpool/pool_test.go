@@ -175,7 +175,7 @@ func TestAuthPool_TryMarkRefreshing(t *testing.T) {
 	p := NewAuthPool()
 	p.AddProfile("claude", "test")
 
-	if ok := p.TryMarkRefreshing("claude", "test"); !ok {
+	if previous, ok := p.TryMarkRefreshing("claude", "test"); !ok || previous != PoolStatusUnknown {
 		t.Fatal("TryMarkRefreshing() = false, want true for first call")
 	}
 
@@ -183,11 +183,11 @@ func TestAuthPool_TryMarkRefreshing(t *testing.T) {
 		t.Fatalf("Status after TryMarkRefreshing() = %v, want Refreshing", status)
 	}
 
-	if ok := p.TryMarkRefreshing("claude", "test"); ok {
+	if _, ok := p.TryMarkRefreshing("claude", "test"); ok {
 		t.Fatal("TryMarkRefreshing() = true, want false when already refreshing")
 	}
 
-	if ok := p.TryMarkRefreshing("claude", "missing"); ok {
+	if _, ok := p.TryMarkRefreshing("claude", "missing"); ok {
 		t.Fatal("TryMarkRefreshing() = true, want false for missing profile")
 	}
 }
@@ -762,9 +762,9 @@ func TestPooledProfile_IsExpiringSoon(t *testing.T) {
 
 func TestPooledProfile_IsInCooldown(t *testing.T) {
 	tests := []struct {
-		name    string
-		until   time.Time
-		want    bool
+		name  string
+		until time.Time
+		want  bool
 	}{
 		{"zero", time.Time{}, false},
 		{"future", time.Now().Add(time.Hour), true},

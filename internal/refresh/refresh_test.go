@@ -3,11 +3,15 @@ package refresh
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,33 +19,301 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
-func TestRefreshCursorDoesNotReportNoOpSuccess(t *testing.T) {
+func TestRefreshNativeCredentialsAreSkippedWithoutMutation(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		body string
-		want string
+		name     string
+		provider string
+		body     string
+		want     string
 	}{
-		{"session", `{"accessToken":"SYNTHETIC-SESSION","refreshToken":"SYNTHETIC-SESSION"}`, "caam login cursor work"},
-		{"API key", `{"apiKey":"SYNTHETIC-KEY"}`, "cursor-agent renews tokens"},
+		{"Cursor session", "cursor", `{"accessToken":"SYNTHETIC-SESSION","refreshToken":"SYNTHETIC-SESSION"}`, "caam login cursor work"},
+		{"Cursor API key", "cursor", `{"apiKey":"SYNTHETIC-KEY"}`, "cursor-agent renews tokens"},
+		{"Claude", "claude", `{"refreshToken":"SYNTHETIC-REFRESH"}`, "Claude Code handles refresh internally"},
+		{"Grok", "grok", `{"refresh_token":"SYNTHETIC-REFRESH"}`, "Grok Build handles token renewal"},
+		{"OpenCode", "opencode", `{"refresh":"SYNTHETIC-REFRESH"}`, "use OpenCode to authenticate"},
+		{"unknown provider", "other", `{}`, "provider not supported"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vault := authfile.NewVault(t.TempDir())
-			path := filepath.Join(vault.ProfilePath("cursor", "work"), "auth.json")
+			path := filepath.Join(vault.ProfilePath(tc.provider, "work"), "auth.json")
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
 				t.Fatal(err)
 			}
-			err := RefreshProfile(context.Background(), "cursor", "work", vault, nil)
-			if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("RefreshProfile error = %v, want unsupported with %q", err, tc.want)
+			healthPath := filepath.Join(t.TempDir(), "health.json")
+			store := health.NewStorage(healthPath)
+			for range 2 {
+				for _, err := range []error{
+					Preflight(tc.provider, "work", vault),
+					RefreshProfile(context.Background(), tc.provider, "work", vault, store),
+				} {
+					if !errors.Is(err, ErrUnsupported) || !IsSkipped(err) || !strings.Contains(err.Error(), tc.want) {
+						t.Fatalf("refresh error = %v, want skipped and unsupported with %q", err, tc.want)
+					}
+				}
 			}
 			after, readErr := os.ReadFile(path)
 			if readErr != nil || !bytes.Equal(after, []byte(tc.body)) {
 				t.Fatalf("unsupported refresh changed auth.json: read error = %v", readErr)
 			}
+			if _, err := os.Stat(healthPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unsupported refresh wrote health metadata: %v", err)
+			}
 		})
+	}
+}
+
+func TestRefreshProfileCodexPreflightPreventsStaleTokenPosts(t *testing.T) {
+	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
+	newer := base.Add(time.Hour)
+	snapshot := codexPreflightAuth(t, "alice", "SYNTHETIC-VAULT-REFRESH", base, base)
+	for _, tc := range []struct {
+		name     string
+		live     []byte
+		wantSkip bool
+	}{
+		{"newer live last_refresh", codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", base, newer), true},
+		{"newer live JWT iat", codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", newer, time.Time{}), true},
+		{"equal freshness", codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", base, base), false},
+		{"older live credential", codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", base.Add(-time.Hour), base.Add(-time.Hour)), false},
+		{"different account newer", codexPreflightAuth(t, "bob", "SYNTHETIC-LIVE-REFRESH", newer, newer), false},
+		{"unknown live identity", codexPreflightAuth(t, "", "SYNTHETIC-LIVE-REFRESH", newer, newer), false},
+		{"unknown live freshness", codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", time.Time{}, time.Time{}), false},
+		{"no live credential", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			liveDir := filepath.Join(root, "live")
+			t.Setenv("CODEX_HOME", liveDir)
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			snapshotPath := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+			writePreflightAuth(t, snapshotPath, snapshot)
+			livePath := filepath.Join(liveDir, "auth.json")
+			if tc.live != nil {
+				writePreflightAuth(t, livePath, tc.live)
+			}
+
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				posts.Add(1)
+				var request map[string]string
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode refresh request: %v", err)
+				}
+				if r.Method != http.MethodPost || request["refresh_token"] != "SYNTHETIC-VAULT-REFRESH" {
+					t.Errorf("unexpected refresh request method or credential")
+				}
+				_, _ = w.Write([]byte(`{"access_token":"SYNTHETIC-NEW-ACCESS","refresh_token":"SYNTHETIC-NEW-REFRESH","expires_in":3600}`))
+			}))
+			t.Cleanup(server.Close)
+			oldURL := CodexTokenURL
+			CodexTokenURL = server.URL
+			t.Cleanup(func() { CodexTokenURL = oldURL })
+
+			err := Preflight("codex", "work", vault)
+			if errors.Is(err, ErrStaleCredential) != tc.wantSkip || (err != nil && !tc.wantSkip) {
+				t.Fatalf("Preflight error = %v, want skipped = %v", err, tc.wantSkip)
+			}
+			if posts.Load() != 0 {
+				t.Fatal("Preflight made a token endpoint request")
+			}
+			if data, err := os.ReadFile(snapshotPath); err != nil || !bytes.Equal(data, snapshot) {
+				t.Fatalf("Preflight changed the vault: %v", err)
+			}
+
+			healthPath := filepath.Join(root, "health.json")
+			err = RefreshProfile(context.Background(), "codex", "work", vault, health.NewStorage(healthPath))
+			if tc.wantSkip {
+				var stale *StaleCredentialError
+				if !errors.As(err, &stale) || !IsSkipped(err) || stale.Provider != "codex" || stale.Profile != "work" {
+					t.Fatalf("RefreshProfile error = %v, want a typed stale-credential skip", err)
+				}
+				if !strings.Contains(err.Error(), "caam backup codex work") {
+					t.Fatalf("skip has no recovery guidance: %v", err)
+				}
+				if posts.Load() != 0 {
+					t.Fatal("a stale vault refresh token reached the token endpoint")
+				}
+				if data, err := os.ReadFile(snapshotPath); err != nil || !bytes.Equal(data, snapshot) {
+					t.Fatalf("skipped refresh changed the vault: %v", err)
+				}
+				if _, err := os.Stat(healthPath); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("skipped refresh wrote a provider verdict: %v", err)
+				}
+			} else {
+				if err != nil || posts.Load() != 1 {
+					t.Fatalf("RefreshProfile = %v; token endpoint calls = %d, want one successful attempt", err, posts.Load())
+				}
+				if data, err := os.ReadFile(snapshotPath); err != nil || !bytes.Contains(data, []byte("SYNTHETIC-NEW-REFRESH")) {
+					t.Fatalf("successful refresh did not update the vault: %v", err)
+				}
+			}
+			if tc.live != nil {
+				if data, err := os.ReadFile(livePath); err != nil || !bytes.Equal(data, tc.live) {
+					t.Fatalf("refresh overwrote a live credential that did not match the vault snapshot: %v", err)
+				}
+			} else if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("refresh unexpectedly created a live credential: %v", err)
+			}
+		})
+	}
+}
+
+func TestRefreshProfileRechecksCodexAndResumesAfterBackup(t *testing.T) {
+	root := t.TempDir()
+	liveDir := filepath.Join(root, "live")
+	t.Setenv("CODEX_HOME", liveDir)
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	snapshotPath := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+	livePath := filepath.Join(liveDir, "auth.json")
+	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
+	old := codexPreflightAuth(t, "alice", "SYNTHETIC-OLD-REFRESH", base, base)
+	newer := codexPreflightAuth(t, "alice", "SYNTHETIC-LIVE-REFRESH", base.Add(time.Hour), base.Add(time.Hour))
+	writePreflightAuth(t, snapshotPath, old)
+	writePreflightAuth(t, livePath, old)
+
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		var request map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode refresh request: %v", err)
+		}
+		if request["refresh_token"] != "SYNTHETIC-LIVE-REFRESH" {
+			t.Error("a superseded refresh token reached the token endpoint")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"SYNTHETIC-NEW-ACCESS","refresh_token":"SYNTHETIC-NEW-REFRESH","expires_in":3600}`))
+	}))
+	t.Cleanup(server.Close)
+	oldURL := CodexTokenURL
+	CodexTokenURL = server.URL
+	t.Cleanup(func() { CodexTokenURL = oldURL })
+
+	if err := Preflight("codex", "work", vault); err != nil {
+		t.Fatal(err)
+	}
+	// The CLI rotates after the caller's preflight. RefreshProfile must make
+	// its own fresh check before it reads or posts the old refresh token.
+	writePreflightAuth(t, livePath, newer)
+	for range 2 {
+		if err := RefreshProfile(context.Background(), "codex", "work", vault, nil); !errors.Is(err, ErrStaleCredential) {
+			t.Fatalf("RefreshProfile after native rotation = %v, want stale skip", err)
+		}
+	}
+	if posts.Load() != 0 {
+		t.Fatal("repeated skipped refreshes made token endpoint requests")
+	}
+	if err := vault.Backup(authfile.CodexAuthFiles(), "work"); err != nil {
+		t.Fatalf("back up the current login: %v", err)
+	}
+	if err := Preflight("codex", "work", vault); err != nil {
+		t.Fatalf("Preflight stayed blocked after backup: %v", err)
+	}
+	if err := RefreshProfile(context.Background(), "codex", "work", vault, nil); err != nil {
+		t.Fatalf("refresh after backup: %v", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("token endpoint calls = %d, want exactly one", posts.Load())
+	}
+	for _, path := range []string{snapshotPath, livePath} {
+		if data, err := os.ReadFile(path); err != nil || !bytes.Contains(data, []byte("SYNTHETIC-NEW-REFRESH")) {
+			t.Errorf("successful refresh did not update %s: %v", path, err)
+		}
+	}
+}
+
+func TestPreflightGeminiReadsConfigurationWithoutMigration(t *testing.T) {
+	const complete = `{"client_id":"SYNTHETIC-ID","client_secret":"SYNTHETIC-SECRET","refresh_token":"SYNTHETIC-REFRESH"}`
+	for _, tc := range []struct {
+		name        string
+		files       map[string]string
+		unsupported bool
+		malformed   bool
+	}{
+		{name: "current ADC", files: map[string]string{"oauth_creds.json": complete}},
+		{name: "settings ADC", files: map[string]string{"settings.json": complete}},
+		{name: "legacy ADC", files: map[string]string{"oauth_credentials.json": complete}},
+		{name: "missing ADC", unsupported: true},
+		{name: "incomplete ADC", files: map[string]string{"oauth_creds.json": `{"refresh_token":"SYNTHETIC-REFRESH"}`}, unsupported: true},
+		{name: "incomplete current does not use superseded legacy", files: map[string]string{"oauth_creds.json": `{}`, "oauth_credentials.json": complete}, unsupported: true},
+		{name: "malformed current does not fall back", files: map[string]string{"oauth_creds.json": `{`, "settings.json": complete}, malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault := authfile.NewVault(t.TempDir())
+			dir := vault.ProfilePath("gemini", "work")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range tc.files {
+				writePreflightAuth(t, filepath.Join(dir, name), []byte(body))
+			}
+			err := Preflight("gemini", "work", vault)
+			if tc.unsupported {
+				if !errors.Is(err, ErrUnsupported) || !IsSkipped(err) {
+					t.Fatalf("Preflight = %v, want missing-configuration skip", err)
+				}
+				if err := RefreshProfile(context.Background(), "gemini", "work", vault, nil); !errors.Is(err, ErrUnsupported) {
+					t.Fatalf("RefreshProfile = %v, want missing-configuration skip", err)
+				}
+			} else if tc.malformed {
+				if err == nil || IsSkipped(err) {
+					t.Fatalf("Preflight = %v, want malformed-configuration error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("Preflight = %v, want supported configuration", err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != len(tc.files) {
+				t.Fatalf("Preflight changed profile files: entries = %d, error = %v", len(entries), err)
+			}
+			for name, body := range tc.files {
+				if data, err := os.ReadFile(filepath.Join(dir, name)); err != nil || !bytes.Equal(data, []byte(body)) {
+					t.Errorf("Preflight changed %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func codexPreflightAuth(t *testing.T, account, refreshToken string, issuedAt, lastRefresh time.Time) []byte {
+	t.Helper()
+	claims := map[string]any{}
+	if account != "" {
+		claims["sub"] = account
+		claims["email"] = account + "@example.com"
+	}
+	if !issuedAt.IsZero() {
+		claims["iat"] = issuedAt.Unix()
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".SYNTHETIC"
+	auth := map[string]any{
+		"tokens": map[string]any{"id_token": jwt, "access_token": jwt, "refresh_token": refreshToken},
+	}
+	if !lastRefresh.IsZero() {
+		auth["last_refresh"] = lastRefresh.Format(time.RFC3339)
+	}
+	data, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func writePreflightAuth(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 

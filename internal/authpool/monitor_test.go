@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 // MockRefresher implements Refresher for testing.
@@ -17,6 +19,139 @@ type MockRefresher struct {
 	shouldFail    map[string]error
 	refreshDelay  time.Duration
 	tokenValidity time.Duration
+}
+
+type preflightTestRefresher struct {
+	*MockRefresher
+	preflightErr error
+}
+
+func (r *preflightTestRefresher) Preflight(provider, profile string) error {
+	return r.preflightErr
+}
+
+func TestMonitorPreflightPreservesEligibilityAndRetries(t *testing.T) {
+	pool := NewAuthPool()
+	pool.AddProfile("codex", "work")
+	pool.UpdateTokenExpiry("codex", "work", time.Now().Add(time.Minute))
+	refresher := &preflightTestRefresher{
+		MockRefresher: NewMockRefresher(),
+		preflightErr:  &refresh.StaleCredentialError{Provider: "codex", Profile: "work"},
+	}
+	var starts, completes, skips int
+	monitor := NewMonitor(pool, refresher, MonitorConfig{
+		OnRefreshStart:    func(string, string) { starts++ },
+		OnRefreshComplete: func(string, string, time.Time, error) { completes++ },
+		OnRefreshSkipped:  func(string, string, error) { skips++ },
+	})
+	before := pool.GetProfile("codex", "work")
+	for tick := 0; tick < 3; tick++ {
+		monitor.checkAndRefresh(context.Background())
+		monitor.refreshWg.Wait()
+	}
+	after := pool.GetProfile("codex", "work")
+	if after.Status != before.Status || after.ErrorCount != before.ErrorCount || !after.LastRefresh.Equal(before.LastRefresh) {
+		t.Fatalf("preflight skip altered pool eligibility or counters: before=%+v after=%+v", before, after)
+	}
+	if starts != 0 || completes != 0 || skips != 3 || refresher.CallCount() != 0 {
+		t.Fatalf("preflight events starts=%d completes=%d skips=%d calls=%d", starts, completes, skips, refresher.CallCount())
+	}
+	// A fresh snapshot lifts the condition; no sticky status or failure cooldown.
+	refresher.preflightErr = nil
+	monitor.checkAndRefresh(context.Background())
+	monitor.refreshWg.Wait()
+	if starts != 1 || completes != 1 || refresher.CallCount() != 1 {
+		t.Fatalf("refresh did not resume: starts=%d completes=%d calls=%d", starts, completes, refresher.CallCount())
+	}
+	if p := pool.GetProfile("codex", "work"); p.Status != PoolStatusReady || p.LastRefresh.IsZero() {
+		t.Fatalf("completed refresh did not restore readiness: %+v", p)
+	}
+}
+
+func TestMonitorLateSkipDoesNotStrandProfile(t *testing.T) {
+	for _, state := range []PoolStatus{PoolStatusReady, PoolStatusExpired, PoolStatusError} {
+		t.Run(state.String(), func(t *testing.T) {
+			pool := NewAuthPool()
+			pool.AddProfile("gemini", "work")
+			if err := pool.SetStatus("gemini", "work", state); err != nil {
+				t.Fatal(err)
+			}
+			refresher := NewMockRefresher()
+			refresher.SetFail("gemini", "work", &refresh.UnsupportedError{Provider: "gemini", Reason: "configuration changed after preflight"})
+			var started, completed bool
+			monitor := NewMonitor(pool, refresher, MonitorConfig{
+				OnRefreshStart: func(string, string) { started = true },
+				OnRefreshComplete: func(provider, profile string, expiry time.Time, err error) {
+					completed = refresh.IsSkipped(err) && expiry.IsZero()
+				},
+			})
+			if err := monitor.ForceRefresh(context.Background(), "gemini", "work"); !refresh.IsSkipped(err) {
+				t.Fatalf("forced refresh claimed success: %v", err)
+			}
+			if !started || !completed {
+				t.Errorf("announced attempt has no skip outcome: started=%t completed=%t", started, completed)
+			}
+			p := pool.GetProfile("gemini", "work")
+			if p.Status != state || p.ErrorCount != 0 || !p.LastRefresh.IsZero() {
+				t.Fatalf("late skip changed pool state: %+v", p)
+			}
+		})
+	}
+}
+
+func TestMonitorFailedAttemptReturnsErrorAndReleasesProfile(t *testing.T) {
+	pool := NewAuthPool()
+	pool.AddProfile("codex", "work")
+	if err := pool.SetStatus("codex", "work", PoolStatusExpired); err != nil {
+		t.Fatal(err)
+	}
+	refresher := NewMockRefresher()
+	want := errors.New("synthetic endpoint unavailable")
+	refresher.SetFail("codex", "work", want)
+	monitor := NewMonitor(pool, refresher, DefaultMonitorConfig())
+	if err := monitor.ForceRefresh(context.Background(), "codex", "work"); !errors.Is(err, want) {
+		t.Fatalf("first failed attempt was reported as success: %v", err)
+	}
+	p := pool.GetProfile("codex", "work")
+	if p.Status != PoolStatusExpired || p.ErrorCount != 1 || !p.LastRefresh.IsZero() {
+		t.Fatalf("failed attempt stranded or falsely refreshed profile: %+v", p)
+	}
+	refresher.SetFail("codex", "work", nil)
+	if err := monitor.ForceRefresh(context.Background(), "codex", "work"); err != nil {
+		t.Fatalf("profile remained stuck after a failed refresh: %v", err)
+	}
+}
+
+func TestMonitorLateSkipPreservesConcurrentCooldown(t *testing.T) {
+	for _, cooldownBeforeReservation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("before_reservation=%t", cooldownBeforeReservation), func(t *testing.T) {
+			pool := NewAuthPool()
+			pool.AddProfile("codex", "work")
+			if err := pool.SetStatus("codex", "work", PoolStatusReady); err != nil {
+				t.Fatal(err)
+			}
+			refresher := NewMockRefresher()
+			refresher.SetFail("codex", "work", &refresh.StaleCredentialError{Provider: "codex", Profile: "work"})
+			monitor := NewMonitor(pool, refresher, DefaultMonitorConfig())
+			if cooldownBeforeReservation {
+				pool.SetCooldown("codex", "work", time.Hour)
+			}
+			previous, reserved := pool.TryMarkRefreshing("codex", "work")
+			if !reserved {
+				t.Fatal("refresh reservation failed")
+			}
+			if !cooldownBeforeReservation {
+				pool.SetCooldown("codex", "work", time.Hour)
+			}
+			if err := monitor.doRefresh(context.Background(), "codex", "work", previous); !refresh.IsSkipped(err) {
+				t.Fatalf("expected a stale skip: %v", err)
+			}
+			p := pool.GetProfile("codex", "work")
+			if p.Status != PoolStatusCooldown || time.Until(p.CooldownUntil) < 59*time.Minute || p.ErrorCount != 0 {
+				t.Fatalf("skip discarded concurrent cooldown: %+v", p)
+			}
+		})
+	}
 }
 
 func NewMockRefresher() *MockRefresher {
@@ -607,7 +742,7 @@ func TestMonitorDoesNotRefreshCursor(t *testing.T) {
 		pool.UpdateTokenExpiry("cursor", profile, time.Now().Add(-time.Hour))
 	}
 	monitor.checkAndRefresh(context.Background())
-	monitor.triggerRefresh(context.Background(), "cursor", "direct", PoolStatusExpired)
+	monitor.triggerRefresh(context.Background(), "cursor", "direct")
 	// Join any accidentally scheduled asynchronous refresh.
 	monitor.refreshWg.Wait()
 	if refresher.CallCount() != 0 {

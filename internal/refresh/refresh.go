@@ -22,6 +22,8 @@ const maxErrorBodySize = 64 * 1024 // 64KB
 // DefaultRefreshThreshold is the time before expiry to trigger a refresh.
 const DefaultRefreshThreshold = 10 * time.Minute
 
+const claudeRefreshDisabledReason = "token refresh disabled; Claude Code handles refresh internally. Use /login to re-authenticate."
+
 // ShouldRefresh determines if a profile needs refreshing.
 func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 	if h == nil || h.TokenExpiresAt.IsZero() {
@@ -42,8 +44,54 @@ func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 	return ttl > 0 && ttl < threshold
 }
 
+// Preflight checks whether CAAM can safely attempt a profile refresh using the
+// current credentials. It only reads files; it does not migrate, synchronize,
+// or refresh them, and does not update health metadata. Callers may use it
+// before announcing an attempt, but RefreshProfile always rechecks because a
+// native CLI can rotate credentials between daemon ticks or UI actions.
+func Preflight(provider, profile string, vault *authfile.Vault) error {
+	switch provider {
+	case "claude":
+		return &UnsupportedError{Provider: provider, Reason: claudeRefreshDisabledReason}
+	case "grok":
+		return &UnsupportedError{Provider: provider, Reason: "Grok Build handles token renewal; CAAM does not refresh Grok credentials"}
+	case "opencode":
+		return &UnsupportedError{Provider: provider, Reason: "CAAM does not refresh OpenCode credentials; use OpenCode to authenticate"}
+	case "codex", "gemini", "cursor":
+		if vault == nil {
+			return fmt.Errorf("profile vault is required for %s refresh", provider)
+		}
+	default:
+		return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
+	}
+
+	vaultPath := vault.ProfilePath(provider, profile)
+	switch provider {
+	case "codex":
+		for _, spec := range authfile.CodexAuthFiles().Files {
+			if authfile.CodexLiveIsNewer(spec.Path, filepath.Join(vaultPath, filepath.Base(spec.Path))) {
+				return &StaleCredentialError{Provider: provider, Profile: profile}
+			}
+		}
+	case "gemini":
+		_, err := readGeminiADC(vaultPath)
+		return err
+	case "cursor":
+		info, err := health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+		if err == nil && info.SelfRefreshing {
+			return &UnsupportedError{Provider: provider, Reason: "cursor-agent renews tokens from the stored API key automatically"}
+		}
+		return &UnsupportedError{Provider: provider, Reason: "Cursor session logins cannot refresh. " + health.CursorReloginInstructions(profile)}
+	}
+	return nil
+}
+
 // RefreshProfile orchestrates the refresh for a specific provider/profile.
 func RefreshProfile(ctx context.Context, provider, profile string, vault *authfile.Vault, store *health.Storage) error {
+	if err := Preflight(provider, profile, vault); err != nil {
+		return err
+	}
+
 	// Check if this profile is currently active before we modify the vault
 	// (which would change the hash and break ActiveProfile detection).
 	//
@@ -74,21 +122,10 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 
 	var err error
 	switch provider {
-	case "claude":
-		err = refreshClaude(ctx, vaultPath)
 	case "codex":
 		err = refreshCodex(ctx, vaultPath)
 	case "gemini":
 		err = refreshGemini(ctx, provider, profile, store, vaultPath)
-	case "cursor":
-		info, parseErr := health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
-		if parseErr == nil && info.SelfRefreshing {
-			return &UnsupportedError{Provider: provider, Reason: "cursor-agent renews tokens from the stored API key automatically"}
-		}
-		return &UnsupportedError{Provider: provider, Reason: "Cursor session logins cannot refresh. " + health.CursorReloginInstructions(profile)}
-	case "opencode":
-		// Token refresh not yet supported for these providers
-		return nil
 	default:
 		return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
 	}
@@ -163,7 +200,7 @@ func refreshClaude(ctx context.Context, vaultPath string) error {
 	// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-006)
 	return &UnsupportedError{
 		Provider: "claude",
-		Reason:   "token refresh disabled; Claude Code handles refresh internally. Use /login to re-authenticate.",
+		Reason:   claudeRefreshDisabledReason,
 	}
 }
 
@@ -196,27 +233,9 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 		return fmt.Errorf("parse gemini auth: %w", err)
 	}
 
-	settingsPath := filepath.Join(vaultPath, "settings.json")
-	oauthCredPath := filepath.Join(vaultPath, "oauth_creds.json")
-
-	var adc *ADC
-	for _, candidate := range []string{oauthCredPath, settingsPath} {
-		parsed, readErr := ReadADC(candidate)
-		if readErr == nil {
-			adc = parsed
-			break
-		}
-		if errors.Is(readErr, os.ErrNotExist) {
-			continue
-		}
-		if errors.Is(readErr, ErrADCIncomplete) {
-			continue
-		}
-		return fmt.Errorf("read oauth credentials: %w", readErr)
-	}
-
-	if adc == nil {
-		return &UnsupportedError{Provider: provider, Reason: "missing oauth client credentials (expected oauth_creds.json with client_id/client_secret/refresh_token)"}
+	adc, err := readGeminiADC(vaultPath)
+	if err != nil {
+		return err
 	}
 
 	resp, err := RefreshGeminiToken(ctx, adc.ClientID, adc.ClientSecret, adc.RefreshToken)
@@ -224,7 +243,7 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 		return fmt.Errorf("refresh api: %w", err)
 	}
 
-	target := settingsPath
+	target := filepath.Join(vaultPath, "settings.json")
 	if _, err := os.Stat(target); err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("stat gemini settings: %w", err)
@@ -245,6 +264,27 @@ func refreshGemini(ctx context.Context, provider, profile string, store *health.
 	}
 
 	return nil
+}
+
+// readGeminiADC uses the same credential precedence before and after migration.
+// Reading the legacy filename when the current one is absent keeps Preflight
+// side-effect-free without rejecting a profile that refreshGemini can migrate.
+func readGeminiADC(vaultPath string) (*ADC, error) {
+	oauthPath := filepath.Join(vaultPath, "oauth_creds.json")
+	if _, err := os.Stat(oauthPath); errors.Is(err, os.ErrNotExist) {
+		oauthPath = filepath.Join(vaultPath, "oauth_credentials.json")
+	}
+	for _, candidate := range []string{oauthPath, filepath.Join(vaultPath, "settings.json")} {
+		adc, err := ReadADC(candidate)
+		if err == nil {
+			return adc, nil
+		}
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, ErrADCIncomplete) {
+			continue
+		}
+		return nil, fmt.Errorf("read oauth credentials: %w", err)
+	}
+	return nil, &UnsupportedError{Provider: "gemini", Reason: "missing oauth client credentials (expected oauth_creds.json with client_id/client_secret/refresh_token)"}
 }
 
 // getRefreshTokenFromJSON reads a JSON file and extracts the refresh_token field.

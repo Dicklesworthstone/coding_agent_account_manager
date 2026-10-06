@@ -176,7 +176,7 @@ func refreshTool(ctx context.Context, tool string, threshold time.Duration, dryR
 		}
 
 		if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore); err != nil {
-			if errors.Is(err, refresh.ErrUnsupported) {
+			if refresh.IsSkipped(err) {
 				skipped++
 				if !quiet {
 					fmt.Printf("skipped (%v)\n", err)
@@ -240,7 +240,7 @@ func refreshSingle(ctx context.Context, tool, profile string, threshold time.Dur
 	}
 
 	if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore); err != nil {
-		if errors.Is(err, refresh.ErrUnsupported) {
+		if refresh.IsSkipped(err) {
 			if !quiet {
 				fmt.Printf("skipped (%v)\n", err)
 			}
@@ -277,6 +277,13 @@ func shouldRefreshProfile(tool, profile string, threshold time.Duration, force b
 		return false, "", err
 	}
 
+	if err := refresh.Preflight(tool, profile, vault); err != nil {
+		if refresh.IsSkipped(err) {
+			return false, err.Error(), nil
+		}
+		return false, "", err
+	}
+
 	info, err := loadExpiryInfo(tool, profile)
 	if err != nil {
 		if errors.Is(err, health.ErrNoAuthFile) {
@@ -286,12 +293,6 @@ func shouldRefreshProfile(tool, profile string, threshold time.Duration, force b
 			return false, "no refresh token", nil
 		}
 		return false, "", err
-	}
-	if tool == "cursor" && info != nil {
-		if info.Renewable {
-			return false, "Cursor renews credentials from the stored API key", nil
-		}
-		return false, "session login cannot be refreshed. " + health.CursorReloginInstructions(profile), nil
 	}
 	if info == nil || !info.HasRefreshToken {
 		return false, "no refresh token", nil

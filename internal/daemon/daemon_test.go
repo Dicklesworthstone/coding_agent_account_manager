@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -413,7 +414,7 @@ func TestDaemon_GetProfileHealth_EmptyVault(t *testing.T) {
 	}
 }
 
-func TestDaemon_GetProfileHealth_FromHealthStore(t *testing.T) {
+func TestDaemon_GetProfileHealth_RequiresCurrentClaudeCredential(t *testing.T) {
 	tmpDir := t.TempDir()
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -434,12 +435,8 @@ func TestDaemon_GetProfileHealth_FromHealthStore(t *testing.T) {
 	d := New(v, hs, cfg)
 
 	gotPh := d.getProfileHealth("claude", "test")
-	if gotPh == nil {
-		t.Fatal("getProfileHealth should return health data from store")
-	}
-
-	if gotPh.TokenExpiresAt.IsZero() {
-		t.Error("TokenExpiresAt should not be zero")
+	if gotPh != nil {
+		t.Fatalf("cached health must not stand in for a missing credential: %+v", gotPh)
 	}
 }
 
@@ -509,7 +506,7 @@ func TestSetPIDFilePath(t *testing.T) {
 	}
 }
 
-func TestDaemon_CheckProfile_ExpiringToken(t *testing.T) {
+func TestDaemon_CheckProfile_CachedExpiryWithoutCredential(t *testing.T) {
 	tmpDir := t.TempDir()
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -533,14 +530,12 @@ func TestDaemon_CheckProfile_ExpiringToken(t *testing.T) {
 	d.ctx, d.cancel = context.WithCancel(context.Background())
 	defer d.cancel()
 
-	// This will attempt to refresh, but fail because there's no actual profile
-	// The important thing is that it exercises the code path
+	// A cached timestamp without a current credential must not drive a refresh.
 	d.checkProfile("claude", "test")
 
 	stats := d.GetStats()
-	// Should have recorded an error (refresh fails because profile doesn't exist in vault)
-	if stats.RefreshErrors != 1 {
-		t.Errorf("RefreshErrors should be 1, got %d", stats.RefreshErrors)
+	if stats.RefreshErrors != 0 || stats.RefreshCount != 0 {
+		t.Errorf("missing credential drove a refresh: %+v", stats)
 	}
 }
 
@@ -718,7 +713,7 @@ func TestGetDaemonStatus_Running(t *testing.T) {
 	}
 }
 
-func TestDaemon_GetProfileHealth_CodexProfile(t *testing.T) {
+func TestDaemon_GetProfileHealth_RequiresCurrentCodexCredential(t *testing.T) {
 	tmpDir := t.TempDir()
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -739,16 +734,12 @@ func TestDaemon_GetProfileHealth_CodexProfile(t *testing.T) {
 	d := New(v, hs, cfg)
 
 	gotPh := d.getProfileHealth("codex", "test")
-	if gotPh == nil {
-		t.Fatal("getProfileHealth should return health data from store")
-	}
-
-	if gotPh.TokenExpiresAt.IsZero() {
-		t.Error("TokenExpiresAt should not be zero")
+	if gotPh != nil {
+		t.Fatalf("cached health must not stand in for a missing credential: %+v", gotPh)
 	}
 }
 
-func TestDaemon_GetProfileHealth_GeminiProfile(t *testing.T) {
+func TestDaemon_GetProfileHealth_RequiresCurrentGeminiCredential(t *testing.T) {
 	tmpDir := t.TempDir()
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -769,8 +760,8 @@ func TestDaemon_GetProfileHealth_GeminiProfile(t *testing.T) {
 	d := New(v, hs, cfg)
 
 	gotPh := d.getProfileHealth("gemini", "test")
-	if gotPh == nil {
-		t.Fatal("getProfileHealth should return health data from store")
+	if gotPh != nil {
+		t.Fatalf("cached health must not stand in for a missing credential: %+v", gotPh)
 	}
 }
 
@@ -1590,6 +1581,202 @@ func TestDaemon_getProfileHealth_ParseGeminiExpiry(t *testing.T) {
 	}
 }
 
+func writeDaemonAuthJSON(t *testing.T, path string, value any) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonRefreshSkipsOnceAtInfoLevel(t *testing.T) {
+	expiry := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+	for _, tt := range []struct {
+		provider string
+		file     string
+		auth     any
+		owner    string
+	}{
+		{
+			provider: "claude", file: ".credentials.json", owner: "Claude Code",
+			auth: map[string]any{"claudeAiOauth": map[string]any{
+				"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": expiry.UnixMilli(),
+			}},
+		},
+		{
+			provider: "grok", file: "auth.json", owner: "Grok Build",
+			auth: map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expiry.Unix()},
+		},
+		{
+			provider: "gemini", file: "oauth_creds.json", owner: "client",
+			auth: map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expiry.Unix()},
+		},
+	} {
+		t.Run(tt.provider, func(t *testing.T) {
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			writeDaemonAuthJSON(t, filepath.Join(vault.ProfilePath(tt.provider, "work"), tt.file), tt.auth)
+			// A cached record cannot hide current expiry or strip renewal policy.
+			if err := store.UpdateProfile(tt.provider, "work", &health.ProfileHealth{
+				TokenExpiresAt: time.Now().Add(24 * time.Hour), PlanType: "pro",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			d := New(vault, store, nil)
+			var output bytes.Buffer
+			d.logger = log.New(&output, "", 0)
+			ph := d.getProfileHealth(tt.provider, "work")
+			if ph == nil || !ph.TokenExpiresAt.Equal(expiry) || ph.PlanType != "pro" {
+				t.Fatalf("current credential or stored metadata lost: %+v", ph)
+			}
+			if tt.provider == "claude" && !ph.SelfRefreshing {
+				t.Fatal("current Claude renewal policy was lost")
+			}
+			for tick := 0; tick < 3; tick++ {
+				d.checkProfile(tt.provider, "work")
+			}
+			logs := output.String()
+			if strings.Count(logs, "not refreshed by caam") != 1 || !strings.Contains(logs, tt.owner) {
+				t.Errorf("expected one actionable notice without verbose logging: %s", logs)
+			}
+			if strings.Contains(logs, "refreshing token") || strings.Contains(logs, "refresh failed") {
+				t.Errorf("skip was announced as an attempt or failure: %s", logs)
+			}
+			if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+				t.Errorf("skip altered refresh counters: %+v", stats)
+			}
+		})
+	}
+}
+
+func writeDaemonCodexAuth(t *testing.T, path, token string, refreshed, expiry time.Time) {
+	t.Helper()
+	claims, err := json.Marshal(map[string]any{"sub": "synthetic-account", "exp": expiry.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDaemonAuthJSON(t, path, map[string]any{
+		"tokens": map[string]any{
+			"access_token":  "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".synthetic",
+			"refresh_token": token,
+		},
+		"last_refresh": refreshed.Format(time.RFC3339Nano),
+	})
+}
+
+func TestDaemonCodexStaleSkipLiftsAfterBackup(t *testing.T) {
+	for _, pooled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pool=%t", pooled), func(t *testing.T) {
+			t.Setenv("CODEX_HOME", t.TempDir())
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			expiry := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+			livePath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+			writeDaemonCodexAuth(t, filepath.Join(vault.ProfilePath("codex", "work"), "auth.json"), "synthetic-spent", time.Now().Add(-2*time.Hour), expiry)
+			writeDaemonCodexAuth(t, livePath, "synthetic-current", time.Now().Add(-time.Hour), expiry)
+			calls := 0
+			original := refresh.RefreshCodexToken
+			refresh.RefreshCodexToken = func(ctx context.Context, token string) (*refresh.TokenResponse, error) {
+				calls++
+				if token != "synthetic-current" {
+					t.Error("stale vault token reached the refresh adapter")
+				}
+				payload := []byte(fmt.Sprintf(`{"sub":"synthetic-account","exp":%d}`, time.Now().Add(time.Hour).Unix()))
+				token = "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".synthetic"
+				return &refresh.TokenResponse{AccessToken: token, RefreshToken: "synthetic-rotated", ExpiresIn: 3600}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshCodexToken = original })
+			d := New(vault, store, &Config{UseAuthPool: pooled, RefreshThreshold: 10 * time.Minute})
+			d.ctx = context.Background()
+			var output bytes.Buffer
+			d.logger = log.New(&output, "", 0)
+			if pooled {
+				d.authPool.AddProfile("codex", "work")
+				d.authPool.UpdateTokenExpiry("codex", "work", expiry)
+				if err := d.authPool.SetStatus("codex", "work", authpool.PoolStatusReady); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for tick := 0; tick < 3; tick++ {
+				if pooled {
+					if err := d.poolMonitor.ForceRefresh(d.ctx, "codex", "work"); !refresh.IsSkipped(err) {
+						t.Fatalf("expected stale skip, got %v", err)
+					}
+				} else {
+					d.checkProfile("codex", "work")
+				}
+			}
+			if calls != 0 || strings.Count(output.String(), "caam backup codex work") != 1 {
+				t.Fatalf("stale refresh calls=%d, logs=%s", calls, output.String())
+			}
+			if strings.Contains(output.String(), "refreshing token") || strings.Contains(output.String(), "starting refresh") {
+				t.Fatalf("stale credential announced a refresh: %s", output.String())
+			}
+			if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+				t.Fatalf("stale skip changed counters: %+v", stats)
+			}
+			if pooled {
+				p := d.authPool.GetProfile("codex", "work")
+				if p == nil || p.Status != authpool.PoolStatusReady || p.ErrorCount != 0 || !p.LastRefresh.IsZero() {
+					t.Fatalf("stale skip changed pool eligibility: %+v", p)
+				}
+			}
+
+			if err := vault.Backup(authfile.CodexAuthFiles(), "work"); err != nil {
+				t.Fatal(err)
+			}
+			if pooled {
+				if err := d.poolMonitor.ForceRefresh(d.ctx, "codex", "work"); err != nil {
+					t.Fatalf("refresh remained suppressed after backup: %v", err)
+				}
+			} else {
+				d.checkProfile("codex", "work")
+			}
+			if calls != 1 {
+				t.Fatalf("refresh calls after backup=%d, want 1; logs=%s", calls, output.String())
+			}
+			if stats := d.GetStats(); stats.RefreshCount != 1 || stats.RefreshErrors != 0 {
+				t.Errorf("successful refresh counters=%+v", stats)
+			}
+			if !strings.Contains(output.String(), "refreshed") || !strings.Contains(output.String(), "expir") {
+				t.Errorf("missing refresh outcome and new expiry: %s", output.String())
+			}
+			updated := d.getProfileHealth("codex", "work")
+			if updated == nil || time.Until(updated.TokenExpiresAt) < 59*time.Minute {
+				t.Errorf("new expiry was hidden by cached health: %+v", updated)
+			}
+		})
+	}
+}
+
+func TestDaemonRefreshFailureReportsOutcome(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	vault := authfile.NewVault(t.TempDir())
+	writeDaemonCodexAuth(t, filepath.Join(vault.ProfilePath("codex", "work"), "auth.json"), "synthetic-current", time.Now(), time.Now().Add(5*time.Minute))
+	original := refresh.RefreshCodexToken
+	refresh.RefreshCodexToken = func(context.Context, string) (*refresh.TokenResponse, error) {
+		return nil, fmt.Errorf("synthetic endpoint unavailable")
+	}
+	t.Cleanup(func() { refresh.RefreshCodexToken = original })
+	d := New(vault, nil, nil)
+	d.ctx = context.Background()
+	var output bytes.Buffer
+	d.logger = log.New(&output, "", 0)
+	d.checkProfile("codex", "work")
+	if !strings.Contains(output.String(), "refreshing token") || !strings.Contains(output.String(), "refresh failed:") || !strings.Contains(output.String(), "synthetic endpoint unavailable") {
+		t.Errorf("default log did not pair the attempt with its failure: %s", output.String())
+	}
+	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 1 {
+		t.Errorf("actual failure counters=%+v", stats)
+	}
+}
+
 func writeDaemonCursorAuth(t *testing.T, path string, expiry time.Time, session, apiKey string) {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": session})
@@ -1669,8 +1856,11 @@ func TestDaemonCursorSessionWarningsDeduplicateAndReset(t *testing.T) {
 	writeDaemonCursorAuth(t, path, expiry, "login-one", "")
 	d.checkProfile("cursor", "work")
 	d.checkProfile("cursor", "work")
-	if got := strings.Count(output.String(), "log in again"); got != 1 {
+	if got := strings.Count(output.String(), ": session "); got != 1 {
 		t.Fatalf("same login generated %d warnings, want 1: %s", got, output.String())
+	}
+	if got := strings.Count(output.String(), "not refreshed by caam"); got != 1 {
+		t.Fatalf("expected one renewal ownership notice, got %d: %s", got, output.String())
 	}
 	if !strings.Contains(output.String(), "cursor-agent login") || !strings.Contains(output.String(), "caam backup cursor") || strings.Contains(output.String(), "caam refresh") {
 		t.Errorf("warning lacks native login/backup guidance: %s", output.String())
@@ -1681,7 +1871,7 @@ func TestDaemonCursorSessionWarningsDeduplicateAndReset(t *testing.T) {
 	writeDaemonCursorAuth(t, path, expiry, "login-two", "")
 	d.checkProfile("cursor", "work")
 	d.checkProfile("cursor", "work")
-	if got := strings.Count(output.String(), "log in again"); got != 2 {
+	if got := strings.Count(output.String(), ": session "); got != 2 {
 		t.Fatalf("replacement login warning count = %d, want 2: %s", got, output.String())
 	}
 
@@ -1689,13 +1879,13 @@ func TestDaemonCursorSessionWarningsDeduplicateAndReset(t *testing.T) {
 	d.checkProfile("cursor", "work")
 	writeDaemonCursorAuth(t, path, time.Now().Add(30*24*time.Hour), "fresh-login", "")
 	d.checkProfile("cursor", "work")
-	if got := strings.Count(output.String(), "log in again"); got != 2 {
+	if got := strings.Count(output.String(), ": session "); got != 2 {
 		t.Fatalf("fresh/API-key login unexpectedly warned: %s", output.String())
 	}
 	writeDaemonCursorAuth(t, path, time.Now().Add(-time.Minute), "expired-login", "")
 	d.checkProfile("cursor", "work")
 	d.checkProfile("cursor", "work")
-	if got := strings.Count(output.String(), "log in again"); got != 3 || !strings.Contains(output.String(), "session EXPIRED") {
+	if got := strings.Count(output.String(), ": session "); got != 3 || !strings.Contains(output.String(), "session EXPIRED") {
 		t.Errorf("expired replacement warning missing or repeated: %s", output.String())
 	}
 	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
@@ -1731,7 +1921,7 @@ func TestDaemonCursorReloginBoundaries(t *testing.T) {
 				// Entering expiry after the advance warning does not repeat the
 				// same login warning at every daemon tick.
 				d.warnCursorSession("work", ph, ph.TokenExpiresAt.Add(time.Second))
-				if got := strings.Count(output.String(), "log in again"); got != 1 {
+				if got := strings.Count(output.String(), ": session "); got != 1 {
 					t.Errorf("same login warned %d times", got)
 				}
 			}
@@ -1784,7 +1974,7 @@ func TestDaemonCursorWarningsContinueWithAuthPool(t *testing.T) {
 	}
 	d.runLoop()
 	d.poolMonitor.Stop()
-	if got := strings.Count(output.String(), "log in again"); got != 1 {
+	if got := strings.Count(output.String(), ": session "); got != 1 {
 		t.Errorf("pool mode generated %d Cursor warnings, want 1: %s", got, output.String())
 	}
 	if stats := d.GetStats(); stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
@@ -1827,24 +2017,24 @@ func TestCursorSessionDaemonWarnsOnceWithoutRefresh(t *testing.T) {
 	d.checkProfile("cursor", "session")
 	d.checkProfile("cursor", "session")
 	d.warnCursorSession("active", parsed, time.Now())
-	if strings.Count(logs.String(), "log in again") != 1 {
+	if strings.Count(logs.String(), ": session ") != 1 {
 		t.Fatalf("logs=%s", logs.String())
 	}
 	// Two logins can have the same exp: deduplicate by credential, not date.
 	other := *parsed
 	other.CredentialFingerprint = "another-synthetic-login"
 	d.warnCursorSession("other", &other, time.Now())
-	if strings.Count(logs.String(), "log in again") != 2 {
+	if strings.Count(logs.String(), ": session ") != 2 {
 		t.Fatalf("distinct login with same expiry not warned: %s", logs.String())
 	}
 	write(expiry.Add(time.Hour), false)
 	d.checkProfile("cursor", "session")
-	if strings.Count(logs.String(), "log in again") != 3 {
+	if strings.Count(logs.String(), ": session ") != 3 {
 		t.Fatalf("new login not warned: %s", logs.String())
 	}
 	write(time.Now().Add(-time.Hour), true)
 	d.checkProfile("cursor", "session")
-	if strings.Count(logs.String(), "log in again") != 3 || d.stats.RefreshErrors != 0 || d.stats.RefreshCount != 0 {
+	if strings.Count(logs.String(), ": session ") != 3 || d.stats.RefreshErrors != 0 || d.stats.RefreshCount != 0 {
 		t.Fatalf("API-backed token attempted refresh or warned: %s %+v", logs.String(), d.stats)
 	}
 }

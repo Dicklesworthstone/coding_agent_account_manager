@@ -1,12 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +19,108 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
+
+func TestRefreshCLIReportsPreflightSkips(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	claims, err := json.Marshal(map[string]any{
+		"sub": "SYNTHETIC-ACCOUNT", "email": "work@example.com", "exp": now.Add(2 * time.Minute).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".SYNTHETIC"
+	codexAuth := func(refreshed time.Time, token string) string {
+		return fmt.Sprintf(`{"tokens":{"id_token":%q,"access_token":%q,"refresh_token":%q},"last_refresh":%q}`,
+			jwt, jwt, token, refreshed.Format(time.RFC3339))
+	}
+	for _, tc := range []struct {
+		name     string
+		provider string
+		filename string
+		body     string
+		live     string
+		reason   string
+	}{
+		{"stale Codex vault", "codex", "auth.json", codexAuth(now.Add(-time.Hour), "SYNTHETIC-OLD-REFRESH"), codexAuth(now, "SYNTHETIC-LIVE-REFRESH"), "caam backup codex work"},
+		{"Claude native renewal", "claude", ".credentials.json", `{"claudeAiOauth":{"accessToken":"SYNTHETIC-ACCESS","refreshToken":"SYNTHETIC-REFRESH"}}`, "", "Claude Code handles refresh internally"},
+		{"Grok native renewal", "grok", "auth.json", `{"refresh_token":"SYNTHETIC-REFRESH"}`, "", "Grok Build handles token renewal"},
+		{"OpenCode unsupported", "opencode", "auth.json", `{"refresh":"SYNTHETIC-REFRESH"}`, "", "use OpenCode to authenticate"},
+		{"Cursor session", "cursor", "auth.json", `{"accessToken":"SYNTHETIC-SESSION"}`, "", "caam login cursor work"},
+		{"Gemini missing client configuration", "gemini", "settings.json", `{"refresh_token":"SYNTHETIC-REFRESH"}`, "", "missing oauth client credentials"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			oldVault, oldHealthStore := vault, healthStore
+			vault = authfile.NewVault(filepath.Join(root, "vault"))
+			healthStore = health.NewStorage(filepath.Join(root, "health.json"))
+			t.Cleanup(func() { vault, healthStore = oldVault, oldHealthStore })
+			dir := vault.ProfilePath(tc.provider, "work")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, tc.filename)
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			liveDir := filepath.Join(root, "live")
+			t.Setenv("CODEX_HOME", liveDir)
+			if tc.live != "" {
+				if err := os.MkdirAll(liveDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(liveDir, "auth.json"), []byte(tc.live), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				posts.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(server.Close)
+			oldCodexURL, oldGeminiURL := refresh.CodexTokenURL, refresh.GeminiTokenURL
+			refresh.CodexTokenURL, refresh.GeminiTokenURL = server.URL, server.URL
+			t.Cleanup(func() { refresh.CodexTokenURL, refresh.GeminiTokenURL = oldCodexURL, oldGeminiURL })
+
+			for _, force := range []bool{false, true} {
+				should, reason, err := shouldRefreshProfile(tc.provider, "work", 10*time.Minute, force)
+				if err != nil || should || !strings.Contains(reason, tc.reason) {
+					t.Fatalf("eligibility (force=%v) = %v, %q, %v; want skip with %q", force, should, reason, err, tc.reason)
+				}
+				for _, dryRun := range []bool{false, true} {
+					output, err := captureStdout(t, func() error {
+						return refreshSingle(context.Background(), tc.provider, "work", 10*time.Minute, dryRun, force, false)
+					})
+					if err != nil || !strings.Contains(output, tc.reason) || strings.Contains(output, "Refreshing ") || strings.Contains(output, "would be refreshed") {
+						t.Errorf("single refresh (force=%v, dry=%v) = %q, %v; want skip before announcement", force, dryRun, output, err)
+					}
+					output, err = captureStdout(t, func() error {
+						refreshed, skipped, failed, err := refreshTool(context.Background(), tc.provider, 10*time.Minute, dryRun, force, false)
+						if refreshed != 0 || skipped != 1 || failed != 0 {
+							t.Errorf("batch counts = %d refreshed, %d skipped, %d failed; want 0,1,0", refreshed, skipped, failed)
+						}
+						return err
+					})
+					if err != nil || !strings.Contains(output, tc.reason) || strings.Contains(output, "Refreshing ") || strings.Contains(output, "would refresh") {
+						t.Errorf("batch refresh (force=%v, dry=%v) = %q, %v; want skip before announcement", force, dryRun, output, err)
+					}
+				}
+			}
+			if posts.Load() != 0 {
+				t.Fatalf("skipped CLI actions made %d token endpoint requests", posts.Load())
+			}
+			if data, err := os.ReadFile(path); err != nil || !bytes.Equal(data, []byte(tc.body)) {
+				t.Errorf("skipped CLI actions changed the vault: %v", err)
+			}
+			if tc.live != "" {
+				if data, err := os.ReadFile(filepath.Join(liveDir, "auth.json")); err != nil || !bytes.Equal(data, []byte(tc.live)) {
+					t.Errorf("skipped CLI actions changed the live credential: %v", err)
+				}
+			}
+		})
+	}
+}
 
 func TestRefreshSingle_CodexUpdatesAuth(t *testing.T) {
 	tmpDir := t.TempDir()

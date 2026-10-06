@@ -25,6 +25,12 @@ func NewPoolRefresher(vault *authfile.Vault, healthStore *health.Storage) *PoolR
 	}
 }
 
+// Preflight lets the pool reject unsupported or stale credentials before
+// announcing a refresh or marking the account unavailable.
+func (r *PoolRefresher) Preflight(provider, profile string) error {
+	return refresh.Preflight(provider, profile, r.vault)
+}
+
 // Refresh implements authpool.Refresher.
 // It refreshes the token for the given provider/profile and returns the new expiry time.
 func (r *PoolRefresher) Refresh(ctx context.Context, provider, profile string) (time.Time, error) {
@@ -36,8 +42,10 @@ func (r *PoolRefresher) Refresh(ctx context.Context, provider, profile string) (
 	// Get the new expiry time after refresh
 	expiry, err := r.getTokenExpiry(provider, profile)
 	if err != nil {
-		// Refresh succeeded but we couldn't determine expiry - return a default
-		return time.Now().Add(time.Hour), nil
+		return time.Time{}, fmt.Errorf("read expiry after refresh: %w", err)
+	}
+	if expiry.IsZero() {
+		return time.Time{}, fmt.Errorf("refreshed credential has no known expiry")
 	}
 
 	return expiry, nil

@@ -14,6 +14,17 @@ import (
 // failure.
 var ErrUnsupported = errors.New("refresh unsupported")
 
+// ErrStaleCredential indicates that a vault credential was superseded by a
+// newer live credential for the same account. No refresh was attempted.
+var ErrStaleCredential = errors.New("refresh skipped: newer live credential")
+
+// IsSkipped identifies outcomes for which CAAM did not attempt a refresh.
+// Callers should report the reason without recording a refresh failure or
+// applying a failure cooldown. The condition must be reconsidered next time.
+func IsSkipped(err error) bool {
+	return errors.Is(err, ErrUnsupported) || errors.Is(err, ErrStaleCredential)
+}
+
 // ErrRefreshTokenReused indicates that the refresh token has already been
 // consumed by another process. OpenAI implements single-use refresh token
 // rotation: once a token is used, any subsequent attempt returns this error.
@@ -51,6 +62,24 @@ func (e *UnsupportedError) Error() string {
 
 func (e *UnsupportedError) Unwrap() error {
 	return ErrUnsupported
+}
+
+// StaleCredentialError prevents replaying a vault refresh token after the
+// native CLI has already rotated the same account's live credential.
+type StaleCredentialError struct {
+	Provider string
+	Profile  string
+}
+
+func (e *StaleCredentialError) Error() string {
+	return fmt.Sprintf(
+		"%s/%s: refresh skipped because the same account has newer live credentials; "+
+			"back up the current login with: caam backup %s %s",
+		e.Provider, e.Profile, e.Provider, e.Profile)
+}
+
+func (e *StaleCredentialError) Unwrap() error {
+	return ErrStaleCredential
 }
 
 // RefreshTokenReusedError is returned when the provider rejects a refresh token
