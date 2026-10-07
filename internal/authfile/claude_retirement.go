@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 )
 
 // A missing raw credential snapshot is an instruction to retire that source,
@@ -70,6 +72,27 @@ func readRetiredClaudeCredential(path string) ([]byte, error) {
 }
 
 func (plan *claudeCredentialRetirement) Apply() error {
+	removal, err := plan.prepareRemoval()
+	if err != nil {
+		return err
+	}
+	return claudesettings.ApplyUpdatesWithRemovals(nil, []*claudesettings.Removal{removal})
+}
+
+// Accept the captured keychain mirror only before preparing the batch. Once
+// staged, the removal also guards that exact file identity and byte sequence.
+func (plan *claudeCredentialRetirement) prepareRemoval() (*claudesettings.Removal, error) {
+	if err := plan.checkUnchanged(); err != nil {
+		return nil, err
+	}
+	current, err := readRetiredClaudeCredential(plan.live)
+	if err != nil {
+		return nil, err
+	}
+	return claudesettings.PrepareCredentialRemoval(plan.snapshot, plan.live, current, plan.checkUnchanged)
+}
+
+func (plan *claudeCredentialRetirement) checkUnchanged() error {
 	if _, err := os.Lstat(plan.snapshot); err == nil {
 		return fmt.Errorf("Claude credential snapshot appeared during activation; retry")
 	} else if !os.IsNotExist(err) {
@@ -95,9 +118,6 @@ func (plan *claudeCredentialRetirement) Apply() error {
 		if (mirror == nil) != (plan.mirror == nil) || !bytes.Equal(bytes.TrimSpace(mirror), bytes.TrimSpace(plan.mirror)) {
 			return fmt.Errorf("Claude keychain changed before credential retirement; retry")
 		}
-	}
-	if err := os.Remove(plan.live); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("retire outgoing Claude credential %s: %w", plan.live, err)
 	}
 	return nil
 }

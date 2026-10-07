@@ -38,6 +38,16 @@ target, a vault restore removes live `.credentials.json` and `auth.json` when
 the selected profile has no snapshot for that source. Present credential
 snapshots still use the existing same-account freshness protection.
 
+Vault restoration stages the mixed settings documents and private recovery
+copies for retired credentials as one batch, regardless of file-set order.
+A settings staging failure cannot first remove the outgoing OAuth token.
+Settings are installed before retirement; a later retirement or validation
+failure also rolls those settings back. Recreated native logins are never
+overwritten by credential rollback: recovery into a retired path requires that
+path to remain absent. Otherwise the error reports the retained private copy
+(`credentials.json.rollback.*`). This batch does not encompass the subsequent
+restore of present OAuth snapshots or the final keychain write.
+
 Desktop's `oauth:tokenCache` and `oauth:tokenCacheV2` fields also come exclusively
 from the target, including absence. Switching to an account without a Desktop
 cache removes the outgoing caches while preserving live Desktop preferences
@@ -175,7 +185,8 @@ checks: they do not lock the native CLI or guarantee a multi-file transaction.
 
 ### Settings-batch failure recovery
 
-Isolated/shallow settings batches, and the settings portion of logout, stage
+Vault mixed-settings/retirement batches, isolated/shallow settings batches,
+and the settings portion of logout stage
 every replacement and rollback copy before installing any document. A staging
 failure leaves the destination documents unchanged. On a later installation or
 input-validation failure, the batch attempts to restore its earlier writes in

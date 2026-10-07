@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -18,6 +19,59 @@ func authSourceTestWrite(t *testing.T, path, data string) {
 	}
 	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClaudeAuthSourceStagingFailurePreservesOutgoingBundle(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires procfs for a deterministic staging failure")
+	}
+	if _, err := os.Stat("/proc/self"); err != nil {
+		t.Skip("procfs unavailable")
+	}
+	for _, entry := range []string{"restore", "switch"} {
+		t.Run(entry, func(t *testing.T) {
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			home := t.TempDir()
+			credentials := filepath.Join(home, ".claude", ".credentials.json")
+			settings := filepath.Join(home, ".claude", "settings.json")
+			legacy := filepath.Join(home, ".claude.json")
+			// The final mixed document cannot be staged, even when tests run
+			// as root. No earlier policy write or OAuth removal may survive.
+			desktop := "/proc/self/Library/Application Support/Claude/config.json"
+			files := AuthFileSet{Tool: "claude", AllowOptionalOnly: true, Files: []AuthFileSpec{
+				{Path: credentials, Required: true}, {Path: legacy}, {Path: settings}, {Path: desktop},
+			}}
+			before := map[string]string{
+				credentials: keychainCreds("outgoing"),
+				settings:    `{"permissions":{"allow":["Read"]},"apiKeyHelper":"outgoing"}`,
+				legacy:      `{"oauthAccount":{"accountUuid":"outgoing"},"projects":{"/repo":{"allowedTools":["Read"]}}}`,
+			}
+			for path, body := range before {
+				authSourceTestWrite(t, path, body)
+			}
+			v := NewVault(t.TempDir())
+			profileDir := v.ProfilePath("claude", "helper")
+			authSourceTestWrite(t, filepath.Join(profileDir, "settings.json"), `{"apiKeyHelper":"incoming"}`)
+			authSourceTestWrite(t, filepath.Join(profileDir, "config.json"), `{"oauth:tokenCacheV2":"incoming-cache"}`)
+			var err error
+			if entry == "restore" {
+				err = v.Restore(files, "helper")
+			} else {
+				_, err = v.Switch(files, "helper", SwitchOptions{})
+			}
+			if err == nil || !strings.Contains(err.Error(), "stage") {
+				t.Fatalf("expected staging error, got %v", err)
+			}
+			for path, want := range before {
+				got, err := os.ReadFile(path)
+				if err != nil || string(got) != want {
+					t.Fatalf("failed %s changed outgoing bundle at %s: %q, %v", entry, path, got, err)
+				}
+			}
+		})
 	}
 }
 

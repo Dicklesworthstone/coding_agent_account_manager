@@ -68,8 +68,8 @@ func readClaudeSettingsForBackup(fileSet AuthFileSet) (map[string]claudeSettings
 }
 
 type claudeSettingsRestore struct {
-	// A plan either merges mixed settings or retires a raw credential source
-	// absent from the selected account. Both are read-only until Apply.
+	// All planned files share one batch; hasAuth remains specific to this file
+	// for Restore's required/optional-source accounting.
 	update  interface{ Apply() error }
 	hasAuth bool
 }
@@ -181,6 +181,25 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 	}
 	if !required && !optional {
 		return nil, fmt.Errorf("no auth files restored for %s", fileSet.Tool)
+	}
+	// Restore visits plans in file-set order. Do not let its first visit
+	// retire the outgoing OAuth token before another document can be staged.
+	batch := &claudeRestoreBatch{}
+	for _, spec := range fileSet.Files {
+		plan, ok := result[spec.Path]
+		if !ok {
+			continue
+		}
+		switch update := plan.update.(type) {
+		case *claudesettings.Update:
+			batch.updates = append(batch.updates, update)
+		case *claudeCredentialRetirement:
+			batch.retirements = append(batch.retirements, update)
+		default:
+			return nil, fmt.Errorf("unsupported Claude restore plan for %s", spec.Path)
+		}
+		plan.update = batch
+		result[spec.Path] = plan
 	}
 	return result, nil
 }
