@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
@@ -308,6 +310,9 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			printSwitchPreservation(os.Stderr, tool, switched)
 		}
 	}
+	if err := checkInteractiveRunCredential(ctx, fileSet, activeProfileName, selector); err != nil {
+		return err
+	}
 
 	// Load profile object
 	if profileStore == nil {
@@ -348,6 +353,50 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	}
 
 	return smartRunner.Run(ctx, runOptions)
+}
+
+// A recognized owner is not necessarily a usable credential. Global execution
+// deliberately skips isolated-profile preflight, so check the actual live grant
+// before loading/locking a profile or giving it to the native CLI. In particular,
+// Cursor may discard a hard-expired browser session when it tries to use it.
+func checkInteractiveRunCredential(ctx context.Context, fileSet authfile.AuthFileSet, name string, selector *rotation.Selector) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage(filepath.Join(filepath.Dir(vault.BasePath()), "health.json"))
+		store.SetVaultPath(vault.BasePath())
+	}
+	ph, err := store.GetProfile(fileSet.Tool, name)
+	if err != nil {
+		return fmt.Errorf("read active credential health: %w", err)
+	}
+	if ph == nil {
+		ph = &health.ProfileHealth{}
+	}
+	// Keep provider-verification evidence, but discard every property derived
+	// from the saved grant. The CLI will use live auth, which may have rotated
+	// since backup or belong to a newly authenticated grant of the same account.
+	applyExpiryInfo(ph, &health.ExpiryInfo{})
+	info, err := health.ParseLiveExpiry(fileSet)
+	if err != nil && !errors.Is(err, health.ErrNoExpiry) && !errors.Is(err, health.ErrNoAuthFile) {
+		return fmt.Errorf("read live %s credential: %w", fileSet.Tool, err)
+	}
+	if info != nil {
+		applyExpiryInfo(ph, info)
+	}
+	selector.SetProfileHealth(map[string]*health.ProfileHealth{name: ph})
+	// Later handoffs must hydrate their own saved credentials normally.
+	defer selector.SetProfileHealth(nil)
+	result, err := selector.Select(fileSet.Tool, []string{name}, "")
+	if err != nil {
+		return fmt.Errorf("active %s profile %q cannot launch: %w", fileSet.Tool, name, err)
+	}
+	if result == nil || result.Selected != name {
+		return fmt.Errorf("active %s profile %q is not available for launch", fileSet.Tool, name)
+	}
+	return ctx.Err()
 }
 
 // loadRunRetryConfig applies explicit flags last. Changed is essential: the

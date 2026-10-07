@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -232,6 +233,72 @@ func CodexCredentialFingerprint(data []byte) string {
 		return ""
 	}
 	return credentialFingerprint(auth.Tokens.RefreshToken, auth.RefreshToken, auth.Tokens.AccessToken, auth.AccessToken)
+}
+
+// An explicit API-key mode ignores leftover OAuth tokens. With no mode, a
+// key-only record selects that key. OAuth-only probes continue to fingerprint
+// the OAuth token they exercised, even when the native CLI selects an API key.
+func codexSelectedAPIKey(data []byte) (string, bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return "", false, err
+	}
+	readAliases := func(object map[string]json.RawMessage, names ...string) (string, error) {
+		var selected string
+		for _, name := range names {
+			var value string
+			if raw, ok := object[name]; ok {
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return "", fmt.Errorf("Codex %s must be a string or null", name)
+				}
+			}
+			value = strings.TrimSpace(value)
+			if selected != "" && value != "" && selected != value {
+				return "", fmt.Errorf("Codex credential aliases conflict")
+			}
+			if value != "" {
+				selected = value
+			}
+		}
+		return selected, nil
+	}
+	key, err := readAliases(root, "OPENAI_API_KEY", "api_key", "apiKey")
+	if err != nil {
+		return "", false, err
+	}
+	mode, err := readAliases(root, "auth_mode")
+	if err != nil {
+		return "", false, err
+	}
+	switch strings.ToLower(mode) {
+	case "apikey", "api-key":
+		if key == "" {
+			return "", false, fmt.Errorf("Codex API-key auth mode has no API key")
+		}
+		return key, true, nil
+	case "":
+		if key == "" {
+			return "", false, nil
+		}
+		var tokens map[string]json.RawMessage
+		if raw, ok := root["tokens"]; ok {
+			if err := json.Unmarshal(raw, &tokens); err != nil {
+				return "", false, fmt.Errorf("Codex tokens must be an object or null")
+			}
+		}
+		for _, object := range []map[string]json.RawMessage{root, tokens} {
+			access, err := readAliases(object, "access_token", "accessToken", "token")
+			if err != nil {
+				return "", false, err
+			}
+			if access != "" {
+				return "", false, nil
+			}
+		}
+		return key, true, nil
+	default:
+		return "", false, nil
+	}
 }
 
 // credentialFingerprint prefers a renewal credential over the access token

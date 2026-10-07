@@ -21,7 +21,9 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wrap"
+	"github.com/creack/pty"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
@@ -94,6 +96,208 @@ func TestHelperProcess_Run(t *testing.T) {
 	}
 	fmt.Fprintln(os.Stderr, "Error: rate limit exceeded")
 	os.Exit(42)
+}
+
+// This helper is reached through Runner's real os/exec path, including the
+// Cursor fallback that does not use SmartRunner's injectable command factory.
+func TestHelperProcess_InteractiveRun(t *testing.T) {
+	if os.Getenv("GO_WANT_INTERACTIVE_RUN_HELPER") != "1" {
+		return
+	}
+	if err := os.WriteFile(os.Getenv("INTERACTIVE_RUN_MARKER"), []byte("launched"), 0600); err != nil {
+		os.Exit(91)
+	}
+	os.Exit(0)
+}
+
+type interactiveRunProvider struct {
+	provider.Provider
+	commandCalls int
+}
+
+func (p *interactiveRunProvider) DefaultBin() string {
+	p.commandCalls++
+	return os.Args[0]
+}
+
+func setupInteractiveRun(t *testing.T, native provider.Provider) (*cobra.Command, *interactiveRunProvider, string) {
+	t.Helper()
+	oldRegistry, oldRunner, oldGetWd := registry, runner, getWd
+	t.Cleanup(func() { registry, runner, getWd = oldRegistry, oldRunner, oldGetWd })
+	prov := &interactiveRunProvider{Provider: native}
+	registry = provider.NewRegistry()
+	registry.Register(prov)
+	runner = caamexec.NewRunner(registry)
+	profileStore = profile.NewStore(filepath.Join(os.Getenv("CAAM_HOME"), "profiles"))
+	getWd = func() (string, error) { return os.Getenv("HOME"), nil }
+	require.NoError(t, config.DefaultConfig().Save())
+	terminal, input, err := pty.Open()
+	if err != nil {
+		t.Skipf("interactive regression requires a PTY: %v", err)
+	}
+	t.Cleanup(func() { terminal.Close(); input.Close() })
+	marker := filepath.Join(t.TempDir(), "interactive-child")
+	t.Setenv("GO_WANT_INTERACTIVE_RUN_HELPER", "1")
+	t.Setenv("INTERACTIVE_RUN_MARKER", marker)
+	cmd := &cobra.Command{Use: "run <tool>", RunE: runWrap, SilenceErrors: true, SilenceUsage: true}
+	addRunFlags(cmd)
+	cmd.SetIn(input)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd, prov, marker
+}
+
+func TestInteractiveRunChecksActiveCursorCredential(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, algorithm := range []string{"smart", "round_robin", "random"} {
+		for _, tc := range []struct {
+			name       string
+			expiry     time.Time
+			apiKey     bool
+			opaque     bool
+			rejection  string
+			cooldown   bool
+			wantReason string
+		}{
+			{name: "expired session", expiry: now.Add(-time.Hour), wantReason: "log in again"},
+			{name: "expiry boundary", expiry: now, wantReason: "log in again"},
+			{name: "valid session", expiry: now.Add(time.Hour)},
+			{name: "renewable expired token", expiry: now.Add(-time.Hour), apiKey: true},
+			{name: "API key without token", apiKey: true},
+			{name: "opaque expiry stays unknown", opaque: true},
+			{name: "current provider rejection", expiry: now.Add(time.Hour), apiKey: true, rejection: "current", wantReason: "log in again"},
+			{name: "replacement clears old rejection", expiry: now.Add(time.Hour), rejection: "previous"},
+			{name: "current account in cooldown", expiry: now.Add(time.Hour), cooldown: true, wantReason: "cooldown"},
+		} {
+			t.Run(algorithm+"/"+tc.name, func(t *testing.T) {
+				paths := setupCursorHealthVault(t)
+				cmd, prov, marker := setupInteractiveRun(t, cursor.New())
+				// Ambient keys are scrubbed by global execution and cannot rescue
+				// an expired browser login from a different account.
+				t.Setenv("CURSOR_API_KEY", "SYNTHETIC-AMBIENT-KEY")
+				data := cursorHealthCredential(t, tc.expiry, tc.apiKey)
+				if tc.opaque {
+					data = []byte(`{"accessToken":"SYNTHETIC-OPAQUE-SESSION"}`)
+				}
+				require.NoError(t, os.MkdirAll(filepath.Dir(paths.AuthFile), 0700))
+				require.NoError(t, os.WriteFile(paths.AuthFile, data, 0600))
+				configPath := filepath.Join(paths.ConfigDir, "cli-config.json")
+				require.NoError(t, os.MkdirAll(paths.ConfigDir, 0700))
+				require.NoError(t, os.WriteFile(configPath, []byte(`{"theme":"light"}`), 0600))
+				require.NoError(t, vault.Backup(authfile.CursorAuthFiles(), "active"))
+				changedConfig := []byte(`{"theme":"dark","lastUpdateCheck":123}`)
+				require.NoError(t, os.WriteFile(configPath, changedConfig, 0600))
+				current, err := vault.CurrentProfile(authfile.CursorAuthFiles())
+				require.NoError(t, err)
+				require.Equal(t, "active", current, "config churn must not hide the active credential")
+				require.NoError(t, healthStore.SetTokenExpiry("cursor", "active", now.Add(-90*24*time.Hour)))
+				if tc.rejection != "" {
+					fingerprint := "previous-replaced-credential"
+					if tc.rejection == "current" {
+						info, err := health.ParseCursorExpiry(paths.AuthFile)
+						require.NoError(t, err)
+						fingerprint = info.Fingerprint
+					}
+					require.NoError(t, healthStore.RecordProviderVerification("cursor", "active", health.ProviderVerification{
+						Reason: "access_token_rejected", Fingerprint: fingerprint,
+					}))
+				}
+				if tc.cooldown {
+					db, err := getDB()
+					require.NoError(t, err)
+					_, err = db.SetCooldown("cursor", "active", time.Now(), time.Hour, "synthetic regression")
+					require.NoError(t, err)
+				}
+				before := snapshotKeepaliveCLIFiles(t, vault.BasePath())
+				cmd.SetArgs([]string{"cursor", "--quiet", "--algorithm", algorithm, "--", "-test.run=^TestHelperProcess_InteractiveRun$"})
+				err = cmd.Execute()
+				if tc.wantReason != "" {
+					require.ErrorContains(t, err, tc.wantReason)
+					require.NotContains(t, err.Error(), "caam refresh")
+					require.Zero(t, prov.commandCalls, "blocked credential reached command construction")
+					require.NoFileExists(t, marker)
+					require.NoDirExists(t, profileStore.ProfilePath("cursor", "active"), "blocked launch created a transient profile")
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, 1, prov.commandCalls)
+					require.FileExists(t, marker, "eligible credential did not reach the real child path")
+				}
+				after, err := os.ReadFile(paths.AuthFile)
+				require.NoError(t, err)
+				require.Equal(t, data, after, "launch check changed native credentials")
+				afterConfig, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+				require.Equal(t, changedConfig, afterConfig)
+				require.Equal(t, before, snapshotKeepaliveCLIFiles(t, vault.BasePath()), "launch check changed the vault")
+			})
+		}
+	}
+}
+
+func TestInteractiveRunUsesLiveClaudeGrant(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, tc := range []struct {
+		name        string
+		savedExpiry time.Time
+		liveExpiry  time.Time
+		refresh     bool
+		rejectSaved bool
+		wantLogin   bool
+	}{
+		{name: "expired live grant with healthy snapshot", savedExpiry: now.Add(time.Hour), liveExpiry: now.Add(-time.Hour), wantLogin: true},
+		{name: "healthy live grant with expired snapshot", savedExpiry: now.Add(-time.Hour), liveExpiry: now.Add(time.Hour)},
+		{name: "renewable expired live grant", savedExpiry: now.Add(time.Hour), liveExpiry: now.Add(-time.Hour), refresh: true},
+		{name: "new live grant replaces rejected snapshot", savedExpiry: now.Add(-time.Hour), liveExpiry: now.Add(time.Hour), rejectSaved: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupCursorHealthVault(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+			tools = map[string]func() authfile.AuthFileSet{"claude": authfile.ClaudeAuthFiles}
+			cmd, prov, marker := setupInteractiveRun(t, claude.New())
+			authPath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
+			require.NoError(t, os.MkdirAll(filepath.Dir(authPath), 0700))
+			credential := func(token string, expiry time.Time) []byte {
+				oauth := map[string]any{"accessToken": token, "expiresAt": expiry.UnixMilli(), "accountId": "synthetic-account"}
+				if tc.refresh {
+					oauth["refreshToken"] = "SYNTHETIC-REFRESH-" + token
+				}
+				data, err := json.Marshal(map[string]any{"claudeAiOauth": oauth})
+				require.NoError(t, err)
+				return data
+			}
+			saved := credential("SYNTHETIC-SAVED", tc.savedExpiry)
+			live := credential("SYNTHETIC-LIVE", tc.liveExpiry)
+			require.NoError(t, os.WriteFile(authPath, saved, 0600))
+			require.NoError(t, vault.Backup(authfile.ClaudeAuthFiles(), "active"))
+			if tc.rejectSaved {
+				info, err := health.ParseClaudeExpiry(os.Getenv("CLAUDE_CONFIG_DIR"))
+				require.NoError(t, err)
+				require.NoError(t, healthStore.RecordProviderVerification("claude", "active", health.ProviderVerification{
+					Reason: "access_token_rejected", Fingerprint: info.Fingerprint,
+				}))
+			}
+			require.NoError(t, os.WriteFile(authPath, live, 0600))
+			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+			require.NoError(t, err)
+			require.Equal(t, "active", current, "rotated grant must remain owned by the same account")
+			before := snapshotKeepaliveCLIFiles(t, vault.BasePath())
+			cmd.SetArgs([]string{"claude", "--quiet", "--", "-test.run=^TestHelperProcess_InteractiveRun$"})
+			err = cmd.Execute()
+			if tc.wantLogin {
+				require.ErrorContains(t, err, "log in again")
+				require.Zero(t, prov.commandCalls)
+				require.NoFileExists(t, marker)
+				require.NoDirExists(t, profileStore.ProfilePath("claude", "active"))
+			} else {
+				require.NoError(t, err)
+				require.FileExists(t, marker)
+			}
+			after, err := os.ReadFile(authPath)
+			require.NoError(t, err)
+			require.Equal(t, live, after)
+			require.Equal(t, before, snapshotKeepaliveCLIFiles(t, vault.BasePath()))
+		})
+	}
 }
 
 func TestRunCommand_Extended(t *testing.T) {

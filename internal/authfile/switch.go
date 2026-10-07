@@ -220,6 +220,110 @@ func (v *Vault) CurrentProfile(fileSet AuthFileSet) (string, error) {
 	return owner, err
 }
 
+// ReadLiveCredential captures the current credential without creating keychain
+// mirrors, migrating files, or consulting a saved profile. Reads are bounded like
+// unattended discovery. The returned name is the artifact's base name; callers
+// must parse its contents before treating it as credential or expiry evidence.
+func ReadLiveCredential(fileSet AuthFileSet) (name string, data []byte, err error) {
+	live, err := readSwitchStateLimited(fileSet, "", MaxDiscoveryFileBytes)
+	if err != nil {
+		return "", nil, err
+	}
+	// A present primary artifact owns the result even when empty or malformed.
+	// Identification can skip empty bytes, but a health reader must not revive
+	// another login from optional settings in that case.
+	var primary []string
+	switch fileSet.Tool {
+	case "claude":
+		primary = []string{claudeCredentialsFile, "auth.json"}
+	case "codex", "cursor", "grok":
+		primary = []string{"auth.json"}
+	case "gemini":
+		selected, err := liveGeminiAuthType(live.files["settings.json"])
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: Gemini settings: %v", ErrInvalidCredentials, err)
+		}
+		if selected == "gemini-api-key" {
+			data, present := live.files[".env"]
+			if !present {
+				return "", nil, fmt.Errorf("%w: selected Gemini API key has no .env credential", ErrInvalidCredentials)
+			}
+			return ".env", data, nil
+		}
+		if selected == "vertex-ai" {
+			// ADC is outside this captured file set. Keep the selected method
+			// unknown rather than attribute an unused OAuth cache's deadline.
+			return "settings.json", live.files["settings.json"], nil
+		}
+		primary = []string{"oauth_creds.json"}
+	}
+	for _, name := range primary {
+		if data, present := live.files[name]; present {
+			return name, data, nil
+		}
+	}
+	if !live.hasAuth() {
+		return "", nil, ErrNoCredentials
+	}
+	return live.credentialName, live.credential, nil
+}
+
+// Native Gemini settings select the credential method before the OAuth cache.
+// Read the same legacy/current selectors as the provider's directory importer,
+// using only the settings bytes already captured with the live credential.
+func liveGeminiAuthType(data []byte) (string, error) {
+	if data == nil {
+		return "", nil
+	}
+	obj, err := discoveryObject(data)
+	if err != nil {
+		return "", err
+	}
+	read := func(obj map[string]json.RawMessage, key string) (string, error) {
+		raw, present := obj[key]
+		if !present {
+			return "", nil
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil || strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("%s must be a nonempty string", key)
+		}
+		return value, nil
+	}
+	selected, err := read(obj, "selectedAuthType")
+	if err != nil {
+		return "", err
+	}
+	if raw, present := obj["security"]; present {
+		security, err := discoveryObject(raw)
+		if err != nil {
+			return "", fmt.Errorf("security must be an object")
+		}
+		if raw, present := security["auth"]; present {
+			auth, err := discoveryObject(raw)
+			if err != nil {
+				return "", fmt.Errorf("security.auth must be an object")
+			}
+			current, err := read(auth, "selectedType")
+			if err != nil {
+				return "", err
+			}
+			if selected != "" && current != "" && selected != current {
+				return "", fmt.Errorf("conflicting selected auth types")
+			}
+			if current != "" {
+				selected = current
+			}
+		}
+	}
+	switch selected {
+	case "", "oauth-personal", "gemini-api-key", "vertex-ai":
+		return selected, nil
+	default:
+		return "", fmt.Errorf("unsupported Gemini selected auth type")
+	}
+}
+
 // HasAuthFilesReadOnly checks live credential presence without creating a
 // keychain mirror, migrating filenames, or changing native settings. It applies
 // the same credential validation as restore, not an online provider check.

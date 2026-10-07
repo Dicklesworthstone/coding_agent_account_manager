@@ -90,6 +90,197 @@ type ExpiryInfo struct {
 	Source string
 }
 
+// ParseLiveExpiry reads only the credential captured from the supplied native
+// file set. It never creates a keychain mirror or borrows a saved profile,
+// isolated profile, or ambient API key. Unknown expiry remains unknown; a
+// readable grant still carries its fingerprint for provider-verdict matching.
+func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
+	name, data, err := authfile.ReadLiveCredential(fileSet)
+	if err != nil {
+		if errors.Is(err, authfile.ErrNoCredentials) {
+			return nil, ErrNoAuthFile
+		}
+		return nil, err
+	}
+	if fileSet.Tool == "claude" || fileSet.Tool == "codex" || fileSet.Tool == "cursor" || fileSet.Tool == "grok" || (fileSet.Tool == "gemini" && name != ".env") {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(data, &object); err != nil || object == nil {
+			return nil, fmt.Errorf("%w: live %s credential must be a JSON object", authfile.ErrInvalidCredentials, fileSet.Tool)
+		}
+	}
+	var info *ExpiryInfo
+	switch fileSet.Tool {
+	case "claude":
+		if name == ".credentials.json" {
+			info, err = parseClaudeCredentialsJSON(data)
+		} else {
+			info, err = parseLiveOAuthJSON(data)
+		}
+	case "codex":
+		if key, selected, modeErr := codexSelectedAPIKey(data); modeErr != nil {
+			return nil, modeErr
+		} else if selected {
+			info = &ExpiryInfo{Renewable: true, SelfRefreshing: true, Fingerprint: credentialFingerprint("codex-api-key\x00" + key)}
+			break
+		}
+		info, err = parseCodexAuthJSON(data)
+		fingerprint := CodexCredentialFingerprint(data)
+		if errors.Is(err, ErrNoExpiry) && fingerprint != "" {
+			info, err = &ExpiryInfo{}, nil
+		}
+		if info != nil {
+			info.Fingerprint = fingerprint
+		}
+	case "cursor":
+		if name != "auth.json" {
+			// Metadata-only native-keychain logins have no readable grant.
+			if _, err := authfile.CursorConfigAuthInfo(data); err != nil {
+				return nil, err
+			}
+			return nil, ErrNoExpiry
+		}
+		if ok, shapeErr := authfile.CursorCredentialMaterial(data); shapeErr != nil || !ok {
+			return nil, fmt.Errorf("%w: Cursor auth has no valid accessToken or apiKey", authfile.ErrInvalidCredentials)
+		}
+		info, err = parseCursorAuthJSON(data)
+	case "gemini":
+		if name == "settings.json" {
+			var selected struct {
+				Legacy   string `json:"selectedAuthType"`
+				Security struct {
+					Auth struct {
+						Type string `json:"selectedType"`
+					} `json:"auth"`
+				} `json:"security"`
+			}
+			if err := json.Unmarshal(data, &selected); err != nil {
+				return nil, err
+			}
+			if selected.Legacy == "vertex-ai" || selected.Security.Auth.Type == "vertex-ai" {
+				return nil, ErrNoExpiry
+			}
+		}
+		if name == ".env" {
+			info, err = parseLiveGeminiAPIKey(data)
+		} else {
+			info, err = parseLiveOAuthJSON(data)
+		}
+	case "grok":
+		info, err = parseLiveGrokJSON(data)
+	default:
+		return nil, ErrNoExpiry
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, ErrNoExpiry
+	}
+	if fileSet.Tool != "cursor" {
+		info.Renewable = info.Renewable || info.HasRefreshToken
+		info.SelfRefreshing = info.SelfRefreshing || (fileSet.Tool == "claude" && info.HasRefreshToken)
+	}
+	info.Source = name
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) == name {
+			info.Source = spec.Path
+			break
+		}
+	}
+	return info, nil
+}
+
+// Parse only the captured .env, following Gemini's stored-key syntax and mode
+// conflicts. Ambient keys and unrelated dotenv entries cannot identify a grant.
+func parseLiveGeminiAPIKey(data []byte) (*ExpiryInfo, error) {
+	values := make(map[string]string)
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" || strings.ContainsAny(key, " \t\r\x00") {
+			return nil, fmt.Errorf("%w: expected a Gemini dotenv assignment", authfile.ErrInvalidCredentials)
+		}
+		if len(value) > 0 && (value[0] == '\'' || value[0] == '"') {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return nil, fmt.Errorf("%w: unterminated Gemini dotenv value", authfile.ErrInvalidCredentials)
+			}
+			end++
+			tail := strings.TrimSpace(value[end+1:])
+			if tail != "" && !strings.HasPrefix(tail, "#") {
+				return nil, fmt.Errorf("%w: unexpected text after Gemini dotenv value", authfile.ErrInvalidCredentials)
+			}
+			value = value[1:end]
+		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return nil, fmt.Errorf("%w: invalid Gemini dotenv value", authfile.ErrInvalidCredentials)
+		}
+		if key == "GEMINI_API_KEY" && (strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t")) {
+			return nil, fmt.Errorf("%w: Gemini API key is empty or contains whitespace", authfile.ErrInvalidCredentials)
+		}
+		values[key] = value
+	}
+	key := values["GEMINI_API_KEY"]
+	if key == "" || strings.ContainsAny(key, " \t") || values["GOOGLE_API_KEY"] != "" || values["GOOGLE_GENAI_USE_GCA"] == "true" || values["GOOGLE_GENAI_USE_VERTEXAI"] == "true" {
+		return nil, fmt.Errorf("%w: selected Gemini API key is absent or conflicts with another auth method", authfile.ErrInvalidCredentials)
+	}
+	return &ExpiryInfo{Renewable: true, SelfRefreshing: true, Fingerprint: credentialFingerprint(key)}, nil
+}
+
+// Preserve opaque access-token fingerprints without changing the saved-file
+// parsers' existing ErrNoExpiry contract.
+func parseLiveOAuthJSON(data []byte) (*ExpiryInfo, error) {
+	info, err := parseOAuthJSON(data)
+	if !errors.Is(err, ErrNoExpiry) {
+		return info, err
+	}
+	var oauth oauthJSON
+	if err := json.Unmarshal(data, &oauth); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+	fingerprint := credentialFingerprint(oauth.RefreshToken, oauth.RefreshTokenCamel, oauth.AccessToken, oauth.AccessTokenCamel, oauth.Key)
+	if fingerprint == "" {
+		return nil, ErrNoExpiry
+	}
+	return &ExpiryInfo{Fingerprint: fingerprint}, nil
+}
+
+func parseLiveGrokJSON(data []byte) (*ExpiryInfo, error) {
+	if info, err := parseGrokAuthJSON(data); !errors.Is(err, ErrNoExpiry) {
+		return info, err
+	}
+	if info, err := parseLiveOAuthJSON(data); err == nil {
+		return info, nil
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		info, err := parseLiveOAuthJSON(entries[key])
+		if err == nil {
+			return info, nil
+		}
+		if !errors.Is(err, ErrNoExpiry) {
+			return nil, err
+		}
+	}
+	return nil, ErrNoExpiry
+}
+
 // ParseClaudeExpiry extracts token expiry from Claude Code auth files.
 //
 // Claude Code stores OAuth credentials in:
@@ -251,7 +442,10 @@ func parseClaudeCredentialsFile(path string) (*ExpiryInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseClaudeCredentialsJSON(data)
+}
 
+func parseClaudeCredentialsJSON(data []byte) (*ExpiryInfo, error) {
 	var creds claudeCredentialsJSON
 	if err := json.Unmarshal(data, &creds); err != nil {
 		return nil, fmt.Errorf("parse JSON: %w", err)
@@ -456,7 +650,18 @@ func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
 		}
 		return nil, err
 	}
+	info, err := parseCursorAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	if info.ExpiresAt.IsZero() && !info.Renewable {
+		return nil, ErrNoExpiry
+	}
+	info.Source = authPath
+	return info, nil
+}
 
+func parseCursorAuthJSON(data []byte) (*ExpiryInfo, error) {
 	var auth struct {
 		AccessToken string `json:"accessToken"`
 		APIKey      string `json:"apiKey"`
@@ -470,10 +675,6 @@ func ParseCursorExpiry(authPath string) (*ExpiryInfo, error) {
 		ExpiresAt:      jwtExpiry(auth.AccessToken),
 		Renewable:      renewable,
 		SelfRefreshing: renewable,
-		Source:         authPath,
-	}
-	if info.ExpiresAt.IsZero() && !renewable {
-		return nil, ErrNoExpiry
 	}
 
 	credential := "cursor-session\x00" + auth.AccessToken
