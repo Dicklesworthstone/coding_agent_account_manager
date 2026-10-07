@@ -54,9 +54,9 @@ version instead. Each host keeps its deployed coordinator config; the new
 binary is checksum-verified (or, for another platform, the matching release
 is installed), the service restarted, and its API verified through SSH. A
 coordinator that fails verification is rolled back to the previous binary
-and unit, which stay on the host as <binary>.caam-prev otherwise. --force
-redeploys and restarts even at the same version (for example to refresh the
-service unit).
+and unit, which stay on the host as <binary>.caam-prev otherwise;
+--remotes --rollback restores them on demand. --force redeploys and restarts
+even at the same version (for example to refresh the service unit).
 
 Flags:
   --check     Check for updates without installing
@@ -66,6 +66,7 @@ Flags:
   --force     Force update even if already at latest version
   --remotes   Update the remote coordinators instead of this binary
   --dry-run   With --remotes, show what would change
+  --rollback  With --remotes, restore the coordinators the last upgrade replaced
 
 Examples:
   caam update              # Update to latest stable version
@@ -73,7 +74,8 @@ Examples:
   caam update --channel=beta  # Update to latest beta version
   caam update --version=1.2.0 # Update to specific version
   caam update --remotes --dry-run  # Plan coordinator upgrades
-  caam update --remotes            # Upgrade coordinators to this version`,
+  caam update --remotes            # Upgrade coordinators to this version
+  caam update --remotes --rollback # Restore the previous coordinators`,
 	RunE: runUpdate,
 }
 
@@ -87,6 +89,7 @@ func init() {
 	updateCmd.Flags().Bool("remotes", false, "update the distributed auth coordinators to this caam's version")
 	updateCmd.Flags().Bool("dry-run", false, "with --remotes, show what would change without changing it")
 	updateCmd.Flags().String("config", "", "with --remotes, the auth-agent config listing the coordinators (default: the 'caam setup distributed' config)")
+	updateCmd.Flags().Bool("rollback", false, "with --remotes, restore the coordinators replaced by the last upgrade")
 }
 
 func runUpdate(cmd *cobra.Command, args []string) error {
@@ -97,13 +100,23 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	force, _ := cmd.Flags().GetBool("force")
 	remotes, _ := cmd.Flags().GetBool("remotes")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	rollback, _ := cmd.Flags().GetBool("rollback")
 
 	if remotes {
 		if checkOnly || targetVersion != "" {
 			return fmt.Errorf("--remotes upgrades coordinators to this caam's version; it cannot be combined with --check or --version")
 		}
+		if rollback && (dryRun || force) {
+			return fmt.Errorf("--rollback cannot be combined with --dry-run or --force")
+		}
 		configPath, _ := cmd.Flags().GetString("config")
-		return runRemoteUpdate(cmd, configPath, deploy.UpgradeOptions{DryRun: dryRun, Force: force}, jsonOutput)
+		return runRemoteUpdate(cmd, configPath, remoteUpdateRequest{
+			Options:  deploy.UpgradeOptions{DryRun: dryRun, Force: force},
+			Rollback: rollback,
+		}, jsonOutput)
+	}
+	if rollback {
+		return fmt.Errorf("--rollback applies to --remotes; 'caam update' keeps a backup of this binary next to it")
 	}
 	if dryRun {
 		return fmt.Errorf("--dry-run applies to --remotes; use --check to see whether this caam has an update")
@@ -263,17 +276,24 @@ func printJSON(v any) error {
 
 // RemoteUpdateOutput is the JSON output of 'caam update --remotes'.
 type RemoteUpdateOutput struct {
-	Action  string                 `json:"action"` // "remote_update"
+	Action  string                 `json:"action"` // "remote_update" or "remote_rollback"
 	DryRun  bool                   `json:"dry_run,omitempty"`
 	Version string                 `json:"version"`
 	Results []deploy.UpgradeResult `json:"results"`
 }
 
+// remoteUpdateRequest is what 'caam update --remotes' does on each host.
+type remoteUpdateRequest struct {
+	Options  deploy.UpgradeOptions
+	Rollback bool // restore the coordinator the last upgrade replaced
+}
+
 // upgradeSkipped marks a coordinator that cannot be reached over SSH.
 const upgradeSkipped = "skipped"
 
-// upgradeCoordinatorHost connects to one coordinator host and upgrades it.
-var upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndpoint, opts deploy.UpgradeOptions, logger *slog.Logger) deploy.UpgradeResult {
+// upgradeCoordinatorHost connects to one coordinator host and upgrades (or
+// rolls back) its coordinator.
+var upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndpoint, req remoteUpdateRequest, logger *slog.Logger) deploy.UpgradeResult {
 	d := deploy.NewDeployer(&caamsync.Machine{
 		Name:       ep.Name,
 		Address:    ep.SSH.Host,
@@ -285,10 +305,13 @@ var upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndp
 		return deploy.UpgradeResult{Machine: ep.Name, Action: deploy.UpgradeFailed, Error: err.Error()}
 	}
 	defer d.Disconnect()
-	return *d.UpgradeCoordinator(ctx, opts)
+	if req.Rollback {
+		return *d.RollbackCoordinator(ctx)
+	}
+	return *d.UpgradeCoordinator(ctx, req.Options)
 }
 
-func runRemoteUpdate(cmd *cobra.Command, configPath string, opts deploy.UpgradeOptions, jsonOutput bool) error {
+func runRemoteUpdate(cmd *cobra.Command, configPath string, req remoteUpdateRequest, jsonOutput bool) error {
 	if configPath == "" {
 		configPath = agent.DefaultConfigPath()
 	}
@@ -312,9 +335,16 @@ func runRemoteUpdate(cmd *cobra.Command, configPath string, opts deploy.UpgradeO
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	out := cmd.OutOrStdout()
-	output := RemoteUpdateOutput{Action: "remote_update", DryRun: opts.DryRun, Version: version.Short()}
+	output := RemoteUpdateOutput{Action: "remote_update", DryRun: req.Options.DryRun, Version: version.Short()}
+	if req.Rollback {
+		output.Action = "remote_rollback"
+	}
 	if !jsonOutput {
-		fmt.Fprintf(out, "Coordinators -> caam %s\n", version.Short())
+		if req.Rollback {
+			fmt.Fprintln(out, "Rolling back coordinators to their previous version")
+		} else {
+			fmt.Fprintf(out, "Coordinators -> caam %s\n", version.Short())
+		}
 	}
 	failures := 0
 	for _, ep := range fc.Coordinators {
@@ -323,12 +353,13 @@ func runRemoteUpdate(cmd *cobra.Command, configPath string, opts deploy.UpgradeO
 			res = deploy.UpgradeResult{Machine: ep.Name, Action: upgradeSkipped,
 				Error: "no ssh block in the agent config; update caam on that host directly"}
 		} else {
-			res = upgradeCoordinatorHost(ctx, ep, opts, logger)
+			res = upgradeCoordinatorHost(ctx, ep, req, logger)
 		}
 		if res.Machine == "" {
 			res.Machine = ep.URL
 		}
-		if res.Action == deploy.UpgradeFailed || res.Action == deploy.UpgradeRolledBack {
+		// A rollback is the goal of --rollback and a failure of an upgrade.
+		if res.Action == deploy.UpgradeFailed || (res.Action == deploy.UpgradeRolledBack && !req.Rollback) {
 			failures++
 		}
 		output.Results = append(output.Results, res)
@@ -346,7 +377,11 @@ func runRemoteUpdate(cmd *cobra.Command, configPath string, opts deploy.UpgradeO
 	}
 	if failures > 0 {
 		cmd.SilenceUsage = true
-		return fmt.Errorf("%d of %d coordinators were not upgraded", failures, len(fc.Coordinators))
+		verb := "upgraded"
+		if req.Rollback {
+			verb = "rolled back"
+		}
+		return fmt.Errorf("%d of %d coordinators were not %s", failures, len(fc.Coordinators), verb)
 	}
 	return nil
 }
@@ -364,7 +399,11 @@ func printUpgradeResult(w io.Writer, r deploy.UpgradeResult) {
 	case deploy.UpgradeWouldApply:
 		fmt.Fprintf(w, "  ~ %s: would upgrade %s -> %s\n", r.Machine, from, r.ToVersion)
 	case deploy.UpgradeRolledBack:
-		fmt.Fprintf(w, "  ↺ %s: rolled back to %s: %s\n", r.Machine, from, r.Error)
+		if r.Error != "" { // an upgrade that failed verification
+			fmt.Fprintf(w, "  ↺ %s: rolled back to %s: %s\n", r.Machine, from, r.Error)
+		} else {
+			fmt.Fprintf(w, "  ↺ %s: rolled back %s -> %s\n", r.Machine, from, r.ToVersion)
+		}
 	case upgradeSkipped:
 		fmt.Fprintf(w, "  - %s: skipped: %s\n", r.Machine, r.Error)
 	default:

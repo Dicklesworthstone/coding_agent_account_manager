@@ -248,8 +248,9 @@ entry's SSH connection, keeps the host's deployed `coordinator.json`,
 replaces the binary (checksum-verified upload, or the release matching
 this version when the local binary is for another platform), rewrites the
 unit, restarts it and verifies `/status`. The previous binary and unit are
-kept (`<binary>.caam-prev`); if the upgraded coordinator does not pass
-verification they are restored and the host is reported as rolled back.
+kept (`<binary>.caam-prev`, `<unit>.caam-prev`); if the upgraded coordinator
+does not pass verification they are restored and the host is reported as
+rolled back, and `caam update --remotes --rollback` restores them on demand.
 `--force` redeploys at the same version, which also refreshes older units
 (for example to pick up the login `PATH`). The command exits non-zero when
 any host failed or was rolled back.

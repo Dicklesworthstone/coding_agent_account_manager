@@ -1053,10 +1053,19 @@ type coordinatorSnapshot struct {
 	binary string // binary backed up to binary+prevBinarySuffix; "" if none
 }
 
+// snapshotCoordinator backs up the installed binary and unit. Both stay on
+// the host (binary and unit path + prevBinarySuffix) for RollbackCoordinator.
 func (d *Deployer) snapshotCoordinator(ctx context.Context) (coordinatorSnapshot, error) {
 	var snap coordinatorSnapshot
 	if unit, err := d.readCoordinatorUnit(ctx); err == nil {
 		snap.unit = unit
+		path, err := d.coordinatorUnitPath(ctx)
+		if err != nil {
+			return snap, err
+		}
+		if err := d.sshClient.WriteFile(path+prevBinarySuffix, []byte(unit), 0644); err != nil {
+			return snap, fmt.Errorf("back up unit: %w", err)
+		}
 	}
 	if bin, ok := d.existingBinary(ctx); ok {
 		if _, err := d.RunCommand(ctx, withSudoFallback("cp -p "+shellEscape(bin)+" "+shellEscape(bin+prevBinarySuffix))); err != nil {
@@ -1095,6 +1104,50 @@ func (d *Deployer) restoreCoordinator(ctx context.Context, snap coordinatorSnaps
 		return fmt.Errorf("restart restored coordinator: %w", err)
 	}
 	return nil
+}
+
+// RollbackCoordinator restores the coordinator that the last upgrade
+// replaced (its unit, and its binary when the backup is still there).
+func (d *Deployer) RollbackCoordinator(ctx context.Context) *UpgradeResult {
+	res := &UpgradeResult{Machine: d.machine.Name}
+	fail := func(err error) *UpgradeResult {
+		res.Action = UpgradeFailed
+		res.Error = err.Error()
+		return res
+	}
+
+	config, err := d.ReadCoordinatorConfig(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	unitPath, err := d.coordinatorUnitPath(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	prevUnit, err := d.RunCommand(ctx, "cat "+shellEscape(unitPath+prevBinarySuffix))
+	if err != nil || strings.TrimSpace(prevUnit) == "" {
+		return fail(fmt.Errorf("no previous coordinator recorded on %s; nothing to roll back", d.machine.Name))
+	}
+	from, _ := d.GetRemoteVersion(ctx)
+	res.FromVersion = shortVersion(from)
+
+	snap := coordinatorSnapshot{unit: prevUnit}
+	if bin := execStartBinary(prevUnit); bin != "" {
+		if _, err := d.RunCommand(ctx, "test -e "+shellEscape(bin+prevBinarySuffix)); err == nil {
+			snap.binary = bin
+		}
+	}
+	if err := d.restoreCoordinator(ctx, snap); err != nil {
+		return fail(err)
+	}
+	to, _ := d.GetRemoteVersion(ctx)
+	res.ToVersion = shortVersion(to)
+	res.Action = UpgradeRolledBack
+
+	vctx, cancel := context.WithTimeout(ctx, d.verifyTimeout)
+	defer cancel()
+	res.Verified = d.VerifyCoordinator(vctx, config) == nil
+	return res
 }
 
 // UpgradeCoordinator brings the host's coordinator to this caam's version,

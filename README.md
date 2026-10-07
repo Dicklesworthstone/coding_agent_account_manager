@@ -1547,6 +1547,19 @@ caam notify test                    # send a test alert through each enabled cha
 caam notify test --channel desktop  # test one channel
 ```
 
+The daemon can also announce new caam releases (opt-in; it never installs
+anything). Each release is announced once:
+
+```bash
+caam config set daemon.update_check.enabled true
+caam config set daemon.update_check.interval 24h   # minimum 1h
+caam config set daemon.update_check.channel stable # or beta
+```
+
+Then `caam update` updates this machine and `caam update --remotes` brings
+distributed-recovery coordinators to the same version (see
+[docs/DISTRIBUTED_AUTH_RECOVERY.md](docs/DISTRIBUTED_AUTH_RECOVERY.md)).
+
 ---
 
 ## TUI Configuration

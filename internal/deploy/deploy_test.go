@@ -788,3 +788,27 @@ func TestExecStartBinary(t *testing.T) {
 		}
 	}
 }
+
+func TestRollbackCoordinatorRestoresLastKnownGood(t *testing.T) {
+	r := startFakeRemote(t, "")
+	r.installCoordinator(t, "v1.0.0")
+	d := r.deployer(t, "v1.5.0")
+
+	if res := d.RollbackCoordinator(context.Background()); res.Action != UpgradeFailed || !strings.Contains(res.Error, "nothing to roll back") {
+		t.Fatalf("rollback before any upgrade = %+v", res)
+	}
+	if res := d.UpgradeCoordinator(context.Background(), UpgradeOptions{}); res.Action != UpgradeUpgraded {
+		t.Fatalf("upgrade = %+v", res)
+	}
+
+	res := d.RollbackCoordinator(context.Background())
+	if res.Action != UpgradeRolledBack || !res.Verified || res.FromVersion != "v1.5.0" || res.ToVersion != "v1.0.0" {
+		t.Fatalf("rollback = %+v", res)
+	}
+	if got := r.read(t, "running-version"); !strings.Contains(got, "v1.0.0") {
+		t.Fatalf("running coordinator after rollback = %q", got)
+	}
+	if bin := execStartBinary(r.read(t, ".config/systemd/user/caam-coordinator.service")); bin != r.path(".local/bin/caam") {
+		t.Fatalf("restored unit runs %q", bin)
+	}
+}

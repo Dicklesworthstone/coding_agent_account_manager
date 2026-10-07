@@ -15,13 +15,13 @@ import (
 )
 
 // stubCoordinatorUpgrades replaces the per-host upgrade with outcomes keyed
-// by host and records the options each host received.
-func stubCoordinatorUpgrades(t *testing.T, outcomes map[string]deploy.UpgradeResult) map[string]deploy.UpgradeOptions {
+// by host and records the request each host received.
+func stubCoordinatorUpgrades(t *testing.T, outcomes map[string]deploy.UpgradeResult) map[string]remoteUpdateRequest {
 	t.Helper()
-	seen := map[string]deploy.UpgradeOptions{}
+	seen := map[string]remoteUpdateRequest{}
 	orig := upgradeCoordinatorHost
-	upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndpoint, opts deploy.UpgradeOptions, logger *slog.Logger) deploy.UpgradeResult {
-		seen[ep.SSH.Host] = opts
+	upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndpoint, req remoteUpdateRequest, logger *slog.Logger) deploy.UpgradeResult {
+		seen[ep.SSH.Host] = req
 		res := outcomes[ep.SSH.Host]
 		res.Machine = ep.Name
 		return res
@@ -53,7 +53,7 @@ func TestRemoteUpdateReportsEachCoordinator(t *testing.T) {
 	c := &cobra.Command{}
 	c.SetOut(&out)
 
-	err := runRemoteUpdate(c, writeRemoteUpdateConfig(t), deploy.UpgradeOptions{Force: true}, false)
+	err := runRemoteUpdate(c, writeRemoteUpdateConfig(t), remoteUpdateRequest{Options: deploy.UpgradeOptions{Force: true}}, false)
 	if err == nil || !strings.Contains(err.Error(), "1 of 3 coordinators were not upgraded") {
 		t.Fatalf("err = %v, want the rolled-back host to fail the command", err)
 	}
@@ -67,7 +67,7 @@ func TestRemoteUpdateReportsEachCoordinator(t *testing.T) {
 			t.Errorf("output lacks %q:\n%s", want, text)
 		}
 	}
-	if !seen["alpha.example"].Force || len(seen) != 2 {
+	if !seen["alpha.example"].Options.Force || len(seen) != 2 {
 		t.Errorf("hosts upgraded with %+v, want both ssh hosts with Force", seen)
 	}
 }
@@ -81,7 +81,7 @@ func TestRemoteUpdateJSONDryRun(t *testing.T) {
 	c := &cobra.Command{}
 	c.SetOut(&out)
 
-	if err := runRemoteUpdate(c, writeRemoteUpdateConfig(t), deploy.UpgradeOptions{DryRun: true}, true); err != nil {
+	if err := runRemoteUpdate(c, writeRemoteUpdateConfig(t), remoteUpdateRequest{Options: deploy.UpgradeOptions{DryRun: true}}, true); err != nil {
 		t.Fatalf("dry run failed: %v", err)
 	}
 	var got RemoteUpdateOutput
@@ -91,14 +91,35 @@ func TestRemoteUpdateJSONDryRun(t *testing.T) {
 	if !got.DryRun || len(got.Results) != 3 || got.Results[0].Action != deploy.UpgradeWouldApply || got.Results[2].Action != upgradeSkipped {
 		t.Fatalf("output = %+v", got)
 	}
-	if !seen["beta.example"].DryRun {
+	if !seen["beta.example"].Options.DryRun {
 		t.Error("dry run not passed to the hosts")
 	}
 }
 
 func TestRemoteUpdateWithoutAgentConfig(t *testing.T) {
-	err := runRemoteUpdate(&cobra.Command{}, filepath.Join(t.TempDir(), "missing.json"), deploy.UpgradeOptions{}, false)
+	err := runRemoteUpdate(&cobra.Command{}, filepath.Join(t.TempDir(), "missing.json"), remoteUpdateRequest{}, false)
 	if err == nil || !strings.Contains(err.Error(), "caam setup distributed") {
 		t.Fatalf("err = %v, want a pointer to setup", err)
+	}
+}
+
+func TestRemoteRollbackCountsOnlyFailures(t *testing.T) {
+	seen := stubCoordinatorUpgrades(t, map[string]deploy.UpgradeResult{
+		"alpha.example": {Action: deploy.UpgradeRolledBack, FromVersion: "v1.5.0", ToVersion: "v1.0.0", Verified: true},
+		"beta.example":  {Action: deploy.UpgradeFailed, Error: "no previous coordinator recorded on beta; nothing to roll back"},
+	})
+	var out bytes.Buffer
+	c := &cobra.Command{}
+	c.SetOut(&out)
+
+	err := runRemoteUpdate(c, writeRemoteUpdateConfig(t), remoteUpdateRequest{Rollback: true}, false)
+	if err == nil || !strings.Contains(err.Error(), "1 of 3 coordinators were not rolled back") {
+		t.Fatalf("err = %v, want only beta counted", err)
+	}
+	if !seen["alpha.example"].Rollback {
+		t.Error("rollback not requested from the hosts")
+	}
+	if text := out.String(); !strings.Contains(text, "↺ alpha: rolled back v1.5.0 -> v1.0.0") {
+		t.Errorf("output:\n%s", text)
 	}
 }

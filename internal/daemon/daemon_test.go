@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -2392,4 +2394,62 @@ func TestDaemonWithoutNotifierDropsAlerts(t *testing.T) {
 		&Config{LogPath: filepath.Join(tmpDir, "daemon.log")})
 	defer d.logFile.Close()
 	d.alertRefreshFailure("codex", "work", context.DeadlineExceeded) // must not panic
+}
+
+// scriptedReleases answers update checks with the next scripted latest
+// version.
+type scriptedReleases struct {
+	latest []string
+	calls  int
+}
+
+func (s *scriptedReleases) Check(ctx context.Context) (*update.CheckResult, error) {
+	v := s.latest[min(s.calls, len(s.latest)-1)]
+	s.calls++
+	if v == "error" {
+		return nil, errors.New("github unreachable")
+	}
+	return &update.CheckResult{CurrentVersion: "v1.0.0", LatestVersion: v, UpdateAvailable: v != "v1.0.0"}, nil
+}
+
+func TestUpdateCheckAnnouncesEachReleaseOnce(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := &recordingAlerts{}
+	releases := &scriptedReleases{latest: []string{"v1.0.0", "v1.1.0", "error", "v1.1.0", "v1.2.0"}}
+	d := New(authfile.NewVault(tmpDir), health.NewStorage(filepath.Join(tmpDir, "health.json")),
+		&Config{Notifier: rec, LogPath: filepath.Join(tmpDir, "daemon.log"), UpdateChecker: releases, UpdateCheckInterval: time.Hour})
+	defer d.logFile.Close()
+
+	due := func() { d.lastUpdateCheck = time.Now().Add(-2 * time.Hour) }
+	d.checkForUpdate() // v1.0.0: current, nothing to announce
+	d.checkForUpdate() // not due yet: no check
+	if releases.calls != 1 {
+		t.Fatalf("checks = %d, want the interval respected", releases.calls)
+	}
+	for range 4 { // v1.1.0, error, v1.1.0 again, v1.2.0
+		due()
+		d.checkForUpdate()
+	}
+
+	got := rec.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("alerts = %d (%+v), want one per new release", len(got), got)
+	}
+	for i, v := range []string{"v1.1.0", "v1.2.0"} {
+		if got[i].Level != notify.Info || !strings.Contains(got[i].Message, v) || !strings.Contains(got[i].Action, "caam update") {
+			t.Errorf("alert %d = %+v, want an info alert for %s with the update command", i, got[i], v)
+		}
+	}
+}
+
+func TestUpdateCheckDisabledByDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := &recordingAlerts{}
+	d := New(authfile.NewVault(tmpDir), health.NewStorage(filepath.Join(tmpDir, "health.json")),
+		&Config{Notifier: rec, LogPath: filepath.Join(tmpDir, "daemon.log")})
+	defer d.logFile.Close()
+	d.checkForUpdate()
+	if len(rec.snapshot()) != 0 || !d.lastUpdateCheck.IsZero() {
+		t.Fatal("update check ran without an UpdateChecker")
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/daemon"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 )
 
 var daemonCmd = &cobra.Command{
@@ -141,6 +142,7 @@ func runDaemonForeground(interval, threshold time.Duration, verbose, usePool boo
 	// desktop and webhook channels.
 	if spmCfg, err := config.LoadSPMConfig(); err == nil {
 		cfg.Notifier = configuredNotifier(spmCfg, notifierChannels{External: true})
+		cfg.UpdateChecker, cfg.UpdateCheckInterval = daemonUpdateChecker(spmCfg.Daemon.UpdateCheck)
 	} else {
 		fmt.Fprintf(os.Stderr, "Warning: alerts disabled (load config: %v)\n", err)
 	}
@@ -459,4 +461,19 @@ func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 	tailCmd.Stderr = os.Stderr
 
 	return tailCmd.Run()
+}
+
+// daemonUpdateChecker returns the release checker for an enabled
+// daemon.update_check setting, or nil when checks are off.
+func daemonUpdateChecker(uc config.UpdateCheckConfig) (daemon.UpdateChecker, time.Duration) {
+	if !uc.Enabled {
+		return nil, 0
+	}
+	cfg := update.DefaultConfig()
+	if uc.Channel == "beta" {
+		cfg.Channel = update.ChannelBeta
+	} else {
+		cfg.Channel = update.ChannelStable
+	}
+	return update.New(cfg), uc.Interval.Duration()
 }

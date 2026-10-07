@@ -683,3 +683,43 @@ func TestSetConfigValue_UnknownStillErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigSetUpdateCheck(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+	if cfg.Daemon.UpdateCheck.Enabled {
+		t.Fatal("update checks must be opt-in")
+	}
+	for key, value := range map[string]string{
+		"daemon.update_check.enabled":  "true",
+		"daemon.update_check.interval": "12h",
+		"daemon.update_check.channel":  "beta",
+	} {
+		if err := setConfigValue(cfg, key, value); err != nil {
+			t.Fatalf("set %s: %v", key, err)
+		}
+	}
+	uc := cfg.Daemon.UpdateCheck
+	if !uc.Enabled || uc.Interval.Duration() != 12*time.Hour || uc.Channel != "beta" {
+		t.Fatalf("update_check = %+v", uc)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid settings rejected: %v", err)
+	}
+	checker, interval := daemonUpdateChecker(uc)
+	if checker == nil || interval != 12*time.Hour {
+		t.Fatalf("daemonUpdateChecker = %v, %v", checker, interval)
+	}
+	if checker, _ := daemonUpdateChecker(config.UpdateCheckConfig{}); checker != nil {
+		t.Fatal("a disabled update check produced a checker")
+	}
+
+	cfg.Daemon.UpdateCheck.Interval = config.Duration(30 * time.Minute)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an update check interval under 1h was accepted")
+	}
+	cfg.Daemon.UpdateCheck.Interval = config.Duration(24 * time.Hour)
+	cfg.Daemon.UpdateCheck.Channel = "nightly"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an unknown update channel was accepted")
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 )
 
 // DefaultCheckInterval is the default time between refresh checks.
@@ -57,6 +58,19 @@ type Config struct {
 	// AlertInterval is the minimum time between identical alerts.
 	// Default: 1h
 	AlertInterval time.Duration
+
+	// UpdateChecker, when set, is asked every UpdateCheckInterval whether a
+	// newer caam release exists; each new version is announced once through
+	// Notifier. Nothing is installed.
+	UpdateChecker UpdateChecker
+
+	// UpdateCheckInterval is the time between update checks. Default: 24h
+	UpdateCheckInterval time.Duration
+}
+
+// UpdateChecker reports whether a newer caam release exists.
+type UpdateChecker interface {
+	Check(ctx context.Context) (*update.CheckResult, error)
 }
 
 // DefaultAlertInterval keeps a condition that persists across checks from
@@ -84,6 +98,11 @@ type Daemon struct {
 
 	// backupScheduler handles automatic backups (may be nil if disabled)
 	backupScheduler *BackupScheduler
+
+	// lastUpdateCheck and announcedVersion pace update checks and keep each
+	// new release to one announcement. Used only by the run loop.
+	lastUpdateCheck  time.Time
+	announcedVersion string
 
 	// authPool manages pooled profile states (may be nil if not enabled)
 	authPool *authpool.AuthPool
@@ -511,6 +530,7 @@ func (d *Daemon) runLoop() {
 		d.checkCursorSessions()
 	}
 	d.checkAndBackup()
+	d.checkForUpdate()
 
 	interval := d.getCheckInterval()
 	if interval <= 0 {
@@ -542,6 +562,7 @@ func (d *Daemon) runLoop() {
 				d.checkCursorSessions()
 			}
 			d.checkAndBackup()
+			d.checkForUpdate()
 		}
 	}
 }
@@ -804,6 +825,44 @@ func (d *Daemon) alert(level notify.AlertLevel, title, provider, profile, messag
 	}); err != nil {
 		d.logger.Printf("%s: alert delivery failed: %v", label, err)
 	}
+}
+
+// checkForUpdate asks whether a newer caam release exists when a check is
+// due and announces each new version once.
+func (d *Daemon) checkForUpdate() {
+	if d.config.UpdateChecker == nil {
+		return
+	}
+	interval := d.config.UpdateCheckInterval
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+	if !d.lastUpdateCheck.IsZero() && time.Since(d.lastUpdateCheck) < interval {
+		return
+	}
+	d.lastUpdateCheck = time.Now()
+
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	res, err := d.config.UpdateChecker.Check(ctx)
+	if err != nil {
+		d.logger.Printf("update check failed: %v", err)
+		return
+	}
+	if res == nil || !res.UpdateAvailable || res.LatestVersion == d.announcedVersion {
+		return
+	}
+	d.announcedVersion = res.LatestVersion
+	d.logger.Printf("caam %s is available (running %s)", res.LatestVersion, res.CurrentVersion)
+	// The version is in the title: alerts are throttled per title, and each
+	// release deserves its own announcement.
+	d.alert(notify.Info, "caam "+res.LatestVersion+" available", "caam", "",
+		fmt.Sprintf("caam %s is available (running %s).", res.LatestVersion, res.CurrentVersion),
+		"caam update, then caam update --remotes for distributed coordinators")
 }
 
 // alertRefreshFailure distinguishes a rejected login, which needs a human,
