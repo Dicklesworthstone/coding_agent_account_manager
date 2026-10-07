@@ -570,7 +570,10 @@ code (at most 10 steps, 90 seconds):
    (by its `data-identifier`); if that account is not signed in to
    the profile, the first offered account is used and reported as the one
    used, so usage tracking stays truthful.
-4. **Consent page**: clicks the approve button. Claude's authorize page
+4. **Consent**: clicks the approve button only on Claude's authorize page and
+   Google's "Sign in to claude.ai" consent page; any other page (a Claude
+   sign-up or onboarding page, say) gets no clicks and the flow fails naming
+   it, so no account is ever created. Claude's authorize page
    approves whatever Claude account the profile is signed in to, without
    asking Google, so when it names a different account than the strategy
    chose, the agent first deletes the claude.ai cookies (Google sessions

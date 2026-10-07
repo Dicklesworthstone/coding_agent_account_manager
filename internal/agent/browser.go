@@ -368,7 +368,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 		}
 
 		// Google account chooser: pick the preferred account, else the first.
-		if strings.Contains(currentURL, "accounts.google.com") {
+		if onGoogleSignIn(currentURL) && !onGoogleConsent(currentURL) {
 			if preferredAccount != "" {
 				if _, _, err := b.clickFirstVisible(taskCtx, preferredAccountSelectors(preferredAccount)); err == nil {
 					usedAccount = preferredAccount
@@ -390,9 +390,11 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			continue
 		}
 
-		// Check if on consent page
-		if strings.Contains(pageHTML, "consent") || strings.Contains(pageHTML, "Allow") ||
-			strings.Contains(pageHTML, "permission") || strings.Contains(pageHTML, "authorize") {
+		// Consent: only Claude's authorize page and Google's OAuth consent
+		// page. Clicking submit-like buttons on any page that merely
+		// mentions "authorize" or "allow" could click through a sign-up or
+		// onboarding page for an account the user never meant to use.
+		if onClaudeAuthorize(currentURL) || onGoogleConsent(currentURL) {
 			if selector, _, err := b.clickFirstVisible(taskCtx, consentSelectors); err == nil {
 				b.logger.Debug("clicked consent button", "selector", selector)
 			} else {
@@ -431,7 +433,21 @@ func onClaudeAuthorize(rawURL string) bool {
 	if err != nil {
 		return false
 	}
-	return isClaudeHost(u.Hostname()) && strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/oauth/authorize")
+	return isClaudeHost(u.Hostname()) && strings.Contains(u.Path, "/oauth/authorize")
+}
+
+// onGoogleSignIn reports whether rawURL is on Google's account sign-in host.
+func onGoogleSignIn(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && strings.EqualFold(u.Hostname(), "accounts.google.com")
+}
+
+// onGoogleConsent reports whether rawURL is Google's OAuth consent page
+// ("Sign in to claude.ai … Continue").
+func onGoogleConsent(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && strings.EqualFold(u.Hostname(), "accounts.google.com") &&
+		(strings.Contains(u.Path, "/consent") || strings.Contains(u.Path, "/oauth/id"))
 }
 
 func isClaudeHost(host string) bool {

@@ -766,11 +766,18 @@ func tunnelProxy(t *testing.T, handler http.Handler) string {
 type oauthFixture struct {
 	googleSignedOut bool
 	claudeSessionAs string
+	// googleConsent shows Google's "Sign in to claude.ai" consent screen
+	// after an account is picked.
+	googleConsent bool
+	// noClaudeAccount is a Google account without a Claude account: signing
+	// in with it lands on Claude's sign-up page.
+	noClaudeAccount string
 
 	mu          sync.Mutex
 	sessionUsed bool
 	chosen      []string // accounts picked in Google's chooser
 	approved    []string // accounts whose consent was granted
+	created     []string // Claude accounts created on the sign-up page
 	emailSubmit int
 }
 
@@ -833,13 +840,36 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.emailSubmit++
 		f.mu.Unlock()
 		fmt.Fprint(w, `<html><body>Check your email</body></html>`)
+	case "accounts.google.com/v3/signin/picked":
+		next := "https://claude.ai/login/google/callback?state=" + state + "&account=" + url.QueryEscape(q.Get("account"))
+		if f.googleConsent {
+			http.Redirect(w, r, "/signin/oauth/id?next="+url.QueryEscape(next), http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, next, http.StatusFound)
+	case "accounts.google.com/signin/oauth/id":
+		fmt.Fprintf(w, `<html><body><h1>Sign in to claude.ai</h1><p>Google will share your name and email with claude.ai.</p>
+<button type="button" aria-label="Continue" onclick="location.href='%s'">Continue</button></body></html>`, q.Get("next"))
 	case "claude.ai/login/google/callback":
 		account := q.Get("account")
 		f.mu.Lock()
 		f.chosen = append(f.chosen, account)
 		f.mu.Unlock()
+		if account == f.noClaudeAccount {
+			http.Redirect(w, r, "/onboarding?state="+state+"&account="+url.QueryEscape(account), http.StatusFound)
+			return
+		}
 		http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: account, Path: "/", Secure: true, MaxAge: 30 * 24 * 3600})
 		http.Redirect(w, r, "/oauth/authorize?state="+state, http.StatusFound)
+	case "claude.ai/onboarding":
+		fmt.Fprintf(w, `<html><body><h1>Create your Claude account</h1>
+<p>To continue, authorize Anthropic to process your data and allow marketing email.</p>
+<form action="/onboarding/create?account=%s" method="post"><button type="submit">Create account</button></form></body></html>`, url.QueryEscape(q.Get("account")))
+	case "claude.ai/onboarding/create":
+		f.mu.Lock()
+		f.created = append(f.created, q.Get("account"))
+		f.mu.Unlock()
+		fmt.Fprint(w, `<html><body>Account created</body></html>`)
 	case "accounts.google.com/v3/signin/identifier":
 		fmt.Fprint(w, `<html><body><h1>Sign in</h1><input type="email" aria-label="Email or phone"><button type="button">Next</button></body></html>`)
 	case "accounts.google.com/v3/signin/accountchooser":
@@ -850,7 +880,7 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><body><h1>Choose an account</h1><ul>
 <li><div role="link" data-identifier="a@example.com" onclick="pick(this)">Alice a@example.com</div></li>
 <li><div role="link" data-identifier="b@example.com" onclick="pick(this)">Bob b@example.com</div></li>
-</ul><script>function pick(el){location.href="https://claude.ai/login/google/callback?state=%s&account="+encodeURIComponent(el.dataset.identifier)}</script></body></html>`, state)
+</ul><script>function pick(el){location.href="https://accounts.google.com/v3/signin/picked?state=%s&account="+encodeURIComponent(el.dataset.identifier)}</script></body></html>`, state)
 	case "claude.ai/oauth/approve":
 		c, _ := r.Cookie("sessionKey")
 		f.mu.Lock()
@@ -1101,5 +1131,40 @@ func TestProfileSessionsReadsRealChromeProfile(t *testing.T) {
 			}
 			return nil
 		})
+	}
+}
+
+func TestCompleteOAuthInChromeClicksThroughGoogleConsent(t *testing.T) {
+	fixture := &oauthFixture{googleConsent: true}
+	b := fixtureBrowser(t, fixture)
+	code, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-g", "b@example.com")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
+	}
+	if code != "fixture-code-123#st-g" || account != "b@example.com" {
+		t.Fatalf("code=%q account=%q", code, account)
+	}
+}
+
+func TestCompleteOAuthInChromeNeverSignsUpForClaude(t *testing.T) {
+	// The preferred account has no Claude account: Claude's sign-up page
+	// mentions "authorize" and "allow" and has a submit button. The agent
+	// must stop there, not create an account.
+	fixture := &oauthFixture{noClaudeAccount: "b@example.com"}
+	b := fixtureBrowser(t, fixture)
+	_, _, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-n", "b@example.com")
+	if err == nil {
+		t.Fatal("CompleteOAuth succeeded through a sign-up page")
+	}
+	if !strings.Contains(err.Error(), "claude.ai/onboarding") {
+		t.Errorf("error = %v, want it to name the page it stopped on", err)
+	}
+	fixture.mu.Lock()
+	created := append([]string(nil), fixture.created...)
+	fixture.mu.Unlock()
+	if len(created) != 0 {
+		t.Fatalf("created Claude accounts %q", created)
 	}
 }
