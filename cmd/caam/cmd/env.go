@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/spf13/cobra"
 )
 
@@ -18,7 +19,9 @@ var envCmd = &cobra.Command{
 This allows you to set up the environment once and run multiple commands
 with the same profile, instead of using 'caam exec' wrapper each time.
 
-The output is valid shell syntax (bash/zsh compatible).
+The output is valid shell syntax (bash/zsh compatible). It clears inherited
+credentials that would override the selected profile's authentication mode.
+API-key profiles keep the ambient key inputs supported by their provider.
 
 Examples:
   # Set up environment for codex work profile
@@ -39,7 +42,8 @@ diagnostic to stderr AND emits a failing shell command ('false') to stdout, so
 shell's environment. With 'set -e' the script stops; otherwise check $? after
 the eval.
 
-Use --unset to print unset commands instead of export commands.
+Use --unset to clear the profile's path overrides; this does not restore the
+previous environment or credentials removed when the profile was selected.
 Use --json to print a data-only object with set and unset fields.
 Use --export-prefix to change the export syntax (default: "export").`,
 	Args: func(cmd *cobra.Command, args []string) error {
@@ -71,10 +75,11 @@ Use --export-prefix to change the export syntax (default: "export").`,
 			return err
 		}
 
-		envVars, err := prov.Env(cmd.Context(), prof)
+		changes, err := provider.ProfileEnvironment(cmd.Context(), prov, prof)
 		if err != nil {
 			return fmt.Errorf("get environment: %w", err)
 		}
+		envVars := changes.Set
 
 		unset, _ := cmd.Flags().GetBool("unset")
 		exportPrefix, _ := cmd.Flags().GetString("export-prefix")
@@ -87,27 +92,24 @@ Use --export-prefix to change the export syntax (default: "export").`,
 		}
 		sort.Strings(keys)
 		out := cmd.OutOrStdout()
+		if unset {
+			changes.Set = map[string]string{}
+			changes.Unset = keys
+		}
 		if jsonOutput {
-			result := struct {
-				Set   map[string]string `json:"set"`
-				Unset []string          `json:"unset"`
-			}{Set: envVars, Unset: []string{}}
-			if unset {
-				result.Set = map[string]string{}
-				result.Unset = keys
-			}
-			return json.NewEncoder(out).Encode(result)
+			return json.NewEncoder(out).Encode(changes)
 		}
 
-		// Print environment variables
-		for _, k := range keys {
-			if unset {
-				if fishMode {
-					fmt.Fprintf(out, "set -e %s\n", k)
-				} else {
-					fmt.Fprintf(out, "unset %s\n", k)
-				}
+		// Clear inherited authentication before setting the selected paths.
+		for _, k := range changes.Unset {
+			if fishMode {
+				fmt.Fprintf(out, "set -e %s\n", k)
 			} else {
+				fmt.Fprintf(out, "unset %s\n", k)
+			}
+		}
+		if !unset {
+			for _, k := range keys {
 				if fishMode {
 					fmt.Fprintf(out, "set -gx %s %s\n", k, fishQuote(envVars[k]))
 				} else {

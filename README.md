@@ -425,9 +425,21 @@ inspection does not prepare, migrate or refresh files:
 
 ```bash
 caam env claude work                 # safely quoted shell assignments
-caam env claude work --json          # {"set": {...}, "unset": []}
+caam env claude work --json          # {"set": {...}, "unset": [...]}
 caam env claude work --unset --json  # {"set": {}, "unset": [...]}
 ```
+
+Profile execution, native login commands, shallow sessions, and `caam env`
+clear inherited credentials that would override the selected provider's
+file-backed login. For example, a Claude OAuth profile clears an inherited
+`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, while a Codex vault launch
+clears an inherited `OPENAI_API_KEY`. Other providers' keys remain available
+to workflow tools. Explicit API-key profile modes retain their documented
+enrollment or helper inputs; saved Codex and Gemini keys take precedence over
+ambient keys. Callers of the Go runner can also supply deliberate environment
+overrides. `caam env --json` describes removals in `unset`, and
+shell output applies them before exporting the profile paths. `--unset`
+clears those path overrides; it cannot restore earlier environment values.
 
 **Notes:** Claude Max has a 5-hour rolling usage window. When you hit it, you'll see rate limit messages. Switch accounts to continue.
 
@@ -1067,6 +1079,27 @@ A lapsed-but-renewable credential shows as `Auto-refresh` rather than
 `Expired`, and its recommendation is `caam refresh <provider> <profile>`, never
 `caam login` (a login is disruptive and would fix nothing). Credentials that
 the provider's CLI renews itself do not get a caam refresh recommendation.
+
+#### Refresh preserves the credential that owns the request
+
+Codex and Gemini refresh requests capture the selected credential before
+contacting the provider. Concurrent CAAM refreshes of that source are
+serialized, and a request whose source changed while waiting or during the
+HTTP exchange is skipped. Its response cannot be merged into a replacement
+login, and its rejection cannot mark that replacement login as rejected.
+
+After successful renewal, CAAM also updates active and isolated credential
+files that held the same access and renewal tokens when the request began.
+Profile names alone do not establish a match. Destination-local settings are
+retained, and a destination that changes during the request is preserved.
+That outcome is reported as a delivery warning: the vault renewal remains
+successful and the account stays eligible in the daemon and auth pool.
+These checks coordinate CAAM refreshes and detect intervening native writes;
+they do not lock arbitrary native CLI writers out of the filesystem.
+
+The default daemon also refreshes an already-expired access token when its
+credential is renewable. Sessions requiring a new login and credentials
+renewed by their own CLI remain outside CAAM's refresh path.
 
 #### Cursor session expiry
 

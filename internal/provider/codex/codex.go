@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -200,6 +201,32 @@ func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]s
 		"CODEX_HOME": prof.CodexHomePath(),
 		"HOME":       prof.HomePath(),
 	}
+	if provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
+		data, err := readCodexCredentialSource(filepath.Join(prof.CodexHomePath(), "auth.json"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return env, nil // A new profile may enroll using the ambient API key.
+			}
+			return nil, err
+		}
+		credential, err := parseCodexCredential(data)
+		if err != nil {
+			return nil, fmt.Errorf("invalid selected Codex credential: %w", err)
+		}
+		if credential.mode == provider.AuthModeAPIKey {
+			// Interactive Codex and codex exec consult different key inputs.
+			// Both must select the saved account; explicit runner overrides
+			// are still applied after this environment by the caller.
+			env["OPENAI_API_KEY"] = credential.apiKey
+			env["CODEX_API_KEY"] = credential.apiKey
+		} else {
+			// Native login can change the saved method before profile metadata
+			// catches up. Its OAuth grant still owns this launch.
+			env["OPENAI_API_KEY"] = ""
+			env["CODEX_API_KEY"] = ""
+			env["OPENAI_BASE_URL"] = ""
+		}
+	}
 	return env, nil
 }
 
@@ -223,10 +250,13 @@ func (p *Provider) SupportsDeviceCode() bool {
 }
 
 func (p *Provider) LoginWithDeviceCode(ctx context.Context, prof *profile.Profile) error {
-	codexHomePath := prof.CodexHomePath()
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.CommandContext(ctx, "codex", "login", "--device-auth")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+codexHomePath)
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -239,10 +269,13 @@ func (p *Provider) LoginWithDeviceCode(ctx context.Context, prof *profile.Profil
 
 // loginWithOAuth runs the browser-based login flow.
 func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) error {
-	codexHomePath := prof.CodexHomePath()
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.CommandContext(ctx, "codex", "login")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+codexHomePath)
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 
 	// Set up URL detection and capture if browser profile is configured
 	var capture *browser.OutputCapture
@@ -276,7 +309,7 @@ func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) er
 		fmt.Println("A browser window will open. Complete the login there.")
 	}
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if capture != nil {
 		capture.Flush()
 	}
@@ -306,7 +339,10 @@ func readAPIKeyFromStdin(stdin *os.File) (key string, hidden bool, err error) {
 
 // loginWithAPIKey prompts for and stores an API key.
 func (p *Provider) loginWithAPIKey(ctx context.Context, prof *profile.Profile) error {
-	codexHomePath := prof.CodexHomePath()
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
+	}
 
 	// Check for OPENAI_API_KEY environment variable first
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -328,7 +364,7 @@ func (p *Provider) loginWithAPIKey(ctx context.Context, prof *profile.Profile) e
 
 	// Use codex login --with-api-key via stdin (safer than argv)
 	cmd := exec.CommandContext(ctx, "codex", "login", "--with-api-key")
-	cmd.Env = append(os.Environ(), "CODEX_HOME="+codexHomePath)
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 	cmd.Stdin = strings.NewReader(apiKey)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -508,6 +544,7 @@ func readCodexCredentialSource(path string) ([]byte, error) {
 
 type codexCredential struct {
 	mode       provider.AuthMode
+	apiKey     string
 	expiresAt  time.Time
 	hasRefresh bool
 }
@@ -609,6 +646,7 @@ func parseCodexCredential(data []byte) (codexCredential, error) {
 		return result, fmt.Errorf("unsupported Codex auth_mode")
 	}
 	if result.mode == provider.AuthModeAPIKey {
+		result.apiKey = apiKey
 		return result, nil
 	}
 	result.hasRefresh = refresh != ""

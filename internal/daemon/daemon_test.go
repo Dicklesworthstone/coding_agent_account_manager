@@ -1777,6 +1777,199 @@ func TestDaemonRefreshFailureReportsOutcome(t *testing.T) {
 	}
 }
 
+func TestClassicDaemonRecoversExpiredRenewableCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ttl       time.Duration
+		refresh   string
+		wantCalls int
+	}{
+		{"expired grant", -time.Hour, "synthetic-renewable", 1},
+		{"expiry boundary", 0, "synthetic-renewable", 1},
+		{"healthy grant", time.Hour, "synthetic-renewable", 0},
+		{"nonrenewable expired token", -time.Hour, "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CAAM_HOME", t.TempDir())
+			t.Setenv("CODEX_HOME", t.TempDir())
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			path := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+			writeDaemonCodexAuth(t, path, tc.refresh, time.Now().Add(-2*time.Hour), time.Now().Add(tc.ttl))
+			calls := 0
+			original := refresh.RefreshCodexToken
+			refresh.RefreshCodexToken = func(_ context.Context, token string) (*refresh.TokenResponse, error) {
+				calls++
+				if token != tc.refresh {
+					t.Error("daemon submitted a different refresh credential")
+				}
+				payload := []byte(fmt.Sprintf(`{"sub":"synthetic-account","exp":%d}`, time.Now().Add(time.Hour).Unix()))
+				return &refresh.TokenResponse{
+					AccessToken:  "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".synthetic",
+					RefreshToken: "synthetic-next", ExpiresIn: 3600,
+				}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshCodexToken = original })
+			d := New(vault, store, nil)
+			d.ctx = context.Background()
+			if d.config.UseAuthPool {
+				t.Fatal("regression must exercise the default classic daemon")
+			}
+			d.checkProfile("codex", "work")
+			d.checkProfile("codex", "work")
+			if calls != tc.wantCalls {
+				t.Fatalf("refresh calls=%d, want %d", calls, tc.wantCalls)
+			}
+			if stats := d.GetStats(); stats.RefreshCount != int64(tc.wantCalls) || stats.RefreshErrors != 0 {
+				t.Errorf("unexpected renewal counters: %+v", stats)
+			}
+			if tc.wantCalls > 0 {
+				current := d.getProfileHealth("codex", "work")
+				if current == nil || time.Until(current.TokenExpiresAt) < 59*time.Minute || current.ProviderRejected() || !current.CredentialRenewable() {
+					t.Fatalf("renewed grant did not recover: %+v", current)
+				}
+			}
+		})
+	}
+}
+
+func TestDaemonPreservesRenewalWhenActiveLoginChanges(t *testing.T) {
+	for _, pooled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pool=%t", pooled), func(t *testing.T) {
+			t.Setenv("CAAM_HOME", t.TempDir())
+			t.Setenv("CODEX_HOME", t.TempDir())
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			vaultPath := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+			livePath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+			expiry := time.Now().Add(time.Minute)
+			writeDaemonCodexAuth(t, vaultPath, "synthetic-request", time.Now(), expiry)
+			before, err := os.ReadFile(vaultPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(livePath, before, 0600); err != nil {
+				t.Fatal(err)
+			}
+			const newLogin = `{"tokens":{"access_token":"synthetic-different-login","refresh_token":"synthetic-new-owner"}}`
+			original := refresh.RefreshCodexToken
+			refresh.RefreshCodexToken = func(context.Context, string) (*refresh.TokenResponse, error) {
+				// A native login completes while the old vault grant is in flight.
+				if err := os.WriteFile(livePath, []byte(newLogin), 0600); err != nil {
+					t.Fatal(err)
+				}
+				payload := []byte(fmt.Sprintf(`{"sub":"synthetic-account","exp":%d}`, time.Now().Add(time.Hour).Unix()))
+				return &refresh.TokenResponse{
+					AccessToken:  "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".synthetic",
+					RefreshToken: "synthetic-next", ExpiresIn: 3600,
+				}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshCodexToken = original })
+			d := New(vault, store, &Config{UseAuthPool: pooled, RefreshThreshold: 10 * time.Minute})
+			d.ctx = context.Background()
+			var output bytes.Buffer
+			d.logger = log.New(&output, "", 0)
+			if pooled {
+				d.authPool.AddProfile("codex", "work")
+				d.authPool.UpdateTokenExpiry("codex", "work", expiry)
+				if err := d.authPool.SetStatus("codex", "work", authpool.PoolStatusReady); err != nil {
+					t.Fatal(err)
+				}
+				if err := d.poolMonitor.ForceRefresh(d.ctx, "codex", "work"); !refresh.IsDeliveryIncomplete(err) {
+					t.Fatalf("changed destination should return a delivery warning: %v", err)
+				}
+				p := d.authPool.GetProfile("codex", "work")
+				if p.Status != authpool.PoolStatusReady || p.ErrorCount != 0 || p.LastRefresh.IsZero() {
+					t.Fatalf("delivery warning poisoned a successful renewal: %+v", p)
+				}
+			} else {
+				d.checkProfile("codex", "work")
+			}
+			if got, err := os.ReadFile(livePath); err != nil || string(got) != newLogin {
+				t.Fatalf("new live login was overwritten: %v", err)
+			}
+			if current := d.getProfileHealth("codex", "work"); current == nil || current.ProviderRejected() || !current.CredentialRenewable() || time.Until(current.TokenExpiresAt) < 59*time.Minute {
+				t.Fatalf("successful vault renewal lost eligibility: %+v", current)
+			}
+			if stats := d.GetStats(); stats.RefreshCount != 1 || stats.RefreshErrors != 0 {
+				t.Errorf("delivery warning counted as a refresh failure: %+v", stats)
+			}
+			if !strings.Contains(output.String(), "delivery warning") || strings.Contains(output.String(), "refresh failed") {
+				t.Errorf("delivery outcome misreported: %s", output.String())
+			}
+		})
+	}
+}
+
+func TestPoolRenewalWithUnknownExpiryPreservesSuccess(t *testing.T) {
+	for _, changedLive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("changed_live=%t", changedLive), func(t *testing.T) {
+			t.Setenv("CAAM_HOME", t.TempDir())
+			t.Setenv("CODEX_HOME", t.TempDir())
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			vaultPath := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+			livePath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+			expiry := time.Now().Add(-time.Minute)
+			writeDaemonCodexAuth(t, vaultPath, "synthetic-request", time.Now(), expiry)
+			before, err := os.ReadFile(vaultPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(livePath, before, 0600); err != nil {
+				t.Fatal(err)
+			}
+			const newLogin = `{"tokens":{"access_token":"synthetic-other-login","refresh_token":"synthetic-other-owner"}}`
+			calls := 0
+			original := refresh.RefreshCodexToken
+			refresh.RefreshCodexToken = func(context.Context, string) (*refresh.TokenResponse, error) {
+				calls++
+				if changedLive {
+					if err := os.WriteFile(livePath, []byte(newLogin), 0600); err != nil {
+						return nil, err
+					}
+				}
+				return &refresh.TokenResponse{AccessToken: "synthetic-opaque-access", RefreshToken: "synthetic-next"}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshCodexToken = original })
+			d := New(vault, store, &Config{UseAuthPool: true, RefreshThreshold: 10 * time.Minute})
+			d.ctx = context.Background()
+			var output bytes.Buffer
+			d.logger = log.New(&output, "", 0)
+			d.authPool.AddProfile("codex", "work")
+			d.authPool.UpdateTokenExpiry("codex", "work", expiry)
+			d.authPool.SetError("codex", "work", fmt.Errorf("synthetic earlier failure"))
+			err = d.poolMonitor.ForceRefresh(d.ctx, "codex", "work")
+			if refresh.IsDeliveryIncomplete(err) != changedLive || (err != nil && !changedLive) {
+				t.Fatalf("successful opaque renewal lost its delivery outcome: %v", err)
+			}
+			p := d.authPool.GetProfile("codex", "work")
+			if p == nil || p.Status != authpool.PoolStatusReady || p.ErrorCount != 0 || p.ErrorMessage != "" || p.LastRefresh.IsZero() || !p.TokenExpiry.IsZero() {
+				t.Fatalf("unknown expiry poisoned the completed renewal: %+v", p)
+			}
+			// This is the monitor's actual candidate source: a ready profile
+			// with unknown expiry must not immediately replay the fresh token.
+			if candidates := d.authPool.GetProfilesNeedingRefresh(""); len(candidates) != 0 || p.IsExpired() || p.IsExpiringSoon(d.config.RefreshThreshold) {
+				t.Fatalf("unknown expiry scheduled another refresh: %+v", candidates)
+			}
+			current := d.getProfileHealth("codex", "work")
+			if current == nil || !current.TokenExpiresAt.IsZero() || current.ProviderRejected() || current.ProviderVerifiedAt().IsZero() || !current.CredentialRenewable() {
+				t.Fatalf("opaque renewal lost its accepted current health: %+v", current)
+			}
+			got, err := os.ReadFile(livePath)
+			if err != nil || (changedLive && string(got) != newLogin) || (!changedLive && !bytes.Contains(got, []byte("synthetic-opaque-access"))) {
+				t.Fatalf("opaque renewal changed the wrong live generation: %v", err)
+			}
+			if stats := d.GetStats(); calls != 1 || stats.RefreshCount != 1 || stats.RefreshErrors != 0 {
+				t.Errorf("unknown expiry changed renewal accounting: calls=%d, stats=%+v", calls, stats)
+			}
+			if strings.Contains(output.String(), "refresh failed") || strings.Contains(output.String(), "delivery warning") != changedLive {
+				t.Errorf("unknown expiry changed the reported outcome: %s", output.String())
+			}
+		})
+	}
+}
+
 func writeDaemonCursorAuth(t *testing.T, path string, expiry time.Time, session, apiKey string) {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": session})

@@ -18,11 +18,29 @@ var ErrUnsupported = errors.New("refresh unsupported")
 // newer live credential for the same account. No refresh was attempted.
 var ErrStaleCredential = errors.New("refresh skipped: newer live credential")
 
-// IsSkipped identifies outcomes for which CAAM did not attempt a refresh.
-// Callers should report the reason without recording a refresh failure or
-// applying a failure cooldown. The condition must be reconsidered next time.
+// ErrCredentialChanged means the request's captured source was replaced or
+// edited. Its result must not overwrite that newer generation or its verdict.
+var ErrCredentialChanged = errors.New("credential changed during refresh; current login was preserved")
+
+// DeliveryError reports successful vault renewal whose captured live or
+// isolated copy could not be updated safely. The committed token must not be
+// rolled back, retried, or marked rejected because delivery was incomplete.
+type DeliveryError struct{ Destinations []string }
+
+func (e *DeliveryError) Error() string {
+	return "credentials refreshed in vault; delivery skipped for " + strings.Join(e.Destinations, ", ") + "; current destination credentials were preserved"
+}
+
+func IsDeliveryIncomplete(err error) bool {
+	var delivery *DeliveryError
+	return errors.As(err, &delivery)
+}
+
+// IsSkipped identifies unsupported or superseded work. A replaced credential
+// can obsolete a request already in flight; that is not evidence that the new
+// login failed. Callers report it without applying a failure cooldown.
 func IsSkipped(err error) bool {
-	return errors.Is(err, ErrUnsupported) || errors.Is(err, ErrStaleCredential)
+	return errors.Is(err, ErrUnsupported) || errors.Is(err, ErrStaleCredential) || errors.Is(err, ErrCredentialChanged)
 }
 
 // ErrRefreshTokenReused indicates that the refresh token has already been

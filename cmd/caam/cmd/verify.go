@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -197,23 +196,25 @@ func runVerifyFix(cmd *cobra.Command, toolFilter string) []VerifyFixResult {
 				continue
 			}
 
-			if err := refresh.RefreshProfile(ctx, provider, profileName, vault, healthStore); err != nil {
-				if errors.Is(err, refresh.ErrUnsupported) {
+			refreshErr := refresh.RefreshProfile(ctx, provider, profileName, vault, healthStore, refresh.WithProfileStore(profileStore))
+			if refreshErr != nil && !refresh.IsDeliveryIncomplete(refreshErr) {
+				if refresh.IsSkipped(refreshErr) {
 					results = append(results, VerifyFixResult{
 						Provider: provider, Profile: profileName,
-						Action: "skipped", Detail: err.Error(),
+						Action: "skipped", Detail: refreshErr.Error(),
 					})
 					continue
 				}
 				results = append(results, VerifyFixResult{
 					Provider: provider, Profile: profileName,
-					Action: "failed", Detail: err.Error(),
+					Action: "failed", Detail: refreshErr.Error(),
 				})
 				continue
 			}
 
-			// Keep the isolated profile in sync to avoid token drift.
-			syncVaultToIsolated(provider, profileName)
+			if refreshErr != nil {
+				reason += "; " + refreshErr.Error()
+			}
 			results = append(results, VerifyFixResult{
 				Provider: provider, Profile: profileName,
 				Action: "refreshed", Detail: reason,

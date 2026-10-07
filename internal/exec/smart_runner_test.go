@@ -14,7 +14,9 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/handoff"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -297,6 +299,79 @@ func TestSmartRunnerRejectsExpiredHandoffBeforeChangingAuth(t *testing.T) {
 	}
 }
 
+func TestSmartRunnerRateLimitExcludesCurrentBeforeEverySelection(t *testing.T) {
+	for _, algorithm := range []rotation.Algorithm{rotation.AlgorithmSmart, rotation.AlgorithmRandom, rotation.AlgorithmRoundRobin} {
+		for _, policy := range []rotation.Policy{rotation.PolicyAvailability, rotation.PolicyDrain} {
+			t.Run(string(algorithm)+"/"+string(policy), func(t *testing.T) {
+				root := t.TempDir()
+				t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+				t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+				vault := authfile.NewVault(filepath.Join(root, "vault"))
+				current := smartSwitchCredentials("current", time.Now().Add(time.Hour))
+				backup := smartSwitchCredentials("backup", time.Now().Add(time.Hour))
+				writeSmartSwitchFile(t, vault.BackupPath("codex", "current", "auth.json"), current)
+				writeSmartSwitchFile(t, vault.BackupPath("codex", "backup", "auth.json"), backup)
+				livePath := filepath.Join(root, "codex", "auth.json")
+				writeSmartSwitchFile(t, livePath, current)
+				selector := rotation.NewSelector(algorithm, nil, nil)
+				selector.SetPolicy(policy)
+				selector.SetProfileHealth(map[string]*health.ProfileHealth{
+					"current": {TokenRenewable: true, PlanType: "enterprise"},
+					"backup":  {TokenRenewable: true},
+				})
+				// No DB: recording a cooldown cannot be the only thing that
+				// prevents selecting the higher-scoring current account.
+				sr := NewSmartRunner(&Runner{}, SmartRunnerOptions{Vault: vault, Rotation: selector, Notifier: &mockNotifier{}})
+				sr.currentProfile = "current"
+				var err error
+				sr.detector, err = ratelimit.NewDetector(ratelimit.ProviderCodex, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				calls := 0
+				sr.loginHandler = &smartSwitchLoginHandler{LoginHandler: handoff.GetHandler("codex"), trigger: func() error {
+					calls++
+					assertSmartSwitchFile(t, livePath, backup)
+					sr.loginDone <- loginResult{success: true}
+					return nil
+				}}
+				sr.handleRateLimit(context.Background())
+				if calls != 1 || sr.currentProfile != "backup" || sr.getState() != Running {
+					t.Fatalf("usable backup not selected: calls=%d current=%s state=%s", calls, sr.currentProfile, sr.getState())
+				}
+			})
+		}
+	}
+}
+
+func TestSmartRunnerRecordsLimitWhenNoBackupExists(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	db, err := caamdb.OpenAt(filepath.Join(root, "events.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	current := smartSwitchCredentials("current", time.Now().Add(time.Hour))
+	writeSmartSwitchFile(t, vault.BackupPath("codex", "current", "auth.json"), current)
+	livePath := filepath.Join(root, "codex", "auth.json")
+	writeSmartSwitchFile(t, livePath, current)
+	sr := NewSmartRunner(&Runner{}, SmartRunnerOptions{Vault: vault, DB: db, Rotation: rotation.NewSelector(rotation.AlgorithmSmart, nil, db), Notifier: &mockNotifier{}})
+	sr.currentProfile = "current"
+	sr.loginHandler = handoff.GetHandler("codex")
+	sr.handleRateLimit(context.Background())
+	if sr.getState() != HandoffFailed {
+		t.Fatalf("state = %s, want failed without backup", sr.getState())
+	}
+	cooldown, err := db.ActiveCooldown("codex", "current", time.Now())
+	if err != nil || cooldown == nil {
+		t.Fatalf("detected rate limit was not persisted: cooldown=%+v err=%v", cooldown, err)
+	}
+	assertSmartSwitchFile(t, livePath, current)
+}
+
 func TestSmartRunnerHandoffPreservesActualCredentialOwner(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
@@ -486,6 +561,8 @@ func (p *envTrackingProvider) Env(_ context.Context, _ *profile.Profile) (map[st
 // isolated profile paths and pointing codex at a profile dir that is not
 // logged in. SmartRunner must honor UseGlobalEnv exactly like Runner.Run.
 func TestSmartRunner_Run_UseGlobalEnv(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "synthetic-ambient")
+	t.Setenv("ANTHROPIC_API_KEY", "synthetic-unrelated")
 	// Mock the spawned command with a trivially-succeeding shell so the PTY
 	// path runs for real while letting us inspect the env caam handed it.
 	var captured *exec.Cmd
@@ -528,6 +605,14 @@ func TestSmartRunner_Run_UseGlobalEnv(t *testing.T) {
 		}
 		if captured == nil {
 			t.Fatal("ExecCommand was never invoked (fell off the SmartRunner path?)")
+		}
+		for _, entry := range captured.Env {
+			if entry == "OPENAI_API_KEY=synthetic-ambient" {
+				t.Fatal("ambient API key overrides selected Codex file")
+			}
+		}
+		if !bytes.Contains([]byte(fmt.Sprint(captured.Env)), []byte("ANTHROPIC_API_KEY=synthetic-unrelated")) {
+			t.Fatal("unrelated provider key was removed from child environment")
 		}
 		return captured.Env
 	}

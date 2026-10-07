@@ -968,19 +968,22 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 		if err := vault.ValidateProfileCredentials(tools[provider](), profile); err != nil {
 			return robotError(cmd, "act", "REFRESH_FAILED", "saved credential is not usable for refresh", err.Error(), nil)
 		}
-		if err := refresh.RefreshProfile(cmd.Context(), provider, profile, vault, healthStore); err != nil {
+		refreshErr := refresh.RefreshProfile(cmd.Context(), provider, profile, vault, healthStore, refresh.WithProfileStore(profileStore))
+		if refreshErr != nil && !refresh.IsDeliveryIncomplete(refreshErr) {
 			code := "REFRESH_FAILED"
 			switch {
-			case errors.Is(err, refresh.ErrUnsupported):
+			case errors.Is(refreshErr, refresh.ErrUnsupported):
 				code = "REFRESH_UNSUPPORTED"
-			case refresh.IsSkipped(err):
+			case refresh.IsSkipped(refreshErr):
 				code = "REFRESH_SKIPPED"
 			}
 			return robotError(cmd, "act", code,
 				fmt.Sprintf("credential was not refreshed for %s/%s", provider, profile),
-				err.Error(), []string{fmt.Sprintf("caam robot validate %s %s", provider, profile)})
+				refreshErr.Error(), []string{fmt.Sprintf("caam robot validate %s %s", provider, profile)})
 		}
-		syncVaultToIsolated(provider, profile)
+		if refreshErr != nil {
+			result.Warnings = append(result.Warnings, refreshErr.Error())
+		}
 		result.Success = true
 		result.Message = fmt.Sprintf("refreshed %s/%s", provider, profile)
 

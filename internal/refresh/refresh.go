@@ -13,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	profilepkg "github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 // maxErrorBodySize limits how much of an error response body we read.
@@ -41,7 +42,7 @@ func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 	}
 
 	ttl := time.Until(h.TokenExpiresAt)
-	return ttl > 0 && ttl < threshold
+	return ttl < threshold && (ttl > 0 || h.TokenRenewable) && !h.ProviderRejected()
 }
 
 // Preflight checks whether CAAM can safely attempt a profile refresh using the
@@ -87,7 +88,7 @@ func Preflight(provider, profile string, vault *authfile.Vault) error {
 }
 
 // RefreshProfile orchestrates the refresh for a specific provider/profile.
-func RefreshProfile(ctx context.Context, provider, profile string, vault *authfile.Vault, store *health.Storage) error {
+func RefreshProfile(ctx context.Context, provider, profile string, vault *authfile.Vault, store *health.Storage, opts ...RefreshOption) error {
 	if err := Preflight(provider, profile, vault); err != nil {
 		return err
 	}
@@ -95,44 +96,55 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 		store.SetVaultPath(vault.BasePath())
 	}
 
-	// Check if this profile is currently active before we modify the vault
-	// (which would change the hash and break ActiveProfile detection).
-	//
-	// IMPORTANT: Capture a snapshot first, then verify it matches the target profile.
-	// This avoids a race where the active profile changes between ActiveProfile()
-	// and the snapshot read, which could otherwise overwrite a newly-activated profile.
-	isActive := false
-	var preRefreshState map[string][]byte
-
-	fileSet, ok := authfile.GetAuthFileSet(provider)
-	if ok {
-		preRefreshState, _ = readAuthFiles(fileSet)
-		if len(preRefreshState) > 0 && snapshotMatchesProfile(fileSet, vault, profile, preRefreshState) {
-			isActive = true
-		}
+	options := refreshOptions{profiles: profilepkg.NewStore(profilepkg.DefaultStorePath())}
+	for _, option := range opts {
+		option(&options)
 	}
-
 	vaultPath := vault.ProfilePath(provider, profile)
-
-	// Fingerprint the credential being refreshed, so a provider verdict on
-	// it is recorded against this credential and not a later login.
-	var fingerprint string
-	if provider == "codex" {
-		if data, readErr := os.ReadFile(filepath.Join(vaultPath, "auth.json")); readErr == nil {
-			fingerprint = health.CodexCredentialFingerprint(data)
+	path, err := refreshSourcePath(provider, vaultPath)
+	if err != nil {
+		return err
+	}
+	source, err := readCredentialSnapshot(path)
+	if err != nil {
+		return err
+	}
+	deliveries := captureRefreshDeliveries(provider, profile, source, options)
+	release, err := acquireRefreshLocks(ctx, source, deliveries)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Another CAAM refresh may have completed while this invocation waited.
+	// It must not exchange either the spent token or the newly rotated token.
+	if err := source.unchanged(); err != nil {
+		return err
+	}
+	if err := Preflight(provider, profile, vault); err != nil {
+		return err
+	}
+	if err := checkRefreshSource(provider, vaultPath, source); err != nil {
+		return err
+	}
+	for _, delivery := range deliveries {
+		if err := delivery.source.unchanged(); err != nil {
+			return err
 		}
 	}
-
-	var err error
-	switch provider {
-	case "codex":
-		err = refreshCodex(ctx, vaultPath)
-	case "gemini":
-		err = refreshGemini(ctx, provider, profile, store, vaultPath)
-	default:
-		return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
+	// Both provider verdicts and response merging use these exact request
+	// bytes. A later login at the same pathname is never their subject.
+	fingerprint := health.CodexCredentialFingerprint(source.data)
+	build, err := exchangeRefresh(ctx, provider, source.data)
+	if changed := source.unchanged(); changed != nil {
+		return changed
+	}
+	if changed := checkRefreshSource(provider, vaultPath, source); changed != nil {
+		return changed
+	}
 	if err != nil {
 		// A refusal by the token endpoint is the provider saying this
 		// credential is dead. Record it so ls/status stop calling the
@@ -151,30 +163,26 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 		return err
 	}
 
-	if provider == "codex" {
-		// The provider just accepted the refresh token and minted a new
-		// credential; record that against the credential now in the vault.
-		newFingerprint := fingerprint
-		if data, readErr := os.ReadFile(filepath.Join(vaultPath, "auth.json")); readErr == nil {
-			newFingerprint = health.CodexCredentialFingerprint(data)
-		}
-		recordProviderVerdict(store, provider, profile, true, "", newFingerprint)
+	updated, err := build(source.data)
+	if err != nil {
+		return err
 	}
-
-	// If the profile was active, restore the updated files to the active location
-	if isActive && len(preRefreshState) > 0 {
-		// Re-verify that the live files haven't changed since we started.
-		// We cannot use ActiveProfile here because the vault has been updated (new token),
-		// so it would no longer match the live files (old token).
-		// Instead, we verify that the live files are exactly as they were before the refresh.
-		currentState, _ := readAuthFiles(fileSet)
-		if filesEqual(preRefreshState, currentState) {
-			if restoreErr := vault.Restore(fileSet, profile); restoreErr != nil {
-				return fmt.Errorf("refresh successful but failed to update active files: %w", restoreErr)
-			}
+	if err := source.publish(updated); err != nil {
+		return err
+	}
+	recordProviderVerdict(store, provider, profile, true, "", health.CodexCredentialFingerprint(updated))
+	var skipped []string
+	for _, delivery := range deliveries {
+		// Keep destination-local metadata and settings rather than restoring
+		// the vault's entire fileset. Only its captured token generation changes.
+		data, buildErr := build(delivery.source.data)
+		if buildErr != nil || delivery.source.publish(data) != nil {
+			skipped = append(skipped, delivery.label)
 		}
 	}
-
+	if len(skipped) > 0 {
+		return &DeliveryError{Destinations: skipped}
+	}
 	return nil
 }
 
@@ -207,53 +215,60 @@ func refreshClaude(ctx context.Context, vaultPath string) error {
 	}
 }
 
-func refreshCodex(ctx context.Context, vaultPath string) error {
-	authPath := filepath.Join(vaultPath, "auth.json")
+func refreshSourcePath(provider, vaultPath string) (string, error) {
+	if provider == "codex" {
+		return filepath.Join(vaultPath, "auth.json"), nil
+	}
+	_, path, err := readGeminiADC(vaultPath)
+	return path, err
+}
 
-	refreshToken, err := getRefreshTokenFromJSON(authPath)
+func checkRefreshSource(provider, vaultPath string, source *credentialSnapshot) error {
+	path, err := refreshSourcePath(provider, vaultPath)
 	if err != nil {
-		return fmt.Errorf("read refresh token: %w", err)
+		return ErrCredentialChanged
 	}
-
-	resp, err := RefreshCodexToken(ctx, refreshToken)
-	if err != nil {
-		return fmt.Errorf("refresh api: %w", err)
+	abs, err := filepath.Abs(path)
+	if err != nil || abs != source.path {
+		return ErrCredentialChanged
 	}
-
-	if err := UpdateCodexAuth(authPath, resp); err != nil {
-		return fmt.Errorf("update auth: %w", err)
-	}
-
 	return nil
 }
 
-func refreshGemini(ctx context.Context, provider, profile string, store *health.Storage, vaultPath string) error {
-	// Migrate legacy vault filename before reading.
-	_ = authfile.MigrateGeminiVaultDir(vaultPath)
-
-	adc, target, err := readGeminiADC(vaultPath)
-	if err != nil {
-		return err
-	}
-
-	resp, err := RefreshGeminiToken(ctx, adc.ClientID, adc.ClientSecret, adc.RefreshToken)
-	if err != nil {
-		return fmt.Errorf("refresh api: %w", err)
-	}
-
-	// Update the grant we actually renewed. settings.json may be policy-only
-	// or hold an unrelated older login; neither should receive this token.
-	if err := UpdateGeminiAuth(target, resp); err != nil {
-		return fmt.Errorf("update auth: %w", err)
-	}
-
-	if store != nil {
-		if err := UpdateGeminiHealth(store, provider, profile, resp); err != nil {
-			return fmt.Errorf("update health: %w", err)
+func exchangeRefresh(ctx context.Context, provider string, data []byte) (func([]byte) ([]byte, error), error) {
+	if provider == "codex" {
+		token, err := codexRefreshToken(data)
+		if err != nil {
+			return nil, err
 		}
+		response, err := RefreshCodexToken(ctx, token)
+		return func(before []byte) ([]byte, error) { return updatedCodexAuth(before, response) }, err
 	}
+	adc, err := parseADC(data)
+	if err != nil {
+		return nil, err
+	}
+	response, err := RefreshGeminiToken(ctx, adc.ClientID, adc.ClientSecret, adc.RefreshToken)
+	return func(before []byte) ([]byte, error) { return updatedGeminiAuth(before, response, true) }, err
+}
 
-	return nil
+// Codex's nested store is authoritative when present. A leftover flat token
+// must not refresh one grant and then be merged into another nested grant.
+func codexRefreshToken(data []byte) (string, error) {
+	var auth map[string]json.RawMessage
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return "", fmt.Errorf("invalid Codex credential object")
+	}
+	if nested, exists := auth["tokens"]; exists {
+		var tokens struct {
+			Refresh string `json:"refresh_token"`
+		}
+		if json.Unmarshal(nested, &tokens) != nil || tokens.Refresh == "" {
+			return "", fmt.Errorf("nested Codex credential has no refresh token")
+		}
+		return tokens.Refresh, nil
+	}
+	return refreshTokenFromJSON(data)
 }
 
 // readGeminiADC uses the same credential precedence before and after migration.
@@ -295,6 +310,10 @@ func getRefreshTokenFromJSON(path string) (string, error) {
 		return "", err
 	}
 
+	return refreshTokenFromJSON(data)
+}
+
+func refreshTokenFromJSON(data []byte) (string, error) {
 	var auth map[string]interface{}
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return "", err
@@ -312,7 +331,7 @@ func getRefreshTokenFromJSON(path string) (string, error) {
 		return val, nil
 	}
 
-	return "", fmt.Errorf("refresh_token not found in %s", path)
+	return "", fmt.Errorf("refresh_token not found in credential")
 }
 
 func readStringField(m map[string]interface{}, keys ...string) string {
@@ -398,65 +417,4 @@ func snapshotMatchesProfile(fileSet authfile.AuthFileSet, vault *authfile.Vault,
 // might return unexpectedly large error responses.
 func readLimitedBody(r io.Reader) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, maxErrorBodySize))
-}
-
-// SyncVaultToIsolatedProfile copies updated auth files from the vault profile
-// to the corresponding isolated profile directory. This prevents token drift
-// where the vault copy gets refreshed but the isolated profile retains a stale
-// (already-consumed) refresh token.
-//
-// For Codex, this copies vault/<profile>/auth.json -> isolated/<profile>/codex_home/auth.json.
-// For other providers, this is a no-op (they don't use isolated profile directories
-// in the same way).
-//
-// isolatedProfileDir is the base directory of the isolated profile (e.g.,
-// ~/.local/share/caam/profiles/codex/<name>).
-// Returns nil if the isolated profile doesn't exist or has no codex_home.
-func SyncVaultToIsolatedProfile(provider, profile string, vault *authfile.Vault, isolatedProfileDir string) error {
-	if vault == nil || isolatedProfileDir == "" {
-		return nil
-	}
-
-	switch provider {
-	case "codex":
-		return syncCodexVaultToIsolated(vault, provider, profile, isolatedProfileDir)
-	default:
-		// Other providers don't have isolated codex_home directories to sync.
-		return nil
-	}
-}
-
-// syncCodexVaultToIsolated copies the vault's auth.json to the isolated profile's
-// codex_home/auth.json, keeping both copies in sync after a token refresh.
-func syncCodexVaultToIsolated(vault *authfile.Vault, provider, profile, isolatedProfileDir string) error {
-	vaultAuthPath := filepath.Join(vault.ProfilePath(provider, profile), "auth.json")
-	isolatedAuthPath := filepath.Join(isolatedProfileDir, "codex_home", "auth.json")
-
-	// Only sync if both the vault auth and the isolated codex_home directory exist.
-	// If the isolated profile doesn't have a codex_home yet, don't create one --
-	// that's the job of 'caam profile add' or 'caam login'.
-	if _, err := os.Stat(vaultAuthPath); err != nil {
-		return nil // Vault auth doesn't exist; nothing to sync
-	}
-	isolatedDir := filepath.Dir(isolatedAuthPath)
-	if _, err := os.Stat(isolatedDir); err != nil {
-		return nil // Isolated codex_home doesn't exist; skip
-	}
-
-	data, err := os.ReadFile(vaultAuthPath)
-	if err != nil {
-		return fmt.Errorf("read vault auth for sync: %w", err)
-	}
-
-	// Write atomically to prevent partial writes from corrupting the auth file.
-	tmpPath := isolatedAuthPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
-		return fmt.Errorf("write isolated auth temp: %w", err)
-	}
-	if err := os.Rename(tmpPath, isolatedAuthPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename isolated auth: %w", err)
-	}
-
-	return nil
 }

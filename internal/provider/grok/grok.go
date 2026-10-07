@@ -125,11 +125,12 @@ func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]s
 
 // Login initiates the authentication flow (`grok login`, browser OIDC).
 func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, "grok", "login")
-	cmd.Env = append(os.Environ(),
-		"HOME="+prof.HomePath(),
-		"GROK_HOME="+profileGrokHome(prof),
-	)
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

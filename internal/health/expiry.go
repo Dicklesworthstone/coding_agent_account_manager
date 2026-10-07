@@ -348,11 +348,13 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 }
 
 // codexTokensJSON is the nested "tokens" block of a ChatGPT-mode Codex
-// auth.json. Every field is a JWT except refresh_token.
+// auth.json. CAAM also persists expires_at from the refresh response so opaque
+// access tokens retain their known lifetime.
 type codexTokensJSON struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    any    `json:"expires_at"`
 }
 
 // codexAuthJSON is the subset of a Codex auth.json needed to locate JWTs in
@@ -366,8 +368,8 @@ type codexAuthJSON struct {
 // parseCodexAuthJSON extracts expiry info from the contents of a Codex
 // auth.json in either layout. An explicit expiry field (flat layout, and
 // Grok's auth.json which reuses this parser) always wins; otherwise the
-// expiry is the access token's exp claim, falling back to the id_token only
-// when no access token parses.
+// expiry is the access token's exp claim, then its stored nested expires_at,
+// falling back to the id_token only when neither describes the access token.
 func parseCodexAuthJSON(data []byte) (*ExpiryInfo, error) {
 	info, err := parseOAuthJSON(data)
 	if err != nil {
@@ -388,8 +390,20 @@ func parseCodexAuthJSON(data []byte) (*ExpiryInfo, error) {
 	}
 
 	if info.ExpiresAt.IsZero() {
-		// Access token first (both layouts), then the identity token.
-		for _, token := range []string{auth.Tokens.AccessToken, auth.AccessToken, auth.Tokens.IDToken, auth.IDToken} {
+		// A native rotation can retain old CAAM metadata. The current access
+		// token's own expiry takes precedence over that cached timestamp.
+		for _, token := range []string{auth.Tokens.AccessToken, auth.AccessToken} {
+			if exp := jwtExpiry(token); !exp.IsZero() {
+				info.ExpiresAt = exp
+				break
+			}
+		}
+	}
+	if info.ExpiresAt.IsZero() {
+		info.ExpiresAt = parseExpiryField(auth.Tokens.ExpiresAt)
+	}
+	if info.ExpiresAt.IsZero() {
+		for _, token := range []string{auth.Tokens.IDToken, auth.IDToken} {
 			if exp := jwtExpiry(token); !exp.IsZero() {
 				info.ExpiresAt = exp
 				break

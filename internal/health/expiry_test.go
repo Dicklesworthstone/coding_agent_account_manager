@@ -1349,6 +1349,48 @@ func TestParseCodexExpiry_ChatGPTMode(t *testing.T) {
 		}
 	})
 
+	t.Run("opaque access token uses refreshed lifetime before stale identity expiry", func(t *testing.T) {
+		for _, explicit := range []any{accessExp.Unix(), accessExp.Format(time.RFC3339)} {
+			path := writeCodexAuthJSON(t, map[string]any{
+				"tokens": map[string]any{
+					"access_token": "synthetic-opaque-access", "refresh_token": "synthetic-renewable",
+					"expires_at": explicit,
+					"id_token":   unsignedJWT(t, map[string]any{"exp": idExp.Unix()}),
+				},
+			})
+			info, err := ParseCodexExpiry(path)
+			if err != nil || !info.ExpiresAt.Equal(accessExp) || !info.Renewable {
+				t.Fatalf("refreshed lifetime was lost: info=%+v err=%v", info, err)
+			}
+		}
+	})
+
+	t.Run("current access JWT outranks stale nested refresh metadata", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"access_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+				"expires_at":   idExp.Unix(),
+			},
+		})
+		info, err := ParseCodexExpiry(path)
+		if err != nil || !info.ExpiresAt.Equal(accessExp) {
+			t.Fatalf("stale metadata overrode the native access token: info=%+v err=%v", info, err)
+		}
+	})
+
+	t.Run("unparseable nested expiry still permits identity fallback", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"access_token": "synthetic-opaque-access", "expires_at": "unknown",
+				"id_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+			},
+		})
+		info, err := ParseCodexExpiry(path)
+		if err != nil || !info.ExpiresAt.Equal(accessExp) {
+			t.Fatalf("valid expiry fallback was lost: info=%+v err=%v", info, err)
+		}
+	})
+
 	t.Run("nothing usable is ErrNoExpiry", func(t *testing.T) {
 		path := writeCodexAuthJSON(t, map[string]any{
 			"tokens": map[string]any{"id_token": "garbage", "access_token": "garbage"},

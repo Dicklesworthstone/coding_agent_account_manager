@@ -224,7 +224,7 @@ func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
 
 // loginWithOAuth launches Gemini CLI for Google login.
 func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) error {
-	env, err := p.Env(ctx, prof)
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
 	if err != nil {
 		return err
 	}
@@ -233,10 +233,7 @@ func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) er
 	fmt.Println("Select 'Login with Google' when prompted.")
 
 	cmd := exec.CommandContext(ctx, "gemini")
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 
 	// Set up URL detection and capture if browser profile is configured
 	var capture *browser.OutputCapture
@@ -299,7 +296,7 @@ func (p *Provider) loginWithAPIKey(ctx context.Context, prof *profile.Profile) e
 
 // loginWithVertexADC guides user through gcloud ADC login.
 func (p *Provider) loginWithVertexADC(ctx context.Context, prof *profile.Profile) error {
-	env, err := p.Env(ctx, prof)
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
 	if err != nil {
 		return err
 	}
@@ -308,10 +305,7 @@ func (p *Provider) loginWithVertexADC(ctx context.Context, prof *profile.Profile
 	fmt.Println("Running: gcloud auth application-default login")
 
 	cmd := exec.CommandContext(ctx, "gcloud", "auth", "application-default", "login")
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 
 	// Set up URL detection and capture if browser profile is configured
 	var capture *browser.OutputCapture

@@ -166,6 +166,15 @@ This creates unnecessary friction in the critical first-use experience.
 
 **Dependency:** Auth Detection (needs detection to know what to import)
 
+**Implemented import publication safeguards:** source credentials are captured
+and validated before changing the registered profile. A forced replacement is
+prepared in a private staging directory, including provider setup and local
+credential checks, then published with recovery of the previous profile if
+publication fails. Locked profiles cannot be replaced. Successful replacement
+retains the complete previous profile outside the routable profile layout and
+reports its backup path; imported credentials and helper paths belong to the
+selected account.
+
 #### 2.3 Init Wizard Enhancement
 
 **What:** Integrate auth detection and import into the init wizard.
@@ -403,6 +412,28 @@ credential deletion, competing owners, concurrent runs, cancellation,
 same-account vault synchronization, and read-only command paths. Claude
 keychain-only logins and Cursor session renewal remain outside this native
 file-based keepalive path.
+
+#### 5.3 Credential ownership across refresh and execution
+
+CAAM-managed Codex and Gemini refreshes now bind requests, provider verdicts,
+and publication to a captured credential generation. Same-source refreshes
+serialize across processes; replaced sources produce a skipped result. Live
+and isolated destinations receive a renewed grant only when their captured
+credentials match and their files remain unchanged. Partial delivery is
+reported without discarding a successful vault renewal or poisoning pool
+eligibility. The default daemon can recover expired renewable access tokens.
+
+Profile runners, native login commands, shallow launches and shell exports
+use a shared provider environment policy. Conflicting ambient credentials
+are removed for file-backed logins, known credential directories are pinned,
+and explicit API-key modes keep their supported key inputs. Rate-limit
+handoff records the current account's cooldown before selecting a different
+eligible account, including when the usage database is unavailable.
+
+Synthetic regressions exercise in-flight source replacement, changed
+destinations, cancellation and cross-process refresh exclusion, invalid token
+responses, real child environments, Windows environment aliases, and every
+rotation algorithm and policy used for rate-limit handoff.
 
 ---
 

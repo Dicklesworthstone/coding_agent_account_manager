@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/daemon"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
 var poolCmd = &cobra.Command{
@@ -169,7 +170,9 @@ func runPoolRefresh(cmd *cobra.Command, args []string) error {
 		err = monitor.ForceRefresh(ctx, provider, profile)
 		cancel()
 
-		if err != nil {
+		if refresh.IsDeliveryIncomplete(err) {
+			fmt.Printf("  Refreshed with a delivery warning: %v\n", err)
+		} else if err != nil {
 			fmt.Printf("  Error: %v\n", err)
 		} else {
 			fmt.Printf("  Success\n")

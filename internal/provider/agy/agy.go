@@ -188,13 +188,14 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 // Env returns the environment variables for running agy in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
 	return map[string]string{
-		"HOME": prof.HomePath(),
+		"HOME":        prof.HomePath(),
+		"GEMINI_HOME": filepath.Join(prof.HomePath(), ".gemini"),
 	}, nil
 }
 
 // Login initiates the Antigravity authentication flow (browser OAuth).
 func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
-	env, err := p.Env(ctx, prof)
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
 	if err != nil {
 		return err
 	}
@@ -203,10 +204,7 @@ func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
 	fmt.Println("Complete the Google login when prompted.")
 
 	cmd := exec.CommandContext(ctx, p.DefaultBin())
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 
 	var capture *browser.OutputCapture
 	if prof.HasBrowserConfig() {

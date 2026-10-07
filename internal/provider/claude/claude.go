@@ -478,7 +478,7 @@ func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) er
 	if err := p.PrepareRun(ctx, prof); err != nil {
 		return err
 	}
-	env, err := p.Env(ctx, prof)
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
 	if err != nil {
 		return err
 	}
@@ -487,10 +487,7 @@ func (p *Provider) loginWithOAuth(ctx context.Context, prof *profile.Profile) er
 	fmt.Println("Once inside, run /login to authenticate.")
 
 	cmd := exec.CommandContext(ctx, "claude")
-	cmd.Env = os.Environ()
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 
 	// Set up URL detection and capture if browser profile is configured
 	var capture *browser.OutputCapture
@@ -819,6 +816,15 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 		}
 		if err := update.Apply(); err != nil {
 			return nil, fmt.Errorf("import settings.json: %w", err)
+		}
+		usesAPIKey, err := claudeSettingsUsesAPIKey(targetPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect imported API key settings: %w", err)
+		}
+		if usesAPIKey {
+			// A helper may intentionally read ANTHROPIC_API_KEY. Preserve that
+			// documented input when the imported profile is launched.
+			prof.AuthMode = string(provider.AuthModeAPIKey)
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
@@ -1164,6 +1170,30 @@ func fileExists(path string) bool {
 
 func claudeSettingsHasAPIKey(path string) (bool, error) {
 	return claudeDocumentHasAuth(path)
+}
+
+func claudeSettingsUsesAPIKey(path string) (bool, error) {
+	data, err := claudesettings.Read(path)
+	if err != nil {
+		return false, err
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return false, err
+	}
+	found, err := nonemptyClaudeFields(obj, "apiKeyHelper", "apiKey", "api_key")
+	if err != nil {
+		return false, err
+	}
+	if raw, ok := obj["env"]; ok {
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return false, err
+		}
+		envKey, err := nonemptyClaudeFields(env, "ANTHROPIC_API_KEY")
+		return found || envKey, err
+	}
+	return found, nil
 }
 
 // Mixed policy documents are not proof of a login. Accept only supported,

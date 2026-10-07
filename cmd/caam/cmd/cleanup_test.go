@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 	"github.com/spf13/cobra"
 )
@@ -314,6 +316,13 @@ func TestEnvCmdJSONIsDataOnlyAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantUnset := []string{"CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"}
+	wantReset := []string{"CODEX_HOME", "HOME"}
+	if runtime.GOOS == "windows" {
+		wantSet["USERPROFILE"] = prof.HomePath()
+		wantUnset = []string{"CODEX_API_KEY", "HOMEDRIVE", "HOMEPATH", "OPENAI_API_KEY", "OPENAI_BASE_URL"}
+		wantReset = append(wantReset, "USERPROFILE")
+	}
 	for _, unset := range []bool{false, true, false} {
 		cmd, out := envOutputCommand(t, false, true, unset)
 		if err := envCmd.RunE(cmd, []string{"codex", prof.Name}); err != nil {
@@ -327,10 +336,10 @@ func TestEnvCmdJSONIsDataOnlyAndReadOnly(t *testing.T) {
 			t.Fatalf("output contains non-JSON text: %s, %v", out, err)
 		}
 		if unset {
-			if len(result.Set) != 0 || !reflect.DeepEqual(result.Unset, []string{"CODEX_HOME", "HOME"}) {
+			if len(result.Set) != 0 || !reflect.DeepEqual(result.Unset, wantReset) {
 				t.Fatalf("unexpected JSON unset operation: %#v", result)
 			}
-		} else if !reflect.DeepEqual(result.Set, wantSet) || len(result.Unset) != 0 {
+		} else if !reflect.DeepEqual(result.Set, wantSet) || !reflect.DeepEqual(result.Unset, wantUnset) {
 			t.Fatalf("unexpected JSON exports: %#v", result)
 		}
 	}
@@ -350,6 +359,97 @@ func TestEnvCmdJSONIsDataOnlyAndReadOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(prof.LockPath()); !os.IsNotExist(err) {
 		t.Fatalf("printing environment created a profile lock: %v", err)
+	}
+}
+
+func TestEnvCmdClearsInheritedCredentialOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		tool string
+		keys []string
+	}{
+		{"codex", []string{"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"}},
+		{"claude", []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"}},
+	} {
+		t.Run(tc.tool, func(t *testing.T) {
+			setupEnvCommandProfile(t, t.TempDir())
+			registry.Register(claude.New())
+			prof, err := profileStore.Create(tc.tool, "selected", "oauth")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range tc.keys {
+				t.Setenv(key, "synthetic-parent-credential")
+			}
+			for _, fish := range []bool{false, true} {
+				cmd, out := envOutputCommand(t, fish, false, false)
+				if err := envCmd.RunE(cmd, []string{tc.tool, prof.Name}); err != nil {
+					t.Fatal(err)
+				}
+				for _, key := range tc.keys {
+					unsetLine := "unset " + key + "\n"
+					if fish {
+						unsetLine = "set -e " + key + "\n"
+					}
+					if !strings.Contains(out.String(), unsetLine) {
+						t.Errorf("missing credential removal for %s in shell plan", key)
+					}
+				}
+				if strings.Contains(out.String(), "synthetic-parent-credential") {
+					t.Fatal("shell plan disclosed an inherited credential")
+				}
+				if !fish && runtime.GOOS != "windows" {
+					// Evaluate the real emitted program, including repeated selection.
+					// Successful export must remove keys rather than merely blank them.
+					check := out.String() + out.String()
+					for _, key := range tc.keys {
+						check += "test -z \"${" + key + "+present}\" || exit 1\n"
+					}
+					child := exec.Command("sh", "-e", "-c", check)
+					if output, err := child.CombinedOutput(); err != nil {
+						t.Fatalf("credential overrides survived shell evaluation: %v, %s", err, output)
+					}
+				}
+			}
+			cmd, out := envOutputCommand(t, false, true, false)
+			if err := envCmd.RunE(cmd, []string{tc.tool, prof.Name}); err != nil {
+				t.Fatal(err)
+			}
+			var changes provider.EnvironmentChanges
+			if err := json.Unmarshal(out.Bytes(), &changes); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range tc.keys {
+				if !slices.Contains(changes.Unset, key) {
+					t.Errorf("JSON plan omitted removal of %s", key)
+				}
+				if os.Getenv(key) != "synthetic-parent-credential" {
+					t.Error("printing a plan modified the caller's environment")
+				}
+			}
+		})
+	}
+}
+
+func TestEnvCmdAPIKeyModeKeepsDocumentedKeyInput(t *testing.T) {
+	prof := setupEnvCommandProfile(t, t.TempDir())
+	prof.AuthMode = "api-key"
+	if err := prof.Save(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENAI_API_KEY", "synthetic-explicit-key")
+	cmd, out := envOutputCommand(t, false, true, false)
+	if err := envCmd.RunE(cmd, []string{"codex", prof.Name}); err != nil {
+		t.Fatal(err)
+	}
+	var changes provider.EnvironmentChanges
+	if err := json.Unmarshal(out.Bytes(), &changes); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(changes.Unset, "OPENAI_API_KEY") {
+		t.Fatal("API-key mode removed its documented ambient key input")
+	}
+	if _, copied := changes.Set["OPENAI_API_KEY"]; copied || strings.Contains(out.String(), "synthetic-explicit-key") {
+		t.Fatal("environment export should not copy or expose the ambient key")
 	}
 }
 

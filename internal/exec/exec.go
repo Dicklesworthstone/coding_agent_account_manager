@@ -3,13 +3,13 @@ package exec
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -48,7 +48,9 @@ type RunOptions struct {
 	// NoLock disables profile locking.
 	NoLock bool
 
-	// Env are additional environment variables.
+	// Env are explicit caller overrides, applied after the selected profile's
+	// paths and inherited-credential filtering. They may intentionally change
+	// a credential or path; ambient variables do not have that priority.
 	Env map[string]string
 
 	// OnRateLimit is called when a rate limit is detected in command output.
@@ -126,10 +128,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 			return fmt.Errorf("lock profile: %w", err)
 		}
 		defer opts.Profile.Unlock()
+		if err := reloadLockedProfile(opts.Profile, opts.Provider.ID()); err != nil {
+			return fmt.Errorf("reload locked profile: %w", err)
+		}
 	}
 
 	// Get provider environment
-	var providerEnv map[string]string
+	environment := provider.CredentialEnvironment(opts.Provider.ID(), provider.AuthModeOAuth, nil)
 	var err error
 	if !opts.UseGlobalEnv {
 		// Required policy is not a convenience-asset refresh. Refuse to start
@@ -139,10 +144,11 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 				return fmt.Errorf("prepare %s profile for launch: %w", opts.Provider.ID(), err)
 			}
 		}
-		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
+		environment, err = provider.ProfileEnvironment(ctx, opts.Provider, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)
 		}
+		providerEnv := environment.Set
 
 		// Refresh passthrough symlinks (HOME dotfiles + XDG config/data/state
 		// entries) on every isolated run. Profiles created before the XDG
@@ -180,32 +186,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 	bin := opts.Provider.DefaultBin()
 	cmd := exec.CommandContext(ctx, bin, opts.Args...)
 
-	// Set up environment with deduplication (last one wins in our map logic)
-	envMap := make(map[string]string)
-
-	// 1. Start with inherited environment
-	for _, e := range os.Environ() {
-		parts := strings.SplitN(e, "=", 2)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-
-	// 2. Apply provider environment (overrides inherited)
-	for k, v := range providerEnv {
-		envMap[k] = v
-	}
-
-	// 3. Apply custom environment options (overrides provider)
-	for k, v := range opts.Env {
-		envMap[k] = v
-	}
-
-	// Reassemble into slice
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), environment, opts.Env)
 
 	// Set working directory
 	if opts.WorkDir != "" {
@@ -360,6 +341,46 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) error {
 		return fmt.Errorf("run command: %w", runErr)
 	}
 
+	return nil
+}
+
+// An import can replace a registered profile after the caller loads it and
+// before Run acquires its lock. Use the published authentication mode and
+// metadata before preparing or launching that account. Transient profiles have
+// no profile.json and keep the caller's explicit configuration.
+func reloadLockedProfile(prof *profile.Profile, providerID string) error {
+	info, err := os.Lstat(prof.MetaPath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 1024*1024 {
+		return fmt.Errorf("profile metadata must be a regular file of at most 1 MiB")
+	}
+	data, err := os.ReadFile(prof.MetaPath())
+	if err != nil {
+		return err
+	}
+	var current profile.Profile
+	if err := json.Unmarshal(data, &current); err != nil {
+		return fmt.Errorf("read current metadata: %w", err)
+	}
+	if current.Name != prof.Name || current.Provider != prof.Provider || current.Provider != providerID {
+		return fmt.Errorf("profile identity changed before launch; reload the selected profile")
+	}
+	// Older metadata may omit BasePath; it still belongs to the directory we
+	// locked. A populated path must identify that same selected directory.
+	if current.BasePath != "" {
+		selected, selectedErr := filepath.Abs(prof.BasePath)
+		stored, storedErr := filepath.Abs(current.BasePath)
+		if selectedErr != nil || storedErr != nil || selected != stored {
+			return fmt.Errorf("profile path changed before launch; reload the selected profile")
+		}
+	}
+	current.BasePath = prof.BasePath
+	*prof = current
 	return nil
 }
 

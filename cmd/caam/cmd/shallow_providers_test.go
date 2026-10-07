@@ -471,3 +471,55 @@ func TestShallowSpawnScrubsForeignProviderHomes(t *testing.T) {
 		}
 	}
 }
+
+func TestShallowSpawnUsesSelectedCredentialsDespiteAmbientKeys(t *testing.T) {
+	for _, tc := range []struct {
+		tool    string
+		profile string
+		keys    []string
+	}{
+		{"claude", "alice", []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"}},
+		{"codex", "bob", []string{"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"}},
+	} {
+		t.Run(tc.tool, func(t *testing.T) {
+			base, _ := shallowEnv(t)
+			args := []string{"shallow-profile", "create", tc.profile, "--json"}
+			if tc.tool == "codex" {
+				stageVaultFile(t, "codex", tc.profile, "auth.json", `{"tokens":{"access_token":"synthetic-selected","refresh_token":"synthetic-refresh"}}`)
+				args = append(args, "--from-vault", "codex/"+tc.profile)
+			}
+			if _, _, err := runCmdCaptured(t, args...); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range tc.keys {
+				t.Setenv(key, "synthetic-parent-credential")
+			}
+			t.Setenv("CAAM_TEST_WORKFLOW", "keep")
+			var got []string
+			original := spawnExec
+			spawnExec = func(_ string, _ []string, env []string) error {
+				got = env
+				return nil
+			}
+			t.Cleanup(func() { spawnExec = original })
+			if _, _, err := runCmdCaptured(t, "shallow-spawn", tc.profile, "--", "sh", "-c", "true"); err != nil {
+				t.Fatal(err)
+			}
+			values := make(map[string]string)
+			for _, entry := range got {
+				key, value, ok := strings.Cut(entry, "=")
+				if ok {
+					values[key] = value
+				}
+			}
+			for _, key := range tc.keys {
+				if _, present := values[key]; present {
+					t.Errorf("spawn inherited %s instead of using the selected profile", key)
+				}
+			}
+			if values["HOME"] != filepath.Join(base, tc.profile) || values["CAAM_TEST_WORKFLOW"] != "keep" {
+				t.Fatal("spawn lost the selected home or unrelated workflow environment")
+			}
+		})
+	}
+}

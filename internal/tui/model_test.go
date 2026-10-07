@@ -867,6 +867,19 @@ func TestRefreshResultDistinguishesSkipsFromFailures(t *testing.T) {
 	}
 }
 
+func TestRefreshDeliveryWarningRetainsSuccessAndReloads(t *testing.T) {
+	m := New()
+	warning := &refresh.DeliveryError{Destinations: []string{"active codex login"}}
+	result, command := m.Update(refreshResultMsg{provider: "codex", profile: "work", err: warning})
+	updated := result.(Model)
+	if command == nil {
+		t.Fatal("successful vault renewal with delivery warning did not reload health")
+	}
+	if updated.statusMessageSeverity() == StatusError || !strings.Contains(updated.statusMsg, warning.Error()) {
+		t.Fatalf("delivery warning was shown as a failed renewal: %q", updated.statusMsg)
+	}
+}
+
 // TestDialogOverlayView tests the dialogOverlayView method.
 func TestDialogOverlayView(t *testing.T) {
 	m := New()

@@ -288,7 +288,7 @@ func (m *Monitor) doRefresh(ctx context.Context, provider, profile string, prevS
 	// Perform refresh
 	newExpiry, err := m.refresher.Refresh(ctx, provider, profile)
 
-	if err != nil {
+	if err != nil && !refresh.IsDeliveryIncomplete(err) {
 		m.pool.restoreRefreshStatus(provider, profile, prevStatus)
 		if refresh.IsSkipped(err) {
 			if m.config.OnRefreshComplete != nil {
@@ -303,13 +303,14 @@ func (m *Monitor) doRefresh(ctx context.Context, provider, profile string, prevS
 		return err
 	}
 
-	// Success - update pool state
+	// The vault grant is renewed even when a live destination changed during
+	// the request. Keep it eligible and report that delivery warning separately.
 	m.pool.MarkRefreshed(provider, profile, newExpiry)
 
 	if m.config.OnRefreshComplete != nil {
-		m.config.OnRefreshComplete(provider, profile, newExpiry, nil)
+		m.config.OnRefreshComplete(provider, profile, newExpiry, err)
 	}
-	return nil
+	return err
 }
 
 // ForceRefresh triggers an immediate refresh for a specific profile.

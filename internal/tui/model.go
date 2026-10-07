@@ -869,7 +869,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refreshProfiles(ctx)
 
 	case refreshResultMsg:
-		if msg.err != nil {
+		if msg.err != nil && !refresh.IsDeliveryIncomplete(msg.err) {
 			if refresh.IsSkipped(msg.err) {
 				m.statusMsg = fmt.Sprintf("Refresh skipped: %v", msg.err)
 				return m, nil
@@ -878,6 +878,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.showRefreshSuccess(msg.profile, time.Time{}) // TODO: pass actual expiry time
+		if msg.err != nil {
+			m.statusMsg += "; " + msg.err.Error()
+		}
 		// Refresh profiles to update any changed state
 		ctx := refreshContext{
 			provider:        msg.provider,

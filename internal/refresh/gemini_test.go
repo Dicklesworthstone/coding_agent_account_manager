@@ -372,9 +372,8 @@ func TestUpdateGeminiAuth_NoExpiresIn(t *testing.T) {
 	var updated map[string]any
 	json.Unmarshal(updatedRaw, &updated)
 
-	// expiry should remain unchanged when ExpiresIn is 0
-	if updated["expiry"] != "2020-01-01T00:00:00Z" {
-		t.Errorf("expiry should remain unchanged when ExpiresIn is 0: %v", updated["expiry"])
+	if _, ok := updated["expiry"]; ok {
+		t.Error("new opaque token inherited the previous token's expiry")
 	}
 }
 

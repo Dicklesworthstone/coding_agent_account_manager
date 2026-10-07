@@ -316,7 +316,7 @@ func TestGeminiRefreshKeepsSelectedGrantAndHydratesCurrentHealth(t *testing.T) {
 			if err := Preflight("gemini", "work", vault); err != nil {
 				t.Fatal(err)
 			}
-			if err := refreshGemini(context.Background(), "gemini", "work", store, dir); err != nil {
+			if err := RefreshProfile(context.Background(), "gemini", "work", vault, store); err != nil {
 				t.Fatal(err)
 			}
 			if got, err := os.ReadFile(settingsPath); err != nil || string(got) != settings {
@@ -457,13 +457,27 @@ func TestShouldRefresh_Expiring(t *testing.T) {
 }
 
 func TestShouldRefresh_AlreadyExpired(t *testing.T) {
-	// Token already expired - should return false (ttl <= 0)
+	// A hard-expired login needs a human, while an expired access token with
+	// a renewal credential must recover after daemon downtime.
 	h := &health.ProfileHealth{
 		TokenExpiresAt: time.Now().Add(-5 * time.Minute),
 	}
 	result := ShouldRefresh(h, 10*time.Minute)
 	if result {
 		t.Errorf("ShouldRefresh with expired token = true, want false")
+	}
+	h.TokenRenewable = true
+	if !ShouldRefresh(h, 10*time.Minute) {
+		t.Fatal("expired renewable access token was not scheduled for recovery")
+	}
+	h.ProviderRejectedAt = time.Now()
+	if ShouldRefresh(h, 10*time.Minute) {
+		t.Fatal("known rejected refresh token was scheduled again")
+	}
+	h.ProviderRejectedAt = time.Time{}
+	h.SelfRefreshing = true
+	if ShouldRefresh(h, 10*time.Minute) {
+		t.Fatal("expired native-owned token was scheduled for CAAM renewal")
 	}
 }
 

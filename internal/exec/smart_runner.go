@@ -219,14 +219,14 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	// vault-based runs (`caam run`) swap auth files inside the REAL home, so
 	// injecting the provider's isolated-profile env (HOME, CODEX_HOME, ...)
 	// would point the tool at a profile directory that is not logged in.
-	var providerEnv map[string]string
+	environment := provider.CredentialEnvironment(opts.Provider.ID(), provider.AuthModeOAuth, nil)
 	if !opts.UseGlobalEnv {
 		if preparer, ok := opts.Provider.(provider.ProfileRunPreparer); ok {
 			if err := preparer.PrepareRun(ctx, opts.Profile); err != nil {
 				return fmt.Errorf("prepare %s launch: %w", opts.Provider.ID(), err)
 			}
 		}
-		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
+		environment, err = provider.ProfileEnvironment(ctx, opts.Provider, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)
 		}
@@ -236,24 +236,7 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	bin := opts.Provider.DefaultBin()
 	cmd := ExecCommand(ctx, bin, opts.Args...)
 
-	// Apply env (same as Runner.Run)
-	envMap := make(map[string]string)
-	for _, e := range os.Environ() {
-		parts := splitEnv(e)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	for k, v := range providerEnv {
-		envMap[k] = v
-	}
-	for k, v := range opts.Env {
-		envMap[k] = v
-	}
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), environment, opts.Env)
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
 	}
@@ -387,6 +370,19 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	}
 	r.previousProfile = ""
 
+	// Detection is evidence about the current account even when no backup is
+	// available. Record it before choosing, so another launch also sees it.
+	cooldownDuration := r.cooldownDuration
+	if cooldownDuration == 0 {
+		cooldownDuration = 60 * time.Minute
+	}
+	if r.authPool != nil {
+		r.authPool.SetCooldown(r.loginHandler.Provider(), r.currentProfile, cooldownDuration)
+	}
+	if r.db != nil {
+		r.db.SetCooldown(r.loginHandler.Provider(), r.currentProfile, time.Now(), cooldownDuration, "auto-detected via SmartRunner")
+	}
+
 	// Select and validate a target before preserving or changing live auth.
 	r.setState(SelectingBackup)
 
@@ -396,6 +392,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		r.failWithManual("failed to list profiles: %v", err)
 		return
 	}
+
+	// The account that just hit a limit is never a backup, even when cooldown
+	// persistence is unavailable or the selector would otherwise favor it.
+	backups := make([]string, 0, len(profiles))
+	for _, name := range profiles {
+		if name != r.currentProfile {
+			backups = append(backups, name)
+		}
+	}
+	profiles = backups
 
 	// Select best
 	selection, err := r.rotation.Select(r.loginHandler.Provider(), profiles, r.currentProfile)
@@ -411,18 +417,6 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	}
 
 	r.notifyHandoff(r.currentProfile, nextProfile)
-
-	// 3. Mark current profile as in cooldown (if authPool is available)
-	cooldownDuration := r.cooldownDuration
-	if cooldownDuration == 0 {
-		cooldownDuration = 60 * time.Minute
-	}
-	if r.authPool != nil {
-		r.authPool.SetCooldown(r.loginHandler.Provider(), r.currentProfile, cooldownDuration)
-	}
-	if r.db != nil {
-		r.db.SetCooldown(r.loginHandler.Provider(), r.currentProfile, time.Now(), cooldownDuration, "auto-detected via SmartRunner")
-	}
 
 	// 4. Preserve the verified live owner and swap auth files. The profile
 	// label recorded at process startup may no longer own the live login.
@@ -653,13 +647,4 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 		}
 		// In drain mode, continue looping without delay until ReadOutput returns EOF
 	}
-}
-
-func splitEnv(s string) []string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '=' {
-			return []string{s[:i], s[i+1:]}
-		}
-	}
-	return []string{s}
 }

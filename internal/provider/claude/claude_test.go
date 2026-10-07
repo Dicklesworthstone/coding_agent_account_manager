@@ -1318,6 +1318,45 @@ func TestImportAuth(t *testing.T) {
 	})
 }
 
+func TestImportSettingsSelectsCredentialMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings, mode string
+	}{
+		{"helper", `{"apiKeyHelper":"selected-helper"}`, "api-key"},
+		{"key", `{"apiKey":"synthetic-selected-key"}`, "api-key"},
+		{"environment key", `{"env":{"ANTHROPIC_API_KEY":"synthetic-selected-key"}}`, "api-key"},
+		{"OAuth token", `{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"synthetic-selected-token"}}`, "oauth"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			p := New()
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(t.TempDir(), "settings.json")
+			writeClaudeLifecycleJSON(t, source, tc.settings)
+			if _, err := p.ImportAuth(context.Background(), source, prof); err != nil {
+				t.Fatal(err)
+			}
+			if prof.AuthMode != tc.mode {
+				t.Fatalf("imported mode = %q, want %q", prof.AuthMode, tc.mode)
+			}
+			changes, err := provider.ProfileEnvironment(context.Background(), p, prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			merged := provider.MergeEnvironment([]string{"ANTHROPIC_API_KEY=synthetic-helper-input"}, changes, nil)
+			found := false
+			for _, value := range merged {
+				found = found || value == "ANTHROPIC_API_KEY=synthetic-helper-input"
+			}
+			if found != (tc.mode == "api-key") {
+				t.Fatalf("imported mode does not control the helper's ambient key input: %v", merged)
+			}
+		})
+	}
+}
+
 // Helper for writing JSON
 func writeJSON(t *testing.T, path string, data interface{}) {
 	t.Helper()
@@ -1574,6 +1613,43 @@ func claudeLifecycleFixture(t *testing.T) (string, *profile.Profile) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CAAM_KEYCHAIN", "0")
 	return realHome, &profile.Profile{Name: "isolated", Provider: "claude", AuthMode: "oauth", BasePath: t.TempDir()}
+}
+
+func TestOAuthLoginUsesSelectedClaudeConfigWithoutAmbientCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture; Windows environment merging is tested in provider")
+	}
+	realHome, prof := claudeLifecycleFixture(t)
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+test "$HOME" = "$CAAM_TEST_SELECTED_HOME" || exit 11
+test "$CLAUDE_CONFIG_DIR" = "$CAAM_TEST_SELECTED_CONFIG" || exit 12
+test -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN$CLAUDE_CODE_USE_BEDROCK$ANTHROPIC_PROFILE" || exit 13
+test "$OPENAI_API_KEY" = unrelated || exit 14
+printf success > "$CAAM_TEST_LOGIN_MARKER"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(realHome, "host-config"))
+	for _, key := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_PROFILE"} {
+		t.Setenv(key, "synthetic-ambient")
+	}
+	t.Setenv("OPENAI_API_KEY", "unrelated")
+	t.Setenv("CAAM_TEST_SELECTED_HOME", prof.HomePath())
+	t.Setenv("CAAM_TEST_SELECTED_CONFIG", claudeConfigDirForProfile(prof))
+	marker := filepath.Join(realHome, "login-ran")
+	t.Setenv("CAAM_TEST_LOGIN_MARKER", marker)
+	if err := New().Login(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(marker); err != nil || string(content) != "success" {
+		t.Fatalf("native login did not use selected environment: %q, %v", content, err)
+	}
 }
 
 func writeClaudeLifecycleJSON(t *testing.T, path, body string) {

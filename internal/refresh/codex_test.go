@@ -489,8 +489,7 @@ func TestUpdateCodexAuth_NoExpiresIn(t *testing.T) {
 	var updatedAuth map[string]interface{}
 	json.Unmarshal(updatedData, &updatedAuth)
 
-	// expires_at should remain unchanged since ExpiresIn is 0
-	if val, ok := updatedAuth["expires_at"].(float64); ok && val != 1500000000 {
-		t.Errorf("expires_at should remain unchanged when ExpiresIn is 0")
+	if _, ok := updatedAuth["expires_at"]; ok {
+		t.Error("new opaque token inherited the previous token's expiry")
 	}
 }

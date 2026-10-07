@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
@@ -490,6 +491,19 @@ func importAuthProfile(ctx context.Context, prov provider.Provider, name, source
 		if err != nil {
 			return err
 		}
+		if force && prov.ID() == "claude" {
+			helpers, err := preserveImportedClaudeHelper(prof, profileStore.ProfilePath(prov.ID(), name), relativeFiles)
+			if err != nil {
+				return fmt.Errorf("preserve imported Claude helper: %w", err)
+			}
+			if len(helpers) > 0 {
+				helperFiles, err := validateImportedFiles(prov.ID(), prof.BasePath, helpers)
+				if err != nil {
+					return err
+				}
+				relativeFiles = append(relativeFiles, helperFiles...)
+			}
+		}
 		if err := prov.ValidateProfile(ctx, prof); err != nil {
 			return fmt.Errorf("validate imported profile: %w", err)
 		}
@@ -516,6 +530,108 @@ func importAuthProfile(ctx context.Context, prov provider.Provider, name, source
 		result.CopiedFiles = append(result.CopiedFiles, filepath.Join(result.ProfilePath, path))
 	}
 	return result, nil
+}
+
+// Preserve a literal helper inside the profile being replaced. Its old directory
+// moves into the retained backup at publication, so the imported settings must
+// refer to a private copy in the replacement. External commands are unchanged.
+func preserveImportedClaudeHelper(prof *profile.Profile, finalPath string, files []string) ([]string, error) {
+	finalPath, err := filepath.Abs(finalPath)
+	if err != nil {
+		return nil, err
+	}
+	var helpers []string
+	for _, relative := range files {
+		if filepath.Base(relative) != "settings.json" {
+			continue
+		}
+		settingsPath := filepath.Join(prof.BasePath, relative)
+		data, err := claudesettings.Read(settingsPath)
+		if err != nil {
+			return nil, err
+		}
+		var settings struct {
+			Helper string `json:"apiKeyHelper"`
+		}
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return nil, err
+		}
+		helperPath := settings.Helper
+		// Recognize only a literal path, including our own quoting convention.
+		// Do not interpret arguments, expansions, or arbitrary shell programs.
+		if strings.HasPrefix(helperPath, "'") && strings.HasSuffix(helperPath, "'") && len(helperPath) >= 2 {
+			unquoted := strings.ReplaceAll(helperPath[1:len(helperPath)-1], "'\"'\"'", "'")
+			if shellQuote(unquoted) == helperPath {
+				helperPath = unquoted
+			}
+		}
+		inside, relErr := filepath.Rel(finalPath, helperPath)
+		if !filepath.IsAbs(helperPath) || relErr != nil || !filepath.IsLocal(inside) {
+			if strings.Contains(settings.Helper, finalPath+string(filepath.Separator)) {
+				return nil, fmt.Errorf("profile-owned apiKeyHelper must be a literal absolute path")
+			}
+			continue
+		}
+		info, err := os.Lstat(helperPath)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+			return nil, fmt.Errorf("profile-owned apiKeyHelper must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+		}
+		resolvedRoot, err := filepath.EvalSymlinks(finalPath)
+		if err != nil {
+			return nil, err
+		}
+		resolvedHelper, err := filepath.EvalSymlinks(helperPath)
+		if err != nil {
+			return nil, err
+		}
+		inside, err = filepath.Rel(resolvedRoot, resolvedHelper)
+		if err != nil || !filepath.IsLocal(inside) {
+			return nil, fmt.Errorf("profile-owned apiKeyHelper points outside the profile")
+		}
+		source, err := os.Open(helperPath)
+		if err != nil {
+			return nil, err
+		}
+		opened, statErr := source.Stat()
+		if statErr != nil || !os.SameFile(info, opened) {
+			source.Close()
+			return nil, fmt.Errorf("profile-owned apiKeyHelper changed during import")
+		}
+		body, readErr := io.ReadAll(io.LimitReader(source, authfile.MaxDiscoveryFileBytes+1))
+		source.Close()
+		if readErr != nil || int64(len(body)) > authfile.MaxDiscoveryFileBytes {
+			return nil, fmt.Errorf("read profile-owned apiKeyHelper: invalid or oversized file")
+		}
+		target, err := os.CreateTemp(prof.BasePath, "imported-api-key-helper-*")
+		if err != nil {
+			return nil, err
+		}
+		if err := target.Chmod(0700); err != nil {
+			target.Close()
+			return nil, err
+		}
+		if _, err := target.Write(body); err != nil {
+			target.Close()
+			return nil, err
+		}
+		if err := target.Sync(); err != nil {
+			target.Close()
+			return nil, err
+		}
+		if err := target.Close(); err != nil {
+			return nil, err
+		}
+		command := shellQuote(filepath.Join(finalPath, filepath.Base(target.Name())))
+		update, err := claudesettings.PrepareAPIKeyHelper(settingsPath, command)
+		if err != nil {
+			return nil, err
+		}
+		if err := update.Apply(); err != nil {
+			return nil, err
+		}
+		helpers = append(helpers, target.Name())
+	}
+	return helpers, nil
 }
 
 func validateImportedFiles(tool, basePath string, files []string) ([]string, error) {

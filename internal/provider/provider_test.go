@@ -3,6 +3,9 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,8 @@ type testProvider struct {
 	id          string
 	displayName string
 	defaultBin  string
+	envVars     map[string]string
+	envErr      error
 }
 
 func (p *testProvider) ID() string                     { return p.id }
@@ -25,7 +30,113 @@ func (p *testProvider) PrepareProfile(ctx context.Context, prof *profile.Profile
 	return nil
 }
 func (p *testProvider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
-	return nil, nil
+	return p.envVars, p.envErr
+}
+
+func TestCredentialEnvironmentSelectsProviderAccount(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		mode     AuthMode
+		removed  []string
+		retained []string
+	}{
+		{"claude", AuthModeOAuth, []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_PROFILE"}, []string{"OPENAI_API_KEY", "ANTHROPIC_MODEL", "HTTPS_PROXY"}},
+		{"claude", AuthModeAPIKey, []string{"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_VERTEX"}, []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}},
+		{"codex", AuthModeDeviceCode, []string{"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"}, []string{"ANTHROPIC_API_KEY", "GEMINI_API_KEY"}},
+		{"codex", AuthModeAPIKey, nil, []string{"OPENAI_API_KEY", "OPENAI_BASE_URL"}},
+		{"gemini", AuthModeOAuth, []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA"}, []string{"ANTHROPIC_API_KEY", "GOOGLE_CLOUD_PROJECT"}},
+		{"gemini", AuthModeAPIKey, []string{"GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA"}, []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}},
+		{"gemini", AuthModeVertexADC, []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA"}, []string{"GOOGLE_CLOUD_PROJECT"}},
+		{"grok", AuthModeOAuth, []string{"GROK_AUTH", "GROK_AUTH_PATH", "GROK_DEPLOYMENT_KEY", "XAI_API_KEY", "XAI_API_TOKEN"}, []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}},
+		{"cursor", AuthModeOAuth, []string{"CURSOR_API_KEY"}, []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}},
+		{"cursor", AuthModeAPIKey, nil, []string{"CURSOR_API_KEY"}},
+		{"unknown", AuthModeOAuth, nil, []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"}},
+	} {
+		t.Run(tc.provider+"/"+string(tc.mode), func(t *testing.T) {
+			inherited := []string{"PATH=/tool/path", "HOME=/host", "EDITOR=vim"}
+			for _, key := range append(append([]string{}, tc.removed...), tc.retained...) {
+				inherited = append(inherited, key+"=synthetic-ambient")
+			}
+			changes := credentialEnvironmentForOS(tc.provider, tc.mode, map[string]string{"HOME": "/selected"}, "linux")
+			got := environmentTestMap(mergeEnvironmentForOS(inherited, changes, nil, "linux"))
+			for _, key := range tc.removed {
+				if _, exists := got[key]; exists {
+					t.Errorf("inherited credential override %s survived", key)
+				}
+			}
+			for _, key := range tc.retained {
+				if got[key] != "synthetic-ambient" {
+					t.Errorf("documented or unrelated input %s was removed", key)
+				}
+			}
+			if got["HOME"] != "/selected" || got["EDITOR"] != "vim" || got["PATH"] != "/tool/path" {
+				t.Fatalf("profile paths/tool environment changed: %+v", got)
+			}
+		})
+	}
+}
+
+func TestProfileEnvironmentReadOnlyAndExplicitPriority(t *testing.T) {
+	set := map[string]string{"HOME": "/selected", "CLAUDE_CONFIG_DIR": "/selected/config"}
+	prov := &testProvider{id: "claude", envVars: set}
+	prof := &profile.Profile{AuthMode: string(AuthModeOAuth)}
+	changes, err := ProfileEnvironment(context.Background(), prov, prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes.Set["ADDED"] = "only-in-plan"
+	if _, exists := set["ADDED"]; exists {
+		t.Fatal("plan mutated provider's environment map")
+	}
+	got := environmentTestMap(MergeEnvironment([]string{"ANTHROPIC_API_KEY=ambient", "HOME=/host"}, changes,
+		map[string]string{"ANTHROPIC_API_KEY": "explicit", "HOME": "/caller"}))
+	if got["ANTHROPIC_API_KEY"] != "explicit" || got["HOME"] != "/caller" {
+		t.Fatalf("explicit caller override lost priority: %+v", got)
+	}
+	wantErr := errors.New("invalid selected credential source")
+	prov.envErr = wantErr
+	if _, err := ProfileEnvironment(context.Background(), prov, prof); !errors.Is(err, wantErr) {
+		t.Fatalf("provider resolution error lost: %v", err)
+	}
+}
+
+func TestEnvironmentWindowsAliasesAndGlobalPaths(t *testing.T) {
+	changes := credentialEnvironmentForOS("claude", AuthModeOAuth, map[string]string{"HOME": `C:\profiles\work`}, "windows")
+	input := []string{"Path=C:\\bin", "HOME=C:\\host", "UserProfile=C:\\host", "HOMEDRIVE=C:", "HomePath=\\host", "anthropic_api_key=ambient", "Anthropic_Model=kept"}
+	got := environmentTestMap(mergeEnvironmentForOS(input, changes, nil, "windows"))
+	if got["HOME"] != `C:\profiles\work` || got["USERPROFILE"] != got["HOME"] || got["ANTHROPIC_MODEL"] != "kept" {
+		t.Fatalf("Windows paths or unrelated setting: %+v", got)
+	}
+	for _, key := range []string{"ANTHROPIC_API_KEY", "HOMEDRIVE", "HOMEPATH"} {
+		if _, exists := got[key]; exists {
+			t.Errorf("Windows inherited alias %s survived", key)
+		}
+	}
+	explicit := map[string]string{"anthropic_api_key": "caller"}
+	merged := mergeEnvironmentForOS(input, changes, explicit, "windows")
+	if environmentTestMap(merged)["ANTHROPIC_API_KEY"] != "caller" {
+		t.Fatal("case-insensitive explicit credential override lost")
+	}
+	if !reflect.DeepEqual(merged, mergeEnvironmentForOS(input, changes, explicit, "windows")) {
+		t.Fatal("environment merge is nondeterministic")
+	}
+	global := credentialEnvironmentForOS("claude", AuthModeOAuth, nil, "windows")
+	globalEnv := environmentTestMap(mergeEnvironmentForOS(input, global, nil, "windows"))
+	if globalEnv["HOME"] != `C:\host` || globalEnv["USERPROFILE"] != `C:\host` {
+		t.Fatalf("global vault launch changed home: %+v", globalEnv)
+	}
+	if _, exists := globalEnv["ANTHROPIC_API_KEY"]; exists {
+		t.Fatal("global vault launch kept ambient account override")
+	}
+}
+
+func environmentTestMap(values []string) map[string]string {
+	out := make(map[string]string, len(values))
+	for _, value := range values {
+		key, value, _ := strings.Cut(value, "=")
+		out[key] = value
+	}
+	return out
 }
 func (p *testProvider) Login(ctx context.Context, prof *profile.Profile) error  { return nil }
 func (p *testProvider) Logout(ctx context.Context, prof *profile.Profile) error { return nil }

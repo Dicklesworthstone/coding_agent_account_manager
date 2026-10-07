@@ -153,11 +153,12 @@ func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]s
 
 // Login initiates the authentication flow.
 func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
-	cmd := exec.CommandContext(ctx, "cursor")
-	cmd.Env = os.Environ()
-	for k, v := range profileEnv(prof) {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
 	}
+	cmd := exec.CommandContext(ctx, "cursor")
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

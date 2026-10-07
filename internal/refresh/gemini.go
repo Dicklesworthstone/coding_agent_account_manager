@@ -1,6 +1,7 @@
 package refresh
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,7 +73,10 @@ var RefreshGeminiToken = func(ctx context.Context, clientID, clientSecret, refre
 		if err != nil {
 			return nil, fmt.Errorf("gemini refresh error %d (failed to read body: %v)", resp.StatusCode, err)
 		}
-		return nil, fmt.Errorf("gemini refresh error %d: %s", resp.StatusCode, string(body))
+		if code, rejected := classifyRefreshRejection(resp.StatusCode, body); rejected {
+			return nil, &RefreshRejectedError{Provider: "gemini", StatusCode: resp.StatusCode, Code: code}
+		}
+		return nil, fmt.Errorf("gemini refresh error %d", resp.StatusCode)
 	}
 
 	var tokenResp GoogleTokenResponse
@@ -90,6 +94,10 @@ func ReadADC(path string) (*ADC, error) {
 		return nil, fmt.Errorf("read ADC file: %w", err)
 	}
 
+	return parseADC(data)
+}
+
+func parseADC(data []byte) (*ADC, error) {
 	var adc ADC
 	if err := json.Unmarshal(data, &adc); err != nil {
 		return nil, fmt.Errorf("parse ADC file: %w", err)
@@ -104,22 +112,34 @@ func ReadADC(path string) (*ADC, error) {
 
 // UpdateGeminiAuth updates Gemini auth settings with a refreshed access token and expiry.
 func UpdateGeminiAuth(path string, resp *GoogleTokenResponse) error {
-	data, err := os.ReadFile(path)
+	source, err := readCredentialSnapshot(path)
 	if err != nil {
 		return fmt.Errorf("read auth file: %w", err)
 	}
+	data, err := updatedGeminiAuth(source.data, resp, false)
+	if err != nil {
+		return err
+	}
+	return source.publish(data)
+}
 
+func updatedGeminiAuth(data []byte, resp *GoogleTokenResponse, flatADC bool) ([]byte, error) {
+	if resp == nil || strings.TrimSpace(resp.AccessToken) == "" || resp.ExpiresIn < 0 {
+		return nil, fmt.Errorf("refresh returned an invalid access credential")
+	}
 	var auth map[string]interface{}
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return fmt.Errorf("parse auth file: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&auth); err != nil || auth == nil {
+		return nil, fmt.Errorf("auth file must contain a JSON object")
 	}
 
 	// Check for nested structures common in settings.json
 	updated := false
-	if oauth, ok := auth["oauth"].(map[string]interface{}); ok {
+	if oauth, ok := auth["oauth"].(map[string]interface{}); ok && !flatADC {
 		updateGeminiTokenMap(oauth, resp)
 		updated = true
-	} else if creds, ok := auth["credentials"].(map[string]interface{}); ok {
+	} else if creds, ok := auth["credentials"].(map[string]interface{}); ok && !flatADC {
 		updateGeminiTokenMap(creds, resp)
 		updated = true
 	}
@@ -133,40 +153,7 @@ func UpdateGeminiAuth(path string, resp *GoogleTokenResponse) error {
 		updateGeminiTokenMap(auth, resp)
 	}
 
-	updatedData, err := json.MarshalIndent(auth, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal updated auth: %w", err)
-	}
-
-	tmpPath := path + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-
-	if _, err := f.Write(updatedData); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write temp file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename file: %w", err)
-	}
-
-	return nil
+	return json.MarshalIndent(auth, "", "  ")
 }
 
 func updateGeminiTokenMap(m map[string]interface{}, resp *GoogleTokenResponse) {
@@ -179,19 +166,20 @@ func updateGeminiTokenMap(m map[string]interface{}, resp *GoogleTokenResponse) {
 		m["access_token"] = resp.AccessToken
 	}
 
-	// Expiry: prefer existing field name when possible.
+	// Prefer the existing spelling, but never attach an older generation's
+	// deadline to a new opaque token when its response carries no lifetime.
+	expiryKey := "expiry"
+	if _, ok := m["expiry"]; !ok {
+		if _, ok := m["expires_at"]; ok {
+			expiryKey = "expires_at"
+		} else if _, ok := m["expiresAt"]; ok {
+			expiryKey = "expiresAt"
+		}
+	}
+	clearCredentialExpiry(m)
 	if resp.ExpiresIn > 0 {
 		expiresAt := time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
-
-		if _, ok := m["expiry"]; ok {
-			m["expiry"] = expiresAt
-		} else if _, ok := m["expires_at"]; ok {
-			m["expires_at"] = expiresAt
-		} else if _, ok := m["expiresAt"]; ok {
-			m["expiresAt"] = expiresAt
-		} else {
-			m["expiry"] = expiresAt
-		}
+		m[expiryKey] = expiresAt
 	}
 }
 

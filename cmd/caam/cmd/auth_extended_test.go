@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -331,6 +333,109 @@ func setupAuthImportStore(t *testing.T) *profile.Store {
 	profileStore = profile.NewStore(filepath.Join(t.TempDir(), "profiles"))
 	t.Cleanup(func() { profileStore = original })
 	return profileStore
+}
+
+func TestAuthImportForcePreservesClaudeHelper(t *testing.T) {
+	for _, quoted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("quoted_%t", quoted), func(t *testing.T) {
+			store := setupAuthImportStore(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			old, err := store.Create("claude", "work", "oauth")
+			require.NoError(t, err)
+			p := claude.New()
+			require.NoError(t, p.PrepareProfile(context.Background(), old))
+			env, err := p.Env(context.Background(), old)
+			require.NoError(t, err)
+			helper := filepath.Join(old.BasePath, "helper with 'quote' $literal.sh")
+			body := []byte("#!/bin/sh\nprintf '%s' \"$ANTHROPIC_API_KEY\"\n")
+			require.NoError(t, os.WriteFile(helper, body, 0700))
+			command := helper
+			if quoted {
+				command = shellQuote(helper)
+			}
+			source := filepath.Join(env["CLAUDE_CONFIG_DIR"], "settings.json")
+			original, err := json.Marshal(map[string]string{"apiKeyHelper": command})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(source, original, 0600))
+
+			result, err := importAuthProfile(context.Background(), p, "work", source, "", true)
+			require.NoError(t, err)
+			require.True(t, result.Success)
+			require.Len(t, result.CopiedFiles, 2)
+			current, err := store.Load("claude", "work")
+			require.NoError(t, err)
+			require.Equal(t, "api-key", current.AuthMode)
+			currentEnv, err := p.Env(context.Background(), current)
+			require.NoError(t, err)
+			settingsData, err := os.ReadFile(filepath.Join(currentEnv["CLAUDE_CONFIG_DIR"], "settings.json"))
+			require.NoError(t, err)
+			var settings struct {
+				Helper string `json:"apiKeyHelper"`
+			}
+			require.NoError(t, json.Unmarshal(settingsData, &settings))
+			assert.Equal(t, shellQuote(result.CopiedFiles[1]), settings.Helper)
+			copied, err := os.ReadFile(result.CopiedFiles[1])
+			require.NoError(t, err)
+			assert.Equal(t, body, copied)
+			if runtime.GOOS != "windows" {
+				info, err := os.Stat(result.CopiedFiles[1])
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0700), info.Mode().Perm())
+				changes, err := provider.ProfileEnvironment(context.Background(), p, current)
+				require.NoError(t, err)
+				native := exec.Command("sh", "-c", settings.Helper)
+				native.Env = provider.MergeEnvironment([]string{"ANTHROPIC_API_KEY=synthetic-selected-helper-key"}, changes, nil)
+				output, err := native.Output()
+				require.NoError(t, err)
+				assert.Equal(t, "synthetic-selected-helper-key", string(output))
+			}
+			backupHelper, err := os.ReadFile(filepath.Join(result.BackupPath, filepath.Base(helper)))
+			require.NoError(t, err)
+			assert.Equal(t, body, backupHelper)
+			relativeSource, err := filepath.Rel(old.BasePath, source)
+			require.NoError(t, err)
+			backupSettings, err := os.ReadFile(filepath.Join(result.BackupPath, relativeSource))
+			require.NoError(t, err)
+			assert.Equal(t, original, backupSettings)
+		})
+	}
+}
+
+func TestAuthImportMissingClaudeHelperPreservesPreviousProfile(t *testing.T) {
+	store := setupAuthImportStore(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	old, err := store.Create("claude", "work", "oauth")
+	require.NoError(t, err)
+	p := claude.New()
+	require.NoError(t, p.PrepareProfile(context.Background(), old))
+	env, err := p.Env(context.Background(), old)
+	require.NoError(t, err)
+	source := filepath.Join(env["CLAUDE_CONFIG_DIR"], "settings.json")
+	original, err := json.Marshal(map[string]string{"apiKeyHelper": filepath.Join(old.BasePath, "missing-helper.sh")})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(source, original, 0600))
+	metadata, err := os.ReadFile(old.MetaPath())
+	require.NoError(t, err)
+	result, err := importAuthProfile(context.Background(), p, "work", source, "", true)
+	require.ErrorContains(t, err, "profile-owned apiKeyHelper")
+	assert.False(t, result.Success)
+	unchanged, err := os.ReadFile(source)
+	require.NoError(t, err)
+	assert.Equal(t, original, unchanged)
+	unchanged, err = os.ReadFile(old.MetaPath())
+	require.NoError(t, err)
+	assert.Equal(t, metadata, unchanged)
+	assert.False(t, old.IsLocked())
 }
 
 func TestAuthImportFailuresPreserveProfiles(t *testing.T) {

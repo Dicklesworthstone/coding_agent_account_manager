@@ -3,6 +3,9 @@ package provider
 
 import (
 	"context"
+	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -17,6 +20,132 @@ const (
 	AuthModeDeviceCode AuthMode = "device-code" // OAuth device code flow (RFC 8628)
 	AuthModeVertexADC  AuthMode = "vertex-adc"  // Vertex AI Application Default Credentials
 )
+
+// EnvironmentChanges describes a profile's environment without mutating the
+// caller's environment or credentials. Unset applies only to inherited values;
+// explicit caller overrides may still supply a different credential.
+type EnvironmentChanges struct {
+	Set   map[string]string `json:"set"`
+	Unset []string          `json:"unset"`
+}
+
+// ProfileEnvironment resolves the selected profile's paths and credential
+// policy. Like Provider.Env, this is read-only; launch preparation is separate.
+func ProfileEnvironment(ctx context.Context, prov Provider, prof *profile.Profile) (EnvironmentChanges, error) {
+	env, err := prov.Env(ctx, prof)
+	if err != nil {
+		return EnvironmentChanges{}, err
+	}
+	return CredentialEnvironment(prov.ID(), AuthMode(prof.AuthMode), env), nil
+}
+
+// CredentialEnvironment removes inherited overrides for the selected
+// provider, leaving other providers' keys available to tools. API-key profiles
+// retain their documented ambient key inputs. Callers selecting a saved vault
+// credential use OAuth mode here even if that file itself contains an API key:
+// the saved file, rather than an ambient key, is the selected account.
+// set may be nil for a global-home launch or contain shallow/isolated paths.
+func CredentialEnvironment(providerID string, mode AuthMode, set map[string]string) EnvironmentChanges {
+	return credentialEnvironmentForOS(providerID, mode, set, runtime.GOOS)
+}
+
+func credentialEnvironmentForOS(providerID string, mode AuthMode, set map[string]string, goos string) EnvironmentChanges {
+	changes := EnvironmentChanges{Set: make(map[string]string, len(set)), Unset: []string{}}
+	for key, value := range set {
+		changes.Set[key] = value
+	}
+	var unset []string
+	apiKey := mode == AuthModeAPIKey
+	switch providerID {
+	case "claude":
+		unset = append(unset, "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+			"CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+			"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+			"ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+			"ANTHROPIC_IDENTITY_TOKEN_FILE")
+		if !apiKey {
+			unset = append(unset, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS")
+		}
+	case "codex":
+		if !apiKey {
+			unset = append(unset, "OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL")
+		}
+	case "gemini":
+		unset = append(unset, "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA")
+		if !apiKey {
+			unset = append(unset, "GEMINI_API_KEY", "GOOGLE_API_KEY")
+		}
+	case "grok":
+		unset = append(unset, "GROK_AUTH", "GROK_AUTH_PATH", "GROK_API_KEY", "GROK_DEPLOYMENT_KEY",
+			"XAI_API_KEY", "XAI_API_TOKEN", "GROK_BASE_URL", "GROK_API_BASE_URL", "XAI_BASE_URL")
+	case "cursor":
+		if !apiKey {
+			unset = append(unset, "CURSOR_API_KEY")
+		}
+	}
+	if goos == "windows" {
+		// Node and native Windows programs can prefer USERPROFILE to HOME.
+		// Override it alongside an isolated HOME and discard legacy aliases.
+		for key, value := range changes.Set {
+			if strings.EqualFold(key, "HOME") && value != "" {
+				changes.Set["USERPROFILE"] = value
+				unset = append(unset, "HOMEDRIVE", "HOMEPATH")
+				break
+			}
+		}
+	}
+	sort.Strings(unset)
+	changes.Unset = append(changes.Unset, unset...)
+	return changes
+}
+
+// MergeEnvironment applies inherited values, the selected profile's removals
+// and settings, then explicit caller overrides. Sorting makes shell/process
+// plans deterministic, and Windows names are compared case-insensitively.
+func MergeEnvironment(inherited []string, changes EnvironmentChanges, explicit map[string]string) []string {
+	return mergeEnvironmentForOS(inherited, changes, explicit, runtime.GOOS)
+}
+
+func mergeEnvironmentForOS(inherited []string, changes EnvironmentChanges, explicit map[string]string, goos string) []string {
+	normalize := func(key string) string {
+		if goos == "windows" {
+			return strings.ToUpper(key)
+		}
+		return key
+	}
+	values := make(map[string]string, len(inherited)+len(changes.Set)+len(explicit))
+	for _, entry := range inherited {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && key != "" {
+			values[normalize(key)] = value
+		}
+	}
+	for _, key := range changes.Unset {
+		delete(values, normalize(key))
+	}
+	apply := func(env map[string]string) {
+		keys := make([]string, 0, len(env))
+		for key := range env {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			values[normalize(key)] = env[key]
+		}
+	}
+	apply(changes.Set)
+	apply(explicit)
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+values[key])
+	}
+	return out
+}
 
 // AuthFileSpec describes where a tool stores authentication credentials.
 type AuthFileSpec struct {

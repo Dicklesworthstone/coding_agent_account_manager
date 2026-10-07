@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +20,65 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
+
+func TestNativeLoginUsesSelectedGeminiSourceWithoutAmbientCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture; Windows environment merging is tested in provider")
+	}
+	for _, mode := range []provider.AuthMode{provider.AuthModeOAuth, provider.AuthModeVertexADC} {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			prof := &profile.Profile{Name: "selected", Provider: "gemini", AuthMode: string(mode), BasePath: filepath.Join(root, "profile")}
+			binDir := filepath.Join(root, "bin")
+			if err := os.MkdirAll(binDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := `#!/bin/sh
+test "$GEMINI_HOME" = "$HOME/.gemini" || exit 11
+test "$GEMINI_CLI_HOME" = "$HOME" || exit 12
+test "$HOME" = "$CAAM_TEST_SELECTED_HOME" || exit 13
+test -z "$GEMINI_API_KEY$GOOGLE_API_KEY" || exit 14
+test "$OPENAI_API_KEY" = unrelated || exit 15
+if [ "$CAAM_TEST_AUTH_MODE" = vertex-adc ]; then
+  test "$GOOGLE_GENAI_USE_VERTEXAI" = true || exit 16
+  test "$GOOGLE_GENAI_USE_GCA" = false || exit 17
+  test "$GOOGLE_APPLICATION_CREDENTIALS" = "$CAAM_TEST_SELECTED_ADC" || exit 18
+  test "$CLOUDSDK_CONFIG/application_default_credentials.json" = "$GOOGLE_APPLICATION_CREDENTIALS" || exit 19
+else
+  test "$GOOGLE_GENAI_USE_VERTEXAI" = false || exit 20
+  test "$GOOGLE_GENAI_USE_GCA" = true || exit 21
+  test -z "$GOOGLE_APPLICATION_CREDENTIALS" || exit 22
+fi
+printf success > "$CAAM_TEST_LOGIN_MARKER"
+`
+			bin := "gemini"
+			if mode == provider.AuthModeVertexADC {
+				bin = "gcloud"
+			}
+			if err := os.WriteFile(filepath.Join(binDir, bin), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("GEMINI_HOME", filepath.Join(root, "ignored-host"))
+			t.Setenv("GEMINI_CLI_HOME", filepath.Join(root, "ignored-native-home"))
+			for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA", "CLOUDSDK_CONFIG"} {
+				t.Setenv(key, "synthetic-ambient")
+			}
+			t.Setenv("OPENAI_API_KEY", "unrelated")
+			t.Setenv("CAAM_TEST_SELECTED_HOME", prof.HomePath())
+			t.Setenv("CAAM_TEST_SELECTED_ADC", filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json"))
+			t.Setenv("CAAM_TEST_AUTH_MODE", string(mode))
+			marker := filepath.Join(root, "login-ran")
+			t.Setenv("CAAM_TEST_LOGIN_MARKER", marker)
+			if err := New().Login(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(marker); err != nil || string(content) != "success" {
+				t.Fatalf("native login did not use selected environment: %q, %v", content, err)
+			}
+		})
+	}
+}
 
 // =============================================================================
 // Provider Factory Tests

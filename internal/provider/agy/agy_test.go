@@ -146,8 +146,11 @@ func TestEnv(t *testing.T) {
 	if env["HOME"] != prof.HomePath() {
 		t.Errorf("HOME = %q, want %q", env["HOME"], prof.HomePath())
 	}
-	if len(env) != 1 {
-		t.Errorf("Env() returned %d vars, want 1", len(env))
+	if env["GEMINI_HOME"] != filepath.Join(prof.HomePath(), ".gemini") {
+		t.Errorf("GEMINI_HOME = %q, want profile Gemini directory", env["GEMINI_HOME"])
+	}
+	if len(env) != 2 {
+		t.Errorf("Env() returned %d vars, want 2", len(env))
 	}
 }
 

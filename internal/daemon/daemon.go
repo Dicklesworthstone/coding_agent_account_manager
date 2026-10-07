@@ -234,7 +234,7 @@ func (d *Daemon) initAuthPool() {
 				return
 			}
 			d.mu.Lock()
-			if err != nil {
+			if err != nil && !refresh.IsDeliveryIncomplete(err) {
 				d.stats.RefreshErrors++
 				d.mu.Unlock()
 				d.logger.Printf("Pool: %s/%s refresh failed: %v", provider, profile, err)
@@ -243,6 +243,9 @@ func (d *Daemon) initAuthPool() {
 				d.mu.Unlock()
 				d.logger.Printf("Pool: %s/%s refreshed, expires %v",
 					provider, profile, newExpiry.Format(time.RFC3339))
+				if err != nil {
+					d.logger.Printf("Pool: %s/%s credential delivery warning: %v", provider, profile, err)
+				}
 			}
 		},
 	}
@@ -731,7 +734,7 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	}
 
 	d.mu.Lock()
-	if err != nil {
+	if err != nil && !refresh.IsDeliveryIncomplete(err) {
 		d.stats.RefreshErrors++
 		d.mu.Unlock()
 
@@ -743,6 +746,9 @@ func (d *Daemon) checkProfile(provider, profile string) {
 			d.logger.Printf("%s/%s: token refreshed successfully (new expiry %s)", provider, profile, updated.TokenExpiresAt.Format(time.RFC3339))
 		} else {
 			d.logger.Printf("%s/%s: token refreshed successfully (new expiry unavailable)", provider, profile)
+		}
+		if err != nil {
+			d.logger.Printf("%s/%s: credential delivery warning: %v", provider, profile, err)
 		}
 	}
 }

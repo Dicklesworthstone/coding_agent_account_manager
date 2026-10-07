@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -75,7 +74,7 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 		if code, rejected := classifyRefreshRejection(resp.StatusCode, body); rejected {
 			return nil, &RefreshRejectedError{Provider: "codex", StatusCode: resp.StatusCode, Code: code}
 		}
-		return nil, fmt.Errorf("codex refresh error %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("codex refresh error %d", resp.StatusCode)
 	}
 
 	var tokenResp TokenResponse
@@ -88,25 +87,38 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 
 // UpdateCodexAuth updates the auth file with the new token.
 func UpdateCodexAuth(path string, resp *TokenResponse) error {
-	// Read existing file
-	data, err := os.ReadFile(path)
+	source, err := readCredentialSnapshot(path)
 	if err != nil {
 		return fmt.Errorf("read auth file: %w", err)
 	}
-
-	var auth map[string]interface{}
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return fmt.Errorf("parse auth file: %w", err)
+	data, err := updatedCodexAuth(source.data, resp)
+	if err != nil {
+		return err
 	}
+	return source.publish(data)
+}
+
+func updatedCodexAuth(data []byte, resp *TokenResponse) ([]byte, error) {
+	if resp == nil || strings.TrimSpace(resp.AccessToken) == "" || resp.ExpiresIn < 0 {
+		return nil, fmt.Errorf("refresh returned an invalid access credential")
+	}
+	var auth map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&auth); err != nil || auth == nil {
+		return nil, fmt.Errorf("auth file must contain a JSON object")
+	}
+	clearCredentialExpiry(auth)
 
 	// Prefer updating nested tokens if present (newer format).
 	if rawTokens, ok := auth["tokens"]; ok {
 		tokens, ok := rawTokens.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("invalid tokens format")
+			return nil, fmt.Errorf("invalid tokens format")
 		}
 
 		tokens["access_token"] = resp.AccessToken
+		clearCredentialExpiry(tokens)
 		if resp.RefreshToken != "" {
 			tokens["refresh_token"] = resp.RefreshToken
 		}
@@ -114,7 +126,7 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 			tokens["expires_at"] = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).Unix()
 		}
 		auth["tokens"] = tokens
-		return writeAuthFile(path, auth)
+		return json.MarshalIndent(auth, "", "  ")
 	}
 
 	// Update root fields (legacy format).
@@ -128,7 +140,7 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 		auth["expires_at"] = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).Unix()
 	}
 
-	return writeAuthFile(path, auth)
+	return json.MarshalIndent(auth, "", "  ")
 }
 
 // CodexVerifyURL is the authenticated endpoint VerifyCodexToken probes. It is

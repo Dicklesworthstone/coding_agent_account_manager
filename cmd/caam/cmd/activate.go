@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -522,9 +521,15 @@ func refreshIfNeeded(ctx context.Context, provider, profile string, quiet bool) 
 		fmt.Printf("Refreshing token (%s)... ", health.FormatTimeRemaining(h.TokenExpiresAt))
 	}
 
-	err := refresh.RefreshProfile(ctx, provider, profile, vault, healthStore)
+	err := refresh.RefreshProfile(ctx, provider, profile, vault, healthStore, refresh.WithProfileStore(profileStore))
 	if err != nil {
-		if errors.Is(err, refresh.ErrUnsupported) {
+		if refresh.IsDeliveryIncomplete(err) {
+			if !quiet {
+				fmt.Printf("done (%v)\n", err)
+			}
+			return true
+		}
+		if refresh.IsSkipped(err) {
 			if !quiet {
 				fmt.Printf("skipped (%v)\n", err)
 			}

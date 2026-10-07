@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,140 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
+
+func TestLoginNativeEnvironmentHonorsSelectedProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture; Windows environment merging is tested in provider")
+	}
+	for _, mode := range []provider.AuthMode{provider.AuthModeOAuth, provider.AuthModeDeviceCode, provider.AuthModeAPIKey} {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			prof := &profile.Profile{Name: "selected", Provider: "codex", AuthMode: string(mode), BasePath: filepath.Join(root, "profile")}
+			binDir := filepath.Join(root, "bin")
+			if err := os.MkdirAll(binDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := `#!/bin/sh
+test "$HOME" = "$CAAM_TEST_SELECTED_HOME" || exit 11
+test "$CODEX_HOME" = "$CAAM_TEST_SELECTED_CODEX_HOME" || exit 12
+test "$ANTHROPIC_API_KEY" = unrelated || exit 13
+if [ "$2" = --with-api-key ]; then
+  test "$(cat)" = synthetic-api-input || exit 14
+else
+  test -z "$OPENAI_API_KEY$CODEX_API_KEY" || exit 15
+fi
+printf success > "$CAAM_TEST_LOGIN_MARKER"
+`
+			if err := os.WriteFile(filepath.Join(binDir, "codex"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("OPENAI_API_KEY", "synthetic-api-input")
+			t.Setenv("CODEX_API_KEY", "synthetic-other-input")
+			t.Setenv("ANTHROPIC_API_KEY", "unrelated")
+			t.Setenv("CODEX_HOME", filepath.Join(root, "ignored-host"))
+			t.Setenv("CAAM_TEST_SELECTED_HOME", prof.HomePath())
+			t.Setenv("CAAM_TEST_SELECTED_CODEX_HOME", prof.CodexHomePath())
+			marker := filepath.Join(root, "login-ran")
+			t.Setenv("CAAM_TEST_LOGIN_MARKER", marker)
+			if err := New().Login(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(marker); err != nil || string(content) != "success" {
+				t.Fatalf("native login did not use selected environment: %q, %v", content, err)
+			}
+		})
+	}
+}
+
+func TestImportedAPIKeyOwnsMergedCodexEnvironment(t *testing.T) {
+	for _, alias := range []string{"OPENAI_API_KEY", "api_key", "apiKey"} {
+		t.Run(alias, func(t *testing.T) {
+			root := t.TempDir()
+			prof := &profile.Profile{Name: "selected", Provider: "codex", AuthMode: "oauth", BasePath: filepath.Join(root, "profile")}
+			source := filepath.Join(root, "selected-auth.json")
+			data, err := json.Marshal(map[string]string{alias: "synthetic-saved-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := New()
+			if _, err := p.ImportAuth(context.Background(), source, prof); err != nil {
+				t.Fatal(err)
+			}
+			changes, err := provider.ProfileEnvironment(context.Background(), p, prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ambient := []string{"OPENAI_API_KEY=synthetic-other-interactive", "CODEX_API_KEY=synthetic-other-exec", "ANTHROPIC_API_KEY=unrelated"}
+			merged := provider.MergeEnvironment(ambient, changes, nil)
+			if !slices.Contains(merged, "OPENAI_API_KEY=synthetic-saved-key") || !slices.Contains(merged, "CODEX_API_KEY=synthetic-saved-key") {
+				t.Fatal("imported key did not take precedence over both native ambient inputs")
+			}
+			if !slices.Contains(merged, "ANTHROPIC_API_KEY=unrelated") {
+				t.Fatal("unrelated provider key was removed")
+			}
+			explicit := provider.MergeEnvironment(ambient, changes, map[string]string{"CODEX_API_KEY": "synthetic-explicit"})
+			if !slices.Contains(explicit, "CODEX_API_KEY=synthetic-explicit") {
+				t.Fatal("explicit caller credential lost its documented priority")
+			}
+			stored, err := os.ReadFile(filepath.Join(prof.CodexHomePath(), "auth.json"))
+			if err != nil || !bytes.Equal(stored, data) {
+				t.Fatal("environment resolution changed the imported credential")
+			}
+		})
+	}
+
+	t.Run("new profile retains ambient enrollment input", func(t *testing.T) {
+		prof := &profile.Profile{Name: "new", Provider: "codex", AuthMode: "api-key", BasePath: t.TempDir()}
+		changes, err := provider.ProfileEnvironment(context.Background(), New(), prof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(provider.MergeEnvironment([]string{"OPENAI_API_KEY=synthetic-enrollment"}, changes, nil), "OPENAI_API_KEY=synthetic-enrollment") {
+			t.Fatal("new profile lost its ambient enrollment key")
+		}
+	})
+
+	t.Run("native OAuth login supersedes API-key metadata", func(t *testing.T) {
+		prof := &profile.Profile{Name: "changed", Provider: "codex", AuthMode: "api-key", BasePath: t.TempDir()}
+		if err := os.MkdirAll(prof.CodexHomePath(), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(prof.CodexHomePath(), "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"synthetic-oauth","refresh_token":"synthetic-renewal"}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		changes, err := provider.ProfileEnvironment(context.Background(), New(), prof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ambient := []string{"OPENAI_API_KEY=synthetic-other", "CODEX_API_KEY=synthetic-other", "OPENAI_BASE_URL=https://other.invalid"}
+		merged := provider.MergeEnvironment(ambient, changes, nil)
+		for _, key := range []string{"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"} {
+			if !slices.Contains(merged, key+"=") {
+				t.Fatalf("saved OAuth grant retained inherited override %s", key)
+			}
+		}
+		if !slices.Contains(provider.MergeEnvironment(ambient, changes, map[string]string{"CODEX_API_KEY": "synthetic-explicit"}), "CODEX_API_KEY=synthetic-explicit") {
+			t.Fatal("explicit caller credential lost priority over native OAuth selection")
+		}
+	})
+
+	t.Run("invalid saved credential does not fall back to ambient account", func(t *testing.T) {
+		prof := &profile.Profile{Name: "invalid", Provider: "codex", AuthMode: "api-key", BasePath: t.TempDir()}
+		if err := os.MkdirAll(prof.CodexHomePath(), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(prof.CodexHomePath(), "auth.json"), []byte(`{"OPENAI_API_KEY":42}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := provider.ProfileEnvironment(context.Background(), New(), prof); err == nil {
+			t.Fatal("malformed selected key was ignored")
+		}
+	})
+}
 
 // =============================================================================
 // Provider Factory Tests

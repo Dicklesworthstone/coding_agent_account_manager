@@ -87,15 +87,21 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 // Env returns the environment variables for running OpenCode in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
 	env := map[string]string{
-		"HOME": prof.HomePath(),
+		"HOME":            prof.HomePath(),
+		"XDG_DATA_HOME":   filepath.Join(prof.HomePath(), ".local", "share"),
+		"XDG_CONFIG_HOME": filepath.Join(prof.HomePath(), ".config"),
 	}
 	return env, nil
 }
 
 // Login initiates the authentication flow.
 func (p *Provider) Login(ctx context.Context, prof *profile.Profile) error {
+	env, err := provider.ProfileEnvironment(ctx, p, prof)
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, "opencode")
-	cmd.Env = append(os.Environ(), "HOME="+prof.HomePath())
+	cmd.Env = provider.MergeEnvironment(os.Environ(), env, nil)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

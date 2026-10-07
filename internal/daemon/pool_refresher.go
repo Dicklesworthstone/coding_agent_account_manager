@@ -34,21 +34,21 @@ func (r *PoolRefresher) Preflight(provider, profile string) error {
 // Refresh implements authpool.Refresher.
 // It refreshes the token for the given provider/profile and returns the new expiry time.
 func (r *PoolRefresher) Refresh(ctx context.Context, provider, profile string) (time.Time, error) {
-	err := refresh.RefreshProfile(ctx, provider, profile, r.vault, r.healthStore)
-	if err != nil {
-		return time.Time{}, err
+	refreshErr := refresh.RefreshProfile(ctx, provider, profile, r.vault, r.healthStore)
+	if refreshErr != nil && !refresh.IsDeliveryIncomplete(refreshErr) {
+		return time.Time{}, refreshErr
 	}
 
-	// Get the new expiry time after refresh
+	// Expiry is scheduling metadata, not the outcome of the completed token
+	// exchange. An opaque response may omit its lifetime, or a native writer
+	// may replace the source before this read. Preserve renewal success (and
+	// any delivery warning) rather than charging a pool error for that read.
 	expiry, err := r.getTokenExpiry(provider, profile)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("read expiry after refresh: %w", err)
-	}
-	if expiry.IsZero() {
-		return time.Time{}, fmt.Errorf("refreshed credential has no known expiry")
+		return time.Time{}, refreshErr
 	}
 
-	return expiry, nil
+	return expiry, refreshErr
 }
 
 // getTokenExpiry reads the token expiry for a profile.

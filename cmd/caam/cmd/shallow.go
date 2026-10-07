@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	providerapi "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/spf13/cobra"
 )
@@ -1029,29 +1030,12 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("lookup %q: %w", rest[0], err)
 	}
 
-	// Build environment: inherit, then apply the provider's overrides and scrub
-	// any inherited variables that could leak the real identity back in.
-	envMap := make(map[string]string, len(os.Environ())+len(set))
-	for _, e := range os.Environ() {
-		idx := strings.IndexByte(e, '=')
-		if idx <= 0 {
-			continue
-		}
-		envMap[e[:idx]] = e[idx+1:]
-	}
-	// Scrub BEFORE applying the overrides: the scrub list now covers every
-	// provider-home variable (issue #106), including the one this provider
-	// re-pins inside the shallow HOME, so the pin must be applied last.
-	for _, k := range scrub {
-		delete(envMap, k)
-	}
-	for k, v := range set {
-		envMap[k] = v
-	}
-	envSlice := make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		envSlice = append(envSlice, k+"="+v)
-	}
+	// A shallow profile selects credentials from its own files. Inherited
+	// keys and tokens must not silently substitute the parent shell's account.
+	// Preserve the shallow-specific home/vault scrub before pinning its paths.
+	changes := providerapi.CredentialEnvironment(shallow.NormalizeProvider(provider), providerapi.AuthModeOAuth, set)
+	changes.Unset = append(changes.Unset, scrub...)
+	envSlice := providerapi.MergeEnvironment(os.Environ(), changes, nil)
 
 	// On Unix, exec the target so signals/exit propagate naturally and we
 	// don't add a stray caam process to the tree.
