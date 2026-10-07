@@ -795,7 +795,7 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 				"action", "cooldown_skip")
 			return
 		}
-		c.sendMethodSelect(ctx, tracker)
+		c.sendMethodSelect(ctx, tracker, output)
 
 	case StateAwaitingURL:
 		// Skip method select, URL shown directly
@@ -828,11 +828,19 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 const maxSelectSends = 3
 
 // sendMethodSelect chooses option 1 (Claude account with subscription) in
-// the login-method menu.
-func (c *Coordinator) sendMethodSelect(ctx context.Context, tracker *PaneTracker) {
+// the login-method menu. Claude Code's menus act on a digit at once, so "1"
+// goes alone: an Enter after it would land on the next screen, the OAuth code
+// prompt. If the menu is still showing on a later attempt with option 1
+// highlighted, Enter confirms it (for a menu where digits only move the
+// highlight).
+func (c *Coordinator) sendMethodSelect(ctx context.Context, tracker *PaneTracker, output string) {
 	time.Sleep(200 * time.Millisecond)
 	sends := tracker.CountSelectSend()
-	if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
+	key := "1"
+	if sends > 1 && atBottom(output, Patterns.OptionOne) {
+		key = "\n"
+	}
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, key, true); err != nil {
 		c.logger.Error("injection failed",
 			"pane_id", tracker.PaneID,
 			"state", StateAwaitingMethodSelect.String(),
@@ -860,7 +868,7 @@ func (c *Coordinator) handleAwaitingMethodSelectState(ctx context.Context, track
 	// times, instead of waiting out the state timeout and stalling.
 	if detected == StateAwaitingMethodSelect && !tracker.IsOnCooldown("method_select") &&
 		tracker.GetSelectSends() < maxSelectSends {
-		c.sendMethodSelect(ctx, tracker)
+		c.sendMethodSelect(ctx, tracker, output)
 		return
 	}
 

@@ -199,10 +199,10 @@ func TestRunWeztermLoginAllSendSummary(t *testing.T) {
 	}
 
 	// Pane 1's usage-limit menu is closed with Esc (its Enter would buy extra
-	// usage), the prompt line emptied, and /login and the menu choice are
-	// separate submissions (one Enter each); pane 2 fails on its first send.
+	// usage), the prompt line emptied, /login submitted, and the menu choice
+	// sent on its own as the digit alone; pane 2 fails on its first send.
 	want := []string{
-		coordinator.KeyEscape, coordinator.KeyEndOfLine, coordinator.KeyKillLine, "/login\n", "1\n",
+		coordinator.KeyEscape, coordinator.KeyEndOfLine, coordinator.KeyKillLine, "/login\n", "1",
 		coordinator.KeyEndOfLine,
 	}
 	if strings.Join(sentPayloads, "|") != strings.Join(want, "|") {

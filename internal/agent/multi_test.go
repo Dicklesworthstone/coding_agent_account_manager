@@ -1093,16 +1093,19 @@ func TestHungCoordinatorDoesNotStarveOthers(t *testing.T) {
 	}
 }
 
-// fakeClaudeScript plays Claude Code's login flow on a real terminal: it
-// reads typed input line by line (so each submission must arrive as an
-// Enter) and records what it was given in $1.
+// fakeClaudeScript plays Claude Code's login flow on a real terminal and
+// records what it was given in $1. Typed input is read line by line (so each
+// submission must arrive as an Enter), except the login-method choice: like
+// Claude Code's menu, it acts on a single keypress, and an Enter sent with it
+// would be taken as an empty code.
 const fakeClaudeScript = `out=$1
 echo "You've hit your limit · resets 2pm (America/New_York)"
 read -r cmd; printf '%s' "$cmd" > "$out/cmd"
 echo "Select login method:"
-echo " 1. Claude account with subscription"
-echo " 2. Anthropic Console account"
-read -r choice; printf '%s' "$choice" > "$out/choice"
+echo "❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise"
+echo "  2. Anthropic Console account · API usage billing"
+stty -icanon min 1; choice=$(dd bs=1 count=1 2>/dev/null); stty icanon
+printf '%s' "$choice" > "$out/choice"
 echo "Browse to https://claude.ai/oauth/authorize?code=true&client_id=c&state=e2e-state"
 printf 'Paste code here if prompted > '
 read -r code; printf '%s' "$code" > "$out/code"

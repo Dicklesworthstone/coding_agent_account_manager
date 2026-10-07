@@ -238,11 +238,13 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 			keys = coordinator.LoginKeys(cleanWeztermText(target.Text))
 		}
 		err := sendWeztermKeys(target.Pane.ID, keys)
-		// The "1" choosing the subscription login is a separate submission:
-		// the login menu has to be on screen before it arrives.
+		// The "1" choosing the subscription login is sent separately: the
+		// login menu has to be on screen before it arrives. It goes without
+		// Enter, which Claude Code's menu does not need and which would reach
+		// the OAuth code prompt that replaces it.
 		if err == nil && subscription {
 			time.Sleep(loginMenuSettle)
-			err = weztermSendTextFunc(target.Pane.ID, "1\n")
+			err = weztermSendTextFunc(target.Pane.ID, "1")
 		}
 		if err != nil {
 			failCount++
@@ -996,7 +998,8 @@ func runAutoRecover(cmd *cobra.Command, states []*RecoverPaneState, yes bool, re
 			}
 		case RecoverAwaitingSelect:
 			time.Sleep(200 * time.Millisecond)
-			err = weztermSendTextFunc(s.Pane.ID, "1\n")
+			// The digit alone: Claude Code's menu acts on it at once.
+			err = weztermSendTextFunc(s.Pane.ID, "1")
 			if err == nil && logger != nil {
 				logger.Debug("injected subscription select", "pane_id", s.Pane.ID)
 			}
@@ -1072,7 +1075,7 @@ func runInteractiveRecover(cmd *cobra.Command, states []*RecoverPaneState, resum
 		case 's', 'S':
 			fmt.Fprintln(cmd.OutOrStdout(), "\nSelecting subscription on awaiting panes...")
 			time.Sleep(200 * time.Millisecond)
-			injectToState(cmd, states, RecoverAwaitingSelect, "1\n", logger)
+			injectToState(cmd, states, RecoverAwaitingSelect, "1", logger)
 
 		case 'p', 'P':
 			fmt.Fprintln(cmd.OutOrStdout(), "\nInjecting resume prompt to resuming panes...")

@@ -1650,6 +1650,31 @@ func TestResumeDismissesPostLoginScreenBeforePrompting(t *testing.T) {
 	}
 }
 
+// TestMethodSelectionIsTheDigitAlone: Claude Code's menus act on a digit at
+// once, so an Enter sent with it would reach the OAuth code prompt that
+// replaces the menu. Without option 1 highlighted, a lost "1" is resent as
+// "1", never as an Enter that would pick another option.
+func TestMethodSelectionIsTheDigitAlone(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}}
+	cfg := DefaultConfig()
+	cfg.MethodSelectCooldown = time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateRateLimited)
+	coord.trackers[1] = tracker
+	ctx := context.Background()
+
+	client.output = "Select login method:\n  1. Claude account with subscription\n❯ 2. Anthropic Console account"
+	for range 4 {
+		coord.pollPanes(ctx)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got, want := client.sentText(), []string{"1", "1", "1"}; !slices.Equal(got, want) {
+		t.Fatalf("selections sent = %q, want %q", got, want)
+	}
+}
+
 func TestLostMethodSelectionIsResentWithinBound(t *testing.T) {
 	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}}
 	cfg := DefaultConfig()
@@ -1661,20 +1686,15 @@ func TestLostMethodSelectionIsResentWithinBound(t *testing.T) {
 	coord.trackers[1] = tracker
 	ctx := context.Background()
 
-	// The menu never advances: every "1" is lost.
+	// The menu never advances: the "1" is lost, and so are the Enters that
+	// confirm the highlighted option 1 on later attempts.
 	client.output = "Select login method:\n❯ 1. Claude account with subscription\n  2. Anthropic Console account"
 	for range 6 {
 		coord.pollPanes(ctx)
 		time.Sleep(5 * time.Millisecond)
 	}
-	selects := 0
-	for _, s := range client.sentText() {
-		if s == "1\n" {
-			selects++
-		}
-	}
-	if selects != maxSelectSends {
-		t.Fatalf("selections sent = %d, want %d (resent while the menu stays, then bounded)", selects, maxSelectSends)
+	if got, want := client.sentText(), []string{"1", "\n", "\n"}; !slices.Equal(got, want) {
+		t.Fatalf("selections sent = %q, want %q (resent while the menu stays, then bounded)", got, want)
 	}
 
 	// Once the URL shows, the flow moves on.

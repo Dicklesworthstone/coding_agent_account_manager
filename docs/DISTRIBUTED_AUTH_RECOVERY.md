@@ -82,9 +82,11 @@ User has 7+ Claude Max accounts and runs multiple Claude Code sessions on a remo
    ↓
 2. auth-coordinator detects "You've hit your limit" in pane output
    ↓
-3. auth-coordinator injects "/login\n" into pane
+3. auth-coordinator types /login into the pane (closing the usage-limit menu
+   first; see Pattern Detection)
    ↓
-4. auth-coordinator detects "Select login method:" → injects "1\n"
+4. auth-coordinator detects "Select login method:" → presses "1" (the menu acts
+   on the digit; no Enter)
    ↓
 5. auth-coordinator extracts OAuth URL from pane output
    ↓
@@ -295,12 +297,12 @@ any host failed or was rolled back.
                     ┌──────────────────┐
                     │  RATE_LIMITED    │
                     └────────┬─────────┘
-                             │ inject "/login\n"
+                             │ type /login
                              ↓
                     ┌──────────────────┐
                     │ AWAITING_METHOD  │
                     └────────┬─────────┘
-                             │ detect "Select login method:" → inject "1\n"
+                             │ detect "Select login method:" → press "1"
                              ↓
                     ┌──────────────────┐
                     │  AWAITING_URL    │
@@ -341,7 +343,7 @@ scrollback the most recent one decides the state.
 | Pattern | Matches (case-insensitive) | Leads to |
 |---------|----------------------------|----------|
 | `RateLimit` | `You've hit your limit · resets …`, `Claude usage limit reached … reset at …`, `5-hour/Weekly/Opus limit reached ∙ resets …`, with the reset on the same line | inject `/login` |
-| `SelectMethod` | `Select login method:` | select option 1 |
+| `SelectMethod` | `Select login method:` | press `1` alone (the menu acts on the digit; an Enter would reach the code prompt that follows); if the menu stays with option 1 highlighted (`OptionOne`), press Enter |
 | `OAuthURL` | `https://claude.ai/oauth/authorize?…` (the newest one) | publish auth request |
 | `PastePrompt` | `Paste code here if prompted` | wait for the code |
 | `LoginSuccess` | `Logged in as`, `Login successful`, `Successfully authenticated/logged in`, `Welcome back` | resume |

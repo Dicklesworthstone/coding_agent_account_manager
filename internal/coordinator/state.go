@@ -358,7 +358,7 @@ var Patterns = struct {
 	// Login failure patterns
 	LoginFailed: regexp.MustCompile(`(?i)(login failed|authentication error|invalid code|expired|error signing)`),
 
-	// "1. Claude account with subscription"
+	// "❯ 1. Claude account with subscription": option 1 highlighted
 	OptionOne: regexp.MustCompile(`[❯>]\s*1\.\s*Claude account`),
 
 	// Extract reset time from rate limit message
