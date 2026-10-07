@@ -61,6 +61,59 @@ func NewBackupScheduler(cfg *config.BackupConfig, vaultPath string, logger inter
 	}
 }
 
+// BackupStatus summarizes scheduled backups for display outside the daemon.
+type BackupStatus struct {
+	Enabled         bool          `json:"enabled"`
+	Interval        time.Duration `json:"-"`
+	IntervalText    string        `json:"interval"`
+	IntervalSeconds int64         `json:"interval_seconds"`
+	KeepLast        int           `json:"keep_last"`
+	Location        string        `json:"location"`
+	LastBackup      time.Time     `json:"last_backup,omitzero"`
+	LastBackupPath  string        `json:"last_backup_path,omitempty"`
+	BackupCount     int64         `json:"backup_count"`
+	NextBackup      time.Time     `json:"next_backup,omitzero"`
+	LastError       string        `json:"last_error,omitempty"`
+	LastErrorTime   time.Time     `json:"last_error_time,omitzero"`
+}
+
+// formatBackupInterval renders whole days or hours compactly ("7d", "12h").
+func formatBackupInterval(d time.Duration) string {
+	switch {
+	case d >= 24*time.Hour && d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", d/(24*time.Hour))
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	default:
+		return d.String()
+	}
+}
+
+// ReadBackupStatus reports the backup schedule from cfg and the state the
+// daemon persisted, without needing a running daemon.
+func ReadBackupStatus(cfg config.BackupConfig) (BackupStatus, error) {
+	s := NewBackupScheduler(&cfg, "", nil)
+	err := s.LoadState()
+	state := s.GetState()
+	status := BackupStatus{
+		Enabled:         cfg.IsEnabled(),
+		Interval:        cfg.GetInterval(),
+		IntervalText:    formatBackupInterval(cfg.GetInterval()),
+		IntervalSeconds: int64(cfg.GetInterval() / time.Second),
+		KeepLast:        cfg.GetKeepLast(),
+		Location:        cfg.GetLocation(),
+		LastBackup:      state.LastBackup,
+		LastBackupPath:  state.LastBackupPath,
+		BackupCount:     state.BackupCount,
+		LastError:       state.LastError,
+		LastErrorTime:   state.LastErrorTime,
+	}
+	if status.Enabled {
+		status.NextBackup = s.NextBackupTime()
+	}
+	return status, err
+}
+
 // LoadState loads the backup state from disk.
 func (s *BackupScheduler) LoadState() error {
 	statePath := s.statePath()

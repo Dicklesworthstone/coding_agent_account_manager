@@ -469,3 +469,55 @@ func TestBackupScheduler_RotateBackups_NoDir(t *testing.T) {
 		t.Errorf("RotateBackups() error = %v, want nil", err)
 	}
 }
+
+func TestReadBackupStatus(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("CAAM_HOME", tmpDir)
+
+	cfg := config.BackupConfig{Enabled: true, Interval: config.Duration(24 * time.Hour), KeepLast: 3, Location: filepath.Join(tmpDir, "backups")}
+
+	// No state yet: enabled, never run, due immediately.
+	st, err := ReadBackupStatus(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Enabled || st.IntervalText != "1d" || st.IntervalSeconds != 86400 || st.KeepLast != 3 || !st.LastBackup.IsZero() || st.NextBackup.IsZero() {
+		t.Fatalf("fresh status = %+v", st)
+	}
+
+	last := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	s := NewBackupScheduler(&cfg, filepath.Join(tmpDir, "vault"), newTestLogger())
+	s.state = BackupState{LastBackup: last, LastBackupPath: "/b/1.tar.gz", BackupCount: 4, LastError: "disk full", LastErrorTime: last}
+	if err := s.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = ReadBackupStatus(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LastBackup.Equal(last) || st.BackupCount != 4 || st.LastError != "disk full" || !st.NextBackup.Equal(last.Add(24*time.Hour)) {
+		t.Fatalf("status = %+v", st)
+	}
+
+	cfg.Enabled = false
+	st, err = ReadBackupStatus(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Enabled || !st.NextBackup.IsZero() || st.BackupCount != 4 {
+		t.Fatalf("disabled status = %+v", st)
+	}
+}
+
+func TestFormatBackupInterval(t *testing.T) {
+	for d, want := range map[time.Duration]string{
+		7 * 24 * time.Hour: "7d",
+		12 * time.Hour:     "12h",
+		90 * time.Minute:   "1h30m0s",
+	} {
+		if got := formatBackupInterval(d); got != want {
+			t.Errorf("formatBackupInterval(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
