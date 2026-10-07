@@ -486,7 +486,11 @@ func readSwitchStateLimited(fileSet AuthFileSet, profileDir string, maxFileBytes
 		if !info.Mode().IsRegular() {
 			return state, fmt.Errorf("auth source is not a regular file: %s", path)
 		}
-		data, err := readSwitchSource(path, info, maxFileBytes)
+		limit := maxFileBytes
+		if limit > 0 && isClaudeSettingsDocument(fileSet.Tool, spec.Path) {
+			limit = MaxSettingsDocumentBytes
+		}
+		data, err := readSwitchSource(path, info, limit)
 		if err != nil {
 			return state, fmt.Errorf("read auth file: %w", err)
 		}
@@ -515,7 +519,7 @@ func readSwitchSource(path string, info os.FileInfo, maxBytes int64) ([]byte, er
 		return os.ReadFile(path)
 	}
 	if info.Size() > maxBytes {
-		return nil, fmt.Errorf("%w: auth file exceeds discovery size limit", ErrInvalidCredentials)
+		return nil, fmt.Errorf("%w: %s exceeds the %d MiB read limit", ErrInvalidCredentials, path, maxBytes>>20)
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -527,7 +531,7 @@ func readSwitchSource(path string, info os.FileInfo, maxBytes int64) ([]byte, er
 		return nil, err
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%w: auth file exceeds discovery size limit", ErrInvalidCredentials)
+		return nil, fmt.Errorf("%w: %s exceeds the %d MiB read limit", ErrInvalidCredentials, path, maxBytes>>20)
 	}
 	return data, nil
 }

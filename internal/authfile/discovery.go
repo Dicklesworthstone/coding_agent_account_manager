@@ -21,6 +21,12 @@ import (
 // Watchers use the same limit while fingerprinting file changes.
 const MaxDiscoveryFileBytes int64 = 16 << 20
 
+// MaxSettingsDocumentBytes bounds reads of Claude's settings and state
+// documents (~/.claude.json, settings.json). ~/.claude.json keeps per-project
+// state and grows with use; the credential limit above refused large but valid
+// ones in backup, add and run (#120). Credential artifacts keep the 16 MiB cap.
+const MaxSettingsDocumentBytes int64 = 256 << 20
+
 // ValidateCredentialData checks the credential material in one native auth
 // artifact without reading or modifying its source. Callers that import a
 // complete bundle must also validate the provider's selected runtime layout.

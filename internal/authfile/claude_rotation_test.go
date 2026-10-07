@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -575,6 +576,37 @@ func TestClaudeSwitchThroughSymlinkedClaudeDir(t *testing.T) {
 	}
 	if got := readFixtureFile(t, f.liveCreds); got != aliceGen2 {
 		t.Fatalf("alice restored with stale tokens through the symlink:\n got %s\nwant %s", got, aliceGen2)
+	}
+}
+
+// ~/.claude.json keeps per-project state and grows with use; one larger than
+// the credential read limit must still back up (v0.1.22 had no limit), while
+// an oversized credential file stays refused (#120).
+func TestClaudeBackupAcceptsLargeStateDocument(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	var root map[string]interface{}
+	if err := json.Unmarshal([]byte(aliceSettings(1)), &root); err != nil {
+		t.Fatal(err)
+	}
+	root["projects"] = map[string]interface{}{"/work": map[string]string{"history": strings.Repeat("x", int(MaxDiscoveryFileBytes)+1024)}}
+	big, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.writeLive(aliceGen1, string(big))
+	if err := f.vault.Backup(f.fileSet, "alice"); err != nil {
+		t.Fatalf("Backup with a %d MiB ~/.claude.json: %v", len(big)>>20, err)
+	}
+	if got := readFixtureFile(t, f.profileFile("alice", ".claude.json")); got != string(big) {
+		t.Fatalf("saved ~/.claude.json is %d bytes, want %d", len(got), len(big))
+	}
+
+	if err := os.Truncate(f.liveCreds, MaxDiscoveryFileBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	err = f.vault.Backup(f.fileSet, "oversized")
+	if err == nil || !strings.Contains(err.Error(), f.liveCreds) {
+		t.Fatalf("oversized credential: err = %v, want a refusal naming %s", err, f.liveCreds)
 	}
 }
 
