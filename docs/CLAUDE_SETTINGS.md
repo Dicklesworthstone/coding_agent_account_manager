@@ -25,6 +25,18 @@ that the operator deliberately removed shared settings. A profile with no
 settings snapshot cannot inherit the previous account's authentication fields.
 Malformed settings fail activation rather than being copied over the live file.
 
+Updating an existing Claude backup also records authentication sources that are
+now absent. It removes obsolete `.credentials.json`, `auth.json` and Desktop
+cache snapshots from that profile instead of accumulating old fallbacks. A live
+Desktop file containing preferences but no token cache is likewise auth-absent;
+those preferences are never copied into the vault. Present raw credentials keep
+their verbatim backup path. Keychain-only OAuth is mirrored before absence is
+classified, and malformed sources fail before any existing vault files change.
+Other profiles and immutable system backups are not rewritten. Backup still
+requires a complete current auth source; policy-only files cannot erase a saved
+login by pretending to be a new one. These checks do not make backup crash-atomic
+or lock native writers; do not run backup while a login is being rewritten.
+
 The same vault restore implementation is used by `activate`, automatic rotation,
 robot/API callers, the TUI, wrap and workspace switches. Shared workflow fields
 in `.claude.json`, including user/project MCP configuration and trust decisions,

@@ -42,27 +42,64 @@ func readClaudeSettingsSnapshot(path string, policy claudesettings.Policy) (clau
 	return claudeSettingsSnapshot{data: data, hasAuth: hasAuth}, nil
 }
 
-// readClaudeSettingsForBackup validates settings before any snapshot files are
-// changed. Full settings remain in backups for first-use/recovery, but an
-// absent live file must remove a previous snapshot, not revive deleted auth.
+// readClaudeSettingsForBackup classifies every Claude source, including absence,
+// before Backup changes the vault. Otherwise updating an OAuth profile after
+// switching it to helper/env auth would retain its obsolete OAuth snapshots.
+// Mixed settings are validated before touching the keychain mirror. The mirror
+// is pulled before raw credentials are captured, so keychain-only logins are
+// never mistaken for an absent source and removed from an existing backup.
 func readClaudeSettingsForBackup(fileSet AuthFileSet) (map[string]claudeSettingsSnapshot, error) {
-	var result map[string]claudeSettingsSnapshot
+	if fileSet.Tool != "claude" {
+		return nil, nil
+	}
+	policy, err := claudeSettingsPolicy()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]claudeSettingsSnapshot)
 	for _, spec := range fileSet.Files {
 		if !isClaudeSettingsDocument(fileSet.Tool, spec.Path) {
 			continue
-		}
-		policy, err := claudeSettingsPolicy()
-		if err != nil {
-			return nil, err
 		}
 		snapshot, err := readClaudeSettingsSnapshot(spec.Path, policy)
 		if err != nil {
 			return nil, err
 		}
-		if result == nil {
-			result = make(map[string]claudeSettingsSnapshot)
-		}
 		result[spec.Path] = snapshot
+	}
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return nil, err
+	}
+	for _, spec := range fileSet.Files {
+		filename := filepath.Base(spec.Path)
+		var fields []string
+		switch {
+		case filename == claudeCredentialsFile || filename == "auth.json":
+			// Validate the complete raw credential, not just its access token.
+		case isClaudeDesktopConfig(fileSet.Tool, spec.Path):
+			fields = claudeDesktopTokenKeys
+		default:
+			continue
+		}
+		data, err := readClaudeBackupSource(spec.Path, fields)
+		if err != nil {
+			return nil, fmt.Errorf("capture Claude backup source %s: %w", spec.Path, err)
+		}
+		hasAuth, err := claudeCredentialMaterial(data, filename)
+		if err != nil {
+			return nil, fmt.Errorf("validate Claude backup source %s: %w", spec.Path, err)
+		}
+		if data != nil && !hasAuth {
+			return nil, fmt.Errorf("%w: %s contains no access credential", ErrNoCredentials, spec.Path)
+		}
+		if fields == nil && data != nil {
+			// Existing raw sources retain Backup's verbatim copy path, including
+			// refreshed keychain bytes. Only their absence needs a new plan.
+			continue
+		}
+		// A nil snapshot deliberately removes the previous vault file through
+		// Backup's existing snapshot branch, rather than skipping that file.
+		result[spec.Path] = claudeSettingsSnapshot{data: data, hasAuth: hasAuth}
 	}
 	return result, nil
 }
