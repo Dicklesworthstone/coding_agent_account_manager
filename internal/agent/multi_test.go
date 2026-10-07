@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -952,7 +953,7 @@ func TestCoordinatorEndpointProbe(t *testing.T) {
 
 	good := &CoordinatorEndpoint{Name: "c", URL: "http://" + listener.Addr().String(), Token: "tok"}
 	probe := good.Probe(context.Background())
-	if !probe.Healthy || probe.Backend != "scripted" || probe.Error != "" {
+	if !probe.Healthy || probe.Backend != "scripted" || probe.Error != "" || probe.Version != version.Short() {
 		t.Fatalf("probe = %+v", probe)
 	}
 

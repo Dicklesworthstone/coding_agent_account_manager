@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 // APIServer exposes the coordinator's HTTP API.
@@ -151,6 +153,7 @@ type HealthResponse struct {
 	Status    string    `json:"status"`
 	Timestamp time.Time `json:"timestamp"`
 	Backend   string    `json:"backend"`
+	Version   string    `json:"version,omitempty"`
 	Uptime    string    `json:"uptime,omitempty"`
 }
 
@@ -159,6 +162,7 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Status:    "ok",
 		Timestamp: time.Now(),
 		Backend:   a.coordinator.Backend(),
+		Version:   version.Short(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -168,6 +172,7 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 // StatusResponse is the response from /status endpoint.
 type StatusResponse struct {
 	Running        bool                 `json:"running"`
+	Version        string               `json:"version,omitempty"`
 	Backend        string               `json:"backend"`
 	PaneCount      int                  `json:"pane_count"`
 	PendingAuths   int                  `json:"pending_auths"`
@@ -207,6 +212,7 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatusResponse{
 		Running:        true,
+		Version:        version.Short(),
 		Backend:        a.coordinator.Backend(),
 		PaneCount:      len(trackers),
 		PendingAuths:   len(pending),

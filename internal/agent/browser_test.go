@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -797,7 +798,7 @@ func (f *oauthFixture) claudeSession(w http.ResponseWriter, r *http.Request) str
 		return ""
 	}
 	f.sessionUsed = true
-	http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: f.claudeSessionAs, Path: "/", Secure: true})
+	http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: f.claudeSessionAs, Path: "/", Secure: true, MaxAge: 30 * 24 * 3600})
 	return f.claudeSessionAs
 }
 
@@ -837,7 +838,7 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.chosen = append(f.chosen, account)
 		f.mu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: account, Path: "/", Secure: true})
+		http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: account, Path: "/", Secure: true, MaxAge: 30 * 24 * 3600})
 		http.Redirect(w, r, "/oauth/authorize?state="+state, http.StatusFound)
 	case "accounts.google.com/v3/signin/identifier":
 		fmt.Fprint(w, `<html><body><h1>Sign in</h1><input type="email" aria-label="Email or phone"><button type="button">Next</button></body></html>`)
@@ -1027,5 +1028,78 @@ func TestShownAccounts(t *testing.T) {
 	text := "Signed in as Bob.Smith@Example.com\nNeed help? support@anthropic.com or privacy@claude.ai\nbob.smith@example.com"
 	if got := shownAccounts(text); len(got) != 1 || got[0] != "bob.smith@example.com" {
 		t.Fatalf("shownAccounts = %q, want the one account, without Anthropic addresses", got)
+	}
+}
+
+func writeCookieDB(t *testing.T, dir string, rows [][2]string) {
+	t.Helper()
+	path := filepath.Join(dir, "Default", "Network", "Cookies")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT NOT NULL, encrypted_value BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(`INSERT INTO cookies (host_key, name, encrypted_value) VALUES (?, ?, x'00')`, r[0], r[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestProfileSessions(t *testing.T) {
+	if g, c, err := ProfileSessions(t.TempDir()); err != nil || g || c {
+		t.Fatalf("unused profile = %v %v %v, want no sessions", g, c, err)
+	}
+
+	signedOut := t.TempDir()
+	writeCookieDB(t, signedOut, [][2]string{{".google.com", "NID"}, {"accounts.google.com", "__Host-GAPS"}, {"claude.ai", "anthropic-device-id"}})
+	if g, c, err := ProfileSessions(signedOut); err != nil || g || c {
+		t.Fatalf("consent/device cookies only = %v %v %v, want no sessions", g, c, err)
+	}
+
+	signedIn := t.TempDir()
+	writeCookieDB(t, signedIn, [][2]string{{".google.com", "__Secure-1PSID"}, {".claude.ai", "sessionKey"}})
+	if g, c, err := ProfileSessions(signedIn); err != nil || !g || !c {
+		t.Fatalf("signed-in profile = %v %v %v, want both sessions", g, c, err)
+	}
+}
+
+func TestProfileSessionsReadsRealChromeProfile(t *testing.T) {
+	fixture := &oauthFixture{claudeSessionAs: "b@example.com"}
+	b := fixtureBrowser(t, fixture)
+	if _, _, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-p", "b@example.com"); err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
+	}
+	// Chrome closed gracefully, so the claude.ai session cookie the fixture
+	// set during the flow is in its cookie store on disk.
+	_, claude, err := ProfileSessions(b.UserDataDir())
+	if err != nil || !claude {
+		t.Errorf("ProfileSessions after a Claude sign-in = claude:%v err:%v", claude, err)
+		filepath.Walk(b.UserDataDir(), func(path string, info os.FileInfo, err error) error {
+			if err == nil && strings.Contains(filepath.Base(path), "Cookies") {
+				t.Logf("cookie store %s (%d bytes)", path, info.Size())
+				if db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1"); err == nil {
+					if rows, err := db.Query(`SELECT host_key, name FROM cookies`); err == nil {
+						for rows.Next() {
+							var host, name string
+							rows.Scan(&host, &name)
+							t.Logf("  cookie %s %s", host, name)
+						}
+						rows.Close()
+					} else {
+						t.Logf("  query: %v", err)
+					}
+					db.Close()
+				}
+			}
+			return nil
+		})
 	}
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
+	_ "modernc.org/sqlite" // database/sql driver for reading Chrome's cookie store
 )
 
 // BrowserConfig configures the browser automation.
@@ -45,12 +47,51 @@ func DefaultChromeUserDataDir() string {
 	return filepath.Join(config.DefaultDataPath(), "auth-agent-chrome")
 }
 
+// ProfileSessions reports whether a Chrome profile directory holds a signed-in
+// Google session and a Claude session (what 'caam auth-agent signin'
+// establishes). It reads only cookie host names and names from Chrome's
+// cookie database, opened read-only so a running Chrome is not disturbed;
+// cookie values stay encrypted and are never read.
+func ProfileSessions(userDataDir string) (google, claude bool, err error) {
+	var dbPath string
+	for _, rel := range []string{filepath.Join("Default", "Network", "Cookies"), filepath.Join("Default", "Cookies")} {
+		if info, statErr := os.Stat(filepath.Join(userDataDir, rel)); statErr == nil && info.Mode().IsRegular() {
+			dbPath = filepath.Join(userDataDir, rel)
+			break
+		}
+	}
+	if dbPath == "" {
+		return false, false, nil // the profile has never been used
+	}
+	dsn := (&url.URL{Scheme: "file", Path: dbPath, RawQuery: "mode=ro&immutable=1"}).String()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false, false, fmt.Errorf("open chrome cookies: %w", err)
+	}
+	defer db.Close()
+	// SID-family cookies exist only while a Google account is signed in;
+	// claude.ai's session cookie is sessionKey.
+	err = db.QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM cookies WHERE (host_key = '.google.com' OR host_key LIKE '%.google.com')
+			AND name IN ('SID', '__Secure-1PSID', '__Secure-3PSID')),
+		EXISTS(SELECT 1 FROM cookies WHERE (host_key LIKE '%claude.ai' OR host_key LIKE '%claude.com')
+			AND name = 'sessionKey')`).Scan(&google, &claude)
+	if err != nil {
+		return false, false, fmt.Errorf("read chrome cookies: %w", err)
+	}
+	return google, claude, nil
+}
+
 // SignInURLs are opened by 'caam auth-agent signin': adding Google accounts
 // and signing in to Claude.
 var SignInURLs = []string{
 	"https://accounts.google.com/AddSession",
 	"https://claude.ai/login",
 }
+
+// browserCloseTimeout bounds waiting for Chrome to close (and save its
+// state) after a flow.
+const browserCloseTimeout = 5 * time.Second
 
 // Browser handles Chrome automation for OAuth flows.
 type Browser struct {
@@ -179,6 +220,11 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.DisableGPU,
 		chromedp.UserDataDir(b.config.UserDataDir),
+		// No crash-reporter helper per flow (chromedp's defaults do the
+		// same). Keychain and password-store flags stay at Chrome's
+		// defaults: cookies must stay readable by the plain Chrome that
+		// 'caam auth-agent signin' runs on this profile.
+		chromedp.Flag("disable-breakpad", true),
 	}
 
 	if b.config.Headless {
@@ -201,15 +247,34 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancelAlloc()
 
-	taskCtx, cancelTask := chromedp.NewContext(allocCtx,
+	browserCtx, cancelTask := chromedp.NewContext(allocCtx,
 		chromedp.WithLogf(func(format string, args ...interface{}) {
 			b.logger.Debug(fmt.Sprintf(format, args...))
 		}),
 	)
 	defer cancelTask()
+	// Close Chrome gracefully so it writes its cookie store. Cancelling the
+	// context kills it, losing cookies set or rotated during the flow: a new
+	// Claude session after an account switch, and Google's frequently
+	// rotated session cookies, without which the profile drifts toward
+	// being signed out.
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(browserCtx, browserCloseTimeout)
+		defer cancel()
+		if err := chromedp.Cancel(closeCtx); err != nil {
+			b.logger.Debug("graceful browser close failed", "error", err)
+		}
+	}()
+
+	// Start Chrome on browserCtx: the context of the first Run owns the
+	// browser, and ending the flow's timeout context below must not kill it
+	// before the graceful close above.
+	if err := chromedp.Run(browserCtx); err != nil {
+		return "", "", fmt.Errorf("start browser: %w", err)
+	}
 
 	// Set timeout for entire flow
-	taskCtx, cancelTimeout := context.WithTimeout(taskCtx, b.flowTimeout)
+	taskCtx, cancelTimeout := context.WithTimeout(browserCtx, b.flowTimeout)
 	defer cancelTimeout()
 
 	var code string

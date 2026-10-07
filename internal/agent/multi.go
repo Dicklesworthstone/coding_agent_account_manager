@@ -115,6 +115,7 @@ type CoordinatorProbe struct {
 	Healthy      bool
 	Latency      time.Duration
 	Backend      string
+	Version      string // caam version the coordinator runs ("" before it reported one)
 	PaneCount    int
 	PendingAuths int
 	Error        string
@@ -145,6 +146,7 @@ func (c *CoordinatorEndpoint) Probe(ctx context.Context) CoordinatorProbe {
 	}
 	var status struct {
 		Backend      string `json:"backend"`
+		Version      string `json:"version"`
 		PaneCount    int    `json:"pane_count"`
 		PendingAuths int    `json:"pending_auths"`
 	}
@@ -154,6 +156,7 @@ func (c *CoordinatorEndpoint) Probe(ctx context.Context) CoordinatorProbe {
 	}
 	probe.Healthy = true
 	probe.Backend = status.Backend
+	probe.Version = status.Version
 	probe.PaneCount = status.PaneCount
 	probe.PendingAuths = status.PendingAuths
 	return probe
