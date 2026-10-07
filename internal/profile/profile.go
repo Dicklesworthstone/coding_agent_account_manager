@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 )
 
 // Profile represents a single account profile for an AI coding tool.
@@ -1075,7 +1076,9 @@ func (s *Store) Clone(provider, sourceName, targetName string, opts CloneOptions
 	if sourceName == targetName {
 		return nil, fmt.Errorf("source and target profile names cannot be the same")
 	}
-	unlock, err := s.lockMutation(provider, targetName)
+	// Hold the source stable while Import owns the destination transaction.
+	// Import acquires the target mutation lock itself.
+	unlock, err := s.lockMutation(provider, sourceName)
 	if err != nil {
 		return nil, err
 	}
@@ -1087,91 +1090,78 @@ func (s *Store) Clone(provider, sourceName, targetName string, opts CloneOptions
 		return nil, fmt.Errorf("load source profile: %w", err)
 	}
 
-	// Check if target exists
-	targetPath := s.ProfilePath(provider, targetName)
-	if _, err := os.Stat(targetPath); err == nil {
-		if !opts.Force {
-			return nil, fmt.Errorf("profile %s/%s already exists (use --force to overwrite)", provider, targetName)
+	sourcePath, err := filepath.Abs(s.ProfilePath(provider, sourceName))
+	if err != nil {
+		return nil, err
+	}
+	storedPath, err := filepath.Abs(source.BasePath)
+	if err != nil || storedPath != sourcePath {
+		return nil, fmt.Errorf("source profile path does not match its store location")
+	}
+	sourceInfo, err := os.Lstat(sourcePath)
+	if err != nil || !sourceInfo.IsDir() {
+		return nil, fmt.Errorf("source profile must be a private directory")
+	}
+	source.BasePath = sourcePath
+	if opts.WithAuth {
+		if err := source.lockFile(); err != nil {
+			return nil, fmt.Errorf("cannot clone credentials from a profile in use: %w", err)
 		}
-		// Remove existing target
-		if err := os.RemoveAll(targetPath); err != nil {
-			return nil, fmt.Errorf("remove existing target: %w", err)
+		owned, err := os.Lstat(source.LockPath())
+		if err != nil {
+			return nil, fmt.Errorf("inspect source profile lock: %w", err)
 		}
+		defer unlockImportedProfile(source, owned)
 	}
 
-	// Create new profile with cloned settings
-	target := &Profile{
-		Name:               targetName,
-		Provider:           provider,
-		AuthMode:           source.AuthMode,
-		BasePath:           targetPath,
-		CreatedAt:          time.Now(),
-		BrowserCommand:     source.BrowserCommand,
-		BrowserProfileDir:  source.BrowserProfileDir,
-		BrowserProfileName: source.BrowserProfileName,
-	}
-
-	// Set description
-	if opts.Description != "" {
+	result, err := s.Import(context.Background(), provider, targetName, source.AuthMode, opts.Force, func(target *Profile) error {
+		target.BrowserCommand = source.BrowserCommand
+		target.BrowserProfileDir = source.BrowserProfileDir
+		target.BrowserProfileName = source.BrowserProfileName
 		target.Description = opts.Description
-	} else {
-		target.Description = fmt.Sprintf("Cloned from %s", sourceName)
-	}
-
-	// Copy metadata
-	if source.Metadata != nil {
-		target.Metadata = make(map[string]string)
+		if target.Description == "" {
+			target.Description = fmt.Sprintf("Cloned from %s", sourceName)
+		}
 		for k, v := range source.Metadata {
 			target.Metadata[k] = v
 		}
-	}
-
-	// Create directory structure
-	dirs := []string{
-		target.BasePath,
-		target.HomePath(),
-		target.XDGConfigPath(),
-		target.CodexHomePath(),
-	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return nil, fmt.Errorf("create directory %s: %w", dir, err)
+		if opts.WithAuth {
+			if err := copyAuthFiles(source, target); err != nil {
+				return fmt.Errorf("copy auth files: %w", err)
+			}
 		}
-	}
-
-	// Optionally copy auth files
-	if opts.WithAuth {
-		if err := copyAuthFiles(source, target); err != nil {
-			// Clean up on failure
-			os.RemoveAll(targetPath)
-			return nil, fmt.Errorf("copy auth files: %w", err)
+		current, err := os.Lstat(sourcePath)
+		if err != nil || !os.SameFile(sourceInfo, current) {
+			return fmt.Errorf("source profile changed during clone; retry")
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Save new profile
-	if err := target.Save(); err != nil {
-		os.RemoveAll(targetPath)
-		return nil, fmt.Errorf("save profile: %w", err)
-	}
-
-	return target, nil
+	return result.Profile, nil
 }
 
 // copyAuthFiles copies auth files from source to target profile.
 func copyAuthFiles(source, target *Profile) error {
 	// Copy home directory contents
-	if err := copyDir(source.HomePath(), target.HomePath()); err != nil {
+	if err := copyDir(source.HomePath(), target.HomePath(), "home"); err != nil {
 		return fmt.Errorf("copy home: %w", err)
 	}
 
 	// Copy xdg_config directory contents
-	if err := copyDir(source.XDGConfigPath(), target.XDGConfigPath()); err != nil {
+	if err := copyDir(source.XDGConfigPath(), target.XDGConfigPath(), "xdg_config"); err != nil {
 		return fmt.Errorf("copy xdg_config: %w", err)
 	}
 
 	// Copy codex_home directory contents
-	if err := copyDir(source.CodexHomePath(), target.CodexHomePath()); err != nil {
+	if err := copyDir(source.CodexHomePath(), target.CodexHomePath(), "codex_home"); err != nil {
 		return fmt.Errorf("copy codex_home: %w", err)
+	}
+	if source.Provider == "gemini" && source.AuthMode == "vertex-adc" {
+		if err := copyDir(filepath.Join(source.BasePath, "gcloud"), filepath.Join(target.BasePath, "gcloud"), "gcloud"); err != nil {
+			return fmt.Errorf("copy gcloud: %w", err)
+		}
 	}
 
 	return nil
@@ -1185,23 +1175,29 @@ func copyAuthFiles(source, target *Profile) error {
 // lstat's the root, sees a symlink (not a directory), and returns immediately
 // without descending — which silently produced an empty clone (issue #60).
 // Resolving to the real path makes Walk traverse the actual tree.
-func copyDir(src, dst string) error {
-	info, err := os.Stat(src) // Stat (not Lstat) follows symlinks.
+func copyDir(src, dst, root string) error {
+	_, err := os.Lstat(src)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // Source doesn't exist, nothing to copy.
 		}
 		return err
 	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err // A dangling root is not an absent optional directory.
+	}
 	if !info.IsDir() {
-		// src resolves to a non-directory (e.g. a dangling or file symlink);
-		// there is no directory tree to copy.
-		return nil
+		return fmt.Errorf("credential root is not a directory: %s", src)
 	}
 
 	// Resolve any symlinks in src so Walk traverses the real directory.
-	if resolved, rerr := filepath.EvalSymlinks(src); rerr == nil {
-		src = resolved
+	src, err = filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0700); err != nil {
+		return err
 	}
 
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -1220,9 +1216,26 @@ func copyDir(src, dst string) error {
 		}
 
 		targetPath := filepath.Join(dst, rel)
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Provider preparation recreates these ambient tooling links. Never
+			// copy shared SSH/cloud trees or preserve a provider credential link.
+			if clonePassthroughLink(root, filepath.ToSlash(rel)) {
+				return nil
+			}
+			info, err = os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("resolve %s: %w", path, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("unsupported credential symlink: %s", path)
+			}
+		}
 
 		if info.IsDir() {
-			return os.MkdirAll(targetPath, info.Mode())
+			return os.MkdirAll(targetPath, 0700)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported credential file: %s", path)
 		}
 
 		// Copy file
@@ -1231,12 +1244,48 @@ func copyDir(src, dst string) error {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
 
-		if err := os.WriteFile(targetPath, data, info.Mode()); err != nil {
+		if err := os.WriteFile(targetPath, data, 0600|info.Mode().Perm()&0100); err != nil {
 			return fmt.Errorf("write %s: %w", targetPath, err)
 		}
 
 		return nil
 	})
+}
+
+// clonePassthroughLink recognizes only the individual non-account links that
+// CAAM's provider preparation installs; their containing roots stay private.
+func clonePassthroughLink(root, rel string) bool {
+	if root == "home" {
+		for _, path := range passthrough.DefaultPassthroughs {
+			if rel == path {
+				return true
+			}
+		}
+		for _, prefix := range []string{".config/", ".local/share/", ".local/state/"} {
+			if name, ok := strings.CutPrefix(rel, prefix); ok && !strings.Contains(name, "/") {
+				return !passthrough.IsIsolatedXDGEntry(name)
+			}
+		}
+	}
+	if root == "xdg_config" && !strings.Contains(rel, "/") {
+		return !passthrough.IsIsolatedXDGEntry(rel)
+	}
+	asset := ""
+	switch root {
+	case "home":
+		if name, ok := strings.CutPrefix(rel, ".claude/"); ok {
+			asset = name
+		}
+	case "xdg_config":
+		if name, ok := strings.CutPrefix(rel, "claude-code/"); ok {
+			asset = name
+		}
+	}
+	switch asset {
+	case "skills", "plugins", "commands", "agents":
+		return true
+	}
+	return false
 }
 
 // Exists checks if a profile exists.

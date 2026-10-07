@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1003,6 +1004,237 @@ func TestStoreCloneWithAuthSymlinkedCodexHome(t *testing.T) {
 
 	if n := cloned.CountAuthFiles(); n == 0 {
 		t.Errorf("CountAuthFiles() = 0, want > 0 after copying auth through symlink")
+	}
+}
+
+func TestStoreCloneWithAuthHandlesInteriorPassthroughs(t *testing.T) {
+	store := NewStore(t.TempDir())
+	source, err := store.Create("claude", "source", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shared, "unrelated-secret"), []byte("synthetic-tool-credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	links := []string{
+		filepath.Join(source.HomePath(), ".ssh"),
+		filepath.Join(source.HomePath(), ".cargo"),
+		filepath.Join(source.HomePath(), ".config", "gh"),
+		filepath.Join(source.HomePath(), ".local", "share", "atuin"),
+		filepath.Join(source.HomePath(), ".local", "state", "tool"),
+		filepath.Join(source.HomePath(), ".claude", "skills"),
+		filepath.Join(source.XDGConfigPath(), "gh"),
+		filepath.Join(source.XDGConfigPath(), "claude-code", "plugins"),
+	}
+	for _, link := range links {
+		if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(shared, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credential := filepath.Join(t.TempDir(), "credential.json")
+	want := `{"claudeAiOauth":{"accessToken":"synthetic-clone-token"}}`
+	if err := os.WriteFile(credential, []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	relCredential := filepath.Join("xdg_config", "claude-code", ".credentials.json")
+	if err := os.Symlink(credential, filepath.Join(source.BasePath, relCredential)); err != nil {
+		t.Fatal(err)
+	}
+	privatePath := filepath.Join("home", ".config", "cursor", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(source.BasePath, privatePath)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source.BasePath, privatePath), []byte("synthetic-private-config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotImportProfile(t, source.BasePath)
+	if _, err := store.Create("claude", "copy", "oauth"); err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := store.Clone("claude", "source", "copy", CloneOptions{WithAuth: true, Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshotImportProfile(t, source.BasePath); !reflect.DeepEqual(got, before) {
+		t.Fatal("cloning changed the source profile")
+	}
+	for _, link := range links {
+		rel, err := filepath.Rel(source.BasePath, link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(cloned.BasePath, rel)); !os.IsNotExist(err) {
+			t.Fatalf("ambient passthrough %s was copied into the credential snapshot: %v", rel, err)
+		}
+	}
+	path := filepath.Join(cloned.BasePath, relCredential)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+		t.Fatalf("cloned credential is not a private regular file: %v, %v", info, err)
+	}
+	if err := os.WriteFile(credential, []byte("changed original credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != want {
+		t.Fatalf("clone shares the original credential: %q, %v", data, err)
+	}
+	data, err = os.ReadFile(filepath.Join(cloned.BasePath, privatePath))
+	if err != nil || string(data) != "synthetic-private-config" {
+		t.Fatalf("private XDG provider data was skipped: %q, %v", data, err)
+	}
+}
+
+func TestStoreClonePreparationFailurePreservesTarget(t *testing.T) {
+	for _, failure := range []string{"directory link", "provider directory link", "dangling link", "dangling root", "file root", "redirected source"} {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/existing=%t", failure, existing), func(t *testing.T) {
+				store := NewStore(t.TempDir())
+				source := seedImportProfile(t, store, "source")
+				targetPath := store.ProfilePath("codex", "target")
+				var before map[string]importProfileEntry
+				if existing {
+					target := seedImportProfile(t, store, "target")
+					before = snapshotImportProfile(t, target.BasePath)
+				}
+				badPath := filepath.Join(source.XDGConfigPath(), "codex", "nested")
+				if err := os.MkdirAll(filepath.Dir(badPath), 0700); err != nil {
+					t.Fatal(err)
+				}
+				switch failure {
+				case "directory link":
+					if err := os.Symlink(t.TempDir(), badPath); err != nil {
+						t.Fatal(err)
+					}
+				case "provider directory link":
+					if err := os.Symlink(t.TempDir(), filepath.Join(source.HomePath(), ".claude")); err != nil {
+						t.Fatal(err)
+					}
+				case "dangling link":
+					if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), badPath); err != nil {
+						t.Fatal(err)
+					}
+				case "dangling root", "file root":
+					if err := os.RemoveAll(source.CodexHomePath()); err != nil {
+						t.Fatal(err)
+					}
+					if failure == "dangling root" {
+						if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), source.CodexHomePath()); err != nil {
+							t.Fatal(err)
+						}
+					} else if err := os.WriteFile(source.CodexHomePath(), []byte("not a credential directory"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "redirected source":
+					redirected := *source
+					redirected.BasePath = t.TempDir()
+					data, err := json.Marshal(redirected)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(source.MetaPath(), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sourceBefore := snapshotImportProfile(t, source.BasePath)
+				if _, err := store.Clone("codex", "source", "target", CloneOptions{WithAuth: true, Force: true}); err == nil {
+					t.Fatal("clone accepted an unusable credential source")
+				}
+				if got := snapshotImportProfile(t, source.BasePath); !reflect.DeepEqual(got, sourceBefore) {
+					t.Fatal("failed clone changed the source profile")
+				}
+				if existing {
+					if got := snapshotImportProfile(t, targetPath); !reflect.DeepEqual(got, before) {
+						t.Fatal("failed force clone changed the existing target")
+					}
+				} else if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
+					t.Fatalf("failed clone published a partial target: %v", err)
+				}
+				if _, err := os.Lstat(source.LockPath()); !os.IsNotExist(err) {
+					t.Fatalf("failed clone left its source locked: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestStoreCloneForceRetainsPreviousAndHonorsLocks(t *testing.T) {
+	for _, locked := range []string{"", "source", "target"} {
+		t.Run("locked="+locked, func(t *testing.T) {
+			store := NewStore(t.TempDir())
+			source := seedImportProfile(t, store, "source")
+			target := seedImportProfile(t, store, "target")
+			if err := os.WriteFile(filepath.Join(source.CodexHomePath(), "auth.json"), []byte(`{"OPENAI_API_KEY":"synthetic-new-key"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if locked != "" {
+				p := source
+				if locked == "target" {
+					p = target
+				}
+				if err := p.Lock(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = p.Unlock() })
+			}
+			before := snapshotImportProfile(t, target.BasePath)
+			cloned, err := store.Clone("codex", "source", "target", CloneOptions{WithAuth: true, Force: true})
+			if locked != "" {
+				if err == nil {
+					t.Fatal("clone ignored an active profile lock")
+				}
+				if got := snapshotImportProfile(t, target.BasePath); !reflect.DeepEqual(got, before) {
+					t.Fatal("clone changed a locked profile's target")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups, err := filepath.Glob(filepath.Join(store.basePath, ".imports", "codex-target-*", "previous"))
+			if err != nil || len(backups) != 1 {
+				t.Fatalf("previous target was not retained: %v, %v", backups, err)
+			}
+			if got := snapshotImportProfile(t, backups[0]); !reflect.DeepEqual(got, before) {
+				t.Fatal("retained target lost credentials or metadata")
+			}
+			data, err := os.ReadFile(filepath.Join(cloned.CodexHomePath(), "auth.json"))
+			if err != nil || string(data) != `{"OPENAI_API_KEY":"synthetic-new-key"}` {
+				t.Fatalf("clone did not publish the source credential: %q, %v", data, err)
+			}
+			profiles, err := store.List("codex")
+			if err != nil || len(profiles) != 2 {
+				t.Fatalf("recovery entered profile listing: %v, %v", profiles, err)
+			}
+		})
+	}
+}
+
+func TestStoreCloneWithVertexADC(t *testing.T) {
+	store := NewStore(t.TempDir())
+	source, err := store.Create("gemini", "vertex", "vertex-adc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adcDir := filepath.Join(source.BasePath, "gcloud")
+	if err := os.MkdirAll(adcDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":"authorized_user","client_id":"synthetic-client","refresh_token":"synthetic-refresh"}`
+	if err := os.WriteFile(filepath.Join(adcDir, "application_default_credentials.json"), []byte(want), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := store.Clone("gemini", "vertex", "copy", CloneOptions{WithAuth: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(cloned.BasePath, "gcloud", "application_default_credentials.json"))
+	if err != nil || string(data) != want {
+		t.Fatalf("clone lost Vertex ADC credentials: %q, %v", data, err)
 	}
 }
 
