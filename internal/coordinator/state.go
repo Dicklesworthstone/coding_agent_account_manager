@@ -362,7 +362,12 @@ var Patterns = struct {
 	CompactingBanner *regexp.Regexp
 	PressEnter       *regexp.Regexp
 	RateLimitMenu    *regexp.Regexp
+	Busy             *regexp.Regexp
 }{
+	// Claude Code's working spinner: "✻ Thinking… (12s · ↑ 1.2k tokens ·
+	// esc to interrupt)". A session showing it is not stopped at a limit.
+	Busy: regexp.MustCompile(`(?i)\besc to interrupt\b`),
+
 	// "Login successful. Press Enter to continue…"
 	PressEnter: regexp.MustCompile(`(?i)press\s+enter\s+to\s+continue`),
 
@@ -457,6 +462,12 @@ func DetectState(output string) (PaneState, map[string]string) {
 			latest = pos
 			state = d.state
 		}
+	}
+
+	// A limit banner in a session that is working is text it printed (a diff,
+	// say), not a limit: a stopped session shows no spinner.
+	if state == StateRateLimited && atBottom(normalizedOutput, Patterns.Busy) {
+		state = StateIdle
 	}
 
 	switch state {

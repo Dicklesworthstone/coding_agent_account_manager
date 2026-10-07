@@ -351,6 +351,7 @@ scrollback the most recent one decides the state.
 | `LoginSuccess` | `Logged in as`, `Login successful`, `Successfully authenticated/logged in`, `Welcome back` | resume |
 | `PressEnter` | `Press Enter to continue` | while resuming, send one Enter first: text typed on that screen is dropped |
 | `RateLimitMenu` | `What do you want to do?` / `Stop and wait for limit to reset` near the bottom of the pane | close the menu with Esc before typing `/login` |
+| `Busy` | `esc to interrupt` (Claude Code's working spinner) near the bottom of the pane | not a limit: a banner in a working session is text it printed, so nothing is typed |
 | `LoginFailed` | `Login failed`, `Authentication error`, `Invalid code`, `expired`, `Error signing` | retry `/login` within the budget, then fail |
 
 At a usage limit Claude Code opens a `What do you want to do?` menu. Its

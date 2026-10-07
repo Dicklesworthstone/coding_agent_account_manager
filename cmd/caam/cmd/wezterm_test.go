@@ -362,6 +362,10 @@ func TestDetectRecoverStateUsesMostRecentMessage(t *testing.T) {
 		{"Paste code here if prompted > CODE\nInvalid code", RecoverFailed, "login_failed", ""},
 		{"Paste code here if prompted > CODE\nLogged in as b@example.com", RecoverResuming, "login_success", ""},
 		{"just a shell", RecoverIdle, "", ""},
+		// Claude Code 2.1 names the limit; the banner starts its line.
+		{"⏺ Working on it\n  ⎿  You've hit your session limit · resets 3pm (America/New_York)\n", RecoverRateLimited, "rate_limit", ""},
+		// A working session that printed a banner is not at a limit.
+		{"  + You've hit your weekly limit · resets Oct 9\n✻ Thinking… (4s · esc to interrupt)\n", RecoverIdle, "", ""},
 	}
 	for _, tt := range tests {
 		state, reason, url := detectRecoverState(tt.text)

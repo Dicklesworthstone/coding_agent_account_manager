@@ -732,7 +732,9 @@ func (r *RecoverPaneState) IsOnCooldown() bool {
 // coordinator's detection, where the most recent message in the scrollback
 // decides.
 func detectRecoverState(text string) (RecoverState, string, string) {
-	state, meta := coordinator.DetectState(normalizeWeztermText(text))
+	// Line breaks matter: banners are matched at the start of a line, and only
+	// the bottom of the screen tells whether a session is working.
+	state, meta := coordinator.DetectState(cleanWeztermText(text))
 	switch state {
 	case coordinator.StateResuming:
 		return RecoverResuming, "login_success", ""

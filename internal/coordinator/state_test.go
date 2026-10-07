@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1530,6 +1531,9 @@ func TestRateLimitBannerVariants(t *testing.T) {
 		{"You've hit your usage credit limit · resets 8pm", "8pm"},
 		{"You've hit your monthly spend limit · raise it at claude.ai/settings · your session limit resets 3pm", "3pm"},
 		{"You're out of usage credits · resets 6pm", "6pm"},
+		// A spinner in scrollback, above the banner, is an earlier turn.
+		{"✻ Thinking… (3s · esc to interrupt)\n⏺ Done.\n" + strings.Repeat("⏺ more output\n", bottomLines) +
+			"  ⎿  You've hit your session limit · resets 4pm", "4pm"},
 	} {
 		state, meta := DetectState(tc.text)
 		if state != StateRateLimited {
@@ -1551,6 +1555,9 @@ func TestRateLimitBannerVariants(t *testing.T) {
 		"> why does it say you're out of usage credits even after the reset?",
 		// Fast mode's own limit falls back by itself; no login needed.
 		"Fast limit reached and temporarily disabled · resets in 5m",
+		// A working session that printed a banner (a diff of this
+		// repository, say) shows Claude Code's spinner below it.
+		"⏺ Update(state_test.go)\n  + You've hit your session limit · resets 3pm\n\n✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)\n",
 	} {
 		if state, _ := DetectState(text); state == StateRateLimited {
 			t.Errorf("DetectState(%q) = RATE_LIMITED, want no rate limit", text)
