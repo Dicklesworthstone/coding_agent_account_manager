@@ -510,7 +510,7 @@ and `random`.
 #### Responsibilities
 
 1. **HTTP Server**: Listen for auth requests from coordinator
-2. **Browser Automation**: Playwright with Chrome
+2. **Browser Automation**: chromedp driving Chrome on a dedicated profile
 3. **Account Selection**: LRU (Least Recently Used) strategy
 4. **Code Extraction**: Parse challenge code from page
 5. **Usage Tracking**: Track when each account was last used
@@ -528,48 +528,33 @@ type AccountUsage struct {
 // Storage: ~/.config/caam/account_usage.json
 ```
 
-#### Playwright Flow
+#### Browser Flow
 
-```typescript
-async function completeOAuth(url: string): Promise<AuthResult> {
-    const browser = await chromium.launch({
-        headless: false,  // Need visible for Google auth
-        channel: 'chrome',
-    });
+`Browser.CompleteOAuth` (chromedp) launches Chrome on the agent's profile,
+opens the OAuth URL, and then inspects the page every step until it has a
+code (at most 10 steps, 90 seconds):
 
-    const context = await browser.newContext({
-        userDataDir: '/path/to/chrome/profile',  // Use existing Chrome profile
-    });
+1. **Code callback** (`.../oauth/code/callback?code=…&state=…`): the code is
+   taken from the URL as `code#state`, the form Claude Code's paste prompt
+   expects. On other Anthropic/Claude `/oauth/code` pages a displayed
+   `code#state` is read from the page; no other page is ever scraped.
+2. **Claude login** (`claude.ai/login`, when the profile's Claude session is
+   missing or expired): clicks "Continue with Google".
+3. **Google account chooser**: clicks the account the strategy prefers
+   (by its `data-identifier`); if that account is not signed in to
+   the profile, the first offered account is used and reported as the one
+   used, so usage tracking stays truthful.
+4. **Consent page**: clicks the approve button.
 
-    const page = await context.newPage();
-    await page.goto(url);
+Each click first checks that a matching element is visible, so an absent
+selector costs one page evaluation rather than the flow's deadline. A flow
+that ends on a sign-in page fails with an error naming that page (host and
+path only, never the query) and the remedy, `caam auth-agent signin`.
 
-    // Wait for either account selection or direct code page
-    await page.waitForSelector(
-        'div[data-email], .challenge-code, [data-testid="challenge-code"]',
-        { timeout: 30000 }
-    );
-
-    // If account selection needed
-    const accounts = await page.locator('div[data-email]').all();
-    if (accounts.length > 0) {
-        const lruAccount = await selectLRUAccount(accounts);
-        await lruAccount.click();
-        await page.waitForNavigation();
-    }
-
-    // Wait for and extract challenge code
-    await page.waitForSelector('.challenge-code, [data-testid="challenge-code"]');
-    const code = await page.textContent('.challenge-code');
-
-    await browser.close();
-
-    return {
-        code: code.trim(),
-        account: selectedAccount,
-    };
-}
-```
+`internal/agent/browser_test.go` drives this flow in real Chrome/Chromium
+against local fixture pages served at the real hostnames through a
+TLS-terminating proxy (skipped with `-short` or when no browser is found;
+`CAAM_TEST_CHROME` selects the binary).
 
 #### Code Location
 

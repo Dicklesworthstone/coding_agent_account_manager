@@ -2,14 +2,23 @@ package agent
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 func TestExtractChallengeCode(t *testing.T) {
@@ -255,42 +264,27 @@ func TestChallengeCodePage(t *testing.T) {
 	}
 }
 
-// TestAccountSelectionSelectors verifies the selector patterns are reasonable.
+// TestAccountSelectionSelectors verifies the chooser selectors target the
+// attribute Google's account chooser actually uses.
 func TestAccountSelectionSelectors(t *testing.T) {
-	// These are the selector patterns used for account selection
-	// We test that they compile and are valid
-	testSelectors := []string{
-		`div[data-email="test@example.com"]`,
-		`li[data-email="test@example.com"]`,
-		`[data-identifier="test@example.com"]`,
-		`button[data-email="test@example.com"]`,
-		`div[data-identifier]`,
-		`[role="listitem"][data-email]`,
+	got := preferredAccountSelectors("test@example.com")
+	if len(got) == 0 || got[0] != `[data-identifier="test@example.com"]` {
+		t.Fatalf("preferredAccountSelectors = %q, want data-identifier first", got)
 	}
-
-	for _, selector := range testSelectors {
-		// Just verify the selector string is not empty and looks like a CSS selector
-		if selector == "" {
-			t.Error("empty selector")
-		}
-		if !strings.Contains(selector, "[") {
-			t.Errorf("selector doesn't look like CSS selector: %s", selector)
+	for _, sel := range append(got, anyAccountSelectors...) {
+		if !strings.Contains(sel, "[data-") {
+			t.Errorf("account selector %q does not match on an account attribute", sel)
 		}
 	}
 }
 
 // TestConsentSelectors verifies consent button selector patterns.
 func TestConsentSelectors(t *testing.T) {
-	consentSelectors := []string{
-		`button[type="submit"]`,
-		`input[type="submit"]`,
-		`#submit_approve_access`,
-		`button[aria-label*="Allow"]`,
-		`button.primary`,
+	if len(consentSelectors) == 0 {
+		t.Fatal("no consent selectors")
 	}
-
 	for _, selector := range consentSelectors {
-		if selector == "" {
+		if strings.TrimSpace(selector) == "" {
 			t.Error("empty selector")
 		}
 	}
@@ -570,6 +564,8 @@ func TestOnCodePage(t *testing.T) {
 		"https://console.anthropic.com/oauth/code/success":   true,
 		"https://platform.claude.com/oauth/code/callback":    true,
 		"https://claude.ai/oauth/authorize?code=true":        false, // consent page
+		"https://claude.ai/login?returnTo=%2Foauth":          false, // not signed in to Claude
+		"https://claude.ai/new":                              false,
 		"https://accounts.google.com/signin/v2/identifier":   false,
 		"https://evil-anthropic.com/oauth/code/callback":     false,
 		"https://claude.ai.evil.example/oauth/code/callback": false,
@@ -661,5 +657,270 @@ func TestOpenForSignInReportsChromeFailure(t *testing.T) {
 	err := b.OpenForSignIn(context.Background(), "https://accounts.google.com/AddSession")
 	if err == nil || !strings.Contains(err.Error(), "profile in use") {
 		t.Fatalf("OpenForSignIn error = %v, want Chrome's exit status and output", err)
+	}
+}
+
+// chromeForTest returns a Chrome or Chromium binary or skips the test.
+func chromeForTest(t *testing.T) string {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("drives a real browser")
+	}
+	for _, p := range []string{os.Getenv("CAAM_TEST_CHROME"), "/opt/pw-browsers/chromium", findChrome()} {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	t.Skip("Chrome/Chromium not installed")
+	return ""
+}
+
+// connListener hands tunneled connections to an http.Server.
+type connListener struct {
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newConnListener() *connListener {
+	return &connListener{conns: make(chan net.Conn), done: make(chan struct{})}
+}
+
+func (l *connListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *connListener) Close() error {
+	l.once.Do(func() { close(l.done) })
+	return nil
+}
+
+func (l *connListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+func (l *connListener) push(c net.Conn) {
+	select {
+	case l.conns <- c:
+	case <-l.done:
+		c.Close()
+	}
+}
+
+// tunnelProxy is a CONNECT proxy that terminates every tunnel with a
+// self-signed certificate and serves handler, so Chrome (with
+// --ignore-certificate-errors) reaches fixture pages at real hostnames.
+func tunnelProxy(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	certSrv := httptest.NewTLSServer(http.NotFoundHandler())
+	certs := certSrv.TLS.Certificates
+	certSrv.Close()
+
+	tunnels := newConnListener()
+	// Chrome's own background connections drop mid-handshake; keep that
+	// out of the test output.
+	site := &http.Server{Handler: handler, ErrorLog: log.New(io.Discard, "", 0)}
+	go site.Serve(tunnels)
+
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+			conn.Close()
+			return
+		}
+		tunnels.push(tls.Server(conn, &tls.Config{Certificates: certs}))
+	}))
+	t.Cleanup(func() {
+		proxy.Close()
+		site.Close()
+		tunnels.Close()
+	})
+	return proxy.URL
+}
+
+// oauthFixture plays the Claude Code OAuth flow for a browser that is not
+// signed in to Claude: authorize -> Claude login -> "Continue with Google"
+// -> Google account chooser -> consent -> code callback. Its markup follows
+// the real pages where it matters: the login page's return URL mentions
+// "authorize" and its submit button belongs to the email form, Google marks
+// accounts with data-identifier only, and the consent button is not a
+// submit button. With googleSignedOut, Google asks for an email instead of
+// offering accounts.
+type oauthFixture struct {
+	googleSignedOut bool
+
+	mu          sync.Mutex
+	chosen      []string
+	emailSubmit int
+}
+
+func (f *oauthFixture) choices() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.chosen...)
+}
+
+func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	state := url.QueryEscape(q.Get("state"))
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	switch host + r.URL.Path {
+	case "claude.ai/oauth/authorize":
+		http.Redirect(w, r, "https://claude.ai/login?returnTo="+url.QueryEscape("/oauth/authorize?state="+q.Get("state")), http.StatusFound)
+	case "claude.ai/login":
+		ret, _ := url.Parse(q.Get("returnTo"))
+		state := url.QueryEscape(ret.Query().Get("state"))
+		fmt.Fprintf(w, `<html><body><form action="/login/email" method="post">
+<input type="hidden" name="returnTo" value="%s"><input name="email" placeholder="Enter your email">
+<button type="submit">Continue with email</button></form>
+<button type="button" onclick="location.href='https://accounts.google.com/v3/signin/accountchooser?state=%s'"><img alt="">Continue with Google</button>
+</body></html>`, q.Get("returnTo"), state)
+	case "claude.ai/login/email":
+		f.mu.Lock()
+		f.emailSubmit++
+		f.mu.Unlock()
+		fmt.Fprint(w, `<html><body>Check your email</body></html>`)
+	case "accounts.google.com/v3/signin/identifier":
+		fmt.Fprint(w, `<html><body><h1>Sign in</h1><input type="email" aria-label="Email or phone"><button type="button">Next</button></body></html>`)
+	case "accounts.google.com/v3/signin/accountchooser":
+		if f.googleSignedOut {
+			http.Redirect(w, r, "/v3/signin/identifier?state="+state, http.StatusFound)
+			return
+		}
+		fmt.Fprintf(w, `<html><body><h1>Choose an account</h1><ul>
+<li><div role="link" data-identifier="a@example.com" onclick="pick(this)">Alice a@example.com</div></li>
+<li><div role="link" data-identifier="b@example.com" onclick="pick(this)">Bob b@example.com</div></li>
+</ul><script>function pick(el){location.href="https://claude.ai/oauth/consent?state=%s&account="+encodeURIComponent(el.dataset.identifier)}</script></body></html>`, state)
+	case "claude.ai/oauth/consent":
+		f.mu.Lock()
+		f.chosen = append(f.chosen, q.Get("account"))
+		f.mu.Unlock()
+		fmt.Fprintf(w, `<html><body><p>Claude Code would like to connect to your Claude account.</p>
+<button type="button" aria-label="Allow access" onclick="location.href='/oauth/approve?state=%s'">Authorize</button></body></html>`, state)
+	case "claude.ai/oauth/approve":
+		http.Redirect(w, r, "https://console.anthropic.com/oauth/code/callback?code=fixture-code-123&state="+state, http.StatusFound)
+	case "console.anthropic.com/oauth/code/callback":
+		fmt.Fprint(w, `<html><body><p>Paste this into Claude Code</p></body></html>`)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func fixtureBrowser(t *testing.T, fixture http.Handler) *Browser {
+	t.Helper()
+	chrome := chromeForTest(t)
+	b := NewBrowser(BrowserConfig{UserDataDir: t.TempDir(), ExecPath: chrome, Headless: true})
+	b.stepDelay = 200 * time.Millisecond
+	b.flowTimeout = 45 * time.Second
+	b.extraOpts = []chromedp.ExecAllocatorOption{
+		chromedp.ProxyServer(tunnelProxy(t, fixture)),
+		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.NoSandbox,
+	}
+	return b
+}
+
+func TestCompleteOAuthInChromeSelectsPreferredAccount(t *testing.T) {
+	fixture := &oauthFixture{}
+	b := fixtureBrowser(t, fixture)
+
+	start := time.Now()
+	code, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-42", "b@example.com")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v (after %v)", err, time.Since(start))
+	}
+	if code != "fixture-code-123#st-42" {
+		t.Errorf("code = %q, want the callback's code#state", code)
+	}
+	if account != "b@example.com" {
+		t.Errorf("account = %q, want the preferred account", account)
+	}
+	if got := fixture.choices(); len(got) != 1 || got[0] != "b@example.com" {
+		t.Errorf("accounts chosen in Google's chooser = %q, want only b@example.com", got)
+	}
+	fixture.mu.Lock()
+	emailSubmits := fixture.emailSubmit
+	fixture.mu.Unlock()
+	if emailSubmits != 0 {
+		t.Errorf("submitted Claude's email login form %d times; the login page must continue with Google", emailSubmits)
+	}
+	// A selector that is absent from the page must not stall the flow.
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Errorf("flow took %v", elapsed)
+	}
+}
+
+func TestCompleteOAuthInChromeReportsAccountActuallyUsed(t *testing.T) {
+	fixture := &oauthFixture{}
+	b := fixtureBrowser(t, fixture)
+
+	// The preferred account is not signed in to this profile: the first
+	// account is used, and that is what must be reported (and recorded).
+	code, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-7", "zoe@example.com")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
+	}
+	if code != "fixture-code-123#st-7" {
+		t.Errorf("code = %q", code)
+	}
+	if got := fixture.choices(); len(got) != 1 || got[0] != "a@example.com" {
+		t.Fatalf("accounts chosen = %q, want the first account", got)
+	}
+	if account != "a@example.com" {
+		t.Errorf("account = %q, want the account actually chosen (a@example.com)", account)
+	}
+}
+
+func TestCompleteOAuthInChromeExplainsSignedOutProfile(t *testing.T) {
+	fixture := &oauthFixture{googleSignedOut: true}
+	b := fixtureBrowser(t, fixture)
+
+	_, _, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=secret-state", "a@example.com")
+	if err == nil {
+		t.Fatal("CompleteOAuth succeeded without any signed-in Google account")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "caam auth-agent signin") || !strings.Contains(msg, "accounts.google.com/v3/signin/identifier") {
+		t.Errorf("error = %q, want the sign-in page and the signin remedy", msg)
+	}
+	if strings.Contains(msg, "secret-state") {
+		t.Errorf("error leaks OAuth state: %q", msg)
+	}
+}
+
+func TestStuckFlowError(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://claude.ai/login?returnTo=%2Foauth%2Fauthorize%3Fstate%3Dx": "caam auth-agent signin",
+		"https://accounts.google.com/v3/signin/identifier?state=x":          "caam auth-agent signin",
+		"https://claude.ai/oauth/authorize?state=x":                         "last page claude.ai/oauth/authorize",
+		"": "no authorization code found",
+	} {
+		msg := stuckFlowError(raw).Error()
+		if !strings.Contains(msg, want) {
+			t.Errorf("stuckFlowError(%q) = %q, want it to mention %q", raw, msg, want)
+		}
+		if strings.Contains(msg, "state=") {
+			t.Errorf("stuckFlowError(%q) leaks the query: %q", raw, msg)
+		}
 	}
 }

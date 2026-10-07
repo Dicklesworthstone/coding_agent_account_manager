@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -56,6 +57,14 @@ type Browser struct {
 	logger     *slog.Logger
 	allocCtx   context.Context
 	cancelFunc context.CancelFunc
+
+	// stepDelay is the pause after each navigation or click for redirects
+	// and rendering to settle; flowTimeout bounds a whole OAuth flow.
+	stepDelay   time.Duration
+	flowTimeout time.Duration
+	// extraOpts are additional Chrome allocator options (tests route
+	// Chrome through a fixture proxy with them).
+	extraOpts []chromedp.ExecAllocatorOption
 }
 
 // NewBrowser creates a new browser automation instance.
@@ -66,8 +75,10 @@ func NewBrowser(config BrowserConfig) *Browser {
 	config.UserDataDir = ResolveChromeUserDataDir(config.UserDataDir)
 
 	return &Browser{
-		config: config,
-		logger: config.Logger,
+		config:      config,
+		logger:      config.Logger,
+		stepDelay:   2 * time.Second,
+		flowTimeout: 90 * time.Second,
 	}
 }
 
@@ -184,6 +195,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	if chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}
+	opts = append(opts, b.extraOpts...)
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancelAlloc()
@@ -196,7 +208,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	defer cancelTask()
 
 	// Set timeout for entire flow
-	taskCtx, cancelTimeout := context.WithTimeout(taskCtx, 90*time.Second)
+	taskCtx, cancelTimeout := context.WithTimeout(taskCtx, b.flowTimeout)
 	defer cancelTimeout()
 
 	var code string
@@ -212,9 +224,10 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	}
 
 	// Wait a moment for redirects
-	time.Sleep(2 * time.Second)
+	time.Sleep(b.stepDelay)
 
 	// Check current state and handle accordingly
+	var lastURL string
 	for attempt := 0; attempt < 10; attempt++ {
 		var currentURL string
 		var pageHTML string
@@ -226,6 +239,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 		if err != nil {
 			return "", "", fmt.Errorf("get page state: %w", err)
 		}
+		lastURL = currentURL
 
 		b.logger.Debug("page state",
 			"attempt", attempt,
@@ -247,131 +261,197 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			}
 		}
 
-		// Check if on Google account selection page
+		// Claude login (the profile's Claude session is missing or expired):
+		// sign in with Google, which leads to the account chooser below.
+		// Checked before the consent heuristics: this page's return URL
+		// mentions "authorize", and its submit button is the email form.
+		if onClaudeLogin(currentURL) {
+			if err := b.clickByText(taskCtx, "button", "Continue with Google"); err == nil {
+				b.logger.Debug("continuing Claude login with Google")
+			} else {
+				b.logger.Debug("Claude login: no Google sign-in button", "error", err)
+			}
+			time.Sleep(b.stepDelay)
+			continue
+		}
+
+		// Google account chooser: pick the preferred account, else the first.
 		if strings.Contains(currentURL, "accounts.google.com") {
 			if preferredAccount != "" {
-				b.logger.Debug("attempting to select account", "account", preferredAccount)
-				usedAccount = preferredAccount
-
-				// Try multiple selector strategies for account selection
-				accountSelectors := []string{
-					fmt.Sprintf(`div[data-email="%s"]`, preferredAccount),
-					fmt.Sprintf(`li[data-email="%s"]`, preferredAccount),
-					fmt.Sprintf(`[data-identifier="%s"]`, preferredAccount),
-					// Anthropic/Claude-specific selectors
-					fmt.Sprintf(`button[data-email="%s"]`, preferredAccount),
-					fmt.Sprintf(`a[data-email="%s"]`, preferredAccount),
+				if _, _, err := b.clickFirstVisible(taskCtx, preferredAccountSelectors(preferredAccount)); err == nil {
+					usedAccount = preferredAccount
+					b.logger.Debug("selected preferred account")
+					time.Sleep(b.stepDelay)
+					continue
 				}
-
-				selected := false
-				for _, selector := range accountSelectors {
-					err = chromedp.Run(taskCtx,
-						chromedp.Click(selector,
-							chromedp.ByQuery,
-							chromedp.NodeVisible),
-					)
-					if err == nil {
-						selected = true
-						break
-					}
-				}
-
-				if !selected {
-					b.logger.Debug("could not click preferred account, trying generic selectors")
-					// Fallback: try clicking any visible account
-					fallbackSelectors := []string{
-						`div[data-identifier]`,
-						`li[data-identifier]`,
-						`[role="listitem"][data-email]`,
-						`button[data-email]`,
-					}
-					for _, selector := range fallbackSelectors {
-						err = chromedp.Run(taskCtx,
-							chromedp.Click(selector,
-								chromedp.ByQuery,
-								chromedp.NodeVisible),
-						)
-						if err == nil {
-							break
-						}
-					}
-				}
-			} else {
-				// No preferred account - click first available
-				fallbackSelectors := []string{
-					`div[data-identifier]`,
-					`li[data-identifier]`,
-					`[role="listitem"][data-email]`,
-					`button[data-email]`,
-					`div[data-email]`,
-				}
-				for _, selector := range fallbackSelectors {
-					err = chromedp.Run(taskCtx,
-						chromedp.Click(selector,
-							chromedp.ByQuery,
-							chromedp.NodeVisible),
-					)
-					if err == nil {
-						break
-					}
-				}
+				b.logger.Debug("preferred account not offered, trying any account")
 			}
-			if err != nil {
+			// Report the account actually chosen so usage tracking stays
+			// truthful when the preferred one is not signed in.
+			if _, identity, err := b.clickFirstVisible(taskCtx, anyAccountSelectors); err == nil {
+				usedAccount = identity
+				b.logger.Debug("selected first offered account")
+			} else {
 				b.logger.Debug("account selection failed", "error", err)
 			}
-			time.Sleep(2 * time.Second)
+			time.Sleep(b.stepDelay)
 			continue
 		}
 
 		// Check if on consent page
 		if strings.Contains(pageHTML, "consent") || strings.Contains(pageHTML, "Allow") ||
 			strings.Contains(pageHTML, "permission") || strings.Contains(pageHTML, "authorize") {
-			b.logger.Debug("handling consent page")
-
-			// Try multiple selector strategies for consent buttons
-			consentSelectors := []string{
-				// Standard form submissions
-				`button[type="submit"]`,
-				`input[type="submit"]`,
-				// Google consent buttons
-				`#submit_approve_access`,
-				`button[data-idom-class="nCP5yc"]`, // Google's "Allow" button
-				`div[role="button"][data-value="approve"]`,
-				// Text-based fallbacks
-				`button[aria-label*="Allow"]`,
-				`button[aria-label*="Continue"]`,
-				`button[aria-label*="Accept"]`,
-				// Generic button patterns
-				`button.primary`,
-				`button.submit`,
-				`input[value="Allow"]`,
-				`input[value="Continue"]`,
-				`input[value="Accept"]`,
+			if selector, _, err := b.clickFirstVisible(taskCtx, consentSelectors); err == nil {
+				b.logger.Debug("clicked consent button", "selector", selector)
+			} else {
+				b.logger.Debug("consent click failed", "error", err)
 			}
-
-			for _, selector := range consentSelectors {
-				err = chromedp.Run(taskCtx,
-					chromedp.Click(selector,
-						chromedp.ByQuery,
-						chromedp.NodeVisible),
-				)
-				if err == nil {
-					b.logger.Debug("clicked consent button", "selector", selector)
-					break
-				}
-			}
-			if err != nil {
-				b.logger.Debug("consent click failed with all selectors", "last_error", err)
-			}
-			time.Sleep(2 * time.Second)
+			time.Sleep(b.stepDelay)
 			continue
 		}
 
 		// Wait and retry
-		time.Sleep(2 * time.Second)
+		time.Sleep(b.stepDelay)
 	}
 
-	return "", "", fmt.Errorf("could not complete OAuth flow - no challenge code found")
+	return "", "", stuckFlowError(lastURL)
+}
+
+// stuckFlowError explains where a flow stopped without a code. Only the host
+// and path are reported: queries carry OAuth state.
+func stuckFlowError(lastURL string) error {
+	u, err := url.Parse(lastURL)
+	if err != nil || u.Host == "" {
+		return errors.New("could not complete OAuth flow: no authorization code found")
+	}
+	page := u.Host + u.Path
+	host := strings.ToLower(u.Hostname())
+	if onClaudeLogin(lastURL) || host == "accounts.google.com" {
+		return fmt.Errorf("could not complete OAuth flow: stuck at sign-in page %s; sign in to the agent's Chrome profile with 'caam auth-agent signin'", page)
+	}
+	return fmt.Errorf("could not complete OAuth flow: no authorization code found (last page %s)", page)
+}
+
+// onClaudeLogin reports whether rawURL is the Claude web login page.
+func onClaudeLogin(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return (host == "claude.ai" || host == "claude.com" || strings.HasSuffix(host, ".claude.ai") || strings.HasSuffix(host, ".claude.com")) &&
+		strings.HasPrefix(u.Path, "/login")
+}
+
+// clickByText clicks the first visible tag element whose text contains text.
+func (b *Browser) clickByText(ctx context.Context, tag, text string) error {
+	args, err := json.Marshal([]string{tag, text})
+	if err != nil {
+		return err
+	}
+	var marked bool
+	script := fmt.Sprintf(`(([tag, text]) => {
+	for (const el of document.querySelectorAll(tag)) {
+		if (el.textContent.includes(text) && el.getClientRects().length > 0) {
+			el.setAttribute("data-caam-target", "1");
+			return true;
+		}
+	}
+	return false;
+})(%s)`, args)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &marked)); err != nil {
+		return err
+	}
+	if !marked {
+		return errNoVisibleMatch
+	}
+	clickCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return chromedp.Run(clickCtx, chromedp.Click(`[data-caam-target="1"]`, chromedp.ByQuery, chromedp.NodeVisible))
+}
+
+// preferredAccountSelectors match one account in Google's account chooser
+// (which marks accounts with data-identifier) or similar pickers.
+func preferredAccountSelectors(email string) []string {
+	return []string{
+		fmt.Sprintf(`[data-identifier=%q]`, email),
+		fmt.Sprintf(`[data-email=%q]`, email),
+	}
+}
+
+// anyAccountSelectors match any offered account.
+var anyAccountSelectors = []string{
+	`div[data-identifier]`,
+	`li[data-identifier]`,
+	`[role="listitem"][data-email]`,
+	`button[data-email]`,
+	`div[data-email]`,
+}
+
+// consentSelectors match approve buttons on OAuth consent pages.
+var consentSelectors = []string{
+	// Standard form submissions
+	`button[type="submit"]`,
+	`input[type="submit"]`,
+	// Google consent buttons
+	`#submit_approve_access`,
+	`button[data-idom-class="nCP5yc"]`, // Google's "Allow" button
+	`div[role="button"][data-value="approve"]`,
+	// Text-based fallbacks
+	`button[aria-label*="Allow"]`,
+	`button[aria-label*="Continue"]`,
+	`button[aria-label*="Accept"]`,
+	// Generic button patterns
+	`button.primary`,
+	`button.submit`,
+	`input[value="Allow"]`,
+	`input[value="Continue"]`,
+	`input[value="Accept"]`,
+}
+
+// errNoVisibleMatch reports that none of the selectors matched a visible
+// element.
+var errNoVisibleMatch = errors.New("no visible element matches")
+
+// visibleMatchScript finds the first selector in a JSON array that matches a
+// visible element and returns it with the element's account identifier.
+const visibleMatchScript = `((selectors) => {
+	for (const s of selectors) {
+		let el = null;
+		try { el = document.querySelector(s); } catch (e) { continue; }
+		if (el && el.getClientRects().length > 0) {
+			return {selector: s, identity: el.getAttribute("data-identifier") || el.getAttribute("data-email") || ""};
+		}
+	}
+	return {selector: "", identity: ""};
+})(%s)`
+
+// clickFirstVisible clicks the first selector that matches a visible element
+// and returns it with that element's data-identifier or data-email. The
+// page is checked before clicking because a chromedp query waits until its
+// selector matches: clicking an absent selector would stall the whole flow
+// until its deadline.
+func (b *Browser) clickFirstVisible(ctx context.Context, selectors []string) (selector, identity string, err error) {
+	list, err := json.Marshal(selectors)
+	if err != nil {
+		return "", "", err
+	}
+	var found struct {
+		Selector string `json:"selector"`
+		Identity string `json:"identity"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(visibleMatchScript, list), &found)); err != nil {
+		return "", "", err
+	}
+	if found.Selector == "" {
+		return "", "", errNoVisibleMatch
+	}
+	clickCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := chromedp.Run(clickCtx, chromedp.Click(found.Selector, chromedp.ByQuery, chromedp.NodeVisible)); err != nil {
+		return "", "", fmt.Errorf("click %s: %w", found.Selector, err)
+	}
+	return found.Selector, found.Identity, nil
 }
 
 // codeFromCallbackURL returns the paste-ready authorization code when rawURL
@@ -393,8 +473,10 @@ func codeFromCallbackURL(rawURL string) string {
 	return code
 }
 
-// onCodePage reports whether rawURL is an Anthropic or Claude page that can
-// display an authorization code (not the authorize/consent page itself).
+// onCodePage reports whether rawURL is an Anthropic or Claude OAuth code page
+// (".../oauth/code/..."), the only pages that display an authorization code.
+// Login, consent and app pages are excluded: their markup is full of numbers
+// and identifiers that the code patterns would mistake for a code.
 func onCodePage(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -407,7 +489,7 @@ func onCodePage(rawURL string) bool {
 			anthropic = true
 		}
 	}
-	return anthropic && !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/oauth/authorize")
+	return anthropic && strings.Contains(u.Path, "/oauth/code")
 }
 
 // pastedCodePattern matches a displayed "code#state" authorization code.
