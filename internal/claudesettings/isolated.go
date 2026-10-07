@@ -147,22 +147,10 @@ func PrepareIsolatedSettings(sharedPath string, paths []string, p Policy) ([]*Up
 	return updates, nil
 }
 
-// ApplyUpdates applies preflighted settings writes without rewriting unchanged
-// documents on every launch. Every source and destination is checked before
-// the first write, including no-ops. This is preflight, not multi-file atomicity.
+// ApplyUpdates stages every document and its rollback copy before installing
+// any changes. A later failure restores only files still owned by this batch;
+// intervening native edits are retained, with recovery paths in the error.
+// This handles returned I/O errors, not process crashes or multi-file visibility.
 func ApplyUpdates(updates []*Update) error {
-	for _, update := range updates {
-		if update == nil {
-			return fmt.Errorf("nil Claude settings update")
-		}
-		if err := update.checkUnchanged(); err != nil {
-			return err
-		}
-	}
-	for _, update := range updates {
-		if err := update.Apply(); err != nil {
-			return err
-		}
-	}
-	return nil
+	return applyUpdatesWithRename(updates, os.Rename)
 }
