@@ -3,10 +3,12 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
@@ -757,5 +759,44 @@ func TestBuildSetupScriptRepeatsHosts(t *testing.T) {
 	}
 	if !strings.Contains(script, "caam setup distributed --yes --host ubuntu@box:2222 --host gpu\n") {
 		t.Errorf("script does not repeat --host:\n%s", script)
+	}
+}
+
+// TestSetupDryRunTouchesNothing: --dry-run plans every host without
+// connecting to it and writes no agent config.
+func TestSetupDryRunTouchesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	opts := DefaultOptions()
+	opts.AgentConfigPath = path
+	opts.DryRun = true
+	orch := NewOrchestrator(opts)
+	orch.localMachine = &DiscoveredMachine{Name: "local", IsLocal: true}
+	// TEST-NET addresses: a real connection attempt would hang or fail.
+	hosts, err := hostsToMachines([]string{"ubuntu@192.0.2.10", "192.0.2.11:2222"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch.remoteMachines = hosts
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var steps []string
+	result, err := orch.Setup(ctx, func(p *SetupProgress) {
+		if p.Status != "running" {
+			steps = append(steps, p.Machine+": "+p.Status+" "+p.Message)
+		}
+	})
+	if err != nil || ctx.Err() != nil {
+		t.Fatalf("dry-run setup: %v (ctx %v)", err, ctx.Err())
+	}
+	want := []string{"192.0.2.10: success dry-run: skipped", "192.0.2.11: success dry-run: skipped"}
+	if strings.Join(steps, "|") != strings.Join(want, "|") {
+		t.Fatalf("progress = %q, want %q", steps, want)
+	}
+	if len(result.DeployResults) != 0 || len(result.Errors) != 0 {
+		t.Fatalf("dry run deployed: %+v", result)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry run wrote the agent config (stat: %v)", err)
 	}
 }
