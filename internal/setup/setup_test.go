@@ -555,3 +555,38 @@ func TestGenerateTokenIsRandom(t *testing.T) {
 		t.Fatalf("tokens %q %q", a, b)
 	}
 }
+
+func TestCoordinatorTokenReusesExistingUnlessRotating(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	orch := setupWithRemotes(t, path)
+	machine := orch.remoteMachines[0]
+
+	existing := strings.Repeat("a", 64)
+	if err := agent.WriteFileConfig(path, agent.FileConfig{Coordinators: []*agent.CoordinatorEndpoint{
+		{Name: "CSD", URL: "http://127.0.0.1:7890", Token: existing},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := orch.coordinatorToken(machine)
+	if err != nil || token != existing {
+		t.Fatalf("token = %q, %v; re-running setup must keep the running agent's token", token, err)
+	}
+
+	orch.opts.RotateTokens = true
+	rotated, err := orch.coordinatorToken(machine)
+	if err != nil || rotated == existing || len(rotated) != 64 {
+		t.Fatalf("rotated token = %q, %v", rotated, err)
+	}
+
+	// A short or missing token is never reused.
+	orch.opts.RotateTokens = false
+	if err := agent.WriteFileConfig(path, agent.FileConfig{Coordinators: []*agent.CoordinatorEndpoint{
+		{Name: "csd", URL: "http://127.0.0.1:7890", Token: "weak"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if token, _ := orch.coordinatorToken(machine); token == "weak" {
+		t.Fatal("a weak token must be replaced")
+	}
+}

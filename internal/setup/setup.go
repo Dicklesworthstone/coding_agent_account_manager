@@ -92,6 +92,10 @@ type Options struct {
 	// Defaults to agent.DefaultConfigPath().
 	AgentConfigPath string
 
+	// RotateTokens issues new coordinator tokens instead of keeping the
+	// tokens already recorded for redeployed hosts.
+	RotateTokens bool
+
 	// Logger for structured logging.
 	Logger *slog.Logger
 }
@@ -551,7 +555,7 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 			continue
 		}
 
-		token, err := generateToken()
+		token, err := o.coordinatorToken(machine)
 		if err != nil {
 			return nil, err
 		}
@@ -597,6 +601,22 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 
 // dryRunTokenPlaceholder stands in for tokens that a real run generates.
 const dryRunTokenPlaceholder = "<generated during setup>"
+
+// coordinatorToken returns the API token to deploy for a machine. Re-running
+// setup keeps a host's existing token, so a running auth-agent service keeps
+// working after coordinators are redeployed; RotateTokens forces new ones.
+func (o *Orchestrator) coordinatorToken(m *DiscoveredMachine) (string, error) {
+	if !o.opts.RotateTokens {
+		if existing, err := agent.LoadFileConfig(o.agentConfigPath()); err == nil {
+			for _, c := range existing.Coordinators {
+				if c != nil && strings.EqualFold(c.Name, m.WezTermDomain) && len(c.Token) >= 32 {
+					return c.Token, nil
+				}
+			}
+		}
+	}
+	return generateToken()
+}
 
 // generateToken returns a random coordinator API token.
 func generateToken() (string, error) {

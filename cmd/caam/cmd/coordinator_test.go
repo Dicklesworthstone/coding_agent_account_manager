@@ -184,7 +184,7 @@ func TestCheckCoordinatorsUsesConfiguredEndpoints(t *testing.T) {
 type fakeCoordinatorPanes struct{}
 
 func (fakeCoordinatorPanes) ListPanes(context.Context) ([]coordinator.Pane, error) { return nil, nil }
-func (fakeCoordinatorPanes) GetText(context.Context, int, int) (string, error)    { return "", nil }
-func (fakeCoordinatorPanes) SendText(context.Context, int, string, bool) error    { return nil }
-func (fakeCoordinatorPanes) IsAvailable(context.Context) bool                     { return true }
-func (fakeCoordinatorPanes) Backend() string                                      { return "fake" }
+func (fakeCoordinatorPanes) GetText(context.Context, int, int) (string, error)     { return "", nil }
+func (fakeCoordinatorPanes) SendText(context.Context, int, string, bool) error     { return nil }
+func (fakeCoordinatorPanes) IsAvailable(context.Context) bool                      { return true }
+func (fakeCoordinatorPanes) Backend() string                                       { return "fake" }

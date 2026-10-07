@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/setup"
 	"github.com/spf13/cobra"
 )
@@ -61,6 +62,7 @@ func init() {
 	setupDistributedCmd.Flags().Int("remote-port", 7890, "port for remote coordinators")
 	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these domain names")
 	setupDistributedCmd.Flags().Bool("no-tailscale", false, "disable Tailscale (use public IPs)")
+	setupDistributedCmd.Flags().Bool("rotate-tokens", false, "issue new coordinator API tokens instead of keeping existing ones")
 }
 
 func runSetupDistributed(cmd *cobra.Command, args []string) error {
@@ -76,6 +78,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")
 	remotes, _ := cmd.Flags().GetStringSlice("remotes")
+	rotateTokens, _ := cmd.Flags().GetBool("rotate-tokens")
 
 	if noTailscale {
 		useTailscale = false
@@ -88,18 +91,24 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		RemotePort:    remotePort,
 		Remotes:       remotes,
 		DryRun:        dryRun,
+		RotateTokens:  rotateTokens,
 	}
 
 	orch := setup.NewOrchestrator(opts)
 
 	// Discovery phase
 	fmt.Println("Discovering machines...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	discoverCtx, cancelDiscover := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelDiscover()
 
-	if err := orch.Discover(ctx); err != nil {
+	if err := orch.Discover(discoverCtx); err != nil {
 		return fmt.Errorf("discovery failed: %w", err)
 	}
+
+	// Deployment uploads or installs binaries, starts services, and verifies
+	// each host in turn; it gets its own, longer budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 
 	// Print discovery results
 	orch.PrintDiscoveryResults()
@@ -193,6 +202,9 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	if dryRun {
 		fmt.Println("Run without --dry-run to apply these changes.")
+	} else if successCount > 0 && restartInstalledAgentService(ctx, result.LocalConfigPath) {
+		fmt.Println("The auth-agent service was restarted with the updated configuration.")
+		fmt.Println("Check it with: caam auth-agent service status")
 	} else if successCount > 0 {
 		fmt.Println("1. Set \"accounts\" (and optionally \"chrome_profile\") in:")
 		fmt.Printf("     %s\n", result.LocalConfigPath)
@@ -203,4 +215,27 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// restartInstalledAgentService restarts an installed auth-agent service so it
+// loads the coordinators and tokens setup just wrote. It reports whether a
+// service was restarted.
+func restartInstalledAgentService(ctx context.Context, configPath string) bool {
+	if configPath == "" {
+		return false
+	}
+	svc, err := deploy.NewAgentService(configPath)
+	if err != nil {
+		return false
+	}
+	st, err := svc.Status(ctx)
+	if err != nil || !st.Installed {
+		return false
+	}
+	if _, err := svc.Install(ctx); err != nil {
+		fmt.Printf("Warning: could not restart the auth-agent service: %v\n", err)
+		fmt.Println("Restart it with: caam auth-agent service install")
+		return false
+	}
+	return true
 }
