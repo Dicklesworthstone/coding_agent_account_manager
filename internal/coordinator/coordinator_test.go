@@ -1683,3 +1683,67 @@ func TestLostMethodSelectionIsResentWithinBound(t *testing.T) {
 		t.Fatalf("state = %v, want AWAITING_URL", tracker.GetState())
 	}
 }
+
+// TestRestartedCoordinatorAdoptsLoginInProgress: a coordinator restarted
+// mid-flow (an upgrade) finds the pane at its paste prompt with fresh, idle
+// trackers and must carry the login through instead of ignoring it.
+func TestRestartedCoordinatorAdoptsLoginInProgress(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "You've hit your limit · resets 2pm\n> /login\nBrowse to https://claude.ai/oauth/authorize?code=true&state=s1\nPaste code here if prompted >",
+	}
+	coord := New(DefaultConfig())
+	coord.paneClient = client
+	ctx := context.Background()
+
+	coord.pollPanes(ctx) // fresh tracker: adopts
+	coord.pollPanes(ctx) // publishes the request
+	tracker := coord.trackers[1]
+	if tracker.GetState() != StateAuthPending {
+		t.Fatalf("state = %v, want AUTH_PENDING after adoption", tracker.GetState())
+	}
+	pending := coord.GetPendingRequests()
+	if len(pending) != 1 || pending[0].URL != "https://claude.ai/oauth/authorize?code=true&state=s1" {
+		t.Fatalf("pending = %+v", pending)
+	}
+	if sent := client.sentText(); len(sent) != 0 {
+		t.Fatalf("adoption typed %q into the pane", sent)
+	}
+}
+
+func TestIdleDoesNotAdoptPromptOnlyInScrollback(t *testing.T) {
+	output := "Browse to https://claude.ai/oauth/authorize?code=true&state=old\nPaste code here if prompted >\n"
+	for i := 0; i < 20; i++ {
+		output += fmt.Sprintf("working on step %d\n", i)
+	}
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}, output: output}
+	coord := New(DefaultConfig())
+	coord.paneClient = client
+	coord.pollPanes(context.Background())
+	if st := coord.trackers[1].GetState(); st != StateIdle {
+		t.Fatalf("state = %v: adopted a prompt that is no longer on screen", st)
+	}
+}
+
+func TestIdleDoesNotAdoptPaneLeftForManualRecovery(t *testing.T) {
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "Browse to https://claude.ai/oauth/authorize?code=true&state=s1\nPaste code here if prompted >",
+	}
+	coord := New(DefaultConfig())
+	coord.paneClient = client
+	tracker := NewPaneTracker(1)
+	tracker.SetGaveUp(true)
+	coord.trackers[1] = tracker
+	coord.pollPanes(context.Background())
+	if st := tracker.GetState(); st != StateIdle {
+		t.Fatalf("state = %v: re-adopted a pane whose retries were spent", st)
+	}
+
+	// The next rate-limit episode starts fresh.
+	client.output = "You've hit your limit · resets 5pm"
+	coord.pollPanes(context.Background())
+	if tracker.HasGivenUp() || tracker.GetState() != StateRateLimited {
+		t.Fatalf("new episode: gaveUp=%v state=%v", tracker.HasGivenUp(), tracker.GetState())
+	}
+}

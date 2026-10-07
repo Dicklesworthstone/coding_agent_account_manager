@@ -71,6 +71,7 @@ type PaneTracker struct {
 	RetryCount   int
 	ContinueSent bool                 // Enter sent to dismiss the post-login screen this cycle
 	SelectSends  int                  // login-method selections sent this cycle
+	GaveUp       bool                 // retries spent this rate-limit episode; left to a human (survives Reset)
 	LastOutput   string               // Cached output for duplicate detection
 	Cooldowns    map[string]time.Time // action -> cooldown expiry
 	mu           sync.RWMutex
@@ -133,6 +134,20 @@ func (t *PaneTracker) CountSelectSend() int {
 	defer t.mu.Unlock()
 	t.SelectSends++
 	return t.SelectSends
+}
+
+// SetGaveUp records whether the pane was left for manual recovery.
+func (t *PaneTracker) SetGaveUp(gaveUp bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.GaveUp = gaveUp
+}
+
+// HasGivenUp reports whether the pane was left for manual recovery.
+func (t *PaneTracker) HasGivenUp() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.GaveUp
 }
 
 // GetSelectSends returns the login-method selections sent this cycle.

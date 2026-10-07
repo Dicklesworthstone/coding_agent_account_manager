@@ -567,6 +567,7 @@ func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker) {
 			"retries", retries,
 			"action", "give_up")
 		tracker.Reset()
+		tracker.SetGaveUp(true)
 		return
 	}
 
@@ -592,6 +593,28 @@ func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker) {
 		"action", "login_retry")
 }
 
+// bottomLines is how much of the end of a pane counts as "on screen" for
+// adopting a login in progress.
+const bottomLines = 12
+
+// atBottom reports whether re matches within the last bottomLines non-empty
+// lines of output.
+func atBottom(output string, re *regexp.Regexp) bool {
+	lines := strings.Split(StripANSI(output), "\n")
+	var tail []string
+	for i := len(lines) - 1; i >= 0 && len(tail) < bottomLines; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			tail = append(tail, lines[i])
+		}
+	}
+	for _, line := range tail {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
 
@@ -606,6 +629,7 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 		tracker.SetState(StateRateLimited)
 		// A new rate-limit episode gets a fresh retry budget.
 		tracker.SetRetryCount(0)
+		tracker.SetGaveUp(false)
 
 		// Check login cooldown before injecting
 		if tracker.IsOnCooldown("login") {
@@ -636,6 +660,33 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			tracker.SetCooldown("login", c.config.LoginCooldown)
 		}
 		return // Don't check for compaction if rate limited
+	}
+
+	// A login in progress that nothing is driving: the coordinator was
+	// restarted mid-flow (an upgrade, say), or someone typed /login. Pick
+	// it up where it stands, unless the pane was deliberately left for
+	// manual recovery this episode.
+	// The prompt must be on screen now, not just somewhere in scrollback:
+	// adopting a finished login would type a code into a working session.
+	if !tracker.HasGivenUp() {
+		switch {
+		case detected == StateAwaitingMethodSelect && atBottom(output, Patterns.SelectMethod):
+			c.logger.Info("adopting login in progress",
+				"pane_id", tracker.PaneID,
+				"to_state", StateAwaitingMethodSelect.String(),
+				"action", "adopt")
+			tracker.SetState(StateAwaitingMethodSelect)
+			return
+		case detected == StateAwaitingURL && metadata["oauth_url"] != "" && atBottom(output, Patterns.PastePrompt):
+			c.logger.Info("adopting login in progress",
+				"pane_id", tracker.PaneID,
+				"to_state", StateAwaitingURL.String(),
+				"url_redacted", RedactURL(metadata["oauth_url"]),
+				"action", "adopt")
+			tracker.SetOAuthURL(metadata["oauth_url"])
+			tracker.SetState(StateAwaitingURL)
+			return
+		}
 	}
 
 	// Check for compaction reminder (only if enabled and not rate limited)
