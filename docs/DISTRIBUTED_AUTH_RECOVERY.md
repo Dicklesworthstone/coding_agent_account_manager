@@ -479,7 +479,22 @@ prompt to ensure the AGENTS reminder is injected after successful auth.
 
 ```bash
 caam auth-agent [--port 7891] [--chrome-profile default] [--headless]
+caam auth-agent --config ~/.config/caam/distributed-agent.json
+
+# Run at login and restart on crash (launchd on macOS, systemd --user on Linux)
+caam auth-agent service install [--config PATH]
+caam auth-agent service status [--json]
+caam auth-agent service uninstall
 ```
+
+On macOS the service is `~/Library/LaunchAgents/com.dicklesworthstone.caam.auth-agent.plist`
+(logs in `~/Library/Logs/caam-auth-agent.log`), started in the GUI session so it
+can drive a visible Chrome window. On Linux it is
+`~/.config/systemd/user/caam-auth-agent.service`. Installing validates the
+config first and is idempotent.
+
+Account strategies: `lru` (default; never-used accounts first), `round_robin`,
+and `random`.
 
 #### Responsibilities
 

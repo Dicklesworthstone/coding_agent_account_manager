@@ -355,3 +355,25 @@ func TestAccountUsage(t *testing.T) {
 		t.Errorf("unexpected last result: %s", usage.LastResult)
 	}
 }
+
+func TestRandomStrategySpreadsAcrossAccounts(t *testing.T) {
+	accounts := []string{"a@example.com", "b@example.com", "c@example.com"}
+
+	single := New(Config{AccountStrategy: StrategyRandom, Accounts: accounts, Logger: discardLogger()})
+	multi := NewMulti(MultiConfig{AccountStrategy: StrategyRandom, Accounts: accounts, Logger: discardLogger()})
+
+	for name, pick := range map[string]func() string{"single": single.selectAccount, "multi": multi.selectAccount} {
+		seen := map[string]int{}
+		for i := 0; i < 300; i++ {
+			seen[pick()]++
+		}
+		if len(seen) != len(accounts) {
+			t.Errorf("%s: random strategy picked %v, want all of %v", name, seen, accounts)
+		}
+		for acc := range seen {
+			if acc != accounts[0] && acc != accounts[1] && acc != accounts[2] {
+				t.Errorf("%s: picked unknown account %q", name, acc)
+			}
+		}
+	}
+}

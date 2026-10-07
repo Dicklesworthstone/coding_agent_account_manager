@@ -194,10 +194,12 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	if dryRun {
 		fmt.Println("Run without --dry-run to apply these changes.")
 	} else if successCount > 0 {
-		fmt.Println("Start the local agent:")
-		fmt.Printf("  caam auth-agent --config %s\n", result.LocalConfigPath)
-		fmt.Println()
-		fmt.Println("Or run it as a background service.")
+		fmt.Println("1. Set \"accounts\" (and optionally \"chrome_profile\") in:")
+		fmt.Printf("     %s\n", result.LocalConfigPath)
+		fmt.Println("2. Run the local agent as a login service:")
+		fmt.Println("     caam auth-agent service install")
+		fmt.Println("   or in the foreground:")
+		fmt.Printf("     caam auth-agent --config %s\n", result.LocalConfigPath)
 	}
 
 	return nil

@@ -2,15 +2,20 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/setup"
 	"github.com/spf13/cobra"
 )
 
@@ -443,6 +448,137 @@ var testAuthCmd = &cobra.Command{
 		fmt.Printf("  Account: %s\n", account)
 		return nil
 	},
+}
+
+var (
+	agentServiceConfig string
+	agentServiceJSON   bool
+)
+
+// agentServiceCmd manages the auth-agent as a per-user background service.
+var agentServiceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Run the auth agent as a login service (launchd on macOS, systemd on Linux)",
+	Long: `Install, remove, or inspect a per-user service that runs
+'caam auth-agent --config <path>' at login and restarts it if it crashes.
+
+macOS:  ~/Library/LaunchAgents/com.dicklesworthstone.caam.auth-agent.plist
+        (logs: ~/Library/Logs/caam-auth-agent.log)
+Linux:  ~/.config/systemd/user/caam-auth-agent.service
+        (logs: journalctl --user -u caam-auth-agent)
+
+The config defaults to the one written by 'caam setup distributed'.`,
+}
+
+func newAgentService() (*deploy.AgentService, error) {
+	configPath := agentServiceConfig
+	if configPath == "" {
+		configPath = setup.LocalAgentConfigPath()
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path: %w", err)
+	}
+	return deploy.NewAgentService(abs)
+}
+
+var agentServiceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install and start the auth-agent service",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		if _, err := loadAgentConfigForService(svc.ConfigPath); err != nil {
+			return err
+		}
+		path, err := svc.Install(cmd.Context())
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Installed auth-agent service: %s\n", path)
+		fmt.Fprintf(out, "  Runs: %s auth-agent --config %s\n", svc.Executable, svc.ConfigPath)
+		if logPath := svc.LogPath(); logPath != "" {
+			fmt.Fprintf(out, "  Logs: %s\n", logPath)
+		} else {
+			fmt.Fprintln(out, "  Logs: journalctl --user -u caam-auth-agent -f")
+		}
+		return nil
+	},
+}
+
+var agentServiceUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Stop and remove the auth-agent service",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		path, err := svc.Uninstall(cmd.Context())
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Removed auth-agent service: %s\n", path)
+		return nil
+	},
+}
+
+var agentServiceStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show whether the auth-agent service is installed and running",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		st, err := svc.Status(cmd.Context())
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		if agentServiceJSON {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(st)
+		}
+		fmt.Fprintf(out, "Unit:      %s\n", st.UnitPath)
+		fmt.Fprintf(out, "Installed: %t\n", st.Installed)
+		fmt.Fprintf(out, "Running:   %t\n", st.Running)
+		if st.Detail != "" {
+			fmt.Fprintf(out, "Detail:    %s\n", st.Detail)
+		}
+		if st.LogPath != "" {
+			fmt.Fprintf(out, "Logs:      %s\n", st.LogPath)
+		}
+		return nil
+	},
+}
+
+// loadAgentConfigForService validates the config before a service is
+// installed that would crash-loop on it.
+func loadAgentConfigForService(path string) (bool, error) {
+	useMulti, _, _, err := loadAgentConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("agent config %s not found: run 'caam setup distributed' or pass --config", path)
+	}
+	if err != nil {
+		return false, fmt.Errorf("agent config %s: %w", path, err)
+	}
+	return useMulti, nil
+}
+
+func init() {
+	agentCmd.AddCommand(agentServiceCmd)
+	agentServiceCmd.AddCommand(agentServiceInstallCmd, agentServiceUninstallCmd, agentServiceStatusCmd)
+	agentServiceCmd.PersistentFlags().StringVar(&agentServiceConfig, "config", "",
+		"agent config file (default: the 'caam setup distributed' config)")
+	agentServiceStatusCmd.Flags().BoolVar(&agentServiceJSON, "json", false, "print status as JSON")
 }
 
 func init() {

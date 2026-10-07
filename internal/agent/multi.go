@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -657,6 +658,8 @@ func (a *MultiAgent) selectAccount() string {
 		return a.selectLRU(accounts)
 	case StrategyRoundRobin:
 		return a.selectRoundRobin(accounts)
+	case StrategyRandom:
+		return accounts[rand.IntN(len(accounts))]
 	default:
 		return accounts[0]
 	}
