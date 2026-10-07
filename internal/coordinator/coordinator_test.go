@@ -3,10 +3,13 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -269,11 +272,11 @@ func TestCoordinatorReceiveAuthResponseNoTracker(t *testing.T) {
 		Account:   "test@example.com",
 	})
 
-	if err == nil {
-		t.Error("expected error for missing tracker")
+	if !errors.Is(err, ErrAuthRequestClosed) {
+		t.Fatalf("expected ErrAuthRequestClosed for missing tracker, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no tracker") {
-		t.Errorf("expected 'no tracker' error, got: %v", err)
+	if len(coord.GetPendingRequests()) != 0 {
+		t.Error("request without a pane must stop being offered to agents")
 	}
 }
 
@@ -317,7 +320,7 @@ func TestAPIHealthEndpoint(t *testing.T) {
 	coord := New(cfg)
 	coord.paneClient = &fakePaneClient{}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -357,7 +360,7 @@ func TestAPIStatusEndpoint(t *testing.T) {
 	coord.trackers[1] = tracker
 	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: "pending"}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	req := httptest.NewRequest("GET", "/status", nil)
 	w := httptest.NewRecorder()
@@ -396,7 +399,7 @@ func TestAPITokenAuth(t *testing.T) {
 	coord := New(cfg)
 	coord.paneClient = &fakePaneClient{}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 	handler := api.authMiddleware(api.handleStatus)
 
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -432,7 +435,7 @@ func TestAPIGetPendingEndpoint(t *testing.T) {
 		Status: "processing", // Not pending
 	}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	req := httptest.NewRequest("GET", "/auth/pending", nil)
 	w := httptest.NewRecorder()
@@ -468,7 +471,7 @@ func TestAPICompleteEndpoint(t *testing.T) {
 	coord.trackers[1] = tracker
 	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: "pending"}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	body := strings.NewReader(`{"request_id":"req-1","code":"ABC123","account":"test@example.com"}`)
 	req := httptest.NewRequest("POST", "/auth/complete", body)
@@ -495,7 +498,7 @@ func TestAPICompleteEndpointBadRequest(t *testing.T) {
 	cfg := DefaultConfig()
 	coord := New(cfg)
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	tests := []struct {
 		name     string
@@ -545,7 +548,7 @@ func TestAPIListPanesEndpoint(t *testing.T) {
 		},
 	}
 
-	api := NewAPIServer(coord, 0, nil)
+	api := NewAPIServer(coord, "", 0, nil)
 
 	req := httptest.NewRequest("GET", "/panes", nil)
 	w := httptest.NewRecorder()
@@ -1092,5 +1095,330 @@ func TestCompactionReminderPromptNewline(t *testing.T) {
 	// Verify newline was appended
 	if !strings.HasSuffix(sent[0], "\n") {
 		t.Errorf("expected prompt to end with newline, got %q", sent[0])
+	}
+}
+
+// =============================================================================
+// Replay-safe acceptance (caam-3ezz.8)
+// =============================================================================
+
+// newAwaitingCodeCoordinator returns a coordinator whose pane 1 is waiting for
+// the code of request "req-1".
+func newAwaitingCodeCoordinator(t *testing.T) (*Coordinator, *PaneTracker, *fakePaneClient) {
+	t.Helper()
+	client := &fakePaneClient{
+		panes:  []Pane{{PaneID: 1}},
+		output: "Paste code here if prompted >",
+	}
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = client.output
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: RequestPending, CreatedAt: time.Now()}
+	return coord, tracker, client
+}
+
+func TestReceiveAuthResponseIsReplaySafe(t *testing.T) {
+	coord, tracker, _ := newAwaitingCodeCoordinator(t)
+
+	first := AuthResponse{RequestID: "req-1", Code: "CODE-A", Account: "a@example.com"}
+	if err := coord.ReceiveAuthResponse(first); err != nil {
+		t.Fatalf("first response: %v", err)
+	}
+	if got := coord.GetPendingRequests(); len(got) != 0 {
+		t.Fatalf("accepted request still offered to agents: %+v", got)
+	}
+
+	// A redelivery after a lost acknowledgement is acknowledged again.
+	if err := coord.ReceiveAuthResponse(first); err != nil {
+		t.Fatalf("identical redelivery: %v", err)
+	}
+
+	// A different response never overwrites the accepted code.
+	err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "CODE-B", Account: "b@example.com"})
+	if !errors.Is(err, ErrAuthResponseConflict) {
+		t.Fatalf("conflicting response error = %v, want ErrAuthResponseConflict", err)
+	}
+	err = coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Error: "late failure"})
+	if !errors.Is(err, ErrAuthResponseConflict) {
+		t.Fatalf("late error response = %v, want ErrAuthResponseConflict", err)
+	}
+	if tracker.GetReceivedCode() != "CODE-A" || tracker.GetUsedAccount() != "a@example.com" {
+		t.Fatalf("accepted response overwritten: code=%q account=%q", tracker.GetReceivedCode(), tracker.GetUsedAccount())
+	}
+	if tracker.GetState() != StateAuthPending {
+		t.Fatalf("state = %v, want AUTH_PENDING until next poll", tracker.GetState())
+	}
+}
+
+func TestReceiveAuthResponseRejectsEmptyOrAmbiguous(t *testing.T) {
+	coord, tracker, _ := newAwaitingCodeCoordinator(t)
+
+	for _, resp := range []AuthResponse{
+		{RequestID: "req-1"},
+		{RequestID: "req-1", Code: "   ", Account: "a@example.com"},
+		{RequestID: "req-1", Code: "CODE", Error: "boom"},
+		{Code: "CODE"},
+	} {
+		if err := coord.ReceiveAuthResponse(resp); !errors.Is(err, ErrInvalidAuthResponse) {
+			t.Errorf("ReceiveAuthResponse(%+v) = %v, want ErrInvalidAuthResponse", resp, err)
+		}
+	}
+	if tracker.GetReceivedCode() != "" || tracker.GetState() != StateAuthPending {
+		t.Fatal("invalid responses must not change the pane")
+	}
+	if len(coord.GetPendingRequests()) != 1 {
+		t.Fatal("invalid responses must leave the request pending")
+	}
+}
+
+func TestReceiveAuthResponseReplayAfterCompletion(t *testing.T) {
+	coord, tracker, client := newAwaitingCodeCoordinator(t)
+	ctx := context.Background()
+
+	accepted := AuthResponse{RequestID: "req-1", Code: "CODE-A", Account: "a@example.com"}
+	if err := coord.ReceiveAuthResponse(accepted); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	coord.processPaneState(ctx, client.panes[0]) // -> CODE_RECEIVED
+	coord.processPaneState(ctx, client.panes[0]) // inject -> AWAITING_CONFIRM
+	client.output = "Logged in as a@example.com"
+	coord.processPaneState(ctx, client.panes[0]) // -> RESUMING
+	coord.processPaneState(ctx, client.panes[0]) // resume -> IDLE
+	if tracker.GetState() != StateIdle {
+		t.Fatalf("state = %v, want IDLE after the cycle", tracker.GetState())
+	}
+
+	// The agent's acknowledgement was lost; its retry arrives after the cycle.
+	if err := coord.ReceiveAuthResponse(accepted); err != nil {
+		t.Fatalf("redelivery after completion = %v, want acknowledgement", err)
+	}
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "CODE-B"}); !errors.Is(err, ErrAuthResponseConflict) {
+		t.Fatalf("conflict after completion = %v, want ErrAuthResponseConflict", err)
+	}
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "never-issued", Code: "X"}); !errors.Is(err, ErrUnknownAuthRequest) {
+		t.Fatalf("unknown request = %v, want ErrUnknownAuthRequest", err)
+	}
+
+	// Injection happened exactly once.
+	injected := 0
+	for _, s := range client.sentText() {
+		if s == "CODE-A\n" {
+			injected++
+		}
+	}
+	if injected != 1 {
+		t.Fatalf("code injected %d times, want 1", injected)
+	}
+}
+
+func TestReceiveAuthResponseAfterTimeoutIsClosed(t *testing.T) {
+	coord, tracker, client := newAwaitingCodeCoordinator(t)
+	coord.config.AuthTimeout = 10 * time.Millisecond
+	tracker.mu.Lock()
+	tracker.StateEntered = time.Now().Add(-time.Second)
+	tracker.mu.Unlock()
+
+	coord.processPaneState(context.Background(), client.panes[0])
+	if tracker.GetState() != StateFailed {
+		t.Fatalf("state = %v, want FAILED after auth timeout", tracker.GetState())
+	}
+
+	err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "LATE"})
+	if !errors.Is(err, ErrAuthRequestClosed) {
+		t.Fatalf("late code = %v, want ErrAuthRequestClosed", err)
+	}
+	if tracker.GetReceivedCode() != "" {
+		t.Fatal("late code must not be stored")
+	}
+}
+
+func TestAcceptedResponseWinsOverConcurrentTimeout(t *testing.T) {
+	coord, tracker, client := newAwaitingCodeCoordinator(t)
+	coord.config.AuthTimeout = 10 * time.Millisecond
+
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "CODE-A"}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	// The poll that observes the code also sees the timeout elapsed.
+	tracker.mu.Lock()
+	tracker.StateEntered = time.Now().Add(-time.Second)
+	tracker.mu.Unlock()
+
+	coord.processPaneState(context.Background(), client.panes[0])
+	if tracker.GetState() != StateCodeReceived {
+		t.Fatalf("state = %v, want CODE_RECEIVED: an accepted code must not time out", tracker.GetState())
+	}
+}
+
+func TestErrorResponseClosesRequestAndReplays(t *testing.T) {
+	coord, tracker, _ := newAwaitingCodeCoordinator(t)
+
+	failure := AuthResponse{RequestID: "req-1", Error: "browser crashed"}
+	if err := coord.ReceiveAuthResponse(failure); err != nil {
+		t.Fatalf("error response: %v", err)
+	}
+	if tracker.GetState() != StateFailed || tracker.GetErrorMessage() != "browser crashed" {
+		t.Fatalf("state=%v error=%q", tracker.GetState(), tracker.GetErrorMessage())
+	}
+	if err := coord.ReceiveAuthResponse(failure); err != nil {
+		t.Fatalf("redelivered error response = %v, want acknowledgement", err)
+	}
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "CODE"}); !errors.Is(err, ErrAuthResponseConflict) {
+		t.Fatalf("code after reported failure = %v, want ErrAuthResponseConflict", err)
+	}
+}
+
+func TestConcurrentResponsesAcceptExactlyOne(t *testing.T) {
+	coord, tracker, _ := newAwaitingCodeCoordinator(t)
+
+	const n = 16
+	results := make(chan error, n)
+	var start sync.WaitGroup
+	start.Add(1)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			start.Wait()
+			results <- coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: fmt.Sprintf("CODE-%d", i)})
+		}(i)
+	}
+	start.Done()
+
+	accepted := 0
+	for i := 0; i < n; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrAuthResponseConflict):
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted %d responses, want exactly 1", accepted)
+	}
+	if !strings.HasPrefix(tracker.GetReceivedCode(), "CODE-") {
+		t.Fatalf("stored code = %q", tracker.GetReceivedCode())
+	}
+}
+
+func TestPaneDisappearanceClosesRequest(t *testing.T) {
+	coord, _, client := newAwaitingCodeCoordinator(t)
+	client.panes = nil
+
+	coord.pollPanes(context.Background())
+	if len(coord.GetPendingRequests()) != 0 {
+		t.Fatal("request for a vanished pane must not stay pending")
+	}
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Code: "CODE"}); !errors.Is(err, ErrAuthRequestClosed) {
+		t.Fatalf("code for vanished pane = %v, want ErrAuthRequestClosed", err)
+	}
+}
+
+func TestClosedRequestsPrunedAfterReplayWindow(t *testing.T) {
+	coord, _, client := newAwaitingCodeCoordinator(t)
+	coord.config.ResponseReplayWindow = time.Millisecond
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Error: "nope"}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	client.output = "idle"
+	coord.pollPanes(context.Background())
+
+	if err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1", Error: "nope"}); !errors.Is(err, ErrUnknownAuthRequest) {
+		t.Fatalf("after replay window = %v, want ErrUnknownAuthRequest", err)
+	}
+}
+
+func TestAPICompleteStatusCodes(t *testing.T) {
+	coord, _, _ := newAwaitingCodeCoordinator(t)
+	api := NewAPIServer(coord, "", 0, nil)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/auth/complete", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		api.handleComplete(w, req)
+		return w
+	}
+
+	if w := post(`{"request_id":"req-1"}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty response status = %d, want 400", w.Code)
+	}
+	w := post(`{"request_id":"req-1","code":"CODE-A","account":"a@example.com"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("accept status = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+	var ack CompleteAck
+	if err := json.Unmarshal(w.Body.Bytes(), &ack); err != nil || ack.Status != "accepted" || ack.RequestID != "req-1" {
+		t.Fatalf("ack = %+v (%v)", ack, err)
+	}
+	if w := post(`{"request_id":"req-1","code":"CODE-A","account":"a@example.com"}`); w.Code != http.StatusOK {
+		t.Fatalf("duplicate status = %d, want 200", w.Code)
+	}
+	if w := post(`{"request_id":"req-1","code":"CODE-B"}`); w.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, want 409", w.Code)
+	}
+	if w := post(`{"request_id":"other","code":"X"}`); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown status = %d, want 404", w.Code)
+	}
+
+	coord.closeRequest("req-1", RequestExpired)
+	coord.mu.Lock()
+	coord.closed["req-2"] = &AuthRequest{ID: "req-2", Status: RequestExpired, closedAt: time.Now()}
+	coord.mu.Unlock()
+	if w := post(`{"request_id":"req-2","code":"X"}`); w.Code != http.StatusGone {
+		t.Fatalf("closed status = %d, want 410", w.Code)
+	}
+}
+
+func TestListenSecurity(t *testing.T) {
+	for _, bind := range []string{"", "127.0.0.1", "localhost", "::1", "[::1]", "127.0.0.2"} {
+		if !IsLoopbackBind(bind) {
+			t.Errorf("IsLoopbackBind(%q) = false", bind)
+		}
+		if err := ValidateListenSecurity(bind, ""); err != nil {
+			t.Errorf("loopback %q without token rejected: %v", bind, err)
+		}
+	}
+	for _, bind := range []string{"0.0.0.0", "::", "100.64.0.5", "example.com"} {
+		if IsLoopbackBind(bind) {
+			t.Errorf("IsLoopbackBind(%q) = true", bind)
+		}
+		if err := ValidateListenSecurity(bind, ""); err == nil {
+			t.Errorf("%q without token accepted", bind)
+		}
+		if err := ValidateListenSecurity(bind, "tok"); err != nil {
+			t.Errorf("%q with token rejected: %v", bind, err)
+		}
+	}
+	if got := ListenAddress("::1", 7890); got != "[::1]:7890" {
+		t.Errorf("ListenAddress(::1) = %q", got)
+	}
+	if got := ListenAddress("", 7890); got != "127.0.0.1:7890" {
+		t.Errorf("ListenAddress(\"\") = %q", got)
+	}
+}
+
+func TestFileConfigApply(t *testing.T) {
+	cfg, err := FileConfig{PollInterval: "1s", ResumeCooldown: "3s", Backend: "WezTerm", AuthToken: "t"}.Apply(DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollInterval != time.Second || cfg.ResumeCooldown != 3*time.Second || cfg.Backend != BackendWezTerm || cfg.AuthToken != "t" {
+		t.Fatalf("applied config = %+v", cfg)
+	}
+	if cfg.AuthTimeout != DefaultConfig().AuthTimeout {
+		t.Fatal("unset fields must keep defaults")
+	}
+	for _, bad := range []FileConfig{{AuthTimeout: "soon"}, {StateTimeout: "0s"}, {Backend: "screen"}, {OutputLines: -1}} {
+		if _, err := bad.Apply(DefaultConfig()); err == nil {
+			t.Errorf("Apply(%+v) accepted invalid config", bad)
+		}
 	}
 }

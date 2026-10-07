@@ -1,8 +1,13 @@
 package setup
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 )
 
 func TestDefaultOptions(t *testing.T) {
@@ -269,8 +274,11 @@ func TestBuildSetupScript(t *testing.T) {
 	if !strings.Contains(script, "caam setup distributed --yes") {
 		t.Error("expected setup command in script")
 	}
-	if !strings.Contains(script, "curl -fsS http://100.100.118.85:7890/status") {
-		t.Error("expected tailscale status curl in script")
+	if strings.Contains(script, "curl -fsS http://100.100.118.85:7890") {
+		t.Error("coordinator API is loopback-only; the script must not curl it remotely")
+	}
+	if !strings.Contains(script, "caam auth-coordinator status") {
+		t.Error("expected authenticated on-host status check in script")
 	}
 	if !strings.Contains(script, "ssh -i /tmp/id_ed25519 -p 2222 ubuntu@100.100.118.85") {
 		t.Error("expected ssh status command in script")
@@ -394,5 +402,156 @@ func TestOptionsWithManualOverrides(t *testing.T) {
 	cssOverride := opts.ManualOverrides["css"]
 	if !cssOverride.Disabled {
 		t.Error("expected css override to be disabled")
+	}
+}
+
+func setupWithRemotes(t *testing.T, configPath string) *Orchestrator {
+	t.Helper()
+	opts := DefaultOptions()
+	opts.AgentConfigPath = configPath
+	orch := NewOrchestrator(opts)
+	orch.localMachine = &DiscoveredMachine{Name: "local", IsLocal: true}
+	orch.remoteMachines = []*DiscoveredMachine{{
+		Name:          "csd-host",
+		WezTermDomain: "csd",
+		PublicIP:      "1.2.3.4",
+		TailscaleIP:   "100.64.0.5",
+		Username:      "ubuntu",
+		Port:          2222,
+		IdentityFile:  "~/.ssh/id_ed25519",
+	}}
+	return orch
+}
+
+func TestCoordinatorEndpointUsesSSHTunnelToLoopback(t *testing.T) {
+	orch := setupWithRemotes(t, filepath.Join(t.TempDir(), "agent.json"))
+	ep := orch.coordinatorEndpoint(orch.remoteMachines[0], "tok")
+
+	if ep.URL != "http://127.0.0.1:7890" {
+		t.Fatalf("URL = %q; the coordinator only listens on remote loopback", ep.URL)
+	}
+	if ep.Token != "tok" {
+		t.Fatalf("Token = %q", ep.Token)
+	}
+	want := agent.SSHTunnel{Host: "100.64.0.5", Port: 2222, User: "ubuntu", IdentityFile: "~/.ssh/id_ed25519"}
+	if ep.SSH == nil || *ep.SSH != want {
+		t.Fatalf("SSH = %+v, want %+v", ep.SSH, want)
+	}
+}
+
+func TestGenerateLocalConfigMergesAndPreservesUserSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	existing := agent.FileConfig{
+		Port:          7999,
+		PollInterval:  "5s",
+		Strategy:      "round_robin",
+		ChromeProfile: "/Users/me/Chrome/Work",
+		Accounts:      []string{"a@example.com", "b@example.com"},
+		Coordinators: []*agent.CoordinatorEndpoint{
+			{Name: "csd", URL: "http://1.2.3.4:7890", Token: "old"},
+			{Name: "other", URL: "http://127.0.0.1:7890", Token: "keep", SSH: &agent.SSHTunnel{Host: "other.example"}},
+		},
+	}
+	if err := agent.WriteFileConfig(path, existing); err != nil {
+		t.Fatal(err)
+	}
+
+	orch := setupWithRemotes(t, path)
+	if _, err := orch.generateLocalConfig([]*agent.CoordinatorEndpoint{orch.coordinatorEndpoint(orch.remoteMachines[0], "new")}); err != nil {
+		t.Fatalf("generateLocalConfig: %v", err)
+	}
+
+	got, err := agent.LoadFileConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Port != 7999 || got.PollInterval != "5s" || got.Strategy != "round_robin" ||
+		got.ChromeProfile != "/Users/me/Chrome/Work" || len(got.Accounts) != 2 {
+		t.Fatalf("user settings lost: %+v", got)
+	}
+	if len(got.Coordinators) != 2 {
+		t.Fatalf("coordinators = %d, want 2", len(got.Coordinators))
+	}
+	csd, other := got.Coordinators[0], got.Coordinators[1]
+	if csd.Name != "csd" || csd.Token != "new" || csd.SSH == nil || csd.URL != "http://127.0.0.1:7890" {
+		t.Fatalf("csd not replaced: %+v", csd)
+	}
+	if other.Name != "other" || other.Token != "keep" {
+		t.Fatalf("unrelated coordinator changed: %+v", other)
+	}
+}
+
+func TestGenerateLocalConfigCreatesPrivateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "caam", "agent.json")
+	orch := setupWithRemotes(t, path)
+	if _, err := orch.generateLocalConfig([]*agent.CoordinatorEndpoint{orch.coordinatorEndpoint(orch.remoteMachines[0], "tok")}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
+	}
+	got, err := agent.LoadFileConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Port != 7891 || got.Strategy != "lru" || got.Accounts == nil || len(got.Coordinators) != 1 {
+		t.Fatalf("defaults = %+v", got)
+	}
+}
+
+func TestGenerateLocalConfigRefusesUnreadableExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	orch := setupWithRemotes(t, path)
+	if _, err := orch.generateLocalConfig([]*agent.CoordinatorEndpoint{orch.coordinatorEndpoint(orch.remoteMachines[0], "tok")}); err == nil {
+		t.Fatal("a corrupt existing config must not be overwritten")
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != "{not json" {
+		t.Fatalf("existing config modified: %q", data)
+	}
+}
+
+func TestRedactedAgentConfigHidesTokens(t *testing.T) {
+	fc := agent.FileConfig{
+		CoordinatorToken: "single-secret",
+		Coordinators: []*agent.CoordinatorEndpoint{
+			{Name: "a", Token: "secret-a"},
+			{Name: "b", Token: dryRunTokenPlaceholder},
+		},
+	}
+	shown := redactedAgentConfig(fc)
+	data, err := json.Marshal(shown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "secret") {
+		t.Fatalf("redacted config leaks tokens: %s", data)
+	}
+	if fc.Coordinators[0].Token != "secret-a" {
+		t.Fatal("redaction must not modify the original config")
+	}
+	if shown.Coordinators[1].Token != dryRunTokenPlaceholder {
+		t.Fatal("placeholder should stay visible")
+	}
+}
+
+func TestGenerateTokenIsRandom(t *testing.T) {
+	a, err := generateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := generateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 64 || a == b {
+		t.Fatalf("tokens %q %q", a, b)
 	}
 }

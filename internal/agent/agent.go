@@ -2,6 +2,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -78,15 +80,189 @@ type AccountUsage struct {
 	LastResult string    `json:"last_result"` // success, failed
 }
 
+// oauthCompleter completes an OAuth flow and returns the challenge code and
+// the account that was used. *Browser is the production implementation.
+type oauthCompleter interface {
+	CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error)
+}
+
+// deliveryPolicy bounds acknowledged delivery of auth results.
+type deliveryPolicy struct {
+	// Timeout is the total time spent retrying one delivery.
+	Timeout time.Duration
+	// InitialDelay is the first retry delay; it doubles up to MaxDelay.
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
+}
+
+// defaultDeliveryPolicy outlasts a dropped SSH tunnel reconnect while staying
+// within the coordinator's default auth timeout plus its replay window.
+var defaultDeliveryPolicy = deliveryPolicy{
+	Timeout:      90 * time.Second,
+	InitialDelay: 500 * time.Millisecond,
+	MaxDelay:     8 * time.Second,
+}
+
+// completion is the auth result body posted to a coordinator's /auth/complete.
+// Exactly one of Code or Error is set. Retries resend identical bytes, which
+// the coordinator acknowledges as a duplicate of the response it accepted.
+type completion struct {
+	RequestID string `json:"request_id"`
+	Code      string `json:"code,omitempty"`
+	Account   string `json:"account,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// DeliveryRejectedError is a final coordinator rejection of an auth result,
+// such as an unknown, closed, or conflicting request. It is not retried.
+type DeliveryRejectedError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *DeliveryRejectedError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("coordinator rejected auth result (HTTP %d)", e.StatusCode)
+	}
+	return fmt.Sprintf("coordinator rejected auth result (HTTP %d): %s", e.StatusCode, e.Message)
+}
+
+// retryableDeliveryStatus reports whether a coordinator status may succeed on
+// redelivery. Everything else other than 2xx is final.
+func retryableDeliveryStatus(code int) bool {
+	return code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests
+}
+
+// deliverCompletion posts an auth result until the coordinator acknowledges
+// it with a 2xx status or rejects it with a final status. Transport errors,
+// 5xx, 408, and 429 are retried with exponential backoff, so a response lost
+// on the way back is redelivered rather than reported as success or dropped.
+func deliverCompletion(ctx context.Context, client *http.Client, baseURL, token string, body completion, policy deliveryPolicy, logger *slog.Logger) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode auth result: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, policy.Timeout)
+	defer cancel()
+
+	delay := policy.InitialDelay
+	for attempt := 1; ; attempt++ {
+		status, msg, err := postCompletion(ctx, client, baseURL, token, payload)
+		if err == nil && status >= 200 && status < 300 {
+			logger.Info("auth result acknowledged",
+				"request_id", body.RequestID,
+				"attempt", attempt)
+			return nil
+		}
+		if err == nil && !retryableDeliveryStatus(status) {
+			return &DeliveryRejectedError{StatusCode: status, Message: msg}
+		}
+		if err == nil {
+			err = fmt.Errorf("HTTP %d: %s", status, msg)
+		}
+
+		logger.Warn("auth result delivery failed",
+			"request_id", body.RequestID,
+			"attempt", attempt,
+			"retry_in", delay,
+			"error", err)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("auth result for request %s not acknowledged after %d attempts: %w", body.RequestID, attempt, err)
+		case <-timer.C:
+		}
+		delay = min(delay*2, policy.MaxDelay)
+	}
+}
+
+func postCompletion(ctx context.Context, client *http.Client, baseURL, token string, payload []byte) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/auth/complete", bytes.NewReader(payload))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// The acknowledgement was cut off; redelivery is safe.
+		return 0, "", fmt.Errorf("read acknowledgement: %w", err)
+	}
+	return resp.StatusCode, coordinatorErrorMessage(data), nil
+}
+
+// coordinatorErrorMessage extracts the "error" field of a coordinator JSON
+// error body, falling back to the raw text.
+func coordinatorErrorMessage(data []byte) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &body) == nil && body.Error != "" {
+		return body.Error
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// pendingRequest is one entry of a coordinator's /auth/pending list.
+type pendingRequest struct {
+	ID        string    `json:"id"`
+	PaneID    int       `json:"pane_id"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// fetchPending lists a coordinator's pending auth requests.
+func fetchPending(ctx context.Context, client *http.Client, baseURL, token string) ([]pendingRequest, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/auth/pending", nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, coordinatorErrorMessage(data))
+	}
+
+	var pending []pendingRequest
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&pending); err != nil {
+		return nil, fmt.Errorf("decode pending requests: %w", err)
+	}
+	return pending, nil
+}
+
 // Agent handles OAuth completion for the coordinator.
 type Agent struct {
 	config       Config
 	logger       *slog.Logger
 	server       *http.Server
 	browser      *Browser
+	oauth        oauthCompleter
+	client       *http.Client
+	delivery     deliveryPolicy
 	accountUsage map[string]*AccountUsage
 	usagePath    string
 	mu           sync.RWMutex
+	cancel       context.CancelFunc
 	stopCh       chan struct{}
 	doneCh       chan struct{}
 	running      bool
@@ -110,6 +286,8 @@ func New(config Config) *Agent {
 	agent := &Agent{
 		config:       config,
 		logger:       config.Logger,
+		client:       &http.Client{Timeout: 15 * time.Second},
+		delivery:     defaultDeliveryPolicy,
 		accountUsage: make(map[string]*AccountUsage),
 		usagePath:    usagePath,
 		stopCh:       make(chan struct{}),
@@ -153,6 +331,12 @@ func (a *Agent) Start(ctx context.Context) error {
 		Headless:    a.config.Headless,
 		Logger:      a.logger,
 	})
+	if a.oauth == nil {
+		a.oauth = a.browser
+	}
+
+	// Stop cancels in-flight OAuth flows and deliveries.
+	ctx, a.cancel = context.WithCancel(ctx)
 
 	// Set up HTTP server
 	mux := http.NewServeMux()
@@ -163,6 +347,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", a.config.Port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		a.cancel()
 		a.mu.Lock()
 		a.running = false
 		close(a.doneCh)
@@ -213,6 +398,9 @@ func (a *Agent) Stop(ctx context.Context) error {
 	default:
 		close(a.stopCh)
 	}
+	if a.cancel != nil {
+		a.cancel()
+	}
 
 	if a.server != nil {
 		if err := a.server.Shutdown(ctx); err != nil {
@@ -254,50 +442,25 @@ func (a *Agent) pollLoop(ctx context.Context) {
 
 // checkPendingRequests fetches and processes pending auth requests.
 func (a *Agent) checkPendingRequests(ctx context.Context) {
-	url := a.config.CoordinatorURL + "/auth/pending"
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	pending, err := fetchPending(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken)
 	if err != nil {
-		return
-	}
-	if a.config.CoordinatorToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		a.logger.Debug("failed to reach coordinator", "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		a.logger.Debug("coordinator returned non-200", "status", resp.StatusCode)
-		return
-	}
-
-	var pending []struct {
-		ID        string    `json:"id"`
-		PaneID    int       `json:"pane_id"`
-		URL       string    `json:"url"`
-		CreatedAt time.Time `json:"created_at"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
-		a.logger.Debug("failed to decode pending requests", "error", err)
+		a.logger.Debug("failed to fetch pending requests", "error", err)
 		return
 	}
 
 	for _, p := range pending {
+		if ctx.Err() != nil {
+			return
+		}
 		a.processAuthRequest(ctx, p.ID, p.URL)
 	}
 }
 
-// processAuthRequest handles a single auth request.
+// processAuthRequest completes one auth request and delivers the result.
+// Success callbacks and usage records happen only after the coordinator
+// acknowledges the code.
 func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL string) {
-	a.logger.Info("processing auth request",
-		"request_id", requestID,
-		"url_prefix", truncate(authURL, 50))
+	a.logger.Info("processing auth request", "request_id", requestID)
 
 	// Select account
 	account := a.selectAccount()
@@ -305,72 +468,45 @@ func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL strin
 		a.OnAuthStart(authURL, account)
 	}
 
-	// Complete OAuth
-	code, usedAccount, err := a.browser.CompleteOAuth(ctx, authURL, account)
+	code, usedAccount, err := a.oauth.CompleteOAuth(ctx, authURL, account)
 	if err != nil {
 		a.logger.Error("OAuth failed",
 			"request_id", requestID,
 			"error", err)
 		a.recordUsage(account, "failed")
 
+		// Report the failure so the pane stops waiting for a code.
+		if derr := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+			completion{RequestID: requestID, Error: err.Error()}, a.delivery, a.logger); derr != nil {
+			a.logger.Warn("failed to report OAuth failure", "request_id", requestID, "error", derr)
+		}
+
 		if a.OnAuthFailed != nil {
 			a.OnAuthFailed(account, err)
 		}
-
-		// Send error to coordinator
-		a.sendAuthComplete(ctx, requestID, "", "", err.Error())
 		return
 	}
 
 	a.logger.Info("OAuth completed",
 		"request_id", requestID,
 		"account", usedAccount)
-	a.recordUsage(usedAccount, "success")
 
+	if err := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+		completion{RequestID: requestID, Code: code, Account: usedAccount}, a.delivery, a.logger); err != nil {
+		a.logger.Error("auth code not delivered",
+			"request_id", requestID,
+			"account", usedAccount,
+			"error", err)
+		a.recordUsage(usedAccount, "undelivered")
+		if a.OnAuthFailed != nil {
+			a.OnAuthFailed(usedAccount, fmt.Errorf("deliver code for request %s: %w", requestID, err))
+		}
+		return
+	}
+
+	a.recordUsage(usedAccount, "success")
 	if a.OnAuthComplete != nil {
 		a.OnAuthComplete(usedAccount, code)
-	}
-
-	// Send success to coordinator
-	a.sendAuthComplete(ctx, requestID, code, usedAccount, "")
-}
-
-// sendAuthComplete sends the auth result to the coordinator.
-func (a *Agent) sendAuthComplete(ctx context.Context, requestID, code, account, errMsg string) {
-	url := a.config.CoordinatorURL + "/auth/complete"
-
-	body := map[string]string{
-		"request_id": requestID,
-		"code":       code,
-		"account":    account,
-	}
-	if errMsg != "" {
-		body["error"] = errMsg
-	}
-
-	bodyJSON, _ := json.Marshal(body)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url,
-		jsonReader(bodyJSON))
-	if err != nil {
-		a.logger.Error("failed to create request", "error", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if a.config.CoordinatorToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		a.logger.Error("failed to send auth complete", "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		a.logger.Warn("coordinator returned error", "status", resp.StatusCode)
 	}
 }
 
@@ -482,7 +618,8 @@ func (a *Agent) saveUsage() {
 	a.mu.RLock()
 	usages := make([]*AccountUsage, 0, len(a.accountUsage))
 	for _, u := range a.accountUsage {
-		usages = append(usages, u)
+		copied := *u
+		usages = append(usages, &copied)
 	}
 	a.mu.RUnlock()
 
@@ -541,10 +678,11 @@ func (a *Agent) withLogging(next http.Handler) http.Handler {
 func (a *Agent) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	accountCount := len(a.accountUsage)
+	running := a.running
 	a.mu.RUnlock()
 
 	status := map[string]interface{}{
-		"running":       a.running,
+		"running":       running,
 		"coordinator":   a.config.CoordinatorURL,
 		"account_count": accountCount,
 		"strategy":      a.config.AccountStrategy,
@@ -558,7 +696,8 @@ func (a *Agent) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	usages := make([]*AccountUsage, 0, len(a.accountUsage))
 	for _, u := range a.accountUsage {
-		usages = append(usages, u)
+		copied := *u
+		usages = append(usages, &copied)
 	}
 	a.mu.RUnlock()
 
@@ -596,7 +735,7 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 		account = a.selectAccount()
 	}
 
-	code, usedAccount, err := a.browser.CompleteOAuth(r.Context(), req.URL, account)
+	code, usedAccount, err := a.oauth.CompleteOAuth(r.Context(), req.URL, account)
 	if err != nil {
 		a.recordUsage(account, "failed")
 		w.Header().Set("Content-Type", "application/json")
@@ -619,22 +758,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
-}
-
-type jsonReaderWrapper struct {
-	data []byte
-	pos  int
-}
-
-func jsonReader(data []byte) *jsonReaderWrapper {
-	return &jsonReaderWrapper{data: data}
-}
-
-func (r *jsonReaderWrapper) Read(p []byte) (n int, err error) {
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
 }

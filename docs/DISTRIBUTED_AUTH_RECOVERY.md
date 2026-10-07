@@ -42,17 +42,16 @@ User has 7+ Claude Max accounts and runs multiple Claude Code sessions on a remo
 │                              │ └── Injects codes back         │ │
 │  ┌──────────────────────┐    └────────────────────────────────┘ │
 │  │ caam watch (daemon)  │              ↑                        │
-│  │ ├── fsnotify auth    │              │ localhost:7890         │
+│  │ ├── fsnotify auth    │              │ 127.0.0.1:7890 + token │
 │  │ │   files            │              │                        │
 │  │ └── Auto-save        │              │                        │
 │  │     profiles         │              │                        │
 │  └──────────────────────┘              │                        │
 └────────────────────────────────────────│────────────────────────┘
+                                         ↑
+                SSH connection opened    │  (agent polls /auth/pending,
+                by the local agent       │   posts /auth/complete)
                                          │
-                    SSH Reverse Tunnel   │
-                    (ssh -R 7890:localhost:7891)
-                                         │
-                                         ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │                      LOCAL (Mac Mini)                            │
 │                                                                  │
@@ -89,26 +88,29 @@ User has 7+ Claude Max accounts and runs multiple Claude Code sessions on a remo
    ↓
 5. auth-coordinator extracts OAuth URL from pane output
    ↓
-6. auth-coordinator POSTs to local auth-agent (via SSH tunnel)
+6. auth-coordinator publishes a pending request; the local auth-agent picks it
+   up from GET /auth/pending over its SSH connection
    {
+     "id": "uuid",
      "pane_id": 123,
      "url": "https://claude.ai/oauth/authorize?...",
-     "timestamp": "2026-01-12T15:30:00Z"
+     "created_at": "2026-01-12T15:30:00Z"
    }
    ↓
-7. auth-agent opens URL in Playwright-controlled Chrome
+7. auth-agent opens URL in chromedp-controlled Chrome
    ↓
 8. auth-agent selects Google account (Least Recently Used)
    ↓
 9. auth-agent extracts challenge code from page
    ↓
-10. auth-agent responds to coordinator with code
+10. auth-agent POSTs /auth/complete and retries until acknowledged
     {
+      "request_id": "uuid",
       "code": "XXXX-XXXX",
       "account": "alice@gmail.com"
     }
     ↓
-11. auth-coordinator injects code + "\n" into pane
+11. auth-coordinator injects code + "\n" into pane (once, even if redelivered)
     ↓
 12. auth-coordinator detects login success → injects resume prompt
     "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n"
@@ -175,11 +177,68 @@ capture and its callbacks to finish.
 #### Command
 
 ```bash
-caam auth-coordinator [--port 7890] [--poll-interval 500ms] [--resume-prompt "..."] [--auth-token "shared-secret"]
+caam auth-coordinator [--bind 127.0.0.1] [--port 7890] [--poll-interval 500ms] [--resume-prompt "..."] [--auth-token "shared-secret"]
+caam auth-coordinator status [--config ~/.config/caam/coordinator.json] [--json]
 ```
 
-If `--auth-token` (or `CAAM_COORDINATOR_TOKEN`) is set, the coordinator API requires
-`Authorization: Bearer <token>` from the local agent.
+If `--auth-token` (or `CAAM_COORDINATOR_TOKEN`, or `auth_token` in the config
+file) is set, the coordinator API requires `Authorization: Bearer <token>` from
+the local agent. The API listens on `127.0.0.1` by default; binding to any
+other address (for example a Tailscale IP) is refused unless a token is set.
+
+#### Transport (what `caam setup distributed` provisions)
+
+`caam setup distributed` deploys each coordinator with a freshly generated
+per-host token in `~/.config/caam/coordinator.json` (mode 0600, `bind:
+127.0.0.1`) and a systemd user unit whose `ExecStart` uses `%h` for the config
+path. After starting the service it calls the authenticated `/status` endpoint
+through the same SSH connection, so a deployment is reported as successful only
+when the agent's exact path works.
+
+The local agent config (`~/.config/caam/distributed-agent.json`, mode 0600)
+gets one entry per verified host. Each entry carries the token and an `ssh`
+block; the agent opens its own SSH connection (ssh-agent, the configured
+identity file, or default keys, with `known_hosts` checking) and reaches the
+loopback-only API through it, reconnecting when the connection drops. Re-running
+setup replaces only the entries of hosts it redeployed and keeps `accounts`,
+`chrome_profile`, `strategy`, and other hosts untouched.
+
+```json
+{
+  "port": 7891,
+  "coordinators": [
+    {
+      "name": "csd",
+      "url": "http://127.0.0.1:7890",
+      "display_name": "csd-host",
+      "token": "<per-host token>",
+      "ssh": {"host": "100.64.0.5", "port": 22, "user": "ubuntu", "identity_file": "~/.ssh/id_ed25519"}
+    }
+  ],
+  "poll_interval": "2s",
+  "chrome_profile": "",
+  "strategy": "lru",
+  "accounts": []
+}
+```
+
+When the local machine's binary targets another platform (a macOS agent
+deploying to Linux), setup reuses an existing remote `caam` or installs the
+published release into `~/.local/bin` with the official installer.
+
+#### Delivery guarantees
+
+- The first valid response for a request is stored and never overwritten.
+- Redelivering the identical response is acknowledged again (`200`), including
+  for 15 minutes after the request closes, so an agent whose acknowledgement was
+  lost can retry safely. The pane receives the code once.
+- A different response for an answered request is rejected with `409`; a
+  response for a request that timed out or lost its pane gets `410`; an unknown
+  request gets `404`; a response with neither (or both) `code` and `error` gets
+  `400`.
+- The agent retries transport errors, `5xx`, `408`, and `429` with exponential
+  backoff for up to 90 seconds, treats every other status as final, and reports
+  success (and records account usage) only after a `2xx` acknowledgement.
 
 #### Responsibilities
 
@@ -261,16 +320,18 @@ var patterns = struct {
 #### HTTP API
 
 ```
-POST /auth/request
-  Request: { "pane_id": 123, "url": "https://...", "timestamp": "..." }
-  Response: 202 Accepted { "request_id": "uuid" }
+GET /health                      (no token required)
+  Response: { "status": "ok", "backend": "wezterm", ... }
 
 GET /auth/pending
-  Response: [{ "request_id": "uuid", "pane_id": 123, "url": "...", "created_at": "..." }]
+  Response: [{ "id": "uuid", "pane_id": 123, "url": "...", "created_at": "...", "status": "pending" }]
 
-POST /auth/complete
+POST /auth/complete              (alias: /auth/submit)
   Request: { "request_id": "uuid", "code": "XXXX-XXXX", "account": "alice@gmail.com" }
-  Response: 200 OK
+       or: { "request_id": "uuid", "error": "why the browser flow failed" }
+  Response: 200 { "status": "accepted", "request_id": "uuid" }   (also for identical redelivery)
+            400 invalid body, 401 bad token, 404 unknown request,
+            409 different response already accepted, 410 request closed
 
 GET /status
   Response: {
@@ -486,37 +547,36 @@ async function completeOAuth(url: string): Promise<AuthResult> {
 
 #### Code Location
 
-- `cmd/caam/cmd/agent.go` - CLI command (Go)
-- `internal/agent/server.go` - HTTP server
-- `internal/agent/browser.go` - Browser automation interface
-- `tools/auth-agent/` - Playwright automation (TypeScript/Node.js)
-  - `package.json`
-  - `src/index.ts` - Main entry point
-  - `src/oauth.ts` - OAuth flow automation
-  - `src/accounts.ts` - Account selection logic
+- `cmd/caam/cmd/agent.go` - CLI command
+- `internal/agent/agent.go` - single-coordinator agent, acknowledged delivery
+- `internal/agent/multi.go` - multi-coordinator agent, SSH tunnel transport, config file
+- `internal/agent/browser.go` - chromedp browser automation
 
-### SSH Tunnel Setup
+### Transport
 
-The local agent binds to localhost:7891. The remote coordinator expects to reach the agent at localhost:7890.
+The agent always initiates the connection: it polls the coordinator and posts
+results back, so nothing on the local machine needs to accept connections.
 
-#### Tunnel Command
+With a config from `caam setup distributed`, each coordinator entry's `ssh`
+block makes the agent tunnel its requests over its own SSH connection; no
+manual tunnel is needed.
 
-```bash
-# On local Mac, establish reverse tunnel
-ssh -R 7890:localhost:7891 user@remote-server -N
-
-# Or add to SSH config (~/.ssh/config)
-Host remote-server
-    RemoteForward 7890 localhost:7891
-```
-
-#### Auto-reconnect with autossh
+For a hand-run single coordinator (`caam auth-agent --coordinator
+http://localhost:7890`), forward the coordinator port yourself:
 
 ```bash
-autossh -M 0 -f -R 7890:localhost:7891 user@remote-server -N \
+# On the local machine
+ssh -N -L 7890:127.0.0.1:7890 user@remote-server
+
+# Or with autossh for automatic reconnects
+autossh -M 0 -f -N -L 7890:127.0.0.1:7890 user@remote-server \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3
 ```
+
+On a private network such as a tailnet you can instead run the coordinator
+with `--bind <tailscale-ip> --auth-token <secret>` and point the agent at
+`http://<tailscale-ip>:7890` with `--coordinator-token <secret>`.
 
 ## Configuration
 

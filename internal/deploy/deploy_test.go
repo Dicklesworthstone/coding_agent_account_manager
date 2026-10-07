@@ -1,8 +1,16 @@
 package deploy
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 )
 
 func TestGenerateSystemdUnit(t *testing.T) {
@@ -62,25 +70,100 @@ func TestDefaultCoordinatorConfig(t *testing.T) {
 	}
 }
 
-func TestExpandPath(t *testing.T) {
-	tests := []struct {
-		input    string
-		contains string // Expected to contain this
-	}{
-		{"~/test", "test"},       // Should expand home
-		{"/absolute/path", "/absolute/path"},
-		{"relative/path", "relative/path"},
+func TestCoordinatorExecStartUsesSystemdHomeSpecifier(t *testing.T) {
+	got := CoordinatorExecStart("/home/u/.local/bin/caam")
+	want := "/home/u/.local/bin/caam auth-coordinator --config %h/.config/caam/coordinator.json"
+	if got != want {
+		t.Fatalf("CoordinatorExecStart = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "~") {
+		t.Fatalf("ExecStart must not rely on tilde expansion: %q", got)
 	}
 
+	unit, err := GenerateSystemdUnit(SystemdUnitConfig{Type: "Auth Recovery Coordinator", ExecStart: got})
+	if err != nil {
+		t.Fatalf("GenerateSystemdUnit: %v", err)
+	}
+	if !strings.Contains(unit, "ExecStart="+want+"\n") {
+		t.Fatalf("unit missing ExecStart line:\n%s", unit)
+	}
+}
+
+func TestSystemdQuote(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"/usr/local/bin/caam", "/usr/local/bin/caam"},
+		{"/home/a b/bin/caam", `"/home/a b/bin/caam"`},
+		{"/opt/100%/caam", "/opt/100%%/caam"},
+		{`/opt/q"x/caam`, `"/opt/q\"x/caam"`},
+		{"/opt/$x/caam", `"/opt/$$x/caam"`},
+	}
 	for _, tt := range tests {
-		result := expandPath(tt.input)
-		if !strings.Contains(result, tt.contains) {
-			t.Errorf("expandPath(%q) = %q, expected to contain %q", tt.input, result, tt.contains)
+		if got := systemdQuote(tt.in); got != tt.want {
+			t.Errorf("systemdQuote(%q) = %q, want %q", tt.in, got, tt.want)
 		}
-		// Home expansion should not start with ~
-		if strings.HasPrefix(tt.input, "~/") && strings.HasPrefix(result, "~") {
-			t.Errorf("expandPath(%q) = %q, tilde not expanded", tt.input, result)
+	}
+}
+
+func TestDefaultCoordinatorConfigStaysOnLoopback(t *testing.T) {
+	config := DefaultCoordinatorConfig()
+	if config.Bind != "127.0.0.1" {
+		t.Fatalf("Bind = %q, want loopback", config.Bind)
+	}
+	if _, err := config.Apply(coordinator.DefaultConfig()); err != nil {
+		t.Fatalf("default deploy config must load in the coordinator: %v", err)
+	}
+
+	// The deployer writes and the coordinator reads the same JSON keys.
+	config.AuthToken = "secret"
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip coordinator.FileConfig
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip != config {
+		t.Fatalf("round trip = %+v, want %+v", roundTrip, config)
+	}
+}
+
+func TestNormalizeArch(t *testing.T) {
+	for in, want := range map[string]string{"x86_64\n": "amd64", "aarch64": "arm64", "arm64": "arm64", "riscv64": "riscv64"} {
+		if got := normalizeArch(in); got != want {
+			t.Errorf("normalizeArch(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestProbeCoordinatorStatus(t *testing.T) {
+	var sawToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawToken = r.Header.Get("Authorization")
+		if r.Header.Get("Authorization") != "Bearer good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte(`{"running":true}`))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+		},
+	}}
+
+	if err := probeCoordinatorStatus(context.Background(), client, "good"); err != nil {
+		t.Fatalf("probe with correct token: %v", err)
+	}
+	if sawToken != "Bearer good" {
+		t.Fatalf("Authorization = %q", sawToken)
+	}
+	if err := probeCoordinatorStatus(context.Background(), client, "bad"); !errors.Is(err, errCoordinatorUnauthorized) {
+		t.Fatalf("probe with wrong token = %v, want errCoordinatorUnauthorized", err)
 	}
 }
 

@@ -154,6 +154,33 @@ func (c *SSHClient) IsConnected() bool {
 	return c.connected && c.client != nil
 }
 
+// NewSession opens a command session on the established connection.
+func (c *SSHClient) NewSession() (*ssh.Session, error) {
+	if !c.IsConnected() {
+		return nil, errors.New("not connected")
+	}
+	return c.client.NewSession()
+}
+
+// Dial opens a connection from the remote machine to addr through the SSH
+// connection, like 'ssh -L'.
+func (c *SSHClient) Dial(network, addr string) (net.Conn, error) {
+	if !c.IsConnected() {
+		return nil, errors.New("not connected")
+	}
+	return c.client.Dial(network, addr)
+}
+
+// Conn returns the underlying SSH connection, or nil when not connected.
+// Its methods are safe for concurrent use; closing it interrupts blocked
+// dials, after which Disconnect still releases the remaining resources.
+func (c *SSHClient) Conn() *ssh.Client {
+	if !c.IsConnected() {
+		return nil
+	}
+	return c.client
+}
+
 // getAuthMethods returns available SSH authentication methods.
 func (c *SSHClient) getAuthMethods() ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
@@ -388,10 +415,13 @@ func (c *SSHClient) WriteFile(remotePath string, data []byte, mode os.FileMode) 
 		return err
 	}
 
-	// Rename to final path (atomic on POSIX)
-	if err := c.sftp.Rename(tmpPath, remotePath); err != nil {
-		c.sftp.Remove(tmpPath)
-		return err
+	// Rename to final path. Plain SFTP rename refuses to replace an existing
+	// file, so prefer the atomic posix-rename extension.
+	if err := c.sftp.PosixRename(tmpPath, remotePath); err != nil {
+		if renameErr := c.sftp.Rename(tmpPath, remotePath); renameErr != nil {
+			c.sftp.Remove(tmpPath)
+			return fmt.Errorf("replace %s: %w", remotePath, errors.Join(err, renameErr))
+		}
 	}
 
 	return nil

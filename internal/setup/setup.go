@@ -3,7 +3,10 @@ package setup
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tailscale"
@@ -85,8 +89,28 @@ type Options struct {
 	// DryRun shows what would be done without making changes.
 	DryRun bool
 
+	// AgentConfigPath is where the local agent config is written.
+	// Defaults to LocalAgentConfigPath().
+	AgentConfigPath string
+
 	// Logger for structured logging.
 	Logger *slog.Logger
+}
+
+// LocalAgentConfigPath returns the default local agent config path.
+func LocalAgentConfigPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		configDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(configDir, "caam", "distributed-agent.json")
+}
+
+func (o *Orchestrator) agentConfigPath() string {
+	if o.opts.AgentConfigPath != "" {
+		return o.opts.AgentConfigPath
+	}
+	return LocalAgentConfigPath()
 }
 
 // DefaultOptions returns the default setup options.
@@ -421,11 +445,7 @@ func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
 	}
 	b.WriteString("\n\n")
 
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = filepath.Join(os.Getenv("HOME"), ".config")
-	}
-	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+	configPath := o.agentConfigPath()
 
 	b.WriteString("# 2) Inspect and edit the local agent config\n")
 	b.WriteString(fmt.Sprintf("CONFIG_PATH=%s\n", shellQuote(configPath)))
@@ -434,17 +454,15 @@ func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
 	b.WriteString("# 3) Check coordinator service status on remotes\n")
 	for _, m := range o.remoteMachines {
 		sshCmd := buildSSHCommand(m, opts)
-		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote("systemctl --user status caam-coordinator --no-pager")))
+		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote("systemctl --user status "+deploy.CoordinatorServiceName+" --no-pager")))
 	}
 	b.WriteString("\n")
 
-	b.WriteString("# 4) Smoke test coordinator status endpoints\n")
+	// The API listens on remote loopback with a token, so query it on the host.
+	b.WriteString("# 4) Smoke test the authenticated coordinator API on each remote\n")
 	for _, m := range o.remoteMachines {
-		addr := m.PublicIP
-		if opts.UseTailscale && m.TailscaleIP != "" {
-			addr = m.TailscaleIP
-		}
-		b.WriteString(fmt.Sprintf("curl -fsS http://%s:%d/status\n", addr, opts.RemotePort))
+		sshCmd := buildSSHCommand(m, opts)
+		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote(`PATH="$HOME/.local/bin:$HOME/bin:$PATH" caam auth-coordinator status`)))
 	}
 	b.WriteString("\n")
 	b.WriteString("# 5) Start the local auth agent\n")
@@ -505,13 +523,17 @@ type SetupResult struct {
 	Errors            []error
 }
 
-// Setup performs the full setup process.
+// Setup performs the full setup process: each remote gets a coordinator with
+// its own API token, and every successfully verified coordinator is recorded
+// in the local agent config with that token and an SSH tunnel endpoint.
 func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress)) (*SetupResult, error) {
 	result := &SetupResult{}
 
 	if len(o.remoteMachines) == 0 {
 		return nil, fmt.Errorf("no remote machines to setup")
 	}
+
+	var endpoints []*agent.CoordinatorEndpoint
 
 	// Deploy coordinators to remote machines
 	for _, machine := range o.remoteMachines {
@@ -529,6 +551,7 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 			o.logger.Info("[dry-run] would deploy coordinator",
 				"machine", machine.Name,
 				"address", o.getAddress(machine))
+			endpoints = append(endpoints, o.coordinatorEndpoint(machine, dryRunTokenPlaceholder))
 			p.Status = "success"
 			p.Message = "dry-run: skipped"
 			p.Finished = time.Now()
@@ -538,7 +561,11 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 			continue
 		}
 
-		deployResult, err := o.deployCoordinator(ctx, machine)
+		token, err := generateToken()
+		if err != nil {
+			return nil, err
+		}
+		deployResult, err := o.deployCoordinator(ctx, machine, token)
 		if err != nil {
 			p.Status = "failed"
 			p.Message = err.Error()
@@ -548,8 +575,9 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 				"error", err)
 		} else {
 			p.Status = "success"
-			p.Message = "deployed successfully"
+			p.Message = "deployed and verified"
 			o.logger.Info("deployment succeeded", "machine", machine.Name)
+			endpoints = append(endpoints, o.coordinatorEndpoint(machine, token))
 		}
 		p.Finished = time.Now()
 
@@ -562,8 +590,12 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 		}
 	}
 
-	// Generate local agent config
-	localConfigPath, err := o.generateLocalConfig()
+	// Record verified coordinators in the local agent config. A failed
+	// deployment keeps whatever entry that host already had.
+	if len(endpoints) == 0 {
+		return result, nil
+	}
+	localConfigPath, err := o.generateLocalConfig(endpoints)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("local config: %w", err))
 	} else {
@@ -573,8 +605,38 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 	return result, nil
 }
 
+// dryRunTokenPlaceholder stands in for tokens that a real run generates.
+const dryRunTokenPlaceholder = "<generated during setup>"
+
+// generateToken returns a random coordinator API token.
+func generateToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate coordinator token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// coordinatorEndpoint describes how the local agent reaches a deployed
+// coordinator: over its own SSH connection to the host the deployment used,
+// to the loopback-only API, authenticated with the host's token.
+func (o *Orchestrator) coordinatorEndpoint(m *DiscoveredMachine, token string) *agent.CoordinatorEndpoint {
+	return &agent.CoordinatorEndpoint{
+		Name:        m.WezTermDomain,
+		URL:         "http://" + coordinator.ListenAddress(coordinator.DefaultBindAddress, o.opts.RemotePort),
+		DisplayName: m.Name,
+		Token:       token,
+		SSH: &agent.SSHTunnel{
+			Host:         o.getAddress(m),
+			Port:         m.Port,
+			User:         m.Username,
+			IdentityFile: m.IdentityFile,
+		},
+	}
+}
+
 // deployCoordinator deploys a coordinator to a remote machine.
-func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachine) (*deploy.DeployResult, error) {
+func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachine, token string) (*deploy.DeployResult, error) {
 	syncMachine := o.toSyncMachine(m)
 
 	deployer := deploy.NewDeployer(syncMachine, o.logger)
@@ -585,97 +647,109 @@ func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachi
 
 	config := deploy.DefaultCoordinatorConfig()
 	config.Port = o.opts.RemotePort
+	config.AuthToken = token
 
 	return deployer.DeployCoordinator(ctx, config)
 }
 
-// generateLocalConfig generates the local agent configuration.
-func (o *Orchestrator) generateLocalConfig() (string, error) {
-	// Build coordinator endpoints
-	var coordinators []*agent.CoordinatorEndpoint
-	for _, m := range o.remoteMachines {
-		addr := o.getAddress(m)
-		coordinators = append(coordinators, &agent.CoordinatorEndpoint{
-			Name:        m.WezTermDomain,
-			URL:         fmt.Sprintf("http://%s:%d", addr, o.opts.RemotePort),
-			DisplayName: m.Name,
-		})
-	}
+// generateLocalConfig merges coordinator endpoints into the local agent
+// config. Endpoints replace existing entries with the same name; other
+// coordinators and user settings (accounts, Chrome profile, strategy) are
+// preserved.
+func (o *Orchestrator) generateLocalConfig(endpoints []*agent.CoordinatorEndpoint) (string, error) {
+	configPath := o.agentConfigPath()
 
-	config := struct {
-		Port          int                          `json:"port"`
-		Coordinators  []*agent.CoordinatorEndpoint `json:"coordinators"`
-		PollInterval  string                       `json:"poll_interval"`
-		Accounts      []string                     `json:"accounts"`
-		Strategy      string                       `json:"strategy"`
-		ChromeProfile string                       `json:"chrome_profile"`
-	}{
-		Port:          o.opts.LocalPort,
-		Coordinators:  coordinators,
-		PollInterval:  "2s",
-		Accounts:      []string{},
-		Strategy:      "lru",
-		ChromeProfile: "",
+	fc := agent.FileConfig{
+		Port:         o.opts.LocalPort,
+		PollInterval: "2s",
+		Strategy:     "lru",
+		Accounts:     []string{},
 	}
-
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", err
+	existing, err := agent.LoadFileConfig(configPath)
+	switch {
+	case err == nil:
+		fc = existing
+		if fc.Port == 0 || (o.opts.LocalPort != 0 && o.opts.LocalPort != DefaultOptions().LocalPort) {
+			fc.Port = o.opts.LocalPort
+		}
+		if fc.Accounts == nil {
+			fc.Accounts = []string{}
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		// Never clobber a config we cannot read; the user may have edited it.
+		return "", fmt.Errorf("existing agent config %s: %w", configPath, err)
 	}
-
-	// Determine config path
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = filepath.Join(os.Getenv("HOME"), ".config")
-	}
-
-	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+	fc.Coordinators = mergeEndpoints(fc.Coordinators, endpoints)
 
 	if o.opts.DryRun {
 		o.logger.Info("[dry-run] would write local agent config",
 			"path", configPath)
+		data, err := json.MarshalIndent(redactedAgentConfig(fc), "", "  ")
+		if err != nil {
+			return "", err
+		}
 		fmt.Println("--- distributed-agent.json ---")
 		fmt.Println(string(data))
 		fmt.Println("---")
 		return configPath, nil
 	}
 
-	// Create directory
-	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+	if err := agent.WriteFileConfig(configPath, fc); err != nil {
 		return "", err
 	}
 
-	// Atomic write: write to temp file, sync, then rename
-	tmpPath := configPath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return "", fmt.Errorf("create temp config file: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("write temp config file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("sync temp config file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("close temp config file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("rename temp config file: %w", err)
-	}
-
-	o.logger.Info("wrote local agent config", "path", configPath)
+	o.logger.Info("wrote local agent config", "path", configPath, "coordinators", len(fc.Coordinators))
 	return configPath, nil
+}
+
+// mergeEndpoints replaces existing coordinators by name and appends new ones.
+func mergeEndpoints(existing, updates []*agent.CoordinatorEndpoint) []*agent.CoordinatorEndpoint {
+	merged := make([]*agent.CoordinatorEndpoint, 0, len(existing)+len(updates))
+	replaced := make(map[string]bool, len(updates))
+	for _, cur := range existing {
+		if cur == nil {
+			continue
+		}
+		replacement := cur
+		for _, u := range updates {
+			if strings.EqualFold(u.Name, cur.Name) {
+				replacement = u
+				replaced[strings.ToLower(u.Name)] = true
+				break
+			}
+		}
+		merged = append(merged, replacement)
+	}
+	for _, u := range updates {
+		if !replaced[strings.ToLower(u.Name)] {
+			merged = append(merged, u)
+		}
+	}
+	return merged
+}
+
+// redactedAgentConfig hides coordinator tokens for display.
+func redactedAgentConfig(fc agent.FileConfig) agent.FileConfig {
+	shown := fc
+	shown.CoordinatorToken = redactToken(fc.CoordinatorToken)
+	shown.Coordinators = make([]*agent.CoordinatorEndpoint, 0, len(fc.Coordinators))
+	for _, c := range fc.Coordinators {
+		shown.Coordinators = append(shown.Coordinators, &agent.CoordinatorEndpoint{
+			Name:        c.Name,
+			URL:         c.URL,
+			DisplayName: c.DisplayName,
+			Token:       redactToken(c.Token),
+			SSH:         c.SSH,
+		})
+	}
+	return shown
+}
+
+func redactToken(token string) string {
+	if token == "" || token == dryRunTokenPlaceholder {
+		return token
+	}
+	return "[REDACTED]"
 }
 
 // getAddress returns the best address to use for a machine.

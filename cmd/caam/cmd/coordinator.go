@@ -3,10 +3,16 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +45,12 @@ TERMINAL BACKENDS:
 This daemon should run on the remote machine where Claude Code sessions are running.
 The local auth-agent connects to this coordinator to complete OAuth flows.
 
+TRANSPORT:
+  The API listens on 127.0.0.1 by default. 'caam setup distributed' configures
+  the local agent to reach it through its own SSH connection, so nothing is
+  exposed on the network. Binding to another address (for example a Tailscale
+  IP with --bind) requires --auth-token.
+
 Examples:
   # Start coordinator (auto-detects best backend)
   caam auth-coordinator
@@ -52,13 +64,17 @@ Examples:
   # Custom port and verbose logging
   caam auth-coordinator --port 7891 --verbose
 
-SSH Tunnel Setup (run on local Mac):
-  ssh -R 7890:localhost:7891 user@remote-server -N`,
+  # Listen on a Tailscale address (token required)
+  caam auth-coordinator --bind 100.64.0.5 --auth-token "$CAAM_COORDINATOR_TOKEN"
+
+Manual SSH tunnel (run on the local machine; the agent then uses http://localhost:7890):
+  ssh -N -L 7890:127.0.0.1:7890 user@remote-server`,
 	RunE: runCoordinator,
 }
 
 var (
 	coordinatorPort         int
+	coordinatorBind         string
 	coordinatorPollMs       int
 	coordinatorResumePrompt string
 	coordinatorVerbose      bool
@@ -72,6 +88,8 @@ func init() {
 	rootCmd.AddCommand(coordinatorCmd)
 
 	coordinatorCmd.Flags().IntVar(&coordinatorPort, "port", 7890, "API server port")
+	coordinatorCmd.Flags().StringVar(&coordinatorBind, "bind", coordinator.DefaultBindAddress,
+		"API listen address (non-loopback addresses require --auth-token)")
 	coordinatorCmd.Flags().IntVar(&coordinatorPollMs, "poll-interval", 500, "Pane poll interval in milliseconds")
 	coordinatorCmd.Flags().StringVar(&coordinatorResumePrompt, "resume-prompt",
 		"proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
@@ -102,15 +120,15 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	logger := slog.New(logHandler)
 
 	config := coordinator.DefaultConfig()
-	apiPort := coordinatorPort
+	listen := coordinatorListen{Bind: coordinator.DefaultBindAddress, Port: coordinatorPort}
 
 	if coordinatorConfigPath != "" {
-		loadedConfig, loadedPort, err := loadCoordinatorConfig(coordinatorConfigPath)
+		loadedConfig, loadedListen, err := loadCoordinatorConfig(coordinatorConfigPath)
 		if err != nil {
 			return err
 		}
 		config = loadedConfig
-		apiPort = loadedPort
+		listen = loadedListen
 	}
 
 	if cmd.Flags().Changed("backend") {
@@ -127,25 +145,39 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 		config.ResumePrompt = coordinatorResumePrompt
 	}
 	if cmd.Flags().Changed("port") {
-		apiPort = coordinatorPort
+		listen.Port = coordinatorPort
+	}
+	if cmd.Flags().Changed("bind") {
+		listen.Bind = coordinatorBind
 	}
 	if cmd.Flags().Changed("auth-token") {
 		config.AuthToken = coordinatorAuthToken
 	} else if envToken := strings.TrimSpace(os.Getenv("CAAM_COORDINATOR_TOKEN")); envToken != "" {
 		config.AuthToken = envToken
 	}
+	if err := coordinator.ValidateListenSecurity(listen.Bind, config.AuthToken); err != nil {
+		return err
+	}
 
 	config.Logger = logger
+
+	// Bind before starting the monitor so a taken port or bad address fails fast.
+	apiAddr := coordinator.ListenAddress(listen.Bind, listen.Port)
+	listener, err := net.Listen("tcp", apiAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", apiAddr, err)
+	}
 
 	// Create coordinator
 	coord := coordinator.New(config)
 
 	// Set up callbacks
 	coord.OnAuthRequest = func(req *coordinator.AuthRequest) {
-		fmt.Printf("[%s] AUTH NEEDED pane=%d url=%s\n",
+		fmt.Printf("[%s] AUTH NEEDED pane=%d request=%s url=%s\n",
 			time.Now().Format("15:04:05"),
 			req.PaneID,
-			truncateURL(req.URL))
+			req.ID,
+			coordinator.RedactURL(req.URL))
 	}
 
 	coord.OnAuthComplete = func(paneID int, account string) {
@@ -163,13 +195,14 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create API server
-	api := coordinator.NewAPIServer(coord, apiPort, logger)
+	api := coordinator.NewAPIServer(coord, listen.Bind, listen.Port, logger)
 
 	// Start coordinator
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
 	if err := coord.Start(ctx); err != nil {
+		listener.Close()
 		return fmt.Errorf("start coordinator: %w", err)
 	}
 
@@ -180,12 +213,12 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	// Start API server in background
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- api.Start()
+		errCh <- api.Serve(listener)
 	}()
 
 	fmt.Printf("Auth coordinator started\n")
 	fmt.Printf("  Backend: %s\n", coord.Backend())
-	fmt.Printf("  API: http://localhost:%d\n", apiPort)
+	fmt.Printf("  API: http://%s\n", apiAddr)
 	fmt.Printf("  Poll interval: %dms\n", int(config.PollInterval.Milliseconds()))
 	if config.AuthToken != "" {
 		fmt.Println("  Auth: token required")
@@ -201,7 +234,8 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	case <-sigCh:
 		fmt.Println("\nShutting down...")
 	case err := <-errCh:
-		if err != nil {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			coord.Stop()
 			return fmt.Errorf("API server error: %w", err)
 		}
 	case <-ctx.Done():
@@ -223,119 +257,163 @@ func runCoordinator(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func truncateURL(url string) string {
-	if len(url) > 80 {
-		return url[:77] + "..."
-	}
-	return url
+// coordinatorListen is where the coordinator API listens.
+type coordinatorListen struct {
+	Bind string
+	Port int
 }
 
-type coordinatorFileConfig struct {
-	Port           int    `json:"port"`
-	PollInterval   string `json:"poll_interval"`
-	AuthTimeout    string `json:"auth_timeout"`
-	StateTimeout   string `json:"state_timeout"`
-	ResumePrompt   string `json:"resume_prompt"`
-	ResumeCooldown string `json:"resume_cooldown"`
-	OutputLines    int    `json:"output_lines"`
-	Backend        string `json:"backend"`
-	AuthToken      string `json:"auth_token"`
-}
-
-func loadCoordinatorConfig(path string) (coordinator.Config, int, error) {
-	data, err := os.ReadFile(path)
+func loadCoordinatorConfig(path string) (coordinator.Config, coordinatorListen, error) {
+	fc, err := coordinator.LoadFileConfig(path)
 	if err != nil {
-		return coordinator.Config{}, 0, fmt.Errorf("read config: %w", err)
+		return coordinator.Config{}, coordinatorListen{}, err
+	}
+	cfg, err := fc.Apply(coordinator.DefaultConfig())
+	if err != nil {
+		return coordinator.Config{}, coordinatorListen{}, fmt.Errorf("config %s: %w", path, err)
 	}
 
-	var raw coordinatorFileConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return coordinator.Config{}, 0, fmt.Errorf("parse config: %w", err)
+	listen := coordinatorListen{Bind: coordinator.DefaultBindAddress, Port: coordinatorPort}
+	if strings.TrimSpace(fc.Bind) != "" {
+		listen.Bind = strings.TrimSpace(fc.Bind)
 	}
-
-	cfg := coordinator.DefaultConfig()
-	apiPort := coordinatorPort
-	if raw.Port != 0 {
-		apiPort = raw.Port
+	if fc.Port != 0 {
+		listen.Port = fc.Port
 	}
-	if raw.PollInterval != "" {
-		if d, err := time.ParseDuration(raw.PollInterval); err == nil {
-			cfg.PollInterval = d
-		} else {
-			return coordinator.Config{}, 0, fmt.Errorf("parse poll_interval: %w", err)
-		}
-	}
-	if raw.AuthTimeout != "" {
-		if d, err := time.ParseDuration(raw.AuthTimeout); err == nil {
-			cfg.AuthTimeout = d
-		} else {
-			return coordinator.Config{}, 0, fmt.Errorf("parse auth_timeout: %w", err)
-		}
-	}
-	if raw.StateTimeout != "" {
-		if d, err := time.ParseDuration(raw.StateTimeout); err == nil {
-			cfg.StateTimeout = d
-		} else {
-			return coordinator.Config{}, 0, fmt.Errorf("parse state_timeout: %w", err)
-		}
-	}
-	if raw.ResumePrompt != "" {
-		cfg.ResumePrompt = raw.ResumePrompt
-	}
-	if raw.ResumeCooldown != "" {
-		if d, err := time.ParseDuration(raw.ResumeCooldown); err == nil {
-			cfg.ResumeCooldown = d
-		} else {
-			return coordinator.Config{}, 0, fmt.Errorf("parse resume_cooldown: %w", err)
-		}
-	}
-	if raw.OutputLines != 0 {
-		cfg.OutputLines = raw.OutputLines
-	}
-	if raw.Backend != "" {
-		backend, err := parseBackend(raw.Backend)
-		if err != nil {
-			return coordinator.Config{}, 0, err
-		}
-		cfg.Backend = backend
-	}
-	if raw.AuthToken != "" {
-		cfg.AuthToken = raw.AuthToken
-	}
-
-	return cfg, apiPort, nil
+	return cfg, listen, nil
 }
 
 func parseBackend(value string) (coordinator.Backend, error) {
-	switch strings.ToLower(value) {
-	case "wezterm":
-		return coordinator.BackendWezTerm, nil
-	case "tmux":
-		return coordinator.BackendTmux, nil
-	case "auto", "":
-		return coordinator.BackendAuto, nil
-	default:
-		return "", fmt.Errorf("invalid backend %q: use wezterm, tmux, or auto", value)
-	}
+	return coordinator.ParseBackend(value)
 }
 
-// statusCmd shows coordinator status
+var (
+	coordinatorStatusURL    string
+	coordinatorStatusConfig string
+	coordinatorStatusToken  string
+	coordinatorStatusJSON   bool
+)
+
+// coordinatorStatusCmd queries a running coordinator.
 var coordinatorStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show auth-coordinator status",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		// This would make an HTTP request to the coordinator
-		// For now, just show how to check
-		fmt.Println("To check coordinator status:")
-		fmt.Printf("  curl http://localhost:%d/status\n", coordinatorPort)
-		fmt.Println("\nTo see pending auth requests:")
-		fmt.Printf("  curl http://localhost:%d/auth/pending\n", coordinatorPort)
-		return nil
-	},
+	Long: `Query a running auth-coordinator's /status endpoint.
+
+The address and token come from --url/--auth-token, or from the coordinator
+config file (default ~/.config/caam/coordinator.json when present).`,
+	Args: cobra.NoArgs,
+	RunE: runCoordinatorStatus,
 }
 
 func init() {
 	coordinatorCmd.AddCommand(coordinatorStatusCmd)
+	coordinatorStatusCmd.Flags().StringVar(&coordinatorStatusURL, "url", "", "coordinator base URL (default from config, else http://127.0.0.1:7890)")
+	coordinatorStatusCmd.Flags().StringVar(&coordinatorStatusConfig, "config", "", "coordinator config file to read address and token from")
+	coordinatorStatusCmd.Flags().StringVar(&coordinatorStatusToken, "auth-token", "", "coordinator API token (default from config or CAAM_COORDINATOR_TOKEN)")
+	coordinatorStatusCmd.Flags().BoolVar(&coordinatorStatusJSON, "json", false, "print the raw status JSON")
+}
+
+func runCoordinatorStatus(cmd *cobra.Command, args []string) error {
+	baseURL, token, err := resolveCoordinatorStatusTarget()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/status", nil)
+	if err != nil {
+		return fmt.Errorf("build status request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("coordinator unreachable at %s: %w", baseURL, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return fmt.Errorf("read status: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("coordinator at %s returned %s: %s", baseURL, resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	out := cmd.OutOrStdout()
+	if coordinatorStatusJSON {
+		_, err := out.Write(body)
+		return err
+	}
+
+	var status coordinator.StatusResponse
+	if err := json.Unmarshal(body, &status); err != nil {
+		return fmt.Errorf("decode status: %w", err)
+	}
+	fmt.Fprintf(out, "Coordinator: %s (backend %s)\n", baseURL, status.Backend)
+	fmt.Fprintf(out, "Panes: %d  Pending auth requests: %d\n", status.PaneCount, status.PendingAuths)
+	sort.Slice(status.Panes, func(i, j int) bool { return status.Panes[i].PaneID < status.Panes[j].PaneID })
+	for _, p := range status.Panes {
+		line := fmt.Sprintf("  pane %-5d %-22s since %s", p.PaneID, p.State, p.StateEntered.Format(time.RFC3339))
+		if p.RequestID != "" {
+			line += " request=" + p.RequestID
+		}
+		if p.Account != "" {
+			line += " account=" + p.Account
+		}
+		if p.Error != "" {
+			line += " error=" + p.Error
+		}
+		fmt.Fprintln(out, line)
+	}
+	return nil
+}
+
+// resolveCoordinatorStatusTarget picks the URL and token for 'status' from
+// flags, then the coordinator config file, then the environment.
+func resolveCoordinatorStatusTarget() (string, string, error) {
+	configPath := coordinatorStatusConfig
+	explicitConfig := configPath != ""
+	if !explicitConfig {
+		if dir, err := os.UserConfigDir(); err == nil {
+			configPath = filepath.Join(dir, "caam", "coordinator.json")
+		}
+	}
+
+	var fc coordinator.FileConfig
+	if configPath != "" {
+		loaded, err := coordinator.LoadFileConfig(configPath)
+		switch {
+		case err == nil:
+			fc = loaded
+		case explicitConfig || !errors.Is(err, os.ErrNotExist):
+			return "", "", err
+		}
+	}
+
+	baseURL := coordinatorStatusURL
+	if baseURL == "" {
+		bind := strings.TrimSpace(fc.Bind)
+		if bind == "" || bind == "0.0.0.0" || bind == "::" {
+			bind = coordinator.DefaultBindAddress
+		}
+		port := fc.Port
+		if port == 0 {
+			port = 7890
+		}
+		baseURL = "http://" + coordinator.ListenAddress(bind, port)
+	}
+
+	token := coordinatorStatusToken
+	if token == "" {
+		token = fc.AuthToken
+	}
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("CAAM_COORDINATOR_TOKEN"))
+	}
+	return baseURL, token, nil
 }
 
 // filterClaudePanes returns true for panes likely running Claude Code.

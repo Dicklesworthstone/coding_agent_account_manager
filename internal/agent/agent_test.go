@@ -1,9 +1,184 @@
 package agent
 
 import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// fastDelivery retries quickly so tests exercise several attempts.
+var fastDelivery = deliveryPolicy{Timeout: 2 * time.Second, InitialDelay: 5 * time.Millisecond, MaxDelay: 20 * time.Millisecond}
+
+// fakeOAuth completes OAuth without a browser.
+type fakeOAuth struct {
+	code, account string
+	err           error
+	calls         atomic.Int32
+}
+
+func (f *fakeOAuth) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return "", "", f.err
+	}
+	return f.code, f.account, nil
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestDeliverCompletionRetriesTransientFailures(t *testing.T) {
+	var attempts atomic.Int32
+	var bodies []string
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(data))
+		mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch attempts.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case 2:
+			w.WriteHeader(http.StatusTooManyRequests)
+		default:
+			w.Write([]byte(`{"status":"accepted","request_id":"r1"}`))
+		}
+	}))
+	defer srv.Close()
+
+	err := deliverCompletion(context.Background(), srv.Client(), srv.URL, "tok",
+		completion{RequestID: "r1", Code: "CODE", Account: "a@example.com"}, fastDelivery, discardLogger())
+	if err != nil {
+		t.Fatalf("deliverCompletion: %v", err)
+	}
+	if attempts.Load() != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts.Load())
+	}
+	// Every attempt carries the identical payload the coordinator deduplicates on.
+	for _, b := range bodies {
+		if b != bodies[0] {
+			t.Fatalf("payload changed between attempts: %q vs %q", b, bodies[0])
+		}
+	}
+	if !strings.Contains(bodies[0], `"code":"CODE"`) || strings.Contains(bodies[0], `"error"`) {
+		t.Fatalf("payload = %s", bodies[0])
+	}
+}
+
+func TestDeliverCompletionStopsOnFinalRejection(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict, http.StatusGone} {
+		var attempts atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			w.Write([]byte(`{"status":"error","error":"nope"}`))
+		}))
+
+		err := deliverCompletion(context.Background(), srv.Client(), srv.URL, "",
+			completion{RequestID: "r1", Code: "CODE"}, fastDelivery, discardLogger())
+		srv.Close()
+
+		var rejected *DeliveryRejectedError
+		if !errors.As(err, &rejected) || rejected.StatusCode != status || rejected.Message != "nope" {
+			t.Errorf("status %d: err = %v, want DeliveryRejectedError", status, err)
+		}
+		if attempts.Load() != 1 {
+			t.Errorf("status %d: attempts = %d, want 1 (final statuses are not retried)", status, attempts.Load())
+		}
+	}
+}
+
+func TestDeliverCompletionGivesUpAfterTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	policy := fastDelivery
+	policy.Timeout = 60 * time.Millisecond
+	start := time.Now()
+	err := deliverCompletion(context.Background(), srv.Client(), srv.URL, "",
+		completion{RequestID: "r1", Code: "CODE"}, policy, discardLogger())
+	if err == nil {
+		t.Fatal("expected failure when the coordinator never acknowledges")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("delivery ran %v, past its timeout", elapsed)
+	}
+}
+
+func TestAgentReportsSuccessOnlyAfterAcknowledgement(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGone)
+		w.Write([]byte(`{"status":"error","error":"auth request is closed"}`))
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.CoordinatorURL = srv.URL
+	cfg.Logger = discardLogger()
+	a := New(cfg)
+	a.delivery = fastDelivery
+	a.oauth = &fakeOAuth{code: "CODE", account: "a@example.com"}
+
+	var completed, failed atomic.Int32
+	a.OnAuthComplete = func(account, code string) { completed.Add(1) }
+	a.OnAuthFailed = func(account string, err error) {
+		var rejected *DeliveryRejectedError
+		if !errors.As(err, &rejected) || rejected.StatusCode != http.StatusGone {
+			t.Errorf("failure error = %v", err)
+		}
+		failed.Add(1)
+	}
+
+	a.processAuthRequest(context.Background(), "r1", "https://claude.ai/oauth/authorize?x=1")
+	if completed.Load() != 0 || failed.Load() != 1 {
+		t.Fatalf("completed=%d failed=%d; an unacknowledged code is a failure", completed.Load(), failed.Load())
+	}
+	a.mu.RLock()
+	result := a.accountUsage["a@example.com"].LastResult
+	a.mu.RUnlock()
+	if result != "undelivered" {
+		t.Fatalf("usage result = %q, want undelivered", result)
+	}
+}
+
+func TestAgentReportsOAuthFailureToCoordinator(t *testing.T) {
+	var got atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		got.Store(string(data))
+		w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.CoordinatorURL = srv.URL
+	cfg.Logger = discardLogger()
+	a := New(cfg)
+	a.delivery = fastDelivery
+	a.oauth = &fakeOAuth{err: errors.New("consent page changed")}
+
+	a.processAuthRequest(context.Background(), "r1", "https://claude.ai/oauth/authorize?x=1")
+	body, _ := got.Load().(string)
+	if !strings.Contains(body, `"error":"consent page changed"`) || strings.Contains(body, `"code"`) {
+		t.Fatalf("reported body = %q", body)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()

@@ -1,13 +1,30 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
+	"golang.org/x/crypto/ssh"
 )
 
 func TestCoordinatorEndpointHealth(t *testing.T) {
@@ -426,5 +443,427 @@ func TestMultiAgentCheckCoordinatorDeduplication(t *testing.T) {
 	healthy, _, _ := config.Coordinators[0].GetHealth()
 	if !healthy {
 		t.Error("expected coordinator to be healthy after poll")
+	}
+}
+
+// =============================================================================
+// Distributed transport end to end (caam-3ezz.8)
+// =============================================================================
+
+// scriptedPane plays a Claude Code pane through the login flow: it is rate
+// limited until /login arrives, then shows the OAuth URL until a code is
+// typed, then reports success.
+type scriptedPane struct {
+	mu       sync.Mutex
+	loggedIn bool
+	codes    []string
+	sent     []string
+}
+
+func (p *scriptedPane) ListPanes(ctx context.Context) ([]coordinator.Pane, error) {
+	return []coordinator.Pane{{PaneID: 1, Title: "claude"}}, nil
+}
+
+func (p *scriptedPane) GetText(ctx context.Context, paneID int, startLine int) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch {
+	case len(p.codes) > 0:
+		return "Logged in as a@example.com", nil
+	case p.loggedIn:
+		return "Browse to https://claude.ai/oauth/authorize?code=true&state=abc\nPaste code here if prompted >", nil
+	default:
+		return "You've hit your limit · resets 2pm", nil
+	}
+}
+
+func (p *scriptedPane) SendText(ctx context.Context, paneID int, text string, noPaste bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sent = append(p.sent, text)
+	switch {
+	case text == "/login\n":
+		p.loggedIn = true
+	case p.loggedIn && strings.HasPrefix(text, "CODE"):
+		p.codes = append(p.codes, text)
+	}
+	return nil
+}
+
+func (p *scriptedPane) IsAvailable(ctx context.Context) bool { return true }
+func (p *scriptedPane) Backend() string                      { return "scripted" }
+
+func (p *scriptedPane) injectedCodes() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.codes...)
+}
+
+// dropFirstAck forwards requests to the coordinator API but, for the first
+// /auth/complete, lets the coordinator process it and then cuts the
+// connection before the acknowledgement reaches the agent.
+func dropFirstAck(t *testing.T, backend string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	target, err := url.Parse(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var completes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/complete" || completes.Add(1) != 1 {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		req, _ := http.NewRequest(http.MethodPost, backend+"/auth/complete", bytes.NewReader(body))
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Errorf("forward first completion: %v", err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("coordinator rejected first completion: %s", resp.Status)
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	return srv, &completes
+}
+
+func TestDroppedAcknowledgementIsRedeliveredAndInjectedOnce(t *testing.T) {
+	pane := &scriptedPane{}
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = pane
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LoginCooldown = time.Millisecond
+	cfg.ResumeCooldown = time.Millisecond
+	cfg.AuthToken = "secret-token"
+	cfg.Logger = discardLogger()
+	coord := coordinator.New(cfg)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardLogger())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coord.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	proxy, completes := dropFirstAck(t, "http://"+listener.Addr().String())
+	defer proxy.Close()
+
+	endpoint := &CoordinatorEndpoint{Name: "remote", URL: proxy.URL, Token: "secret-token"}
+
+	// Wait for the coordinator to publish the pane's auth request.
+	var pending []pendingRequest
+	deadline := time.Now().Add(5 * time.Second)
+	for len(pending) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("coordinator never published an auth request")
+		}
+		time.Sleep(10 * time.Millisecond)
+		pending, err = fetchPending(ctx, endpoint.httpClient(), endpoint.URL, endpoint.Token)
+		if err != nil {
+			t.Fatalf("fetch pending: %v", err)
+		}
+	}
+
+	mcfg := DefaultMultiConfig()
+	mcfg.Coordinators = []*CoordinatorEndpoint{endpoint}
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+	ma.delivery = fastDelivery
+	ma.oauth = &fakeOAuth{code: "CODE-123", account: "a@example.com"}
+
+	var completed, failed atomic.Int32
+	ma.OnAuthComplete = func(c, account, code string) { completed.Add(1) }
+	ma.OnAuthFailed = func(c, account string, err error) {
+		t.Errorf("unexpected failure: %v", err)
+		failed.Add(1)
+	}
+
+	ma.processAuthRequest(ctx, endpoint, pending[0].ID, pending[0].URL)
+
+	if completes.Load() < 2 {
+		t.Fatalf("completion attempts = %d; the dropped acknowledgement must be redelivered", completes.Load())
+	}
+	if completed.Load() != 1 || failed.Load() != 0 {
+		t.Fatalf("completed=%d failed=%d, want exactly one acknowledged success", completed.Load(), failed.Load())
+	}
+
+	// The pane receives the code once and returns to idle.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		status := coord.GetStatus()
+		if len(pane.injectedCodes()) > 0 && status[1] == coordinator.StateIdle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pane never completed login: state=%v injected=%v", status[1], pane.injectedCodes())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := pane.injectedCodes(); len(got) != 1 || got[0] != "CODE-123\n" {
+		t.Fatalf("injected codes = %q, want exactly one", got)
+	}
+}
+
+func TestCoordinatorRejectsAgentWithWrongToken(t *testing.T) {
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = &scriptedPane{}
+	cfg.AuthToken = "right"
+	cfg.Logger = discardLogger()
+	coord := coordinator.New(cfg)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardLogger())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+
+	endpoint := &CoordinatorEndpoint{Name: "remote", URL: "http://" + listener.Addr().String(), Token: "wrong"}
+	mcfg := DefaultMultiConfig()
+	mcfg.Coordinators = []*CoordinatorEndpoint{endpoint}
+	mcfg.Logger = discardLogger()
+	NewMulti(mcfg).checkCoordinator(context.Background(), endpoint)
+
+	healthy, lastErr, _ := endpoint.GetHealth()
+	if healthy || !strings.Contains(lastErr, "401") {
+		t.Fatalf("healthy=%v lastErr=%q, want unauthorized", healthy, lastErr)
+	}
+
+	err = deliverCompletion(context.Background(), endpoint.httpClient(), endpoint.URL, endpoint.Token,
+		completion{RequestID: "r1", Code: "CODE"}, fastDelivery, discardLogger())
+	var rejected *DeliveryRejectedError
+	if !errors.As(err, &rejected) || rejected.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("delivery with wrong token = %v, want 401 rejection", err)
+	}
+}
+
+// testSSHServer is a minimal SSH server that accepts one public key and
+// forwards direct-tcpip channels, like sshd with AllowTcpForwarding.
+type testSSHServer struct {
+	addr     string
+	listener net.Listener
+	mu       sync.Mutex
+	conns    []net.Conn
+	accepted atomic.Int32
+}
+
+func startTestSSHServer(t *testing.T, clientKey ssh.PublicKey) *testSSHServer {
+	t.Helper()
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), clientKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, errors.New("unknown key")
+		},
+	}
+	config.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &testSSHServer{addr: listener.Addr().String(), listener: listener}
+	go func() {
+		for {
+			nc, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			s.mu.Lock()
+			s.conns = append(s.conns, nc)
+			s.mu.Unlock()
+			go s.serve(nc, config)
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		s.dropConnections()
+	})
+	return s
+}
+
+func (s *testSSHServer) serve(nc net.Conn, config *ssh.ServerConfig) {
+	conn, chans, reqs, err := ssh.NewServerConn(nc, config)
+	if err != nil {
+		nc.Close()
+		return
+	}
+	s.accepted.Add(1)
+	defer conn.Close()
+	go ssh.DiscardRequests(reqs)
+	for newCh := range chans {
+		if newCh.ChannelType() != "direct-tcpip" {
+			newCh.Reject(ssh.UnknownChannelType, "only direct-tcpip")
+			continue
+		}
+		var dest struct {
+			Host     string
+			Port     uint32
+			OrigHost string
+			OrigPort uint32
+		}
+		if err := ssh.Unmarshal(newCh.ExtraData(), &dest); err != nil {
+			newCh.Reject(ssh.ConnectionFailed, "bad payload")
+			continue
+		}
+		target, err := net.Dial("tcp", net.JoinHostPort(dest.Host, strconv.Itoa(int(dest.Port))))
+		if err != nil {
+			newCh.Reject(ssh.ConnectionFailed, err.Error())
+			continue
+		}
+		ch, chReqs, err := newCh.Accept()
+		if err != nil {
+			target.Close()
+			continue
+		}
+		go ssh.DiscardRequests(chReqs)
+		go func() {
+			defer ch.Close()
+			defer target.Close()
+			done := make(chan struct{}, 2)
+			go func() { io.Copy(ch, target); done <- struct{}{} }()
+			go func() { io.Copy(target, ch); done <- struct{}{} }()
+			<-done
+		}()
+	}
+}
+
+// dropConnections severs every SSH connection, as a network change would.
+func (s *testSSHServer) dropConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.conns {
+		c.Close()
+	}
+	s.conns = nil
+}
+
+func TestSSHTunnelReachesLoopbackCoordinatorAndReconnects(t *testing.T) {
+	// The coordinator listens only on loopback of the "remote" host.
+	var polls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		polls.Add(1)
+		json.NewEncoder(w).Encode([]pendingRequest{})
+	}))
+	defer backend.Close()
+
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, err := ssh.NewPublicKey(clientPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(clientPriv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id_test")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	server := startTestSSHServer(t, sshPub)
+	host, portStr, _ := net.SplitHostPort(server.addr)
+	port, _ := strconv.Atoi(portStr)
+
+	endpoint := &CoordinatorEndpoint{
+		Name:  "remote",
+		URL:   backend.URL, // resolved on the SSH server's side
+		Token: "tok",
+		SSH:   &SSHTunnel{Host: host, Port: port, User: "tester", IdentityFile: keyPath},
+	}
+	defer endpoint.close()
+	mcfg := DefaultMultiConfig()
+	mcfg.Coordinators = []*CoordinatorEndpoint{endpoint}
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+
+	ma.checkCoordinator(context.Background(), endpoint)
+	if healthy, lastErr, _ := endpoint.GetHealth(); !healthy {
+		t.Fatalf("poll over SSH failed: %s", lastErr)
+	}
+
+	// Sever the SSH connection; the next poll reconnects transparently.
+	server.dropConnections()
+	endpoint.httpClient().CloseIdleConnections()
+	ma.checkCoordinator(context.Background(), endpoint)
+	if healthy, lastErr, _ := endpoint.GetHealth(); !healthy {
+		t.Fatalf("poll after reconnect failed: %s", lastErr)
+	}
+	if polls.Load() != 2 {
+		t.Fatalf("coordinator polls = %d, want 2", polls.Load())
+	}
+	if server.accepted.Load() < 2 {
+		t.Fatalf("ssh connections = %d, want a reconnect", server.accepted.Load())
+	}
+}
+
+func TestAgentFileConfigRoundTripKeepsTransport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	fc := FileConfig{
+		Port:          7891,
+		PollInterval:  "2s",
+		Strategy:      "lru",
+		ChromeProfile: "/profiles/work",
+		Accounts:      []string{"a@example.com"},
+		Coordinators: []*CoordinatorEndpoint{{
+			Name:  "csd",
+			URL:   "http://127.0.0.1:7890",
+			Token: "tok",
+			SSH:   &SSHTunnel{Host: "100.64.0.5", Port: 22, User: "ubuntu", IdentityFile: "~/.ssh/id_ed25519"},
+		}},
+	}
+	if err := WriteFileConfig(path, fc); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("config mode = %v, want 0600 (it holds tokens)", info.Mode().Perm())
+	}
+	got, err := LoadFileConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := got.Coordinators[0]
+	if c.Token != "tok" || c.SSH == nil || *c.SSH != *fc.Coordinators[0].SSH || got.ChromeUserDataDir() != "/profiles/work" {
+		t.Fatalf("round trip lost data: %+v ssh=%+v", got, c.SSH)
 	}
 }

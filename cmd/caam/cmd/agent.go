@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,11 +29,16 @@ existing Google account sessions. It:
 5. Sends the code back to the coordinator
 
 The coordinator then injects this code into the waiting Claude Code session.
+Codes are redelivered until the coordinator acknowledges them, so a dropped
+connection does not lose a completed login.
 
-SSH Tunnel Setup (run on local Mac):
-  ssh -R 7890:localhost:7891 user@remote-server -N
+TRANSPORT:
+  'caam setup distributed' writes a config whose coordinators carry an "ssh"
+  block: the agent opens its own SSH connection to each host and reaches the
+  loopback-only coordinator API through it, with a per-host token.
 
-This forwards the coordinator's port 7890 to your local agent's port 7891.
+  With --coordinator, forward the port yourself (run on this machine):
+    ssh -N -L 7890:127.0.0.1:7890 user@remote-server
 
 Examples:
   # Start agent with default settings
@@ -274,6 +278,17 @@ func runMultiAgent(cmd *cobra.Command, logger *slog.Logger, config agent.MultiCo
 	fmt.Printf("Auth agent started (multi-coordinator)\n")
 	fmt.Printf("  API: http://localhost:%d\n", config.Port)
 	fmt.Printf("  Coordinators: %d\n", len(config.Coordinators))
+	for _, c := range config.Coordinators {
+		via := c.URL
+		if c.SSH != nil {
+			via = fmt.Sprintf("%s via ssh %s", c.URL, c.SSH.Host)
+		}
+		auth := "no token"
+		if c.Token != "" {
+			auth = "token"
+		}
+		fmt.Printf("    - %s: %s (%s)\n", c.Name, via, auth)
+	}
 	fmt.Printf("  Strategy: %s\n", config.AccountStrategy)
 	if len(config.Accounts) > 0 {
 		fmt.Printf("  Accounts: %v\n", config.Accounts)
@@ -301,30 +316,10 @@ func runMultiAgent(cmd *cobra.Command, logger *slog.Logger, config agent.MultiCo
 	return nil
 }
 
-type agentFileConfig struct {
-	Port             int                          `json:"port"`
-	CoordinatorURL   string                       `json:"coordinator_url"`
-	Coordinator      string                       `json:"coordinator"`
-	CoordinatorToken string                       `json:"coordinator_token"`
-	PollInterval     string                       `json:"poll_interval"`
-	ChromeProfile    string                       `json:"chrome_profile"`
-	Headless         bool                         `json:"headless"`
-	Strategy         string                       `json:"strategy"`
-	Accounts         []string                     `json:"accounts"`
-	Coordinators     []*agent.CoordinatorEndpoint `json:"coordinators"`
-	ChromeUserData   string                       `json:"chrome_user_data_dir"`
-	ChromeProfileDir string                       `json:"chrome_profile_dir"`
-}
-
 func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error) {
-	data, err := os.ReadFile(path)
+	raw, err := agent.LoadFileConfig(path)
 	if err != nil {
-		return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("read config: %w", err)
-	}
-
-	var raw agentFileConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("parse config: %w", err)
+		return false, agent.Config{}, agent.MultiConfig{}, err
 	}
 
 	useMulti := len(raw.Coordinators) > 0
@@ -333,6 +328,14 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 		return false, agent.Config{}, agent.MultiConfig{}, err
 	}
 	if useMulti {
+		for i, c := range raw.Coordinators {
+			if c == nil || strings.TrimSpace(c.URL) == "" {
+				return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("config %s: coordinator %d has no url", path, i+1)
+			}
+			if c.SSH != nil && strings.TrimSpace(c.SSH.Host) == "" {
+				return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("config %s: coordinator %q has ssh without host", path, c.Name)
+			}
+		}
 		cfg := agent.DefaultMultiConfig()
 		if raw.Port != 0 {
 			cfg.Port = raw.Port
@@ -340,7 +343,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 		if pollInterval != 0 {
 			cfg.PollInterval = pollInterval
 		}
-		cfg.ChromeUserDataDir = firstNonEmpty(raw.ChromeProfile, raw.ChromeUserData, raw.ChromeProfileDir)
+		cfg.ChromeUserDataDir = raw.ChromeUserDataDir()
 		cfg.Headless = raw.Headless
 		if raw.Strategy != "" {
 			strategy, err := parseStrategy(raw.Strategy)
@@ -361,7 +364,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 	if pollInterval != 0 {
 		cfg.PollInterval = pollInterval
 	}
-	cfg.ChromeUserDataDir = firstNonEmpty(raw.ChromeProfile, raw.ChromeUserData, raw.ChromeProfileDir)
+	cfg.ChromeUserDataDir = raw.ChromeUserDataDir()
 	cfg.Headless = raw.Headless
 	if raw.Strategy != "" {
 		strategy, err := parseStrategy(raw.Strategy)
