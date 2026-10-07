@@ -913,6 +913,16 @@ func (d *Deployer) DeployCoordinator(ctx context.Context, config coordinator.Fil
 		return result, err
 	}
 
+	// The coordinator runs as a systemd user service; say so before
+	// installing anything on a host without one (macOS, say).
+	if _, err := d.RunCommand(ctx, "command -v systemctl"); err != nil && ctx.Err() == nil {
+		osName := d.GetRemoteOS(ctx)
+		if osName == "" {
+			osName = "unknown"
+		}
+		return fail(fmt.Errorf("%s has no systemd (uname: %s): the coordinator is installed as a systemd user service, so only such hosts are set up automatically; run 'caam auth-coordinator' there yourself (in a tmux window, say)", d.machine.Name, osName))
+	}
+
 	installPath, err := d.ensureBinary(ctx, result)
 	if err != nil {
 		return fail(err)

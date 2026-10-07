@@ -194,7 +194,9 @@ other address (for example a Tailscale IP) is refused unless a token is set.
 any hosts named with `--host [user@]host[:port]` (repeatable). A `--host` that
 matches a `~/.ssh/config` alias takes its `HostName`, `User`, `Port`, and
 `IdentityFile`. With `--host`, no WezTerm config is needed, so tmux-only
-setups work the same way.
+setups work the same way. Coordinators are installed as systemd user
+services. A host without systemd (macOS, say) is reported and skipped before
+anything is installed; run `caam auth-coordinator` there yourself.
 
 It deploys each coordinator with a freshly generated
 per-host token in `~/.config/caam/coordinator.json` (mode 0600, `bind:

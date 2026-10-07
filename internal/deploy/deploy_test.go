@@ -399,6 +399,17 @@ type fakeRemote struct {
 	addr    string
 	keyPath string
 	apiPort int
+	// systemPath follows the stubs on PATH (default /usr/bin:/bin).
+	systemPath string
+	noSystemd  bool // no systemctl anywhere on PATH
+}
+
+// withoutSystemd makes a fake remote that has no systemctl, like macOS.
+func withoutSystemd(t *testing.T) func(*fakeRemote) {
+	return func(r *fakeRemote) {
+		r.noSystemd = true
+		r.systemPath = t.TempDir()
+	}
 }
 
 const fakeSystemctl = `#!/bin/sh
@@ -423,14 +434,20 @@ echo "$v" >> "$HOME/installs.log"
 EOS
 `
 
-func startFakeRemote(t *testing.T, remoteOS string) *fakeRemote {
+func startFakeRemote(t *testing.T, remoteOS string, opts ...func(*fakeRemote)) *fakeRemote {
 	t.Helper()
-	r := &fakeRemote{home: t.TempDir(), stubs: t.TempDir()}
+	r := &fakeRemote{home: t.TempDir(), stubs: t.TempDir(), systemPath: "/usr/bin:/bin"}
+	for _, opt := range opts {
+		opt(r)
+	}
 	stubs := map[string]string{
 		"systemctl": fakeSystemctl,
 		"loginctl":  "#!/bin/sh\necho yes\n",
 		"sudo":      "#!/bin/sh\nexit 1\n",
 		"curl":      fakeCurl,
+	}
+	if r.noSystemd {
+		delete(stubs, "systemctl")
 	}
 	if remoteOS != "" {
 		stubs["uname"] = "#!/bin/sh\nif [ \"$1\" = -s ]; then echo " + remoteOS + "; exit 0; fi\n" +
@@ -576,7 +593,7 @@ func (r *fakeRemote) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			}
 			req.Reply(true, nil)
 			cmd := exec.Command("/bin/sh", "-c", payload.Command)
-			cmd.Env = []string{"HOME=" + r.home, "PATH=" + r.stubs + ":/usr/bin:/bin", "SHELL=/bin/sh", "USER=tester"}
+			cmd.Env = []string{"HOME=" + r.home, "PATH=" + r.stubs + ":" + r.systemPath, "SHELL=/bin/sh", "USER=tester"}
 			cmd.Stdout = ch
 			cmd.Stderr = ch.Stderr()
 			status := 0
@@ -810,5 +827,24 @@ func TestRollbackCoordinatorRestoresLastKnownGood(t *testing.T) {
 	}
 	if bin := execStartBinary(r.read(t, ".config/systemd/user/caam-coordinator.service")); bin != r.path(".local/bin/caam") {
 		t.Fatalf("restored unit runs %q", bin)
+	}
+}
+
+// TestDeployCoordinatorRefusesHostWithoutSystemd: on a host without systemd
+// (macOS, say) deployment stops with a clear reason before installing
+// anything, instead of failing later at systemctl.
+func TestDeployCoordinatorRefusesHostWithoutSystemd(t *testing.T) {
+	r := startFakeRemote(t, "Darwin", withoutSystemd(t))
+	d := r.deployer(t, "v1.5.0")
+
+	res, err := d.DeployCoordinator(context.Background(), coordinator.FileConfig{Port: r.apiPort, AuthToken: "tok"})
+	if err == nil || !strings.Contains(err.Error(), "no systemd") || !strings.Contains(err.Error(), "darwin") {
+		t.Fatalf("DeployCoordinator error = %v, want a no-systemd refusal naming the OS", err)
+	}
+	if res == nil || res.Success || res.ConfigWritten || res.BinaryPath != "" {
+		t.Fatalf("result = %+v; nothing should have been installed", res)
+	}
+	if _, err := os.Stat(r.path(".config/caam/coordinator.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("coordinator config written on a host that cannot run the service (stat: %v)", err)
 	}
 }
