@@ -47,14 +47,17 @@ SECURITY:
   - Token file has 0600 permissions
 
 Examples:
-  caam serve                        # Start on default port 7891
+  caam serve                        # Start on default port 7892
   caam serve --port 8080            # Use custom port
   caam serve --verbose              # Debug logging
   caam serve --show-token           # Print the API token
 
 Querying the API:
   TOKEN=$(cat ~/.config/caam/.api_token)
-  curl -H "Authorization: Bearer $TOKEN" http://localhost:7891/api/v1/status`,
+  curl -H "Authorization: Bearer $TOKEN" http://localhost:7892/api/v1/status
+
+The default port avoids 7891, which the local auth-agent uses; both can run
+on the same machine. /api/v1/coordinators reports the agent's coordinators.`,
 	RunE: runServe,
 }
 
@@ -68,7 +71,7 @@ var (
 func init() {
 	rootCmd.AddCommand(serveCmd)
 
-	serveCmd.Flags().IntVar(&servePort, "port", 7891, "API server port")
+	serveCmd.Flags().IntVar(&servePort, "port", api.DefaultConfig().Port, "API server port")
 	serveCmd.Flags().BoolVar(&serveVerbose, "verbose", false, "Enable debug logging")
 	serveCmd.Flags().BoolVar(&serveShowToken, "show-token", false, "Print API token and exit")
 	serveCmd.Flags().BoolVar(&serveJSONLogs, "json", false, "Output logs in JSON format")

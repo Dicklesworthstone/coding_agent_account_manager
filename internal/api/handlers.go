@@ -1,9 +1,15 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
@@ -16,6 +22,9 @@ type Handlers struct {
 	vault       *authfile.Vault
 	healthStore *health.Storage
 	db          *caamdb.DB
+
+	// agentConfigPath overrides the auth agent config location (tests).
+	agentConfigPath string
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -102,12 +111,21 @@ type CoordinatorsResponse struct {
 }
 
 // CoordinatorStatus represents coordinator health.
+//
+// Status is one of: healthy, unreachable, pending (the agent has not polled
+// it yet), unknown (the running agent does not report it), agent_running
+// (single-coordinator agent, no per-coordinator health), or
+// agent_not_running.
 type CoordinatorStatus struct {
-	ID       string `json:"id"`
-	Endpoint string `json:"endpoint"`
-	Status   string `json:"status"`
-	Backend  string `json:"backend,omitempty"`
-	LastSeen string `json:"last_seen,omitempty"`
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name,omitempty"`
+	Endpoint    string `json:"endpoint"`
+	Transport   string `json:"transport"`
+	Status      string `json:"status"`
+	Backend     string `json:"backend,omitempty"`
+	LastSeen    string `json:"last_seen,omitempty"`
+	LastChecked string `json:"last_checked,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // ActivateRequest is the request for POST /actions/activate.
@@ -356,12 +374,125 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 	return resp, nil
 }
 
-// GetCoordinators returns coordinator status.
+// GetCoordinators lists the distributed auth-recovery coordinators the local
+// auth agent is configured for, with live health from the running agent when
+// it answers. Tokens are never included.
 func (h *Handlers) GetCoordinators() (*CoordinatorsResponse, error) {
-	// For now, return empty - coordinator discovery could be added later
-	return &CoordinatorsResponse{
-		Coordinators: []CoordinatorStatus{},
-	}, nil
+	resp := &CoordinatorsResponse{Coordinators: []CoordinatorStatus{}}
+
+	path := h.agentConfigPath
+	if path == "" {
+		path = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return resp, nil
+		}
+		return nil, err
+	}
+	port := fc.Port
+	if port == 0 {
+		port = agent.DefaultMultiConfig().Port
+	}
+
+	if len(fc.Coordinators) == 0 {
+		url := fc.CoordinatorURL
+		if url == "" {
+			url = fc.Coordinator
+		}
+		if url == "" {
+			return resp, nil
+		}
+		status := "agent_not_running"
+		if h.agentAnswers(port, "/status") {
+			status = "agent_running"
+		}
+		resp.Coordinators = append(resp.Coordinators, CoordinatorStatus{
+			ID: "coordinator", Endpoint: url, Transport: "direct", Status: status,
+		})
+		return resp, nil
+	}
+
+	live, running := h.agentCoordinatorHealth(port)
+	for _, c := range fc.Coordinators {
+		if c == nil {
+			continue
+		}
+		st := CoordinatorStatus{
+			ID:          c.Name,
+			DisplayName: c.DisplayName,
+			Endpoint:    c.URL,
+			Transport:   c.Transport(),
+			Status:      "agent_not_running",
+		}
+		if c.SSH != nil {
+			st.Endpoint = c.URL + " via ssh " + c.SSH.Host
+		}
+		if running {
+			l, ok := live[c.Name]
+			switch {
+			case !ok:
+				st.Status = "unknown"
+			case l.LastCheck.IsZero():
+				st.Status = "pending"
+			case l.IsHealthy:
+				st.Status = "healthy"
+				st.LastSeen = l.LastCheck.Format(time.RFC3339)
+			default:
+				st.Status = "unreachable"
+				st.Error = l.LastError
+			}
+			if !l.LastCheck.IsZero() {
+				st.LastChecked = l.LastCheck.Format(time.RFC3339)
+			}
+		}
+		resp.Coordinators = append(resp.Coordinators, st)
+	}
+	return resp, nil
+}
+
+// agentCoordinator is one entry of the auth agent's GET /coordinators.
+type agentCoordinator struct {
+	Name      string    `json:"name"`
+	IsHealthy bool      `json:"is_healthy"`
+	LastCheck time.Time `json:"last_check"`
+	LastError string    `json:"last_error"`
+}
+
+// agentCoordinatorHealth asks the local auth agent for its coordinators'
+// health. It reports whether the agent answered.
+func (h *Handlers) agentCoordinatorHealth(port int) (map[string]agentCoordinator, bool) {
+	resp, err := h.agentClient().Get(fmt.Sprintf("http://127.0.0.1:%d/coordinators", port))
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var list []agentCoordinator
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&list); err != nil {
+		return nil, false
+	}
+	byName := make(map[string]agentCoordinator, len(list))
+	for _, c := range list {
+		byName[c.Name] = c
+	}
+	return byName, true
+}
+
+func (h *Handlers) agentAnswers(port int, path string) bool {
+	resp, err := h.agentClient().Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, path))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func (h *Handlers) agentClient() *http.Client {
+	return &http.Client{Timeout: 2 * time.Second}
 }
 
 // Activate activates a profile.

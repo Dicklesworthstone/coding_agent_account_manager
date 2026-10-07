@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -90,27 +89,18 @@ type Options struct {
 	DryRun bool
 
 	// AgentConfigPath is where the local agent config is written.
-	// Defaults to LocalAgentConfigPath().
+	// Defaults to agent.DefaultConfigPath().
 	AgentConfigPath string
 
 	// Logger for structured logging.
 	Logger *slog.Logger
 }
 
-// LocalAgentConfigPath returns the default local agent config path.
-func LocalAgentConfigPath() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = filepath.Join(os.Getenv("HOME"), ".config")
-	}
-	return filepath.Join(configDir, "caam", "distributed-agent.json")
-}
-
 func (o *Orchestrator) agentConfigPath() string {
 	if o.opts.AgentConfigPath != "" {
 		return o.opts.AgentConfigPath
 	}
-	return LocalAgentConfigPath()
+	return agent.DefaultConfigPath()
 }
 
 // DefaultOptions returns the default setup options.

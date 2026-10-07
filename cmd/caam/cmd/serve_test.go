@@ -28,8 +28,9 @@ func TestServeFlagsDefaults(t *testing.T) {
 	if portFlag == nil {
 		t.Fatal("port flag not found")
 	}
-	if portFlag.DefValue != "7891" {
-		t.Errorf("port default = %s, want 7891", portFlag.DefValue)
+	// 7891 belongs to the local auth-agent, which runs on the same machine.
+	if portFlag.DefValue != "7892" {
+		t.Errorf("port default = %s, want 7892", portFlag.DefValue)
 	}
 
 	verboseFlag := serveCmd.Flags().Lookup("verbose")
@@ -101,7 +102,7 @@ func TestServeShowTokenCreatesToken(t *testing.T) {
 	}()
 
 	// Reset flag values
-	servePort = 7891
+	servePort = 7892
 	serveVerbose = false
 	serveShowToken = true
 	serveJSONLogs = false

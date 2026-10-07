@@ -234,6 +234,16 @@ type FileConfig struct {
 	Accounts         []string               `json:"accounts"`
 }
 
+// DefaultConfigPath is where 'caam setup distributed' writes the agent
+// config and where 'caam auth-agent service' and 'caam serve' look for it.
+func DefaultConfigPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		configDir = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(configDir, "caam", "distributed-agent.json")
+}
+
 // LoadFileConfig reads an agent FileConfig from path.
 func LoadFileConfig(path string) (FileConfig, error) {
 	data, err := os.ReadFile(path)

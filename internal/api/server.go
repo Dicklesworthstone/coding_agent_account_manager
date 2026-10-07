@@ -47,7 +47,8 @@ type Config struct {
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		Port:      7891,
+		// 7891 is the local auth-agent's port; both run on the same machine.
+		Port:      7892,
 		TokenPath: defaultTokenPath(),
 		Logger:    slog.Default(),
 	}

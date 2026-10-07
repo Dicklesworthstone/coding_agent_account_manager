@@ -5,12 +5,17 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
@@ -519,5 +524,103 @@ func TestToolsMapContainsExpectedTools(t *testing.T) {
 		if _, ok := tools[tool]; !ok {
 			t.Errorf("tools map missing %q", tool)
 		}
+	}
+}
+
+func TestGetCoordinatorsFromAgentConfig(t *testing.T) {
+	var agentHits int
+	agentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agentHits++
+		if r.URL.Path != "/coordinators" {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"name": "csd", "is_healthy": true, "last_check": time.Now().UTC().Format(time.RFC3339)},
+			{"name": "css", "is_healthy": false, "last_check": time.Now().UTC().Format(time.RFC3339), "last_error": "ssh tunnel 1.2.3.4: connection refused"},
+			{"name": "new", "is_healthy": false},
+		})
+	}))
+	defer agentSrv.Close()
+	_, portStr, _ := net.SplitHostPort(agentSrv.Listener.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	path := filepath.Join(t.TempDir(), "distributed-agent.json")
+	fc := agent.FileConfig{
+		Port: port,
+		Coordinators: []*agent.CoordinatorEndpoint{
+			{Name: "csd", DisplayName: "CSD", URL: "http://127.0.0.1:7890", Token: "secret-1", SSH: &agent.SSHTunnel{Host: "100.64.0.5"}},
+			{Name: "css", URL: "http://127.0.0.1:7890", Token: "secret-2", SSH: &agent.SSHTunnel{Host: "1.2.3.4"}},
+			{Name: "new", URL: "http://100.64.0.9:7890", Token: "secret-3"},
+			{Name: "gone", URL: "http://127.0.0.1:7890"},
+		},
+	}
+	if err := agent.WriteFileConfig(path, fc); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHandlers(nil, nil, nil)
+	h.agentConfigPath = path
+	resp, err := h.GetCoordinators()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]CoordinatorStatus{}
+	for _, c := range resp.Coordinators {
+		got[c.ID] = c
+	}
+	if got["csd"].Status != "healthy" || got["csd"].Transport != "ssh" || got["csd"].Endpoint != "http://127.0.0.1:7890 via ssh 100.64.0.5" || got["csd"].LastSeen == "" {
+		t.Errorf("csd = %+v", got["csd"])
+	}
+	if got["css"].Status != "unreachable" || !strings.Contains(got["css"].Error, "connection refused") {
+		t.Errorf("css = %+v", got["css"])
+	}
+	if got["new"].Status != "pending" || got["new"].Transport != "direct" {
+		t.Errorf("new = %+v", got["new"])
+	}
+	if got["gone"].Status != "unknown" {
+		t.Errorf("gone = %+v", got["gone"])
+	}
+	data, _ := json.Marshal(resp)
+	if strings.Contains(string(data), "secret-") {
+		t.Fatalf("coordinator tokens leaked: %s", data)
+	}
+
+	// Agent down: entries remain, marked as such.
+	agentSrv.Close()
+	resp, err = h.GetCoordinators()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range resp.Coordinators {
+		if c.Status != "agent_not_running" {
+			t.Errorf("%s status = %q with the agent down", c.ID, c.Status)
+		}
+	}
+}
+
+func TestGetCoordinatorsWithoutAgentConfig(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+	h.agentConfigPath = filepath.Join(t.TempDir(), "missing.json")
+	resp, err := h.GetCoordinators()
+	if err != nil || resp == nil || resp.Coordinators == nil || len(resp.Coordinators) != 0 {
+		t.Fatalf("resp = %+v, err = %v", resp, err)
+	}
+
+	single := filepath.Join(t.TempDir(), "agent.json")
+	if err := agent.WriteFileConfig(single, agent.FileConfig{Port: 1, CoordinatorURL: "http://localhost:7890"}); err != nil {
+		t.Fatal(err)
+	}
+	h.agentConfigPath = single
+	resp, err = h.GetCoordinators()
+	if err != nil || len(resp.Coordinators) != 1 || resp.Coordinators[0].Status != "agent_not_running" {
+		t.Fatalf("single-coordinator resp = %+v, err = %v", resp, err)
+	}
+
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	os.WriteFile(bad, []byte("{"), 0o600)
+	h.agentConfigPath = bad
+	if _, err := h.GetCoordinators(); err == nil {
+		t.Fatal("a corrupt agent config must be reported")
 	}
 }

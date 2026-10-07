@@ -15,7 +15,6 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/setup"
 	"github.com/spf13/cobra"
 )
 
@@ -473,7 +472,7 @@ The config defaults to the one written by 'caam setup distributed'.`,
 func newAgentService() (*deploy.AgentService, error) {
 	configPath := agentServiceConfig
 	if configPath == "" {
-		configPath = setup.LocalAgentConfigPath()
+		configPath = agent.DefaultConfigPath()
 	}
 	abs, err := filepath.Abs(configPath)
 	if err != nil {
