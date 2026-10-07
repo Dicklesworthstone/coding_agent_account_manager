@@ -70,6 +70,7 @@ type PaneTracker struct {
 	ErrorMessage string
 	RetryCount   int
 	ContinueSent bool                 // Enter sent to dismiss the post-login screen this cycle
+	SelectSends  int                  // login-method selections sent this cycle
 	LastOutput   string               // Cached output for duplicate detection
 	Cooldowns    map[string]time.Time // action -> cooldown expiry
 	mu           sync.RWMutex
@@ -121,7 +122,24 @@ func (t *PaneTracker) Reset() {
 	t.UsedAccount = ""
 	t.ErrorMessage = ""
 	t.ContinueSent = false
+	t.SelectSends = 0
 	t.Cooldowns = make(map[string]time.Time)
+}
+
+// CountSelectSend records a login-method selection and returns how many were
+// sent this cycle, including this one.
+func (t *PaneTracker) CountSelectSend() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.SelectSends++
+	return t.SelectSends
+}
+
+// GetSelectSends returns the login-method selections sent this cycle.
+func (t *PaneTracker) GetSelectSends() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.SelectSends
 }
 
 // MarkContinueSent records that the post-login screen was dismissed and

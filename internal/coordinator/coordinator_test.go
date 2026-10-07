@@ -138,8 +138,8 @@ func TestCoordinatorConfig(t *testing.T) {
 	if cfg.PollInterval != 500*time.Millisecond {
 		t.Errorf("expected 500ms poll interval, got %v", cfg.PollInterval)
 	}
-	if cfg.AuthTimeout != 60*time.Second {
-		t.Errorf("expected 60s auth timeout, got %v", cfg.AuthTimeout)
+	if cfg.AuthTimeout != 5*time.Minute {
+		t.Errorf("expected 5m auth timeout, got %v", cfg.AuthTimeout)
 	}
 	if cfg.StateTimeout != 30*time.Second {
 		t.Errorf("expected 30s state timeout, got %v", cfg.StateTimeout)
@@ -808,7 +808,8 @@ func TestE2EAuthTimeout(t *testing.T) {
 	tracker.mu.Unlock()
 
 	coord.trackers[1] = tracker
-	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: "pending"}
+	// An agent fetched the request and then never answered.
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: "pending", ClaimedAt: time.Now().Add(-100 * time.Millisecond)}
 
 	ctx := context.Background()
 	coord.pollPanes(ctx)
@@ -818,6 +819,59 @@ func TestE2EAuthTimeout(t *testing.T) {
 	}
 	if failedPaneID != 1 {
 		t.Errorf("expected OnAuthFailed to be called with pane 1, got %d", failedPaneID)
+	}
+}
+
+// TestUnclaimedRequestWaitsForAgent: while no agent has fetched a request
+// (the agent's machine is asleep, say), the pane keeps waiting at its paste
+// prompt instead of timing out and spending its retries; once an agent
+// fetches it, AuthTimeout applies from then.
+func TestUnclaimedRequestWaitsForAgent(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}, output: "Paste code here if prompted >"}
+	cfg := DefaultConfig()
+	cfg.AuthTimeout = 50 * time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+	failures := 0
+	coord.OnAuthFailed = func(int, error) { failures++ }
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	tracker.mu.Lock()
+	tracker.StateEntered = time.Now().Add(-time.Hour) // asleep for an hour
+	tracker.mu.Unlock()
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: RequestPending}
+
+	ctx := context.Background()
+	coord.pollPanes(ctx)
+	coord.pollPanes(ctx)
+	if tracker.GetState() != StateAuthPending || failures != 0 {
+		t.Fatalf("unclaimed request: state=%v failures=%d, want still pending", tracker.GetState(), failures)
+	}
+	if got := coord.GetPendingRequests(); len(got) != 1 || !got[0].ClaimedAt.IsZero() {
+		t.Fatalf("pending = %+v; status reads must not claim", got)
+	}
+
+	// The agent wakes up and fetches it: the clock starts now.
+	claimed := coord.ClaimPendingRequests()
+	if len(claimed) != 1 || claimed[0].ClaimedAt.IsZero() {
+		t.Fatalf("claimed = %+v", claimed)
+	}
+	first := claimed[0].ClaimedAt
+	if again := coord.ClaimPendingRequests(); !again[0].ClaimedAt.Equal(first) {
+		t.Fatal("a second fetch moved the claim time")
+	}
+	coord.pollPanes(ctx)
+	if tracker.GetState() != StateAuthPending {
+		t.Fatalf("state = %v right after the claim, want pending", tracker.GetState())
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	coord.pollPanes(ctx)
+	if tracker.GetState() != StateFailed || failures != 1 {
+		t.Fatalf("after the claimed request timed out: state=%v failures=%d", tracker.GetState(), failures)
 	}
 }
 
@@ -1225,6 +1279,10 @@ func TestReceiveAuthResponseAfterTimeoutIsClosed(t *testing.T) {
 	tracker.mu.Lock()
 	tracker.StateEntered = time.Now().Add(-time.Second)
 	tracker.mu.Unlock()
+	// An agent fetched the request a second ago and never answered.
+	coord.mu.Lock()
+	coord.requests["req-1"].ClaimedAt = time.Now().Add(-time.Second)
+	coord.mu.Unlock()
 
 	coord.processPaneState(context.Background(), client.panes[0])
 	if tracker.GetState() != StateFailed {
@@ -1588,5 +1646,40 @@ func TestResumeDismissesPostLoginScreenBeforePrompting(t *testing.T) {
 	}
 	if tracker.GetState() != StateIdle {
 		t.Fatalf("state = %v, want idle after resuming", tracker.GetState())
+	}
+}
+
+func TestLostMethodSelectionIsResentWithinBound(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}}
+	cfg := DefaultConfig()
+	cfg.MethodSelectCooldown = time.Millisecond
+	coord := New(cfg)
+	coord.paneClient = client
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateRateLimited)
+	coord.trackers[1] = tracker
+	ctx := context.Background()
+
+	// The menu never advances: every "1" is lost.
+	client.output = "Select login method:\n❯ 1. Claude account with subscription\n  2. Anthropic Console account"
+	for range 6 {
+		coord.pollPanes(ctx)
+		time.Sleep(5 * time.Millisecond)
+	}
+	selects := 0
+	for _, s := range client.sentText() {
+		if s == "1\n" {
+			selects++
+		}
+	}
+	if selects != maxSelectSends {
+		t.Fatalf("selections sent = %d, want %d (resent while the menu stays, then bounded)", selects, maxSelectSends)
+	}
+
+	// Once the URL shows, the flow moves on.
+	client.output = "Browse to https://claude.ai/oauth/authorize?code=true&state=x\nPaste code here if prompted >"
+	coord.pollPanes(ctx)
+	if tracker.GetState() != StateAwaitingURL {
+		t.Fatalf("state = %v, want AWAITING_URL", tracker.GetState())
 	}
 }

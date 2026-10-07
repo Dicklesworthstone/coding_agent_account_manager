@@ -78,8 +78,8 @@ func TestDefaultCoordinatorConfig(t *testing.T) {
 	if config.PollInterval != "500ms" {
 		t.Errorf("expected poll_interval 500ms, got %s", config.PollInterval)
 	}
-	if config.AuthTimeout != "60s" {
-		t.Errorf("expected auth_timeout 60s, got %s", config.AuthTimeout)
+	if config.AuthTimeout != "5m" {
+		t.Errorf("expected auth_timeout 5m, got %s", config.AuthTimeout)
 	}
 	if config.OutputLines != 100 {
 		t.Errorf("expected output_lines 100, got %d", config.OutputLines)

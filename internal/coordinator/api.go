@@ -218,8 +218,10 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleGetPending serves agents: fetching a request claims it, which
+// starts its AuthTimeout.
 func (a *APIServer) handleGetPending(w http.ResponseWriter, r *http.Request) {
-	pending := a.coordinator.GetPendingRequests()
+	pending := a.coordinator.ClaimPendingRequests()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pending)

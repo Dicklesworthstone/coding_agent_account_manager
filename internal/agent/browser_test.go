@@ -868,7 +868,21 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func fixtureBrowser(t *testing.T, fixture http.Handler) *Browser {
 	t.Helper()
 	chrome := chromeForTest(t)
-	b := NewBrowser(BrowserConfig{UserDataDir: t.TempDir(), ExecPath: chrome, Headless: true})
+	// Not t.TempDir: Chrome's helper processes can write to the profile for
+	// a moment after the browser exits, which fails its strict cleanup.
+	profile, err := os.MkdirTemp("", "caam-chrome-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for range 30 {
+			if os.RemoveAll(profile) == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+	b := NewBrowser(BrowserConfig{UserDataDir: profile, ExecPath: chrome, Headless: true})
 	b.stepDelay = 200 * time.Millisecond
 	b.flowTimeout = 45 * time.Second
 	b.extraOpts = []chromedp.ExecAllocatorOption{

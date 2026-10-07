@@ -394,7 +394,7 @@ func DefaultCoordinatorConfig() coordinator.FileConfig {
 		Bind:         coordinator.DefaultBindAddress,
 		Port:         7890,
 		PollInterval: "500ms",
-		AuthTimeout:  "60s",
+		AuthTimeout:  "5m",
 		StateTimeout: "30s",
 		ResumePrompt: "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
 		OutputLines:  100,

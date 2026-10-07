@@ -44,7 +44,8 @@ type Config struct {
 	// PollInterval is how often to check pane output.
 	PollInterval time.Duration
 
-	// AuthTimeout is how long to wait for auth completion.
+	// AuthTimeout is how long an agent has to answer a request once it has
+	// fetched it. Requests no agent has fetched yet wait without a limit.
 	AuthTimeout time.Duration
 
 	// StateTimeout is how long to wait in intermediate states before timing out.
@@ -117,7 +118,7 @@ func DefaultConfig() Config {
 	return Config{
 		Backend:                    BackendAuto, // Try WezTerm first, fall back to tmux
 		PollInterval:               500 * time.Millisecond,
-		AuthTimeout:                60 * time.Second,
+		AuthTimeout:                5 * time.Minute,
 		StateTimeout:               30 * time.Second,
 		OutputLines:                100,
 		ResumePrompt:               "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
@@ -262,6 +263,9 @@ type AuthRequest struct {
 	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"created_at"`
 	Status    string    `json:"status"` // pending, accepted, completed, failed, expired
+	// ClaimedAt is when an agent first fetched the request. AuthTimeout runs
+	// from here: until an agent is around, the request simply waits.
+	ClaimedAt time.Time `json:"claimed_at,omitzero"`
 
 	// response is the first valid response accepted for this request.
 	response *AuthResponse
@@ -724,7 +728,8 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 			"action", "transition")
 		tracker.SetState(StateAwaitingMethodSelect)
 
-		// Check method select cooldown before injecting
+		// Check method select cooldown before injecting; the
+		// AwaitingMethodSelect handler sends once it has passed.
 		if tracker.IsOnCooldown("method_select") {
 			c.logger.Debug("action blocked by cooldown",
 				"pane_id", tracker.PaneID,
@@ -734,25 +739,7 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 				"action", "cooldown_skip")
 			return
 		}
-
-		// Auto-select option 1 (Claude account with subscription)
-		time.Sleep(200 * time.Millisecond)
-		if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
-			c.logger.Error("injection failed",
-				"pane_id", tracker.PaneID,
-				"state", StateAwaitingMethodSelect.String(),
-				"inject_type", "subscription_select",
-				"error", err,
-				"action", "inject_failed")
-		} else {
-			c.logger.Debug("injection succeeded",
-				"pane_id", tracker.PaneID,
-				"state", StateAwaitingMethodSelect.String(),
-				"inject_type", "subscription_select",
-				"cooldown_set", c.config.MethodSelectCooldown,
-				"action", "inject_success")
-			tracker.SetCooldown("method_select", c.config.MethodSelectCooldown)
-		}
+		c.sendMethodSelect(ctx, tracker)
 
 	case StateAwaitingURL:
 		// Skip method select, URL shown directly
@@ -781,8 +768,45 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 	}
 }
 
+// maxSelectSends bounds login-method selections per cycle.
+const maxSelectSends = 3
+
+// sendMethodSelect chooses option 1 (Claude account with subscription) in
+// the login-method menu.
+func (c *Coordinator) sendMethodSelect(ctx context.Context, tracker *PaneTracker) {
+	time.Sleep(200 * time.Millisecond)
+	sends := tracker.CountSelectSend()
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateAwaitingMethodSelect.String(),
+			"inject_type", "subscription_select",
+			"error", err,
+			"action", "inject_failed")
+		return
+	}
+	c.logger.Debug("injection succeeded",
+		"pane_id", tracker.PaneID,
+		"state", StateAwaitingMethodSelect.String(),
+		"inject_type", "subscription_select",
+		"attempt", sends,
+		"cooldown_set", c.config.MethodSelectCooldown,
+		"action", "inject_success")
+	tracker.SetCooldown("method_select", c.config.MethodSelectCooldown)
+}
+
 func (c *Coordinator) handleAwaitingMethodSelectState(ctx context.Context, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
+
+	// The menu still showing once the cooldown has passed means the
+	// selection keystroke was lost (sent while the menu was rendering, or
+	// never sent because of a cooldown); select again, a bounded number of
+	// times, instead of waiting out the state timeout and stalling.
+	if detected == StateAwaitingMethodSelect && !tracker.IsOnCooldown("method_select") &&
+		tracker.GetSelectSends() < maxSelectSends {
+		c.sendMethodSelect(ctx, tracker)
+		return
+	}
 
 	if detected == StateAwaitingURL {
 		url := metadata["oauth_url"]
@@ -866,6 +890,9 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 	}
 }
 
+// agentWaitLogInterval spaces the warnings about a request no agent fetched.
+const agentWaitLogInterval = 10 * time.Minute
+
 func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneTracker, output string) {
 	// Check if we received a code
 	if tracker.GetReceivedCode() != "" {
@@ -880,8 +907,26 @@ func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneT
 		return
 	}
 
+	// Only an agent can complete the request, and the pane waits at its
+	// paste prompt, so the timeout runs from when an agent claimed it. While
+	// no agent is around (its machine asleep, say) the request waits rather
+	// than spending the pane's retry budget.
+	claimed := c.requestClaimedAt(tracker.GetRequestID())
+	if claimed.IsZero() {
+		if tracker.TimeSinceStateChange() > c.config.AuthTimeout && !tracker.IsOnCooldown("agent_wait") {
+			c.logger.Warn("no auth agent has fetched the request; still waiting",
+				"pane_id", tracker.PaneID,
+				"state", StateAuthPending.String(),
+				"request_id", tracker.GetRequestID(),
+				"waiting", tracker.TimeSinceStateChange().Round(time.Second),
+				"action", "await_agent")
+			tracker.SetCooldown("agent_wait", agentWaitLogInterval)
+		}
+		return
+	}
+
 	// Check auth timeout
-	if tracker.TimeSinceStateChange() > c.config.AuthTimeout {
+	if time.Since(claimed) > c.config.AuthTimeout {
 		// A response accepted concurrently wins over the timeout; the next
 		// poll moves the pane to CODE_RECEIVED.
 		if !c.expireUnansweredRequest(tracker.GetRequestID()) {
@@ -1194,7 +1239,37 @@ func (c *Coordinator) replayResult(req *AuthRequest, resp AuthResponse) error {
 func (c *Coordinator) GetPendingRequests() []*AuthRequest {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.pendingSnapshotsLocked()
+}
 
+// ClaimPendingRequests returns the pending requests for an agent to work on
+// and records when each was first claimed, which starts its AuthTimeout.
+func (c *Coordinator) ClaimPendingRequests() []*AuthRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for _, req := range c.requests {
+		if req.Status == RequestPending && req.ClaimedAt.IsZero() {
+			req.ClaimedAt = now
+		}
+	}
+	return c.pendingSnapshotsLocked()
+}
+
+// requestClaimedAt returns when an agent first claimed the request (zero if
+// no agent has).
+func (c *Coordinator) requestClaimedAt(requestID string) time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if req, ok := c.requests[requestID]; ok {
+		return req.ClaimedAt
+	}
+	return time.Time{}
+}
+
+// pendingSnapshotsLocked returns copies of the pending requests, oldest
+// first. Callers must hold c.mu.
+func (c *Coordinator) pendingSnapshotsLocked() []*AuthRequest {
 	pending := make([]*AuthRequest, 0, len(c.requests))
 	for _, req := range c.requests {
 		if req.Status == RequestPending {

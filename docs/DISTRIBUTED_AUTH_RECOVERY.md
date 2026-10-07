@@ -304,7 +304,7 @@ any host failed or was rolled back.
                     ┌──────────────────┐
                     │ AUTH_PENDING     │──────┐
                     └────────┬─────────┘      │
-                             │ receive code   │ timeout (60s)
+                             │ receive code   │ timeout (5m after an agent fetches it)
                              ↓                │
                     ┌──────────────────┐      │
                     │ CODE_RECEIVED    │      │
@@ -348,8 +348,9 @@ scrollback the most recent one decides the state.
 GET /health                      (no token required)
   Response: { "status": "ok", "backend": "wezterm", ... }
 
-GET /auth/pending
-  Response: [{ "id": "uuid", "pane_id": 123, "url": "...", "created_at": "...", "status": "pending" }]
+GET /auth/pending                (agents only: fetching claims each request)
+  Response: [{ "id": "uuid", "pane_id": 123, "url": "...", "created_at": "...",
+               "claimed_at": "...", "status": "pending" }]
 
 POST /auth/complete              (alias: /auth/submit)
   Request: { "request_id": "uuid", "code": "XXXX-XXXX", "account": "alice@gmail.com" }
@@ -634,7 +635,7 @@ installs passes it) and by `caam auth-coordinator status`.
   "bind": "127.0.0.1",
   "port": 7890,
   "poll_interval": "500ms",
-  "auth_timeout": "60s",
+  "auth_timeout": "5m",
   "state_timeout": "30s",
   "resume_prompt": "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
   "resume_cooldown": "10s",
@@ -649,7 +650,7 @@ installs passes it) and by `caam auth-coordinator status`.
 | `bind` | `127.0.0.1` | Listen host. A non-loopback bind is refused unless `auth_token` is set. |
 | `port` | `7890` | Listen port. |
 | `poll_interval` | `500ms` | How often panes are scanned. |
-| `auth_timeout` | `60s` | How long a published auth request waits for the agent before failing. |
+| `auth_timeout` | `5m` | How long an agent has to answer a request after it first fetches it (`claimed_at`). Requests no agent has fetched wait without a limit, so panes recover when a sleeping agent machine wakes up. |
 | `state_timeout` | `30s` | How long a pane may sit in a transitional state. |
 | `resume_prompt` | see above | Text injected after a successful login. |
 | `resume_cooldown` | `10s` | Wait after login success before injecting the resume prompt. |

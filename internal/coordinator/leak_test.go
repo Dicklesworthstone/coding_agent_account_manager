@@ -30,7 +30,8 @@ func TestAuthRequestLeakOnTimeout(t *testing.T) {
 	tracker.mu.Unlock()
 
 	coord.trackers[1] = tracker
-	coord.requests[reqID] = &AuthRequest{ID: reqID, Status: "pending"}
+	// Claimed by an agent that then never answered.
+	coord.requests[reqID] = &AuthRequest{ID: reqID, Status: "pending", ClaimedAt: time.Now().Add(-1 * time.Second)}
 
 	ctx := context.Background()
 
