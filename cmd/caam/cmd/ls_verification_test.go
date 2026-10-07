@@ -4,17 +4,21 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
 )
@@ -31,6 +35,192 @@ type lsVerificationRow struct {
 		ProviderRejection  string `json:"provider_rejection"`
 		ProviderRejectedAt string `json:"provider_rejected_at"`
 	} `json:"health"`
+}
+
+func TestSavedSelectedAPIKeyHealthPropagation(t *testing.T) {
+	for _, tool := range []string{"codex", "gemini"} {
+		t.Run(tool, func(t *testing.T) {
+			vaultDir, store := setupCodexVerificationVault(t)
+			nativeDir := t.TempDir()
+			t.Setenv("CODEX_HOME", nativeDir)
+			t.Setenv("GEMINI_HOME", nativeDir)
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			tools = map[string]func() authfile.AuthFileSet{
+				"codex":  authfile.CodexAuthFiles,
+				"gemini": authfile.GeminiAuthFiles,
+			}
+			store.SetVaultPath(vaultDir)
+			expired := time.Now().Add(-time.Hour)
+			oauth := fmt.Sprintf(`{"access_token":"synthetic-old-oauth","expires_at":%d}`, expired.Unix())
+			files := map[string]map[string]string{}
+			if tool == "codex" {
+				files["oauth"] = map[string]string{"auth.json": fmt.Sprintf(`{"auth_mode":"chatgpt","OPENAI_API_KEY":"unused-key","tokens":%s}`, oauth)}
+				files["api"] = map[string]string{"auth.json": fmt.Sprintf(`{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-selected-key","tokens":%s}`, oauth)}
+				files["malformed-unused"] = map[string]string{"auth.json": `{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-selected-key","tokens":17}`}
+			} else {
+				files["oauth"] = map[string]string{"settings.json": `{"security":{"auth":{"selectedType":"oauth-personal"}}}`, "oauth_creds.json": oauth, ".env": "GEMINI_API_KEY=unused-key\n"}
+				files["api"] = map[string]string{"settings.json": `{"security":{"auth":{"selectedType":"gemini-api-key"}}}`, "oauth_credentials.json": oauth, ".env": "GEMINI_API_KEY=synthetic-selected-key\n"}
+				files["malformed-unused"] = map[string]string{"settings.json": `{"selectedAuthType":"gemini-api-key"}`, "oauth_credentials.json": "{", ".env": "GEMINI_API_KEY=synthetic-selected-key\n"}
+			}
+			for name, contents := range files {
+				for filename, data := range contents {
+					writeNativeTestCredential(t, filepath.Join(vaultDir, tool, name, filename), data)
+				}
+				if err := store.SetTokenExpiry(tool, name, expired); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.RecordProviderVerification(tool, name, health.ProviderVerification{Reason: "refresh_token_reused", Fingerprint: "obsolete-oauth-credential"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertKeyHealth := func(t *testing.T, ph *health.ProfileHealth) {
+				t.Helper()
+				if ph == nil || !ph.TokenExpiresAt.IsZero() || !ph.TokenRenewable || !ph.SelfRefreshing || ph.CredentialFingerprint == "" || ph.ProviderRejected() || health.CalculateStatus(ph) != health.StatusHealthy {
+					t.Fatalf("selected API key inherited unused OAuth health: %+v", ph)
+				}
+				signals := health.CredentialSignals(ph, health.DefaultHealthConfig())
+				if signals.LaunchUsable == nil || !*signals.LaunchUsable || signals.LoginRequired == nil || *signals.LoginRequired || signals.RefreshDue == nil || *signals.RefreshDue {
+					t.Fatalf("selected API key has wrong launch/refresh signals: %+v", signals)
+				}
+			}
+			for _, name := range []string{"api", "malformed-unused"} {
+				t.Run(name, func(t *testing.T) {
+					assertKeyHealth(t, buildProfileHealth(tool, name))
+					ph, err := readVaultProfileHealth(tool, name)
+					if err != nil {
+						t.Fatalf("passive saved credential check failed: %v", err)
+					}
+					assertKeyHealth(t, ph)
+					verified := verifyProfile(tool, name)
+					if verified.Status != "healthy" || verified.TokenExpiry != nil || verified.LaunchUsable == nil || !*verified.LaunchUsable || verified.LoginRequired == nil || *verified.LoginRequired {
+						t.Fatalf("verify inherited unused OAuth state: %+v", verified)
+					}
+					row := runLsJSONForTest(t, tool)[name]
+					if row.Health.Status != "healthy" || row.Health.ExpiresAt != "" || row.Health.LaunchUsable == nil || !*row.Health.LaunchUsable || row.Health.LoginRequired == nil || *row.Health.LoginRequired || row.Health.ProviderRejection != "" {
+						t.Fatalf("ls inherited unused OAuth state: %+v", row)
+					}
+					for _, compact := range []bool{false, true} {
+						robot := buildProfileInfo(tool, name, "", nil, compact)
+						if robot.Health.Status != "healthy" || !robot.Health.Renewable || robot.Health.LoginRequired == nil || *robot.Health.LoginRequired {
+							t.Fatalf("robot compact=%t inherited unused OAuth state: %+v", compact, robot.Health)
+						}
+					}
+					validation, _ := validateVaultProfile(tool, name)
+					if !validation.Valid || validation.ExpiresAt != "" || validation.LoginRequired == nil || *validation.LoginRequired {
+						t.Fatalf("validation inherited unused OAuth state: %+v", validation)
+					}
+				})
+			}
+			for _, algorithm := range []rotation.Algorithm{rotation.AlgorithmSmart, rotation.AlgorithmRoundRobin, rotation.AlgorithmRandom} {
+				for _, policy := range []rotation.Policy{rotation.PolicyAvailability, rotation.PolicyDrain} {
+					selector := rotation.NewSelector(algorithm, store, nil)
+					selector.SetVaultPath(vaultDir)
+					selector.SetPolicy(policy)
+					selector.SetIgnoreCooldown(true)
+					if result, err := selector.Select(tool, []string{"oauth"}, ""); err == nil {
+						t.Fatalf("explicit OAuth borrowed an unused key: %+v", result)
+					}
+					if result, err := selector.Select(tool, []string{"oauth", "api"}, ""); err != nil || result.Selected != "api" {
+						t.Fatalf("%s/%s blocked selected key: %+v, %v", algorithm, policy, result, err)
+					}
+				}
+			}
+			// Listing and identity reads must leave legacy caches untouched,
+			// even when they are invalid and unused by the selected method.
+			for name, contents := range files {
+				for filename, want := range contents {
+					got, err := os.ReadFile(filepath.Join(vaultDir, tool, name, filename))
+					if err != nil || string(got) != want {
+						t.Fatalf("passive reporting changed %s/%s: %v", name, filename, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestLiveSelectedAPIKeyReplacesVaultDeadline(t *testing.T) {
+	for _, tool := range []string{"codex", "gemini"} {
+		for _, isolated := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/isolated=%t", tool, isolated), func(t *testing.T) {
+				vaultDir, _ := setupCodexVerificationVault(t)
+				dir := t.TempDir()
+				t.Setenv("CODEX_HOME", dir)
+				t.Setenv("GEMINI_HOME", dir)
+				oauth := fmt.Sprintf(`{"access_token":"synthetic-old-oauth","expires_at":%d}`, time.Now().Add(-time.Hour).Unix())
+				filename := "auth.json"
+				if tool == "gemini" {
+					filename = "oauth_creds.json"
+				}
+				writeNativeTestCredential(t, filepath.Join(vaultDir, tool, "work", filename), oauth)
+				if ph := buildProfileHealth(tool, "work"); ph.TokenExpiresAt.IsZero() {
+					t.Fatal("fixture has no old vault deadline to replace")
+				}
+				if isolated {
+					profileStore = profile.NewStore(t.TempDir())
+					prof, err := profileStore.Create(tool, "work", "api-key")
+					if err != nil {
+						t.Fatal(err)
+					}
+					dir = prof.CodexHomePath()
+					if tool == "gemini" {
+						dir = filepath.Join(prof.HomePath(), ".gemini")
+					}
+				}
+				selectedPath := filepath.Join(dir, "auth.json")
+				if tool == "codex" {
+					writeNativeTestCredential(t, selectedPath, `{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-new-key"}`)
+				} else {
+					selectedPath = filepath.Join(dir, "settings.json")
+					writeNativeTestCredential(t, selectedPath, `{"security":{"auth":{"selectedType":"gemini-api-key"}}}`)
+					writeNativeTestCredential(t, filepath.Join(dir, ".env"), "GEMINI_API_KEY=synthetic-new-key\n")
+				}
+				currentHealth := func() *health.ProfileHealth {
+					ph := buildProfileHealth(tool, "work")
+					if !isolated {
+						applyLiveExpiry(tool, ph)
+					}
+					return ph
+				}
+				ph := currentHealth()
+				if !ph.TokenExpiresAt.IsZero() || !ph.TokenRenewable || !ph.SelfRefreshing || health.CalculateStatus(ph) != health.StatusHealthy {
+					t.Fatalf("current API key retained the vault deadline: %+v", ph)
+				}
+				writeNativeTestCredential(t, selectedPath, "{")
+				if ph := currentHealth(); !ph.TokenExpiresAt.IsZero() || ph.TokenRenewable || ph.SelfRefreshing {
+					t.Fatalf("invalid current credential borrowed vault expiry or renewal: %+v", ph)
+				}
+			})
+		}
+	}
+}
+
+func TestDoctorDoesNotProbeUnusedCodexOAuth(t *testing.T) {
+	vaultDir, store := setupCodexVerificationVault(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	oldURL := refresh.CodexVerifyURL
+	refresh.CodexVerifyURL = server.URL
+	t.Cleanup(func() { refresh.CodexVerifyURL = oldURL })
+	liveOAuth := fmt.Sprintf(`{"access_token":"synthetic-unused-oauth","expires_at":%d}`, time.Now().Add(time.Hour).Unix())
+	for _, mode := range []string{"apikey", "chatgpt"} {
+		data := fmt.Sprintf(`{"auth_mode":%q,"OPENAI_API_KEY":"synthetic-key","tokens":%s}`, mode, liveOAuth)
+		writeNativeTestCredential(t, filepath.Join(vaultDir, "codex", mode, "auth.json"), data)
+	}
+	if result := probeVaultToken("codex", "apikey"); result != nil || requests.Load() != 0 {
+		t.Fatalf("doctor probed unused OAuth: result=%+v requests=%d", result, requests.Load())
+	}
+	ph, err := store.GetProfile("codex", "apikey")
+	if err != nil || !ph.ProviderRejectedAt.IsZero() || !ph.LastVerifiedAt.IsZero() {
+		t.Fatalf("unused OAuth probe altered API key verification: %+v, %v", ph, err)
+	}
+	if result := probeVaultToken("codex", "chatgpt"); result == nil || requests.Load() != 1 {
+		t.Fatalf("explicit OAuth probe was disabled: result=%+v requests=%d", result, requests.Load())
+	}
 }
 
 func TestCursorSessionRobotReloginRecommendations(t *testing.T) {

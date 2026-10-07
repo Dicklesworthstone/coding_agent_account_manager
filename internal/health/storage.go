@@ -306,7 +306,9 @@ func hydrateVaultHealth(root, provider, name string, stored *ProfileHealth) *Pro
 	case "claude":
 		candidates = []string{".credentials.json", ".claude.json", "auth.json", filepath.Join("claude-code", "auth.json")}
 	case "gemini":
-		candidates = []string{"settings.json", "oauth_creds.json", "oauth_credentials.json"}
+		// ParseGeminiExpiry validates the selected source itself. An unused
+		// cache must not invalidate an explicitly selected API key.
+		candidates = []string{"settings.json"}
 	case "codex", "cursor", "grok":
 		candidates = []string{"auth.json"}
 	default:

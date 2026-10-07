@@ -1220,6 +1220,11 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	if err != nil {
 		return nil // Can't read auth file; other checks will catch this
 	}
+	if selected, err := health.CodexUsesAPIKey(data); err != nil || selected {
+		// This probe only verifies OAuth. A stored API key selects a
+		// different credential, even when an old access token remains.
+		return nil
+	}
 
 	var auth map[string]interface{}
 	if err := json.Unmarshal(data, &auth); err != nil {

@@ -714,6 +714,7 @@ func (p *AuthPool) LoadFromVault(ctx context.Context) error {
 func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name string) (string, error) {
 	dir := filepath.Join(p.vault.BasePath(), fileSet.Tool, name)
 	files := fileSet.Files
+	selectedAPIKey := false
 	if fileSet.Tool == "cursor" {
 		path := filepath.Join(dir, "auth.json")
 		if _, err := os.Lstat(path); !os.IsNotExist(err) {
@@ -721,11 +722,24 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 		}
 	}
 	if fileSet.Tool == "gemini" {
-		for _, candidate := range []string{"oauth_creds.json", "oauth_credentials.json"} {
-			path := filepath.Join(dir, candidate)
-			if _, err := os.Lstat(path); !os.IsNotExist(err) {
-				files = []authfile.AuthFileSpec{{Path: path}}
-				break
+		settings, err := readPoolCredentialFile(filepath.Join(dir, "settings.json"))
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("invalid saved Gemini settings")
+		}
+		selected, err := authfile.GeminiSelectedAuthType(settings)
+		if err != nil {
+			return "", fmt.Errorf("invalid saved Gemini auth selection")
+		}
+		selectedAPIKey = selected == "gemini-api-key"
+		if selectedAPIKey {
+			files = []authfile.AuthFileSpec{{Path: filepath.Join(dir, ".env")}}
+		} else {
+			for _, candidate := range []string{"oauth_creds.json", "oauth_credentials.json"} {
+				path := filepath.Join(dir, candidate)
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					files = []authfile.AuthFileSpec{{Path: path}}
+					break
+				}
 			}
 		}
 	}
@@ -734,21 +748,32 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 	for _, spec := range files {
 		filename := filepath.Base(spec.Path)
 		path := filepath.Join(dir, filename)
-		info, err := os.Stat(path)
+		data, err := readPoolCredentialFile(path)
 		if os.IsNotExist(err) {
 			continue
 		}
-		if err != nil || !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
-			return "", fmt.Errorf("invalid saved auth source")
-		}
-		f, err := os.Open(path)
 		if err != nil {
 			return "", fmt.Errorf("unreadable saved auth source")
 		}
-		data, readErr := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
-		closeErr := f.Close()
-		if readErr != nil || closeErr != nil || int64(len(data)) > authfile.MaxDiscoveryFileBytes {
-			return "", fmt.Errorf("unreadable saved auth source")
+		if fileSet.Tool == "codex" {
+			selectedAPIKey, err = health.CodexUsesAPIKey(data)
+			if err != nil {
+				return "", fmt.Errorf("invalid saved Codex auth selection")
+			}
+		}
+		if selectedAPIKey {
+			// Validate the selected key with its native parser. Unused OAuth
+			// bytes and their previous failures do not define this generation.
+			var current *health.ExpiryInfo
+			if fileSet.Tool == "codex" {
+				current, err = health.ParseCodexExpiry(path)
+			} else {
+				current, err = health.ParseGeminiExpiry(dir)
+			}
+			if err != nil || current == nil || current.Fingerprint == "" || !current.Renewable || !current.SelfRefreshing {
+				return "", fmt.Errorf("invalid saved API-key credential")
+			}
+			return current.Fingerprint, nil
 		}
 		if filename == "oauth_credentials.json" {
 			filename = "oauth_creds.json"
@@ -785,6 +810,26 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 		return "", fmt.Errorf("incomplete saved auth source")
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func readPoolCredentialFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+		return nil, fmt.Errorf("invalid saved auth source")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil || int64(len(data)) > authfile.MaxDiscoveryFileBytes {
+		return nil, fmt.Errorf("unreadable saved auth source")
+	}
+	return data, nil
 }
 
 // A complete Google ADC grant authenticates by exchanging its refresh token;

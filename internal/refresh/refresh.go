@@ -70,6 +70,9 @@ func Preflight(provider, profile string, vault *authfile.Vault) error {
 	vaultPath := vault.ProfilePath(provider, profile)
 	switch provider {
 	case "codex":
+		if _, err := refreshSourcePath(provider, vaultPath); err != nil {
+			return err
+		}
 		for _, spec := range authfile.CodexAuthFiles().Files {
 			if authfile.CodexLiveIsNewer(spec.Path, filepath.Join(vaultPath, filepath.Base(spec.Path))) {
 				return &StaleCredentialError{Provider: provider, Profile: profile}
@@ -110,6 +113,7 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	if err != nil {
 		return err
 	}
+	source.provider = provider
 	deliveries := captureRefreshDeliveries(provider, profile, source, options)
 	release, err := acquireRefreshLocks(ctx, source, deliveries)
 	if err != nil {
@@ -237,7 +241,19 @@ func refreshClaude(ctx context.Context, vaultPath string) error {
 
 func refreshSourcePath(provider, vaultPath string) (string, error) {
 	if provider == "codex" {
-		return filepath.Join(vaultPath, "auth.json"), nil
+		path := filepath.Join(vaultPath, "auth.json")
+		source, err := readCredentialSnapshot(path)
+		if err != nil {
+			return "", err
+		}
+		selected, err := health.CodexUsesAPIKey(source.data)
+		if err != nil {
+			return "", err
+		}
+		if selected {
+			return "", &UnsupportedError{Provider: provider, Reason: "the selected API key does not use OAuth token refresh"}
+		}
+		return path, nil
 	}
 	_, path, err := readGeminiADC(vaultPath)
 	return path, err
@@ -295,6 +311,19 @@ func codexRefreshToken(data []byte) (string, error) {
 // Reading the legacy filename when the current one is absent keeps Preflight
 // side-effect-free without rejecting a profile that refreshGemini can migrate.
 func readGeminiADC(vaultPath string) (*ADC, string, error) {
+	settings, err := readCredentialSnapshot(filepath.Join(vaultPath, "settings.json"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, "", fmt.Errorf("read Gemini auth selection: %w", err)
+	}
+	if settings != nil {
+		selected, err := authfile.GeminiSelectedAuthType(settings.data)
+		if err != nil {
+			return nil, "", fmt.Errorf("read Gemini auth selection: %w", err)
+		}
+		if selected == "gemini-api-key" || selected == "vertex-ai" {
+			return nil, "", &UnsupportedError{Provider: "gemini", Reason: "the selected authentication method does not use the saved OAuth cache"}
+		}
+	}
 	for _, name := range []string{"oauth_creds.json", "oauth_credentials.json", "settings.json"} {
 		candidate := filepath.Join(vaultPath, name)
 		fi, err := os.Lstat(candidate)

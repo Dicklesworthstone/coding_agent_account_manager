@@ -333,8 +333,6 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		authPath := filepath.Join(vaultPath, "auth.json")
 		expInfo, err = health.ParseCodexExpiry(authPath)
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	case "grok":
 		// Grok's auth.json is keyed by a dynamic "<issuer>::<client-id>" key,
@@ -353,12 +351,12 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// reads the real, current token; it also keeps TokenExpiresAt from
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
-	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && (!liveExp.ExpiresAt.IsZero() || tool == "cursor" || tool == "claude") {
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil {
 		applyExpiryInfo(ph, liveExp)
-	} else if err == nil && expInfo != nil && (!expInfo.ExpiresAt.IsZero() || tool == "cursor") {
+	} else if err == nil && expInfo != nil {
 		// Fallback: the vault snapshot is the best information we have.
-		// Cursor API keys can have no JWT at all; still copy their renewal
-		// semantics and clear any expiry left by a previous session login.
+		// API keys can have no expiry; still copy their credential semantics
+		// and clear any deadline left by a previous session login.
 		applyExpiryInfo(ph, expInfo)
 	}
 
@@ -400,8 +398,14 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 		}
 	case "codex":
 		info, err = health.ParseCodexExpiry("")
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "gemini":
 		info, err = health.ParseGeminiExpiry("")
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "cursor":
 		info, err = health.ParseCursorExpiry("")
 	case "grok":
@@ -429,7 +433,7 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if tool == "cursor" {
 		applyExpiryInfo(ph, &health.ExpiryInfo{})
 	}
-	if info := liveAuthExpiry(tool); info != nil && (!info.ExpiresAt.IsZero() || tool == "cursor" || tool == "claude") {
+	if info := liveAuthExpiry(tool); info != nil {
 		applyExpiryInfo(ph, info)
 	}
 }
@@ -452,8 +456,8 @@ func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
-// directory (following adoption symlinks). Present but unreadable Cursor or
-// Claude credentials return unknown expiry, so an older vault login cannot
+// directory (following adoption symlinks). Present but unreadable credentials
+// return unknown expiry, so an older vault login cannot
 // supply a false deadline. Missing credentials allow a vault fallback.
 func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	if profileStore == nil {
@@ -467,6 +471,9 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	switch tool {
 	case "codex":
 		info, err = health.ParseCodexExpiry(filepath.Join(prof.CodexHomePath(), "auth.json"))
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "claude":
 		p := claude.New()
 		env, envErr := p.Env(context.Background(), prof)
@@ -491,6 +498,9 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 		}
 	case "gemini":
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
 	case "cursor":
@@ -541,11 +551,10 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 		normalizeIdentityPlan(id)
 		return id
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		candidates := []string{
 			filepath.Join(vaultPath, "settings.json"),
 			filepath.Join(vaultPath, "oauth_creds.json"),
+			filepath.Join(vaultPath, "oauth_credentials.json"),
 		}
 		for _, path := range candidates {
 			id, err := identity.ExtractFromGeminiConfig(path)

@@ -14,6 +14,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	profilepkg "github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
@@ -65,6 +66,9 @@ type credentialSnapshot struct {
 	path, canonical string
 	data            []byte
 	info            os.FileInfo
+	// Refresh publication must still target the selected auth method. For
+	// Gemini the selector lives in a sibling settings file, not this token file.
+	provider string
 }
 
 func readCredentialSnapshot(path string) (*credentialSnapshot, error) {
@@ -119,6 +123,9 @@ func (s *credentialSnapshot) unchanged() error {
 	if err != nil || current.canonical != s.canonical || !os.SameFile(current.info, s.info) ||
 		current.info.Mode() != s.info.Mode() || !bytes.Equal(current.data, s.data) {
 		return ErrCredentialChanged
+	}
+	if s.provider != "" {
+		return checkRefreshSource(s.provider, filepath.Dir(s.path), s)
 	}
 	return nil
 }
@@ -232,6 +239,9 @@ func credentialGeneration(provider string, data []byte) []byte {
 		return nil
 	}
 	if provider == "codex" {
+		if selected, err := health.CodexUsesAPIKey(data); err != nil || selected {
+			return nil
+		}
 		if tokens, ok := raw["tokens"]; ok {
 			var nested map[string]json.RawMessage
 			if json.Unmarshal(tokens, &nested) != nil {
@@ -269,6 +279,7 @@ func captureRefreshDeliveries(provider, name string, source *credentialSnapshot,
 		if len(generation) == 0 || !bytes.Equal(generation, credentialGeneration(provider, target.data)) {
 			return
 		}
+		target.provider = provider
 		for _, candidate := range candidates {
 			if os.SameFile(candidate.source.info, target.info) {
 				return

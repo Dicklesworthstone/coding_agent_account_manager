@@ -917,8 +917,8 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	case "codex":
 		expiryInfo, err = health.ParseCodexExpiry(filepath.Join(vaultPath, "auth.json"))
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
+		// Passive health reads must not migrate an unused OAuth cache when
+		// settings select an API key or another native authentication method.
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
 	case "cursor":
 		expiryInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))

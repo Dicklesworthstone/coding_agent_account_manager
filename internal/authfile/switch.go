@@ -239,7 +239,7 @@ func ReadLiveCredential(fileSet AuthFileSet) (name string, data []byte, err erro
 	case "codex", "cursor", "grok":
 		primary = []string{"auth.json"}
 	case "gemini":
-		selected, err := liveGeminiAuthType(live.files["settings.json"])
+		selected, err := GeminiSelectedAuthType(live.files["settings.json"])
 		if err != nil {
 			return "", nil, fmt.Errorf("%w: Gemini settings: %v", ErrInvalidCredentials, err)
 		}
@@ -271,7 +271,10 @@ func ReadLiveCredential(fileSet AuthFileSet) (name string, data []byte, err erro
 // Native Gemini settings select the credential method before the OAuth cache.
 // Read the same legacy/current selectors as the provider's directory importer,
 // using only the settings bytes already captured with the live credential.
-func liveGeminiAuthType(data []byte) (string, error) {
+// GeminiSelectedAuthType reads the native authentication selector from captured
+// settings. A nil slice means no settings file; conflicting selectors or invalid
+// settings are errors so callers cannot silently use another credential method.
+func GeminiSelectedAuthType(data []byte) (string, error) {
 	if data == nil {
 		return "", nil
 	}

@@ -30,6 +30,64 @@ func writeLiveExpiryFile(t *testing.T, path, data string) {
 	}
 }
 
+func TestSavedAPIKeySelectionMatchesLiveHealth(t *testing.T) {
+	for _, tc := range []struct {
+		name, tool, settings, cache string
+	}{
+		{"codex_expired_oauth", "codex", "", `{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-selected-key","tokens":{"access_token":"synthetic-unused-oauth","expires_at":1600000000}}`},
+		{"codex_malformed_unused_oauth", "codex", "", `{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-selected-key","tokens":17}`},
+		{"codex_key_only", "codex", "", `{"OPENAI_API_KEY":"synthetic-selected-key"}`},
+		{"gemini_legacy_selector", "gemini", `{"selectedAuthType":"gemini-api-key"}`, `{"access_token":"synthetic-unused-oauth","expires_at":1600000000}`},
+		{"gemini_current_selector", "gemini", `{"security":{"auth":{"selectedType":"gemini-api-key"}}}`, `{"access_token":"synthetic-unused-oauth","expires_at":1600000000}`},
+		{"gemini_malformed_unused_oauth", "gemini", `{"selectedAuthType":"gemini-api-key"}`, `{`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, tc.tool, "work")
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			t.Setenv("CODEX_HOME", dir)
+			t.Setenv("GEMINI_HOME", dir)
+			files := authfile.CodexAuthFiles()
+			before := map[string]string{"auth.json": tc.cache}
+			parse := func() (*ExpiryInfo, error) { return ParseCodexExpiry(filepath.Join(dir, "auth.json")) }
+			if tc.tool == "gemini" {
+				files = authfile.GeminiAuthFiles()
+				before = map[string]string{"settings.json": tc.settings, "oauth_creds.json": tc.cache, ".env": "GEMINI_API_KEY=synthetic-selected-key\n"}
+				parse = func() (*ExpiryInfo, error) { return ParseGeminiExpiry(dir) }
+			}
+			for name, data := range before {
+				writeLiveExpiryFile(t, filepath.Join(dir, name), data)
+			}
+			live, err := ParseLiveExpiry(files)
+			if err != nil || live == nil {
+				t.Fatalf("live reference: %+v, %v", live, err)
+			}
+			saved, err := parse()
+			if err != nil || saved == nil || !saved.ExpiresAt.IsZero() || !saved.Renewable || !saved.SelfRefreshing || saved.HasRefreshToken || saved.Fingerprint != live.Fingerprint {
+				t.Fatalf("saved API-key selection differs from live: saved=%+v live=%+v err=%v", saved, live, err)
+			}
+			store := NewStorage(filepath.Join(root, "health.json"))
+			store.SetVaultPath(root)
+			if err := store.UpdateProfile(tc.tool, "work", &ProfileHealth{
+				TokenExpiresAt: time.Unix(1600000000, 0), ProviderRejectedAt: time.Now(),
+				ProviderRejection: "access_token_rejected", RejectedFingerprint: credentialFingerprint("synthetic-unused-oauth"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			h, err := store.GetProfile(tc.tool, "work")
+			if err != nil || h == nil || !h.TokenExpiresAt.IsZero() || !h.TokenRenewable || !h.SelfRefreshing || h.CredentialFingerprint != live.Fingerprint || h.ProviderRejected() {
+				t.Fatalf("stored health revived the unused OAuth grant: %+v, %v", h, err)
+			}
+			for name, want := range before {
+				got, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil || string(got) != want {
+					t.Fatalf("passive health changed %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
 func TestParseLiveExpiryCredentialModes(t *testing.T) {
 	expiry := time.Now().Add(-time.Hour).Truncate(time.Second)
 	jwt := liveExpiryJWT(expiry)

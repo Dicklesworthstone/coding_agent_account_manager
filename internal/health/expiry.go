@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -524,6 +525,15 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		return nil, err
 	}
 
+	if key, selected, err := codexSelectedAPIKey(data); err != nil {
+		return nil, fmt.Errorf("%w: %v", authfile.ErrInvalidCredentials, err)
+	} else if selected {
+		return &ExpiryInfo{
+			Renewable: true, SelfRefreshing: true, Source: authPath,
+			Fingerprint: credentialFingerprint("codex-api-key\x00" + key),
+		}, nil
+	}
+
 	info, err := parseCodexAuthJSON(data)
 	if err != nil {
 		return nil, err
@@ -811,6 +821,43 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		authDir = geminiHome
 	}
 
+	// The selected method owns health. Old OAuth caches commonly remain after
+	// switching to an API key or Vertex and must not supply that method's TTL.
+	settingsPath := filepath.Join(authDir, "settings.json")
+	settings, settingsErr := readGeminiModeFile(settingsPath)
+	if settingsErr != nil && !os.IsNotExist(settingsErr) {
+		return nil, settingsErr
+	}
+	selected, err := authfile.GeminiSelectedAuthType(settings)
+	if err != nil {
+		return nil, fmt.Errorf("%w: Gemini settings: %v", authfile.ErrInvalidCredentials, err)
+	}
+	switch selected {
+	case "gemini-api-key":
+		path := filepath.Join(authDir, ".env")
+		data, err := readGeminiModeFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: selected Gemini API key: %v", authfile.ErrInvalidCredentials, err)
+		}
+		info, err := parseLiveGeminiAPIKey(data)
+		if info != nil {
+			info.Source = path
+		}
+		return info, err
+	case "vertex-ai":
+		if checkSystem {
+			path := getADCPath()
+			if info, err := parseADCFile(path); err == nil {
+				info.Renewable = info.HasRefreshToken
+				info.Source = path
+				return info, nil
+			}
+		}
+		// The vault does not capture Vertex ADC. Do not borrow a different
+		// account's OAuth credential or the invoking user's ambient ADC.
+		return nil, ErrNoExpiry
+	}
+
 	// The current credential cache is authoritative. Settings can contain
 	// unrelated policy or an older access token; never combine that token's
 	// expiry with a different cache's refresh token. A present but invalid
@@ -843,7 +890,6 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	}
 
 	// Settings-only OAuth profiles predate the separate credential cache.
-	settingsPath := filepath.Join(authDir, "settings.json")
 	info, err := parseOAuthFile(settingsPath)
 	if err == nil {
 		info.Renewable = info.HasRefreshToken
@@ -864,7 +910,7 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	}
 
 	// Report ErrNoAuthFile only when *none* of the supported auth files exist.
-	_, settingsErr := os.Stat(settingsPath)
+	_, settingsErr = os.Stat(settingsPath)
 	_, oauthErr := os.Stat(oauthPath)
 	_, legacyOAuthErr := os.Stat(legacyOAuthPath)
 	adcExists := false
@@ -878,6 +924,31 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	}
 
 	return nil, ErrNoExpiry
+}
+
+// readGeminiModeFile bounds the small settings/key files required to choose a
+// credential before opening any potentially unused OAuth cache.
+func readGeminiModeFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > authfile.MaxDiscoveryFileBytes {
+		return nil, fmt.Errorf("%w: Gemini settings/key source must be a bounded regular file", authfile.ErrInvalidCredentials)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > authfile.MaxDiscoveryFileBytes {
+		return nil, fmt.Errorf("%w: Gemini settings/key source is too large", authfile.ErrInvalidCredentials)
+	}
+	return data, nil
 }
 
 func getADCPath() string {

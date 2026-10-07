@@ -109,6 +109,212 @@ func awaitTransaction(t *testing.T, ready <-chan struct{}) {
 	}
 }
 
+func selectTransactionAPIKey(t *testing.T, provider, path string) map[string][]byte {
+	t.Helper()
+	writes := make(map[string][]byte)
+	if provider == "codex" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var auth map[string]any
+		if err := json.Unmarshal(data, &auth); err != nil {
+			t.Fatal(err)
+		}
+		auth["auth_mode"], auth["OPENAI_API_KEY"] = "apikey", "SYNTHETIC-SELECTED-KEY"
+		data, err = json.Marshal(auth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writes[path] = data
+	} else {
+		writes[filepath.Join(filepath.Dir(path), "settings.json")] = []byte(`{"security":{"auth":{"selectedType":"gemini-api-key"}}}`)
+		writes[filepath.Join(filepath.Dir(path), ".env")] = []byte("GEMINI_API_KEY=SYNTHETIC-SELECTED-KEY\n")
+	}
+	for path, data := range writes {
+		writeTransactionFile(t, path, data)
+	}
+	return writes
+}
+
+func TestRefreshSelectedAPIKeyNeverExchangesUnusedOAuth(t *testing.T) {
+	for _, provider := range []string{"codex", "gemini"} {
+		t.Run(provider, func(t *testing.T) {
+			f := newTransactionFixture(t, provider)
+			before := selectTransactionAPIKey(t, provider, f.source)
+			for _, path := range []string{f.source, f.live, f.home} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = data
+			}
+			var requests atomic.Int32
+			transactionServer(t, provider, func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				transactionResponse(w)
+			})
+			if err := Preflight(provider, "work", f.vault); !IsSkipped(err) {
+				t.Fatalf("selected key preflight = %v, want safe skip", err)
+			}
+			if err := RefreshProfile(context.Background(), provider, "work", f.vault, f.health, WithProfileStore(f.profiles)); !IsSkipped(err) {
+				t.Fatalf("selected key refresh = %v, want safe skip", err)
+			}
+			if requests.Load() != 0 {
+				t.Fatal("selected API key exchanged an unused OAuth refresh token")
+			}
+			for path, want := range before {
+				got, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatal("skipped refresh modified credentials or selected mode")
+				}
+			}
+			stored, err := f.health.Load()
+			if err != nil || stored.Profiles[provider+"/work"] != nil {
+				t.Fatalf("unused OAuth created provider verification: %+v, %v", stored, err)
+			}
+		})
+	}
+}
+
+func TestRefreshDiscardsOutcomeWhenSelectedMethodChanges(t *testing.T) {
+	for _, provider := range []string{"codex", "gemini"} {
+		for _, outcome := range []string{"success", "rejection"} {
+			t.Run(provider+"/"+outcome, func(t *testing.T) {
+				f := newTransactionFixture(t, provider)
+				entered, release := make(chan struct{}), make(chan struct{})
+				transactionServer(t, provider, func(w http.ResponseWriter, r *http.Request) {
+					close(entered)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+					if outcome == "rejection" {
+						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+						return
+					}
+					transactionResponse(w)
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				result := make(chan error, 1)
+				go func() {
+					result <- RefreshProfile(ctx, provider, "work", f.vault, f.health, WithProfileStore(f.profiles))
+				}()
+				awaitTransaction(t, entered)
+				before := selectTransactionAPIKey(t, provider, f.source)
+				for _, path := range []string{f.source, f.live, f.home} {
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					before[path] = data
+				}
+				close(release)
+				if err := <-result; !errors.Is(err, ErrCredentialChanged) || !IsSkipped(err) {
+					t.Fatalf("obsolete auth method result = %v, want changed-credential skip", err)
+				}
+				for path, want := range before {
+					got, err := os.ReadFile(path)
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatal("obsolete refresh outcome modified the selected credential or cache")
+					}
+				}
+				stored, err := f.health.Load()
+				if err != nil || stored.Profiles[provider+"/work"] != nil {
+					t.Fatalf("obsolete auth method recorded a provider verdict: %+v, %v", stored, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRefreshDeliveryRespectsSelectedMethod(t *testing.T) {
+	for _, provider := range []string{"codex", "gemini"} {
+		for _, destination := range []string{"live", "isolated"} {
+			for _, during := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/during=%t", provider, destination, during), func(t *testing.T) {
+					f := newTransactionFixture(t, provider)
+					target := f.live
+					if destination == "isolated" {
+						target = f.home
+					}
+					var selected map[string][]byte
+					if !during {
+						selected = selectTransactionAPIKey(t, provider, target)
+					}
+					entered, release := make(chan struct{}), make(chan struct{})
+					transactionServer(t, provider, func(w http.ResponseWriter, r *http.Request) {
+						close(entered)
+						select {
+						case <-release:
+						case <-r.Context().Done():
+							return
+						}
+						transactionResponse(w)
+					})
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					result := make(chan error, 1)
+					go func() {
+						result <- RefreshProfile(ctx, provider, "work", f.vault, f.health, WithProfileStore(f.profiles))
+					}()
+					awaitTransaction(t, entered)
+					if during {
+						selected = selectTransactionAPIKey(t, provider, target)
+					}
+					before, err := os.ReadFile(target)
+					if err != nil {
+						t.Fatal(err)
+					}
+					selected[target] = before
+					close(release)
+					err = <-result
+					if IsDeliveryIncomplete(err) != during || (err != nil && !during) || IsSkipped(err) {
+						t.Fatalf("delivery result = %v, want partial=%t", err, during)
+					}
+					for path, want := range selected {
+						got, err := os.ReadFile(path)
+						if err != nil || !bytes.Equal(got, want) {
+							t.Fatal("OAuth delivery modified an API-key destination")
+						}
+					}
+					for _, path := range []string{f.source, f.live, f.home} {
+						if path == target {
+							continue
+						}
+						got, err := os.ReadFile(path)
+						if err != nil || !bytes.Contains(got, []byte("SYNTHETIC-NEW-ACCESS")) {
+							t.Fatal("API destination prevented renewal of an unchanged OAuth owner")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestRefreshGeminiAllowsUnrelatedSettingsChange(t *testing.T) {
+	f := newTransactionFixture(t, "gemini")
+	settings := filepath.Join(filepath.Dir(f.source), "settings.json")
+	writeTransactionFile(t, settings, []byte(`{"selectedAuthType":"oauth-personal","theme":"light"}`))
+	transactionServer(t, "gemini", func(w http.ResponseWriter, r *http.Request) {
+		if err := os.WriteFile(settings, []byte(`{"selectedAuthType":"oauth-personal","theme":"dark"}`), 0600); err != nil {
+			t.Errorf("write synthetic settings: %v", err)
+		}
+		transactionResponse(w)
+	})
+	if err := RefreshProfile(context.Background(), "gemini", "work", f.vault, f.health, WithProfileStore(f.profiles)); err != nil {
+		t.Fatalf("unrelated settings churn blocked OAuth renewal: %v", err)
+	}
+	got, err := os.ReadFile(settings)
+	if err != nil || string(got) != `{"selectedAuthType":"oauth-personal","theme":"dark"}` {
+		t.Fatal("OAuth renewal replaced native settings")
+	}
+}
+
 func TestRefreshRejectsSourceReplacementDuringExchange(t *testing.T) {
 	for _, provider := range []string{"codex", "gemini"} {
 		for _, outcome := range []string{"success", "rejection"} {

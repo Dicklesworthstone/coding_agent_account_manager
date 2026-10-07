@@ -235,6 +235,14 @@ func CodexCredentialFingerprint(data []byte) string {
 	return credentialFingerprint(auth.Tokens.RefreshToken, auth.RefreshToken, auth.Tokens.AccessToken, auth.AccessToken)
 }
 
+// CodexUsesAPIKey reports whether the captured native auth record selects its
+// stored API key. OAuth refresh and probe callers must not exercise leftover
+// OAuth tokens when this returns true.
+func CodexUsesAPIKey(data []byte) (bool, error) {
+	_, selected, err := codexSelectedAPIKey(data)
+	return selected, err
+}
+
 // An explicit API-key mode ignores leftover OAuth tokens. With no mode, a
 // key-only record selects that key. OAuth-only probes continue to fingerprint
 // the OAuth token they exercised, even when the native CLI selects an API key.

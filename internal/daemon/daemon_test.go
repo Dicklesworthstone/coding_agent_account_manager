@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1834,6 +1837,92 @@ func TestClassicDaemonRecoversExpiredRenewableCredentials(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDaemonSelectedAPIKeyDoesNotRefreshUnusedOAuth(t *testing.T) {
+	for _, provider := range []string{"codex", "gemini"} {
+		for _, pooled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pool=%t", provider, pooled), func(t *testing.T) {
+				t.Setenv("CAAM_HOME", t.TempDir())
+				t.Setenv("CODEX_HOME", t.TempDir())
+				t.Setenv("GEMINI_HOME", t.TempDir())
+				vault := authfile.NewVault(t.TempDir())
+				store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+				dir := vault.ProfilePath(provider, "work")
+				files := []string{"auth.json"}
+				if provider == "codex" {
+					payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(-time.Hour).Unix())))
+					writeDaemonAuthJSON(t, filepath.Join(dir, "auth.json"), map[string]any{
+						"auth_mode": "apikey", "OPENAI_API_KEY": "synthetic-selected-key",
+						"tokens": map[string]any{"access_token": "e30." + payload + ".synthetic", "refresh_token": "synthetic-unused-refresh"},
+					})
+				} else {
+					files = []string{"settings.json", ".env", "oauth_credentials.json"}
+					writeDaemonAuthJSON(t, filepath.Join(dir, "settings.json"), map[string]any{"selectedAuthType": "gemini-api-key"})
+					writeDaemonAuthJSON(t, filepath.Join(dir, "oauth_credentials.json"), map[string]any{
+						"access_token": "synthetic-unused-access", "refresh_token": "synthetic-unused-refresh",
+						"client_id": "synthetic-client", "client_secret": "synthetic-secret", "expires_at": time.Now().Add(-time.Hour).Unix(),
+					})
+					if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("GEMINI_API_KEY=synthetic-selected-key\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before := make(map[string][]byte)
+				for _, file := range files {
+					data, err := os.ReadFile(filepath.Join(dir, file))
+					if err != nil {
+						t.Fatal(err)
+					}
+					before[file] = data
+				}
+				var requests atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests.Add(1)
+					_, _ = w.Write([]byte(`{"access_token":"synthetic-unwanted-access","refresh_token":"synthetic-unwanted-refresh","expires_in":3600}`))
+				}))
+				defer server.Close()
+				codexURL, geminiURL := refresh.CodexTokenURL, refresh.GeminiTokenURL
+				refresh.CodexTokenURL, refresh.GeminiTokenURL = server.URL, server.URL
+				t.Cleanup(func() { refresh.CodexTokenURL, refresh.GeminiTokenURL = codexURL, geminiURL })
+				d := New(vault, store, &Config{UseAuthPool: pooled, RefreshThreshold: 10 * time.Minute})
+				d.ctx = context.Background()
+				if pooled {
+					defer d.poolMonitor.Stop()
+					results, err := d.poolMonitor.RefreshAll(d.ctx)
+					if err != nil || len(results) != 1 || !refresh.IsSkipped(results[0].Err) {
+						t.Fatalf("selected key batch result = %+v, %v", results, err)
+					}
+					if current := d.authPool.GetProfile(provider, "work"); current == nil || current.Status != authpool.PoolStatusReady || !current.LastRefresh.IsZero() {
+						t.Fatalf("selected key did not stay ready and unrefreshed: %+v", current)
+					}
+				} else {
+					d.checkProfile(provider, "work")
+				}
+				current := d.getProfileHealth(provider, "work")
+				if current == nil || !current.TokenExpiresAt.IsZero() || !current.CredentialRenewable() || !current.SelfRefreshing {
+					t.Fatalf("daemon health inherited unused OAuth: %+v", current)
+				}
+				if stats := d.GetStats(); requests.Load() != 0 || stats.RefreshCount != 0 || stats.RefreshErrors != 0 {
+					t.Fatalf("selected key drove OAuth work: requests=%d stats=%+v", requests.Load(), stats)
+				}
+				for file, want := range before {
+					got, err := os.ReadFile(filepath.Join(dir, file))
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("daemon changed unused cache or selected key: %s", file)
+					}
+				}
+				if provider == "gemini" {
+					if _, err := os.Stat(filepath.Join(dir, "oauth_creds.json")); !os.IsNotExist(err) {
+						t.Fatalf("daemon migrated an unused legacy cache: %v", err)
+					}
+				}
+				stored, err := store.Load()
+				if err != nil || stored.Profiles[provider+"/work"] != nil {
+					t.Fatalf("skipped OAuth recorded provider evidence: %+v, %v", stored, err)
+				}
+			})
+		}
 	}
 }
 

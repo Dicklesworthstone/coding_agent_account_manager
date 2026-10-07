@@ -113,6 +113,102 @@ func TestPoolReconcilesRealVaultCredentialsAndMembership(t *testing.T) {
 	}
 }
 
+func TestPoolSelectedAPIKeyOwnsHealthAndGeneration(t *testing.T) {
+	for _, provider := range []string{"codex", "gemini"} {
+		t.Run(provider, func(t *testing.T) {
+			root := t.TempDir()
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			store := health.NewStorage(filepath.Join(root, "health.json"))
+			pool := NewAuthPool(WithVault(vault), WithHealthStorage(store))
+			old := poolCodexCredential(time.Now().Add(-time.Hour), "synthetic-unused-refresh")
+			writeKey := func(key string) {
+				if provider == "codex" {
+					body := map[string]any{"auth_mode": "apikey", "OPENAI_API_KEY": key, "tokens": old["tokens"]}
+					writePoolCredential(t, vault.BasePath(), provider, "work", "auth.json", body)
+				} else {
+					writePoolCredential(t, vault.BasePath(), provider, "work", "settings.json", map[string]any{"security": map[string]any{"auth": map[string]any{"selectedType": "gemini-api-key"}}})
+					path := filepath.Join(vault.ProfilePath(provider, "work"), ".env")
+					if err := os.WriteFile(path, []byte("export GEMINI_API_KEY='"+key+"' # selected account\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			writeKey("synthetic-selected-key")
+			if provider == "gemini" {
+				// A selected API key must not even validate an unused OAuth cache.
+				if err := os.WriteFile(filepath.Join(vault.ProfilePath(provider, "work"), "oauth_creds.json"), []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldData, err := json.Marshal(old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordProviderVerification(provider, "work", health.ProviderVerification{
+				Reason: "refresh_token_invalidated", Fingerprint: health.CodexCredentialFingerprint(oldData),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			first := pool.GetProfile(provider, "work")
+			if first == nil || first.Status != PoolStatusReady || !first.TokenExpiry.IsZero() || first.refreshable || first.generation == "" {
+				t.Fatalf("unused OAuth determined selected key state: %+v", first)
+			}
+			if candidates := pool.GetProfilesNeedingRefresh(provider); len(candidates) != 0 {
+				t.Fatalf("API key scheduled unused OAuth refresh: %+v", candidates)
+			}
+			for range pool.maxRetries {
+				pool.SetError(provider, "work", fmt.Errorf("synthetic failure for selected key"))
+			}
+			// Rotating unused OAuth cannot erase the selected key's errors.
+			old["tokens"].(map[string]any)["refresh_token"] = "synthetic-unused-rotated"
+			if provider == "gemini" {
+				writePoolCredential(t, vault.BasePath(), provider, "work", "oauth_creds.json", map[string]any{
+					"access_token": "synthetic-unused-access", "refresh_token": "synthetic-unused-rotated", "expires_at": time.Now().Add(-time.Hour).Unix(),
+				})
+			}
+			writeKey("synthetic-selected-key")
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if current := pool.GetProfile(provider, "work"); current.generation != first.generation || current.ErrorCount != pool.maxRetries {
+				t.Fatalf("unchanged selected key lost its operational errors: %+v", current)
+			}
+			writeKey("synthetic-replacement-key")
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if current := pool.GetProfile(provider, "work"); current.Status != PoolStatusReady || current.ErrorCount != 0 || current.generation == first.generation || current.refreshable {
+				t.Fatalf("selected key replacement inherited old grant state: %+v", current)
+			}
+		})
+	}
+}
+
+func TestPoolSelectedGeminiKeyCannotBorrowOAuth(t *testing.T) {
+	for _, key := range []string{"", "GEMINI_API_KEY=\n", "GEMINI_API_KEY='unterminated\n"} {
+		t.Run(fmt.Sprintf("key-bytes=%d", len(key)), func(t *testing.T) {
+			vault := authfile.NewVault(t.TempDir())
+			pool := NewAuthPool(WithVault(vault))
+			writePoolCredential(t, vault.BasePath(), "gemini", "work", "settings.json", map[string]any{"selectedAuthType": "gemini-api-key"})
+			writePoolCredential(t, vault.BasePath(), "gemini", "work", "oauth_creds.json", map[string]any{"access_token": "synthetic-unrelated-access", "refresh_token": "synthetic-unrelated-refresh", "expires_at": time.Now().Add(time.Hour).Unix()})
+			if key != "" {
+				if err := os.WriteFile(filepath.Join(vault.ProfilePath("gemini", "work"), ".env"), []byte(key), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if current := pool.GetProfile("gemini", "work"); current == nil || current.Status != PoolStatusError || current.refreshable {
+				t.Fatalf("missing selected key borrowed unused OAuth: %+v", current)
+			}
+		})
+	}
+}
+
 func TestPoolCurrentProviderRejectionAndInvalidSource(t *testing.T) {
 	root := t.TempDir()
 	vault := authfile.NewVault(filepath.Join(root, "vault"))
