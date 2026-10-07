@@ -4,12 +4,19 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
+	caamsync "github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
@@ -41,18 +48,32 @@ The update process:
   4. Creates a backup of the current binary
   5. Atomically replaces the binary
 
+With --remotes, brings the distributed auth coordinators listed in the
+auth-agent config (written by 'caam setup distributed') to this caam's
+version instead. Each host keeps its deployed coordinator config; the new
+binary is checksum-verified (or, for another platform, the matching release
+is installed), the service restarted, and its API verified through SSH. A
+coordinator that fails verification is rolled back to the previous binary
+and unit, which stay on the host as <binary>.caam-prev otherwise. --force
+redeploys and restarts even at the same version (for example to refresh the
+service unit).
+
 Flags:
   --check     Check for updates without installing
   --channel   Update channel: "stable" (default) or "beta"
   --version   Update to a specific version (e.g., "1.2.3")
   --json      Output results in JSON format
   --force     Force update even if already at latest version
+  --remotes   Update the remote coordinators instead of this binary
+  --dry-run   With --remotes, show what would change
 
 Examples:
   caam update              # Update to latest stable version
   caam update --check      # Check if updates are available
   caam update --channel=beta  # Update to latest beta version
-  caam update --version=1.2.0 # Update to specific version`,
+  caam update --version=1.2.0 # Update to specific version
+  caam update --remotes --dry-run  # Plan coordinator upgrades
+  caam update --remotes            # Upgrade coordinators to this version`,
 	RunE: runUpdate,
 }
 
@@ -63,6 +84,9 @@ func init() {
 	updateCmd.Flags().String("version", "", "update to a specific version")
 	updateCmd.Flags().Bool("json", false, "output in JSON format")
 	updateCmd.Flags().Bool("force", false, "force update even if at latest version")
+	updateCmd.Flags().Bool("remotes", false, "update the distributed auth coordinators to this caam's version")
+	updateCmd.Flags().Bool("dry-run", false, "with --remotes, show what would change without changing it")
+	updateCmd.Flags().String("config", "", "with --remotes, the auth-agent config listing the coordinators (default: the 'caam setup distributed' config)")
 }
 
 func runUpdate(cmd *cobra.Command, args []string) error {
@@ -71,6 +95,19 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	targetVersion, _ := cmd.Flags().GetString("version")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
+	remotes, _ := cmd.Flags().GetBool("remotes")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+
+	if remotes {
+		if checkOnly || targetVersion != "" {
+			return fmt.Errorf("--remotes upgrades coordinators to this caam's version; it cannot be combined with --check or --version")
+		}
+		configPath, _ := cmd.Flags().GetString("config")
+		return runRemoteUpdate(cmd, configPath, deploy.UpgradeOptions{DryRun: dryRun, Force: force}, jsonOutput)
+	}
+	if dryRun {
+		return fmt.Errorf("--dry-run applies to --remotes; use --check to see whether this caam has an update")
+	}
 
 	// Build update config
 	config := update.DefaultConfig()
@@ -222,4 +259,121 @@ func printJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// RemoteUpdateOutput is the JSON output of 'caam update --remotes'.
+type RemoteUpdateOutput struct {
+	Action  string                 `json:"action"` // "remote_update"
+	DryRun  bool                   `json:"dry_run,omitempty"`
+	Version string                 `json:"version"`
+	Results []deploy.UpgradeResult `json:"results"`
+}
+
+// upgradeSkipped marks a coordinator that cannot be reached over SSH.
+const upgradeSkipped = "skipped"
+
+// upgradeCoordinatorHost connects to one coordinator host and upgrades it.
+var upgradeCoordinatorHost = func(ctx context.Context, ep *agent.CoordinatorEndpoint, opts deploy.UpgradeOptions, logger *slog.Logger) deploy.UpgradeResult {
+	d := deploy.NewDeployer(&caamsync.Machine{
+		Name:       ep.Name,
+		Address:    ep.SSH.Host,
+		Port:       ep.SSH.Port,
+		SSHUser:    ep.SSH.User,
+		SSHKeyPath: ep.SSH.IdentityFile,
+	}, logger)
+	if err := d.Connect(); err != nil {
+		return deploy.UpgradeResult{Machine: ep.Name, Action: deploy.UpgradeFailed, Error: err.Error()}
+	}
+	defer d.Disconnect()
+	return *d.UpgradeCoordinator(ctx, opts)
+}
+
+func runRemoteUpdate(cmd *cobra.Command, configPath string, opts deploy.UpgradeOptions, jsonOutput bool) error {
+	if configPath == "" {
+		configPath = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no auth-agent config at %s: run 'caam setup distributed' first", configPath)
+	}
+	if err != nil {
+		return fmt.Errorf("agent config %s: %w", configPath, err)
+	}
+	if len(fc.Coordinators) == 0 {
+		return fmt.Errorf("agent config %s lists no coordinators", configPath)
+	}
+
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 15*time.Minute)
+	defer cancel()
+	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	out := cmd.OutOrStdout()
+	output := RemoteUpdateOutput{Action: "remote_update", DryRun: opts.DryRun, Version: version.Short()}
+	if !jsonOutput {
+		fmt.Fprintf(out, "Coordinators -> caam %s\n", version.Short())
+	}
+	failures := 0
+	for _, ep := range fc.Coordinators {
+		var res deploy.UpgradeResult
+		if ep.SSH == nil || strings.TrimSpace(ep.SSH.Host) == "" {
+			res = deploy.UpgradeResult{Machine: ep.Name, Action: upgradeSkipped,
+				Error: "no ssh block in the agent config; update caam on that host directly"}
+		} else {
+			res = upgradeCoordinatorHost(ctx, ep, opts, logger)
+		}
+		if res.Machine == "" {
+			res.Machine = ep.URL
+		}
+		if res.Action == deploy.UpgradeFailed || res.Action == deploy.UpgradeRolledBack {
+			failures++
+		}
+		output.Results = append(output.Results, res)
+		if !jsonOutput {
+			printUpgradeResult(out, res)
+		}
+	}
+
+	if jsonOutput {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(output); err != nil {
+			return err
+		}
+	}
+	if failures > 0 {
+		cmd.SilenceUsage = true
+		return fmt.Errorf("%d of %d coordinators were not upgraded", failures, len(fc.Coordinators))
+	}
+	return nil
+}
+
+func printUpgradeResult(w io.Writer, r deploy.UpgradeResult) {
+	from := r.FromVersion
+	if from == "" {
+		from = "not installed"
+	}
+	switch r.Action {
+	case deploy.UpgradeUpgraded:
+		fmt.Fprintf(w, "  ✓ %s: %s -> %s\n", r.Machine, from, r.ToVersion)
+	case deploy.UpgradeUpToDate:
+		fmt.Fprintf(w, "  = %s: up to date (%s)\n", r.Machine, from)
+	case deploy.UpgradeWouldApply:
+		fmt.Fprintf(w, "  ~ %s: would upgrade %s -> %s\n", r.Machine, from, r.ToVersion)
+	case deploy.UpgradeRolledBack:
+		fmt.Fprintf(w, "  ↺ %s: rolled back to %s: %s\n", r.Machine, from, r.Error)
+	case upgradeSkipped:
+		fmt.Fprintf(w, "  - %s: skipped: %s\n", r.Machine, r.Error)
+	default:
+		fmt.Fprintf(w, "  ✗ %s: %s\n", r.Machine, r.Error)
+	}
+	if !r.Verified && (r.Action == deploy.UpgradeUpToDate || r.Action == deploy.UpgradeUpgraded || r.Action == deploy.UpgradeRolledBack) {
+		fmt.Fprintf(w, "      ⚠ the coordinator is not answering its status check\n")
+	}
+	for _, warning := range r.Warnings {
+		fmt.Fprintf(w, "      ⚠ %s\n", warning)
+	}
 }

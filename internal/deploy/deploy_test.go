@@ -1,21 +1,32 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
+	caamsync "github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 )
 
 func TestGenerateSystemdUnit(t *testing.T) {
@@ -373,5 +384,407 @@ func TestParseSHA256OutputRejectsGarbage(t *testing.T) {
 	upper := strings.Repeat("AB", 32) + "  /tmp/f\n"
 	if got, err := parseSHA256Output(upper); err != nil || got != strings.Repeat("ab", 32) {
 		t.Fatalf("parseSHA256Output(shasum style) = %q, %v", got, err)
+	}
+}
+
+// fakeRemote stands in for a coordinator host: an SSH server that runs
+// commands with /bin/sh in a private home directory, serves SFTP, and
+// forwards direct-tcpip. Stubs for systemctl, loginctl, sudo, uname and curl
+// come first on its PATH. The stub systemctl "starts" the coordinator by
+// recording the --version of the binary the unit runs, and the fake
+// coordinator API is healthy unless that version contains "broken".
+type fakeRemote struct {
+	home    string
+	stubs   string
+	addr    string
+	keyPath string
+	apiPort int
+}
+
+const fakeSystemctl = `#!/bin/sh
+echo "$*" >> "$HOME/systemctl.log"
+case "$*" in
+*restart*)
+	bin=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$HOME/.config/systemd/user/caam-coordinator.service")
+	"$bin" --version > "$HOME/running-version"
+	;;
+esac
+exit 0
+`
+
+const fakeCurl = `#!/bin/sh
+cat <<'EOS'
+v=latest
+for a in "$@"; do case "$a" in --version=*) v="${a#--version=}";; esac; done
+mkdir -p "$INSTALL_DIR"
+printf '#!/bin/sh\necho "caam %s (release) built on today"\n' "$v" > "$INSTALL_DIR/caam"
+chmod 755 "$INSTALL_DIR/caam"
+echo "$v" >> "$HOME/installs.log"
+EOS
+`
+
+func startFakeRemote(t *testing.T, remoteOS string) *fakeRemote {
+	t.Helper()
+	r := &fakeRemote{home: t.TempDir(), stubs: t.TempDir()}
+	stubs := map[string]string{
+		"systemctl": fakeSystemctl,
+		"loginctl":  "#!/bin/sh\necho yes\n",
+		"sudo":      "#!/bin/sh\nexit 1\n",
+		"curl":      fakeCurl,
+	}
+	if remoteOS != "" {
+		stubs["uname"] = "#!/bin/sh\nif [ \"$1\" = -s ]; then echo " + remoteOS + "; exit 0; fi\n" +
+			"for u in /usr/bin/uname /bin/uname; do [ -x \"$u\" ] && exec \"$u\" \"$@\"; done\n"
+	}
+	for name, body := range stubs {
+		if err := os.WriteFile(filepath.Join(r.stubs, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		running, _ := os.ReadFile(filepath.Join(r.home, "running-version"))
+		if len(running) == 0 || strings.Contains(string(running), "broken") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"running":true}`))
+	}))
+	t.Cleanup(api.Close)
+	_, port, _ := net.SplitHostPort(api.Listener.Addr().String())
+	r.apiPort, _ = strconv.Atoi(port)
+
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, err := ssh.NewPublicKey(clientPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(clientPriv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.keyPath = filepath.Join(t.TempDir(), "id_test")
+	if err := os.WriteFile(r.keyPath, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), sshPub.Marshal()) {
+				return nil, nil
+			}
+			return nil, errors.New("unknown key")
+		},
+	}
+	config.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	r.addr = listener.Addr().String()
+	go func() {
+		for {
+			nc, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go r.serve(nc, config)
+		}
+	}()
+	return r
+}
+
+func (r *fakeRemote) serve(nc net.Conn, config *ssh.ServerConfig) {
+	conn, chans, reqs, err := ssh.NewServerConn(nc, config)
+	if err != nil {
+		nc.Close()
+		return
+	}
+	defer conn.Close()
+	go ssh.DiscardRequests(reqs)
+	for newCh := range chans {
+		switch newCh.ChannelType() {
+		case "session":
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			go r.session(ch, chReqs)
+		case "direct-tcpip":
+			var dest struct {
+				Host     string
+				Port     uint32
+				OrigHost string
+				OrigPort uint32
+			}
+			if err := ssh.Unmarshal(newCh.ExtraData(), &dest); err != nil {
+				newCh.Reject(ssh.ConnectionFailed, "bad payload")
+				continue
+			}
+			target, err := net.Dial("tcp", net.JoinHostPort(dest.Host, strconv.Itoa(int(dest.Port))))
+			if err != nil {
+				newCh.Reject(ssh.ConnectionFailed, err.Error())
+				continue
+			}
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				target.Close()
+				continue
+			}
+			go ssh.DiscardRequests(chReqs)
+			go func() {
+				defer ch.Close()
+				defer target.Close()
+				done := make(chan struct{}, 2)
+				go func() { io.Copy(ch, target); done <- struct{}{} }()
+				go func() { io.Copy(target, ch); done <- struct{}{} }()
+				<-done
+			}()
+		default:
+			newCh.Reject(ssh.UnknownChannelType, "unsupported")
+		}
+	}
+}
+
+func (r *fakeRemote) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
+	defer ch.Close()
+	for req := range reqs {
+		switch req.Type {
+		case "exec":
+			var payload struct{ Command string }
+			if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+				req.Reply(false, nil)
+				return
+			}
+			req.Reply(true, nil)
+			cmd := exec.Command("/bin/sh", "-c", payload.Command)
+			cmd.Env = []string{"HOME=" + r.home, "PATH=" + r.stubs + ":/usr/bin:/bin", "SHELL=/bin/sh", "USER=tester"}
+			cmd.Stdout = ch
+			cmd.Stderr = ch.Stderr()
+			status := 0
+			if err := cmd.Run(); err != nil {
+				status = 1
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
+					status = exitErr.ExitCode()
+				}
+			}
+			ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
+			return
+		case "subsystem":
+			var payload struct{ Name string }
+			if err := ssh.Unmarshal(req.Payload, &payload); err != nil || payload.Name != "sftp" {
+				req.Reply(false, nil)
+				return
+			}
+			req.Reply(true, nil)
+			server, err := sftp.NewServer(ch)
+			if err != nil {
+				return
+			}
+			server.Serve()
+			return
+		default:
+			req.Reply(false, nil)
+		}
+	}
+}
+
+func (r *fakeRemote) path(rel string) string { return filepath.Join(r.home, rel) }
+
+func (r *fakeRemote) read(t *testing.T, rel string) string {
+	t.Helper()
+	data, err := os.ReadFile(r.path(rel))
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// writeExecutable writes a stand-in caam that reports version.
+func writeExecutable(t *testing.T, path, version string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\necho \"caam %s (test) built on today\"\n", version)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// installCoordinator puts a running coordinator of version on the remote.
+func (r *fakeRemote) installCoordinator(t *testing.T, version string) {
+	t.Helper()
+	bin := r.path(".local/bin/caam")
+	writeExecutable(t, bin, version)
+	cfg := fmt.Sprintf(`{"bind":"127.0.0.1","port":%d,"auth_token":"tok"}`, r.apiPort)
+	unit := "[Service]\nExecStart=" + bin + " auth-coordinator --config %h/.config/caam/coordinator.json\n"
+	for rel, content := range map[string]string{
+		".config/caam/coordinator.json":                 cfg,
+		".config/systemd/user/caam-coordinator.service": unit,
+		"running-version":                               "caam " + version,
+	} {
+		if err := os.MkdirAll(filepath.Dir(r.path(rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(r.path(rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// deployer connects to the fake remote with a local caam of localVersion.
+func (r *fakeRemote) deployer(t *testing.T, localVersion string) *Deployer {
+	t.Helper()
+	host, port, _ := net.SplitHostPort(r.addr)
+	portNum, _ := strconv.Atoi(port)
+	d := NewDeployer(&caamsync.Machine{Name: "fake", Address: host, Port: portNum, SSHUser: "tester", SSHKeyPath: r.keyPath}, nil)
+	d.localBinary = filepath.Join(t.TempDir(), "caam")
+	writeExecutable(t, d.localBinary, localVersion)
+	d.verifyTimeout = 2 * time.Second
+	if err := d.Connect(); err != nil {
+		t.Fatalf("connect to fake remote: %v", err)
+	}
+	t.Cleanup(func() { d.Disconnect() })
+	return d
+}
+
+func TestUpgradeCoordinatorReplacesVerifiesAndKeepsLastKnownGood(t *testing.T) {
+	r := startFakeRemote(t, "")
+	r.installCoordinator(t, "v1.0.0")
+	d := r.deployer(t, "v1.5.0")
+
+	res := d.UpgradeCoordinator(context.Background(), UpgradeOptions{})
+	if res.Action != UpgradeUpgraded || !res.Verified || res.Error != "" {
+		t.Fatalf("result = %+v", res)
+	}
+	if res.FromVersion != "v1.0.0" || res.ToVersion != "v1.5.0" {
+		t.Fatalf("versions %s -> %s", res.FromVersion, res.ToVersion)
+	}
+	if got := r.read(t, "running-version"); !strings.Contains(got, "v1.5.0") {
+		t.Fatalf("running coordinator = %q, want v1.5.0", got)
+	}
+	unit := r.read(t, ".config/systemd/user/caam-coordinator.service")
+	if bin := execStartBinary(unit); bin != r.path("bin/caam") {
+		t.Fatalf("unit runs %q, want the uploaded %q:\n%s", bin, r.path("bin/caam"), unit)
+	}
+	if !strings.Contains(r.read(t, ".local/bin/caam"+prevBinarySuffix), "v1.0.0") {
+		t.Fatal("previous binary not kept as last-known-good")
+	}
+	if cfg := r.read(t, ".config/caam/coordinator.json"); !strings.Contains(cfg, `"auth_token": "tok"`) {
+		t.Fatalf("deployed config not preserved:\n%s", cfg)
+	}
+}
+
+func TestUpgradeCoordinatorRollsBackWhenNewVersionFailsVerification(t *testing.T) {
+	r := startFakeRemote(t, "")
+	r.installCoordinator(t, "v1.0.0")
+	d := r.deployer(t, "v1.6.0-broken")
+
+	res := d.UpgradeCoordinator(context.Background(), UpgradeOptions{})
+	if res.Action != UpgradeRolledBack || !res.Verified {
+		t.Fatalf("result = %+v, want a verified rollback", res)
+	}
+	if !strings.Contains(res.Error, "verification failed") {
+		t.Fatalf("error = %q, want the failed verification", res.Error)
+	}
+	if got := r.read(t, "running-version"); !strings.Contains(got, "v1.0.0") {
+		t.Fatalf("running coordinator after rollback = %q, want v1.0.0", got)
+	}
+	unit := r.read(t, ".config/systemd/user/caam-coordinator.service")
+	if bin := execStartBinary(unit); bin != r.path(".local/bin/caam") {
+		t.Fatalf("restored unit runs %q:\n%s", bin, unit)
+	}
+	if got := r.read(t, ".local/bin/caam"); !strings.Contains(got, "v1.0.0") {
+		t.Fatalf("restored binary = %q", got)
+	}
+}
+
+func TestUpgradeCoordinatorDryRunAndUpToDateChangeNothing(t *testing.T) {
+	r := startFakeRemote(t, "")
+	r.installCoordinator(t, "v1.0.0")
+
+	res := r.deployer(t, "v1.5.0").UpgradeCoordinator(context.Background(), UpgradeOptions{DryRun: true})
+	if res.Action != UpgradeWouldApply || res.FromVersion != "v1.0.0" || res.ToVersion != "v1.5.0" {
+		t.Fatalf("dry run = %+v", res)
+	}
+
+	res = r.deployer(t, "v1.0.0").UpgradeCoordinator(context.Background(), UpgradeOptions{})
+	if res.Action != UpgradeUpToDate || !res.Verified {
+		t.Fatalf("same version = %+v", res)
+	}
+	if log := r.read(t, "systemctl.log"); log != "" {
+		t.Fatalf("systemctl was called without an upgrade:\n%s", log)
+	}
+	if _, err := os.Stat(r.path("bin/caam")); err == nil {
+		t.Fatal("a binary was uploaded without an upgrade")
+	}
+}
+
+func TestUpgradeCoordinatorOnOtherPlatformInstallsMatchingRelease(t *testing.T) {
+	r := startFakeRemote(t, "FakeOS")
+	r.installCoordinator(t, "v1.0.0")
+	d := r.deployer(t, "v1.5.0")
+
+	res := d.UpgradeCoordinator(context.Background(), UpgradeOptions{})
+	if res.Action != UpgradeUpgraded || !res.Verified {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := strings.TrimSpace(r.read(t, "installs.log")); got != "v1.5.0" {
+		t.Fatalf("installer ran for %q, want the local release v1.5.0", got)
+	}
+	if got := r.read(t, "running-version"); !strings.Contains(got, "v1.5.0") {
+		t.Fatalf("running coordinator = %q", got)
+	}
+
+	// A second run finds the release already in place.
+	res = d.UpgradeCoordinator(context.Background(), UpgradeOptions{})
+	if res.Action != UpgradeUpToDate {
+		t.Fatalf("second run = %+v, want up to date", res)
+	}
+}
+
+func TestReleaseTag(t *testing.T) {
+	for in, want := range map[string]string{
+		"caam v1.2.3 (abc) built on x":        "v1.2.3",
+		"caam 1.2.3 (abc)":                    "v1.2.3",
+		"caam v2.0.0-rc.1 (abc)":              "v2.0.0-rc.1",
+		"caam dev (unknown) built on unknown": "",
+		"":                                    "",
+	} {
+		if got := releaseTag(in); got != want {
+			t.Errorf("releaseTag(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestExecStartBinary(t *testing.T) {
+	for unit, want := range map[string]string{
+		"[Service]\nExecStart=/home/u/bin/caam auth-coordinator --config %h/x\n": "/home/u/bin/caam",
+		"ExecStart=" + CoordinatorExecStart("/opt/my tools/caam%1") + "\n":       "/opt/my tools/caam%1",
+		"[Service]\nType=simple\n": "",
+	} {
+		if got := execStartBinary(unit); got != want {
+			t.Errorf("execStartBinary(%q) = %q, want %q", unit, got, want)
+		}
 	}
 }

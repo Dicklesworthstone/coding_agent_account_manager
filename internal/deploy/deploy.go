@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"text/template"
@@ -44,6 +45,8 @@ type Deployer struct {
 	localVersion string
 	localBinary  string
 	remoteHome   string
+	// verifyTimeout bounds waiting for a (re)started coordinator to answer.
+	verifyTimeout time.Duration
 }
 
 // NewDeployer creates a new deployer for a machine.
@@ -52,9 +55,10 @@ func NewDeployer(m *sync.Machine, logger *slog.Logger) *Deployer {
 		logger = slog.Default()
 	}
 	return &Deployer{
-		machine:   m,
-		sshClient: sync.NewSSHClient(m),
-		logger:    logger,
+		machine:       m,
+		sshClient:     sync.NewSSHClient(m),
+		logger:        logger,
+		verifyTimeout: 20 * time.Second,
 	}
 }
 
@@ -231,6 +235,19 @@ func (d *Deployer) findLocalBinary() (string, error) {
 	return "", fmt.Errorf("caam binary not found locally")
 }
 
+// releaseTagPattern matches a release version such as v1.2.3 or 1.2.3-rc.1.
+var releaseTagPattern = regexp.MustCompile(`^v?\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$`)
+
+// releaseTag returns the release tag ("v1.2.3") in `caam --version` output,
+// or "" for a development build.
+func releaseTag(versionOutput string) string {
+	fields := strings.Fields(versionOutput)
+	if len(fields) < 2 || !releaseTagPattern.MatchString(fields[1]) {
+		return ""
+	}
+	return "v" + strings.TrimPrefix(fields[1], "v")
+}
+
 // NeedsUpdate checks if the remote needs a binary update.
 func (d *Deployer) NeedsUpdate(ctx context.Context) (bool, string, string, error) {
 	localVer, err := d.GetLocalVersion()
@@ -306,11 +323,11 @@ func (d *Deployer) UploadBinary(ctx context.Context) (string, error) {
 	return installPath, nil
 }
 
-// InstallFromRelease installs the published release on the remote machine
-// with the official installer. It is used when the local binary is built for
-// a different OS or architecture (for example a macOS agent deploying to a
-// Linux coordinator host).
-func (d *Deployer) InstallFromRelease(ctx context.Context) (string, error) {
+// InstallFromRelease installs the published release tag (the latest when
+// empty) on the remote machine with the official installer. It is used when
+// the local binary is built for a different OS or architecture (for example
+// a macOS agent deploying to a Linux coordinator host).
+func (d *Deployer) InstallFromRelease(ctx context.Context, tag string) (string, error) {
 	home, err := d.RemoteHome(ctx)
 	if err != nil {
 		return "", err
@@ -319,11 +336,16 @@ func (d *Deployer) InstallFromRelease(ctx context.Context) (string, error) {
 
 	d.logger.Info("installing caam release on remote",
 		"machine", d.machine.Name,
-		"install_dir", installDir)
+		"install_dir", installDir,
+		"version", tag)
 
-	cmd := fmt.Sprintf("command -v curl >/dev/null 2>&1 || { echo 'curl is required to install caam' >&2; exit 127; }; "+
-		"curl -fsSL %s | INSTALL_DIR=%s bash",
-		shellEscape(installScriptURL), shellEscape(installDir))
+	installArgs := ""
+	if tag != "" {
+		installArgs = " -s -- --version=" + shellEscape(tag)
+	}
+	cmd := "sh -c " + shellEscape(fmt.Sprintf("command -v curl >/dev/null 2>&1 || { echo 'curl is required to install caam' >&2; exit 127; }; "+
+		"curl -fsSL %s | INSTALL_DIR=%s bash%s",
+		shellEscape(installScriptURL), shellEscape(installDir), installArgs))
 	if _, err := d.RunCommand(ctx, cmd); err != nil {
 		return "", fmt.Errorf("install caam release on %s: %w", d.machine.Name, err)
 	}
@@ -335,12 +357,17 @@ func (d *Deployer) InstallFromRelease(ctx context.Context) (string, error) {
 	return installPath, nil
 }
 
-// existingBinary locates an installed caam binary on the remote machine.
+// existingBinary locates an installed caam binary on the remote machine,
+// preferring the one the coordinator service runs: version checks must
+// describe the deployed coordinator, not another copy on the host.
 func (d *Deployer) existingBinary(ctx context.Context) (string, bool) {
-	locations := []string{
-		"/usr/local/bin/caam",
-		"/usr/bin/caam",
+	var locations []string
+	if unit, err := d.readCoordinatorUnit(ctx); err == nil {
+		if bin := execStartBinary(unit); bin != "" {
+			locations = append(locations, bin)
+		}
 	}
+	locations = append(locations, "/usr/local/bin/caam", "/usr/bin/caam")
 	if home, err := d.RemoteHome(ctx); err == nil {
 		locations = append(locations, home+"/bin/caam", home+"/.local/bin/caam")
 	}
@@ -570,6 +597,56 @@ func CoordinatorExecStart(binaryPath string) string {
 	return systemdQuote(binaryPath) + " auth-coordinator --config %h/" + coordinatorConfigRel
 }
 
+// execStartBinary returns the executable of a unit's ExecStart line,
+// undoing systemdQuote.
+func execStartBinary(unit string) string {
+	for _, line := range strings.Split(unit, "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "ExecStart=")
+		if !ok {
+			continue
+		}
+		var arg string
+		if rest, quoted := strings.CutPrefix(value, `"`); quoted {
+			var b strings.Builder
+			for i := 0; i < len(rest); i++ {
+				c := rest[i]
+				if c == '\\' && i+1 < len(rest) {
+					i++
+					b.WriteByte(rest[i])
+					continue
+				}
+				if c == '"' {
+					break
+				}
+				b.WriteByte(c)
+			}
+			arg = strings.ReplaceAll(b.String(), "$$", "$")
+		} else {
+			arg, _, _ = strings.Cut(value, " ")
+		}
+		return strings.ReplaceAll(arg, "%%", "%")
+	}
+	return ""
+}
+
+// coordinatorUnitPath returns the remote path of the coordinator unit file.
+func (d *Deployer) coordinatorUnitPath(ctx context.Context) (string, error) {
+	home, err := d.RemoteHome(ctx)
+	if err != nil {
+		return "", err
+	}
+	return home + "/.config/systemd/user/" + CoordinatorServiceName + ".service", nil
+}
+
+// readCoordinatorUnit returns the installed coordinator unit file.
+func (d *Deployer) readCoordinatorUnit(ctx context.Context) (string, error) {
+	path, err := d.coordinatorUnitPath(ctx)
+	if err != nil {
+		return "", err
+	}
+	return d.RunCommand(ctx, "cat "+shellEscape(path))
+}
+
 // systemdQuote quotes a literal argument for an ExecStart line: "%" starts a
 // specifier and whitespace, quotes, and backslashes need double quoting.
 func systemdQuote(arg string) string {
@@ -782,17 +859,24 @@ type DeployResult struct {
 func (d *Deployer) ensureBinary(ctx context.Context, result *DeployResult) (string, error) {
 	canUpload, reason := d.CanDeploy(ctx)
 	if !canUpload {
+		// The local binary cannot run there: install the release matching
+		// this caam (any release when this is a development build).
+		localVer, _ := d.GetLocalVersion()
+		result.LocalVersion = localVer
+		tag := releaseTag(localVer)
 		if path, ok := d.existingBinary(ctx); ok {
-			d.logger.Info("using existing remote caam (local binary targets another platform)",
-				"machine", d.machine.Name,
-				"path", path,
-				"reason", reason)
 			result.RemoteVersion, _ = d.GetRemoteVersion(ctx)
-			return path, nil
+			if tag == "" || releaseTag(result.RemoteVersion) == tag {
+				d.logger.Info("using existing remote caam (local binary targets another platform)",
+					"machine", d.machine.Name,
+					"path", path,
+					"reason", reason)
+				return path, nil
+			}
 		}
-		path, err := d.InstallFromRelease(ctx)
+		path, err := d.InstallFromRelease(ctx, tag)
 		if err != nil {
-			return "", fmt.Errorf("%s and no caam installed remotely: %w", reason, err)
+			return "", fmt.Errorf("%s; installing the caam release remotely failed: %w", reason, err)
 		}
 		result.BinaryUpdated = true
 		return path, nil
@@ -869,7 +953,7 @@ func (d *Deployer) DeployCoordinator(ctx context.Context, config coordinator.Fil
 		d.logger.Debug("could not check service environment", "machine", d.machine.Name, "error", err)
 	}
 
-	verifyCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	verifyCtx, cancel := context.WithTimeout(ctx, d.verifyTimeout)
 	defer cancel()
 	verifyErr := d.VerifyCoordinator(verifyCtx, config)
 	result.ServiceStatus, _ = d.GetServiceStatus(ctx, CoordinatorServiceName)
@@ -880,6 +964,197 @@ func (d *Deployer) DeployCoordinator(ctx context.Context, config coordinator.Fil
 	result.Success = true
 
 	return result, nil
+}
+
+// Upgrade actions reported by UpgradeCoordinator.
+const (
+	UpgradeUpToDate   = "up_to_date"
+	UpgradeWouldApply = "would_upgrade"
+	UpgradeUpgraded   = "upgraded"
+	UpgradeRolledBack = "rolled_back"
+	UpgradeFailed     = "failed"
+)
+
+// UpgradeOptions controls UpgradeCoordinator.
+type UpgradeOptions struct {
+	DryRun bool // report the plan without changing the host
+	Force  bool // redeploy and restart even when the versions match
+}
+
+// UpgradeResult reports one coordinator upgrade.
+type UpgradeResult struct {
+	Machine     string   `json:"machine"`
+	Action      string   `json:"action"`
+	FromVersion string   `json:"from_version,omitempty"`
+	ToVersion   string   `json:"to_version,omitempty"`
+	Verified    bool     `json:"verified"`
+	Warnings    []string `json:"warnings,omitempty"`
+	Error       string   `json:"error,omitempty"`
+}
+
+// ReadCoordinatorConfig reads the coordinator config deployed on the host.
+func (d *Deployer) ReadCoordinatorConfig(ctx context.Context) (coordinator.FileConfig, error) {
+	var config coordinator.FileConfig
+	home, err := d.RemoteHome(ctx)
+	if err != nil {
+		return config, err
+	}
+	out, err := d.RunCommand(ctx, "cat "+shellEscape(home+"/"+coordinatorConfigRel))
+	if err != nil {
+		return config, fmt.Errorf("no coordinator config on %s (deploy one with 'caam setup distributed'): %w", d.machine.Name, err)
+	}
+	if err := json.Unmarshal([]byte(out), &config); err != nil {
+		return config, fmt.Errorf("parse coordinator config on %s: %w", d.machine.Name, err)
+	}
+	return config, nil
+}
+
+// binaryPlan reports whether deploying would replace the remote binary and
+// the versions involved, using the same rules as ensureBinary.
+func (d *Deployer) binaryPlan(ctx context.Context) (needs bool, from, to string, err error) {
+	from, _ = d.GetRemoteVersion(ctx)
+	local, localErr := d.GetLocalVersion()
+	if canUpload, _ := d.CanDeploy(ctx); !canUpload {
+		tag := releaseTag(local)
+		switch {
+		case from == "":
+			if tag == "" {
+				tag = "latest release"
+			}
+			return true, from, tag, nil
+		case tag == "":
+			return false, from, from, nil
+		default:
+			return releaseTag(from) != tag, from, tag, nil
+		}
+	}
+	if localErr != nil {
+		return false, from, "", localErr
+	}
+	return from != local, from, local, nil
+}
+
+// shortVersion reduces `caam --version` output to its version field.
+func shortVersion(versionOutput string) string {
+	fields := strings.Fields(versionOutput)
+	if len(fields) >= 2 && fields[0] == "caam" {
+		return fields[1]
+	}
+	return strings.TrimSpace(versionOutput)
+}
+
+// prevBinarySuffix marks the last-known-good binary kept during an upgrade.
+const prevBinarySuffix = ".caam-prev"
+
+// coordinatorSnapshot is what an upgrade restores when the new coordinator
+// fails verification.
+type coordinatorSnapshot struct {
+	unit   string // installed unit file; "" if none
+	binary string // binary backed up to binary+prevBinarySuffix; "" if none
+}
+
+func (d *Deployer) snapshotCoordinator(ctx context.Context) (coordinatorSnapshot, error) {
+	var snap coordinatorSnapshot
+	if unit, err := d.readCoordinatorUnit(ctx); err == nil {
+		snap.unit = unit
+	}
+	if bin, ok := d.existingBinary(ctx); ok {
+		if _, err := d.RunCommand(ctx, withSudoFallback("cp -p "+shellEscape(bin)+" "+shellEscape(bin+prevBinarySuffix))); err != nil {
+			return snap, fmt.Errorf("back up %s: %w", bin, err)
+		}
+		snap.binary = bin
+	}
+	return snap, nil
+}
+
+// withSudoFallback retries cmd with passwordless sudo, for binaries
+// installed into root-owned directories.
+func withSudoFallback(cmd string) string {
+	return "sh -c " + shellEscape(cmd+" 2>/dev/null || sudo -n "+cmd)
+}
+
+// restoreCoordinator puts back the snapshotted binary and unit and restarts
+// the service.
+func (d *Deployer) restoreCoordinator(ctx context.Context, snap coordinatorSnapshot) error {
+	if snap.binary != "" {
+		// rename, not copy: a running executable cannot be overwritten.
+		if _, err := d.RunCommand(ctx, withSudoFallback("mv -f "+shellEscape(snap.binary+prevBinarySuffix)+" "+shellEscape(snap.binary))); err != nil {
+			return fmt.Errorf("restore %s: %w", snap.binary, err)
+		}
+	}
+	if snap.unit != "" {
+		path, err := d.coordinatorUnitPath(ctx)
+		if err != nil {
+			return err
+		}
+		if err := d.sshClient.WriteFile(path, []byte(snap.unit), 0644); err != nil {
+			return fmt.Errorf("restore unit: %w", err)
+		}
+	}
+	if _, err := d.RunCommand(ctx, "systemctl --user daemon-reload && systemctl --user restart "+shellEscape(CoordinatorServiceName)); err != nil {
+		return fmt.Errorf("restart restored coordinator: %w", err)
+	}
+	return nil
+}
+
+// UpgradeCoordinator brings the host's coordinator to this caam's version,
+// keeping its deployed config. The previous binary and unit are restored
+// when the upgraded coordinator does not pass verification.
+func (d *Deployer) UpgradeCoordinator(ctx context.Context, opts UpgradeOptions) *UpgradeResult {
+	res := &UpgradeResult{Machine: d.machine.Name}
+	fail := func(err error) *UpgradeResult {
+		res.Action = UpgradeFailed
+		res.Error = err.Error()
+		return res
+	}
+	verify := func(config coordinator.FileConfig) bool {
+		vctx, cancel := context.WithTimeout(ctx, d.verifyTimeout)
+		defer cancel()
+		return d.VerifyCoordinator(vctx, config) == nil
+	}
+
+	config, err := d.ReadCoordinatorConfig(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	needs, from, to, err := d.binaryPlan(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	res.FromVersion, res.ToVersion = shortVersion(from), shortVersion(to)
+
+	if !needs && !opts.Force {
+		res.Action = UpgradeUpToDate
+		res.Verified = verify(config)
+		return res
+	}
+	if opts.DryRun {
+		res.Action = UpgradeWouldApply
+		return res
+	}
+
+	snap, err := d.snapshotCoordinator(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	deployed, err := d.DeployCoordinator(ctx, config)
+	if err == nil {
+		res.Action = UpgradeUpgraded
+		res.Verified = deployed.Verified
+		res.Warnings = deployed.Warnings
+		return res
+	}
+
+	d.logger.Warn("coordinator upgrade failed; rolling back", "machine", d.machine.Name, "error", err)
+	res.Error = err.Error()
+	if rbErr := d.restoreCoordinator(ctx, snap); rbErr != nil {
+		res.Action = UpgradeFailed
+		res.Error += "; rollback failed: " + rbErr.Error()
+		return res
+	}
+	res.Action = UpgradeRolledBack
+	res.Verified = verify(config)
+	return res
 }
 
 // Helper functions

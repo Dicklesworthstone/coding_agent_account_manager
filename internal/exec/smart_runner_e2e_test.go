@@ -228,10 +228,17 @@ func TestSmartRunner_E2E(t *testing.T) {
 	assert.Equal(t, "active", switched[0].Details["from"])
 
 	// Check DB for Activation Event
+	// The profile also has the later rate-limit event, so look for the
+	// activation rather than assuming it is the newest.
 	activations, err := db.GetEvents("gemini", "active", time.Now().Add(-1*time.Hour), 10)
 	require.NoError(t, err)
-	assert.NotEmpty(t, activations, "Should have logged activation event")
-	assert.Equal(t, caamdb.EventActivate, activations[0].Type)
+	foundActivate := false
+	for _, e := range activations {
+		if e.Type == caamdb.EventActivate {
+			foundActivate = true
+		}
+	}
+	assert.True(t, foundActivate, "Should have logged activation event: %+v", activations)
 
 	// Check DB for Wrap Session
 	sessions, err := db.GetWrapSessions("gemini", time.Now().Add(-1*time.Hour), 10)

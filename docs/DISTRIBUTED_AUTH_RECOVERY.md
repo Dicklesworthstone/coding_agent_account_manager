@@ -228,8 +228,31 @@ setup replaces only the entries of hosts it redeployed and keeps `accounts`,
 ```
 
 When the local machine's binary targets another platform (a macOS agent
-deploying to Linux), setup reuses an existing remote `caam` or installs the
-published release into `~/.local/bin` with the official installer.
+deploying to Linux), setup installs the published release matching the local
+version into `~/.local/bin` with the official installer, keeping an existing
+remote `caam` only when it already runs that release (any release for a
+development build).
+
+#### Upgrading coordinators
+
+Keep coordinators on the same caam version as the local agent:
+
+```bash
+caam update                      # update this machine
+caam update --remotes --dry-run  # show each coordinator's planned change
+caam update --remotes            # bring every coordinator to this version
+```
+
+`--remotes` walks the coordinators in the agent config and, over each
+entry's SSH connection, keeps the host's deployed `coordinator.json`,
+replaces the binary (checksum-verified upload, or the release matching
+this version when the local binary is for another platform), rewrites the
+unit, restarts it and verifies `/status`. The previous binary and unit are
+kept (`<binary>.caam-prev`); if the upgraded coordinator does not pass
+verification they are restored and the host is reported as rolled back.
+`--force` redeploys at the same version, which also refreshes older units
+(for example to pick up the login `PATH`). The command exits non-zero when
+any host failed or was rolled back.
 
 #### Delivery guarantees
 
