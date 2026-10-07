@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +20,9 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wrap"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // getWd allows mocking os.Getwd in tests
@@ -31,13 +33,18 @@ var runCmd = &cobra.Command{
 	Use:   "run <tool> [-- args...]",
 	Short: "Run AI CLI with automatic account switching",
 	Long: `Wraps AI CLI execution with transparent rate limit detection and automatic
-profile switching. This is the "zero friction" mode - just use caam run instead
-of calling the CLI directly.
+profile switching. Headless commands use bounded retries when they fail with
+a rate limit. Interactive commands retain their native terminal handling.
 
-When a rate limit is detected:
+When a headless command fails with a rate limit:
 1. The current profile is put into cooldown
 2. The next best profile is automatically selected
-3. The command is re-executed seamlessly
+3. After the configured backoff, the command is re-executed with the same input
+
+Retry settings come from config.json's wrap section, then per-provider overrides,
+then explicit CLI flags. --max-retries 0 disables retries. An observable
+Retry-After header sets a minimum wait. Successful commands and other failures
+are not retried. A retry repeats the command; any completed work remains.
 
 Use --precheck for proactive switching:
   When enabled, caam checks real-time usage levels BEFORE running and
@@ -48,23 +55,21 @@ Use --precheck for proactive switching:
   account's quota cannot be measured, caam says so and does not switch.
 
 Examples:
-  caam run claude -- "explain this code"
-  caam run codex -- --model gpt-5 "write tests"
-  caam run gemini -- "summarize this file"
+  caam run claude -- -p "explain this code"
+  caam run codex -- exec "write tests"
+  caam run gemini -- -p "summarize this file"
 
   # Proactive switching (checks usage before running)
-  caam run claude --precheck -- "explain this code"
+  caam run claude --precheck -- -p "explain this code"
 
-  # Interactive mode (no auto-retry on rate limit)
+  # Interactive mode (no command replay)
   caam run claude
 
 For shell integration, add an alias:
   alias claude='caam run claude --precheck --'
 
-Then you can just use:
-  claude "explain this code"
-
-And rate limits will be handled automatically!`,
+Then use native headless arguments when command retries are wanted:
+  claude -p "explain this code"`,
 	Args:               cobra.MinimumNArgs(1),
 	DisableFlagParsing: false,
 	RunE:               runWrap,
@@ -72,13 +77,17 @@ And rate limits will be handled automatically!`,
 
 func init() {
 	rootCmd.AddCommand(runCmd)
-	runCmd.Flags().Int("max-retries", 1, "maximum retry attempts on rate limit (0 = no retries)")
-	runCmd.Flags().Duration("cooldown", 60*time.Minute, "cooldown duration after rate limit")
-	runCmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
-	runCmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
-	runCmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
-	runCmd.Flags().Bool("precheck", false, "check usage levels before running and switch if near limit")
-	runCmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for precheck switching (0-1)")
+	addRunFlags(runCmd)
+}
+
+func addRunFlags(cmd *cobra.Command) {
+	cmd.Flags().Int("max-retries", config.DefaultWrapConfig().MaxRetries, "maximum retries or interactive handoffs on rate limit (0 = none; overrides wrap config)")
+	cmd.Flags().Duration("cooldown", 60*time.Minute, "cooldown duration after rate limit")
+	cmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
+	cmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
+	cmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
+	cmd.Flags().Bool("precheck", false, "check usage levels before running and switch if near limit")
+	cmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for precheck switching (0-1)")
 }
 
 func runWrap(cmd *cobra.Command, args []string) error {
@@ -92,6 +101,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[tool]; !ok {
 		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Parse CLI args (everything after the tool name)
 	var cliArgs []string
@@ -102,7 +120,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Get flags
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	algorithmStr, _ := cmd.Flags().GetString("algorithm")
-	cooldownDur, _ := cmd.Flags().GetDuration("cooldown")
+	retryConfig, err := loadRunRetryConfig(cmd, tool)
+	if err != nil {
+		return err
+	}
+	cooldownDur := retryConfig.CooldownDuration.Duration()
 
 	// Parse algorithm
 	var algorithm rotation.Algorithm
@@ -135,15 +157,14 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	db, err := getDB()
 	if err != nil {
 		// Non-fatal: cooldowns won't be recorded but execution can continue
-		fmt.Fprintf(os.Stderr, "Warning: database unavailable, cooldowns will not be recorded\n")
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: database unavailable, cooldowns will not be recorded\n")
 		db = nil
 	}
 
 	// Load global config
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
-		// Non-fatal: use defaults
-		spmCfg = config.DefaultSPMConfig()
+		return fmt.Errorf("load run settings: %w", err)
 	}
 
 	// CLI --policy overrides the configured rotation policy
@@ -161,14 +182,17 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
 	if precheck && isLimitsProvider(tool) {
-		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
-			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
+		if switched := runPrecheck(ctx, tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
 		// Loud fallback (issue #79): usage prechecking needs real-time limit
 		// support. Say so — on stderr, even in quiet mode — instead of
 		// silently ignoring the flag.
-		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for %s); running without a usage precheck\n", tool, strings.Join(limitsProviders, ", "))
+		fmt.Fprintf(cmd.ErrOrStderr(), "caam: --precheck is not supported for %q (real-time limits are implemented for %s); running without a usage precheck\n", tool, strings.Join(limitsProviders, ", "))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Initialize AuthPool (if enabled in config)
@@ -193,7 +217,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Initialize Notifier
 	var notifier notify.Notifier
 	if !quiet {
-		notifier = notify.NewTerminalNotifier(os.Stderr, true)
+		notifier = notify.NewTerminalNotifier(cmd.ErrOrStderr(), true)
 	}
 
 	// Create SmartRunner
@@ -205,6 +229,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		AuthPool:         pool,
 		Rotation:         selector,
 		CooldownDuration: cooldownDur,
+		RetryConfig:      &retryConfig,
 	}
 	smartRunner := exec.NewSmartRunner(runner, opts)
 
@@ -219,6 +244,45 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	activeProfileName, err := vault.CurrentProfile(fileSet)
 	if err != nil {
 		return fmt.Errorf("read current auth: %w", err)
+	}
+	stdin := cmd.InOrStdin()
+	stdinTerminal := runInputIsTerminal(stdin)
+	if runUsesHeadless(tool, cliArgs, stdinTerminal) {
+		if stdinTerminal {
+			// Native batch forms take their prompt from arguments or redirected
+			// input. Do not wait for or attempt to replay terminal keystrokes.
+			stdin = strings.NewReader("")
+		}
+		switchOptions := switchOptionsFromConfig(spmCfg)
+		wrapConfig := wrap.Config{
+			Provider:          tool,
+			Args:              cliArgs,
+			WorkDir:           cwd,
+			MaxRetries:        retryConfig.MaxRetries,
+			InitialDelay:      retryConfig.InitialDelay.Duration(),
+			MaxDelay:          retryConfig.MaxDelay.Duration(),
+			BackoffMultiplier: retryConfig.BackoffMultiplier,
+			Jitter:            retryConfig.Jitter,
+			CooldownDuration:  cooldownDur,
+			NotifyOnSwitch:    !quiet,
+			Algorithm:         algorithm,
+			InitialProfile:    activeProfileName,
+			Selector:          selector,
+			SwitchOptions:     &switchOptions,
+			Bin:               prov.DefaultBin(),
+			Stdin:             stdin,
+			ReplayStdin:       !stdinTerminal,
+			Stdout:            cmd.OutOrStdout(),
+			Stderr:            cmd.ErrOrStderr(),
+		}
+		result := wrap.NewWrapper(vault, db, healthStore, wrapConfig).Run(ctx)
+		if result.Err != nil {
+			return result.Err
+		}
+		if result.ExitCode != 0 {
+			return &exec.ExitCodeError{Code: result.ExitCode}
+		}
+		return nil
 	}
 	if activeProfileName == "" {
 		// If no active profile, try to select one
@@ -244,6 +308,9 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load profile object
+	if profileStore == nil {
+		profileStore = profile.NewStore(profile.DefaultStorePath())
+	}
 	prof, err := profileStore.Load(tool, activeProfileName)
 	if err != nil {
 		// If profile object doesn't exist (only in vault), create a transient one.
@@ -278,38 +345,80 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		UseGlobalEnv: true, // Force global environment for vault-based switching
 	}
 
-	// Handle signals - use cmd.Context() for proper context propagation
-	ctx, cancel := context.WithCancel(cmd.Context())
-	defer cancel()
+	return smartRunner.Run(ctx, runOptions)
+}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		select {
-		case <-sigChan:
-			cancel()
-		case <-ctx.Done():
-			// Context cancelled, goroutine can exit cleanly
-		}
-	}()
-
-	err = smartRunner.Run(ctx, runOptions)
-
-	// Stop signal handling and allow the signal goroutine to exit
-	signal.Stop(sigChan)
-	cancel() // Ensure goroutine exits via ctx.Done() path
-
-	// Handle exit code
-	var exitErr *exec.ExitCodeError
-	if errors.As(err, &exitErr) {
-		// Clean up before exiting - os.Exit() bypasses defers
-		if db != nil {
-			db.Close()
-		}
-		os.Exit(exitErr.Code)
+// loadRunRetryConfig applies explicit flags last. Changed is essential: the
+// displayed flag default must not erase a global or per-provider setting.
+func loadRunRetryConfig(cmd *cobra.Command, tool string) (config.WrapConfig, error) {
+	global, err := config.Load()
+	if err != nil {
+		return config.WrapConfig{}, fmt.Errorf("load retry settings: %w", err)
 	}
+	result := global.Wrap.ForProvider(tool)
+	if cmd.Flags().Changed("max-retries") {
+		result.MaxRetries, err = cmd.Flags().GetInt("max-retries")
+		if err != nil {
+			return result, err
+		}
+	}
+	if cmd.Flags().Changed("cooldown") {
+		duration, flagErr := cmd.Flags().GetDuration("cooldown")
+		if flagErr != nil {
+			return result, flagErr
+		}
+		result.CooldownDuration = config.Duration(duration)
+	}
+	if err := result.Validate(); err != nil {
+		return result, fmt.Errorf("invalid retry settings for %s: %w", tool, err)
+	}
+	return result, nil
+}
 
-	return err
+func runInputIsTerminal(input io.Reader) bool {
+	file, ok := input.(interface{ Fd() uintptr })
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+// runUsesHeadless recognizes native batch forms even when launched from a
+// terminal. Without a terminal, commands use pipes instead of a nested PTY.
+// Native arguments are never rewritten or given additional permissions.
+func runUsesHeadless(tool string, args []string, stdinTerminal bool) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if tool == "gemini" && (arg == "-i" || arg == "--prompt-interactive" || strings.HasPrefix(arg, "--prompt-interactive=")) {
+			return false
+		}
+	}
+	if !stdinTerminal {
+		return true
+	}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		switch tool {
+		case "claude", "cursor":
+			if arg == "-p" || arg == "--print" || arg == "--print=true" {
+				return true
+			}
+		case "gemini":
+			if arg == "-p" || arg == "--prompt" || strings.HasPrefix(arg, "--prompt=") {
+				return true
+			}
+		}
+	}
+	if len(args) > 0 {
+		switch tool {
+		case "codex":
+			return args[0] == "exec" || args[0] == "e" || args[0] == "review"
+		case "opencode":
+			return args[0] == "run"
+		}
+	}
+	return false
 }
 
 // runPrecheck checks current usage levels and switches profile if near limit.
@@ -319,7 +428,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 // arguments, so a spent per-model quota counts as "near limit" even when the
 // account's general windows are idle (issue #97); "" means unknown, and then
 // every model-scoped quota counts.
-func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
+func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
 	// Get current profile's access token
 	vaultDir := authfile.DefaultVaultPath()
 	if vault != nil {
@@ -359,11 +468,11 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	if native {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	fetcher := usage.NewMultiProfileFetcher()
-	results := fetcher.FetchAllProfiles(ctx, tool, map[string]string{currentProfile: token})
+	results := fetcher.FetchAllProfiles(queryCtx, tool, map[string]string{currentProfile: token})
 
 	if len(results) == 0 || results[0].Usage == nil {
 		if native {
@@ -401,7 +510,7 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 
 	// Fetch usage for all profiles, on a fresh deadline: the read above may
 	// have used most of the first one.
-	allCtx, allCancel := context.WithTimeout(context.Background(), timeout)
+	allCtx, allCancel := context.WithTimeout(ctx, timeout)
 	defer allCancel()
 	allResults := fetcher.FetchAllProfiles(allCtx, tool, allCredentials)
 
@@ -452,6 +561,9 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	}
 
 	// Switch to the better profile
+	if ctx.Err() != nil {
+		return false
+	}
 	switched, err := vault.Switch(fileSet, result.Selected, switchOptionsFromConfig(spmCfg))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "caam: precheck could not switch %s to %s: %v\n", tool, result.Selected, err)

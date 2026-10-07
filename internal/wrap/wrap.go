@@ -7,14 +7,13 @@ package wrap
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"math"
-	"math/rand"
 	"os"
 	"os/exec"
-	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
@@ -33,6 +33,20 @@ var ExecCommand = exec.CommandContext
 type Config struct {
 	// Provider is the AI CLI provider (claude, codex, gemini).
 	Provider string
+
+	// InitialProfile keeps the caller's current account for the first attempt.
+	// An empty value selects an initial account using Selector or Algorithm.
+	InitialProfile string
+
+	// Selector carries the caller's rotation policy and usage information.
+	Selector *rotation.Selector
+
+	// SwitchOptions are the caller's resolved activation safety settings.
+	// If nil, the standalone wrapper loads the existing SPM safety settings.
+	SwitchOptions *authfile.SwitchOptions
+
+	// Bin overrides the native executable (for example, cursor-agent).
+	Bin string
 
 	// Args are the arguments to pass to the CLI.
 	Args []string
@@ -73,6 +87,15 @@ type Config struct {
 	// Algorithm is the rotation algorithm to use (smart, round_robin, random).
 	Algorithm rotation.Algorithm
 
+	// Stdin is passed to the child. Defaults to os.Stdin.
+	Stdin io.Reader
+
+	// ReplayStdin privately spools finite redirected input before activation,
+	// then replays exactly those bytes on each retry. Input is limited to 16 MiB.
+	// Without replay, consumed input prevents a retry; an untracked *os.File
+	// also prevents retry because its consumption cannot be proven safe.
+	ReplayStdin bool
+
 	// Stdout is where to write stdout. Defaults to os.Stdout.
 	Stdout io.Writer
 
@@ -82,18 +105,7 @@ type Config struct {
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
-	return Config{
-		MaxRetries:        3,
-		InitialDelay:      30 * time.Second,
-		MaxDelay:          5 * time.Minute,
-		BackoffMultiplier: 2.0,
-		Jitter:            true,
-		CooldownDuration:  60 * time.Minute,
-		NotifyOnSwitch:    true,
-		Algorithm:         rotation.AlgorithmSmart,
-		Stdout:            os.Stdout,
-		Stderr:            os.Stderr,
-	}
+	return ConfigFromGlobal(config.DefaultConfig(), "")
 }
 
 // ConfigFromGlobal creates a wrap.Config using settings from the global config.
@@ -110,41 +122,27 @@ func ConfigFromGlobal(cfg *config.Config, provider string) Config {
 		CooldownDuration:  wrapCfg.CooldownDuration.Duration(),
 		NotifyOnSwitch:    true,
 		Algorithm:         rotation.AlgorithmSmart,
+		Stdin:             os.Stdin,
 		Stdout:            os.Stdout,
 		Stderr:            os.Stderr,
 	}
 }
 
-// NextDelay calculates the delay before the next retry attempt using exponential backoff.
-// Formula: delay = min(initial * multiplier^attempt, max)
-// With jitter: delay *= (0.8 + random*0.4) for ±20% variation
+func (c *Config) retryConfig() config.WrapConfig {
+	return config.WrapConfig{
+		MaxRetries:        c.MaxRetries,
+		InitialDelay:      config.Duration(c.InitialDelay),
+		MaxDelay:          config.Duration(c.MaxDelay),
+		BackoffMultiplier: c.BackoffMultiplier,
+		Jitter:            c.Jitter,
+		CooldownDuration:  config.Duration(c.CooldownDuration),
+	}
+}
+
+// NextDelay shares the validated policy used by configuration and handoffs.
 func (c *Config) NextDelay(attempt int) time.Duration {
-	if attempt < 0 {
-		attempt = 0
-	}
-
-	// Calculate base delay with exponential backoff
-	initial := float64(c.InitialDelay)
-	multiplier := c.BackoffMultiplier
-	if multiplier <= 0 {
-		multiplier = 2.0
-	}
-
-	delay := initial * math.Pow(multiplier, float64(attempt))
-
-	// Cap at max delay
-	maxDelay := float64(c.MaxDelay)
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-
-	// Apply jitter if enabled (±20%)
-	if c.Jitter {
-		jitterFactor := 0.8 + rand.Float64()*0.4
-		delay *= jitterFactor
-	}
-
-	return time.Duration(delay)
+	policy := c.retryConfig()
+	return policy.NextDelay(attempt)
 }
 
 // ShouldRetry returns true if another retry should be attempted.
@@ -157,7 +155,7 @@ type Result struct {
 	// ExitCode is the exit code of the last process run.
 	ExitCode int
 
-	// ProfilesUsed is the list of profiles that were used, in order.
+	// ProfilesUsed is the list of profiles whose processes started, in order.
 	ProfilesUsed []string
 
 	// RateLimitHit is true if a rate limit was detected.
@@ -193,6 +191,9 @@ func NewWrapper(vault *authfile.Vault, db *caamdb.DB, healthStore *health.Storag
 	if config.Stderr == nil {
 		config.Stderr = os.Stderr
 	}
+	if config.Stdin == nil {
+		config.Stdin = os.Stdin
+	}
 
 	return &Wrapper{
 		vault:       vault,
@@ -206,6 +207,7 @@ func NewWrapper(vault *authfile.Vault, db *caamdb.DB, healthStore *health.Storag
 func (w *Wrapper) Run(ctx context.Context) *Result {
 	result := &Result{
 		StartTime: time.Now(),
+		ExitCode:  1,
 	}
 
 	// Defer recording of the session
@@ -214,7 +216,43 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 		w.recordSession(result)
 	}()
 
-	// Get available profiles
+	if err := ctx.Err(); err != nil {
+		result.Err = err
+		return result
+	}
+	if err := w.config.retryConfig().Validate(); err != nil {
+		result.Err = fmt.Errorf("invalid retry configuration: %w", err)
+		return result
+	}
+	if w.vault == nil {
+		result.Err = fmt.Errorf("vault is required")
+		return result
+	}
+	fileSet, ok := AuthFileSetForProvider(w.config.Provider)
+	if !ok {
+		result.Err = fmt.Errorf("unknown provider: %s", w.config.Provider)
+		return result
+	}
+	detector, err := ratelimit.NewDetector(ratelimit.ProviderFromString(w.config.Provider), w.config.CustomPatterns)
+	if err != nil {
+		result.Err = fmt.Errorf("create detector: %w", err)
+		return result
+	}
+	var switchOptions authfile.SwitchOptions
+	if w.config.SwitchOptions != nil {
+		switchOptions = *w.config.SwitchOptions
+	} else {
+		spmConfig, err := config.LoadSPMConfig()
+		if err != nil {
+			result.Err = fmt.Errorf("load activation safety settings: %w", err)
+			return result
+		}
+		switchOptions = authfile.SwitchOptions{
+			BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
+			MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
+		}
+	}
+
 	profiles, err := w.vault.List(w.config.Provider)
 	if err != nil {
 		result.Err = fmt.Errorf("list profiles: %w", err)
@@ -228,197 +266,307 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 		return result
 	}
 
-	// Create selector
-	selector := rotation.NewSelector(w.config.Algorithm, w.healthStore, w.db)
+	selector := w.config.Selector
+	if selector == nil {
+		selector = rotation.NewSelector(w.config.Algorithm, w.healthStore, w.db)
+	}
 	selector.SetVaultPath(w.vault.BasePath())
 
-	// Select initial profile
-	currentProfile := ""
-	selection, err := selector.Select(w.config.Provider, profiles, currentProfile)
+	currentProfile := w.config.InitialProfile
+	if currentProfile != "" {
+		// Apply the same credential and cooldown eligibility checks without
+		// silently replacing the caller's chosen initial account.
+		profiles = []string{currentProfile}
+	}
+	selection, err := selector.Select(w.config.Provider, profiles, "")
 	if err != nil {
 		result.Err = fmt.Errorf("select profile: %w", err)
 		result.ExitCode = 1
 		return result
 	}
-
-	currentProfile = selection.Selected
-
-	// Run with retry loop
-	for attempt := 0; attempt <= w.config.MaxRetries; attempt++ {
-		result.ProfilesUsed = append(result.ProfilesUsed, currentProfile)
-
-		if w.config.NotifyOnSwitch && attempt > 0 {
-			fmt.Fprintf(w.config.Stderr, "⚠️  Switching to '%s'...\n", currentProfile)
-		} else if w.config.NotifyOnSwitch && attempt == 0 {
-			fmt.Fprintf(w.config.Stderr, "Using profile '%s'...\n", currentProfile)
-		}
-
-		// Run the command
-		exitCode, rateLimitHit, runErr := w.runOnce(ctx, currentProfile)
-		result.ExitCode = exitCode
-
-		if runErr != nil && !rateLimitHit {
-			result.Err = runErr
-			return result
-		}
-
-		// Check if rate limit was hit
-		if rateLimitHit {
-			result.RateLimitHit = true
-			result.RetryCount++
-
-			// Record cooldown
-			if w.db != nil {
-				w.db.SetCooldown(
-					w.config.Provider,
-					currentProfile,
-					time.Now(),
-					w.config.CooldownDuration,
-					"auto-detected via caam wrap",
-				)
-			}
-
-			// Check if we can retry
-			if attempt >= w.config.MaxRetries {
-				if w.config.NotifyOnSwitch {
-					fmt.Fprintf(w.config.Stderr, "⚠️  Rate limit hit. No more retries available.\n")
-				}
-				return result
-			}
-
-			// Try to select a new profile
-			selection, err = selector.Select(w.config.Provider, profiles, currentProfile)
-			if err != nil {
-				if w.config.NotifyOnSwitch {
-					fmt.Fprintf(w.config.Stderr, "⚠️  Rate limit hit. %v\n", err)
-				}
-				return result
-			}
-
-			currentProfile = selection.Selected
-
-			// Calculate and apply backoff delay before retry
-			delay := w.config.NextDelay(attempt)
-			if w.config.NotifyOnSwitch {
-				fmt.Fprintf(w.config.Stderr, "⏳ Waiting %v before retry...\n", delay.Round(time.Second))
-			}
-
-			// Wait with context cancellation support
-			select {
-			case <-ctx.Done():
-				result.Err = ctx.Err()
-				return result
-			case <-time.After(delay):
-				// Continue to retry
-			}
-			continue
-		}
-
-		// Success or non-rate-limit error
+	if selection == nil || selection.Selected == "" {
+		result.Err = fmt.Errorf("no profile selected for %s", w.config.Provider)
 		return result
 	}
+	currentProfile = selection.Selected
 
-	return result
+	input, err := prepareInput(ctx, w.config.Stdin, w.config.ReplayStdin)
+	if err != nil {
+		result.Err = fmt.Errorf("prepare stdin: %w", err)
+		return result
+	}
+	defer input.Close()
+	exhausted := make(map[string]bool)
+	for {
+		if err := ctx.Err(); err != nil {
+			result.Err = err
+			return result
+		}
+		// A token can expire while waiting; eligibility is checked again
+		// immediately before Switch, which validates the actual file bytes.
+		if _, err := selector.Select(w.config.Provider, []string{currentProfile}, ""); err != nil {
+			result.Err = fmt.Errorf("profile is no longer launchable: %w", err)
+			return result
+		}
+		if err := input.Rewind(); err != nil {
+			result.Err = fmt.Errorf("rewind stdin: %w", err)
+			return result
+		}
+		if w.config.NotifyOnSwitch {
+			fmt.Fprintf(w.config.Stderr, "Using profile '%s'...\n", currentProfile)
+		}
+		attempt := w.runOnce(ctx, currentProfile, input.reader, fileSet, switchOptions, detector)
+		if attempt.started {
+			if len(result.ProfilesUsed) > 0 {
+				result.RetryCount++
+			}
+			result.ProfilesUsed = append(result.ProfilesUsed, currentProfile)
+		}
+		result.ExitCode = attempt.exitCode
+		if attempt.err != nil {
+			result.Err = attempt.err
+			return result
+		}
+		if !attempt.rateLimitHit {
+			return result // Success and unrelated failures are never replayed.
+		}
+		result.RateLimitHit = true
+		exhausted[currentProfile] = true
+		if w.db != nil && w.config.CooldownDuration > 0 {
+			cooldown := ratelimit.RetryDelay(w.config.CooldownDuration, attempt.retryAfter, time.Now())
+			if _, err := w.db.SetCooldown(w.config.Provider, currentProfile, time.Now(), cooldown, "auto-detected via caam run"); err != nil {
+				fmt.Fprintf(w.config.Stderr, "Warning: failed to record cooldown: %v\n", err)
+			}
+		}
+		if !w.config.ShouldRetry(result.RetryCount) {
+			return result
+		}
+		if !input.CanRetry() {
+			result.Err = fmt.Errorf("cannot safely retry consumed or untracked stdin; pipe input to enable replay")
+			return result
+		}
+		profiles, err = w.vault.List(w.config.Provider)
+		if err != nil {
+			result.Err = fmt.Errorf("list backup profiles: %w", err)
+			return result
+		}
+		candidates := make([]string, 0, len(profiles))
+		for _, name := range profiles {
+			if !exhausted[name] && !authfile.IsSystemProfile(name) {
+				candidates = append(candidates, name)
+			}
+		}
+		if len(candidates) == 0 {
+			return result // Preserve the last child status after exhausting accounts.
+		}
+		selection, err = selector.Select(w.config.Provider, candidates, currentProfile)
+		if err != nil {
+			result.Err = fmt.Errorf("select unused backup profile: %w", err)
+			return result
+		}
+		if selection == nil || selection.Selected == "" || exhausted[selection.Selected] {
+			result.Err = fmt.Errorf("no unused backup profile selected for %s", w.config.Provider)
+			return result
+		}
+		delay := ratelimit.RetryDelay(w.config.NextDelay(result.RetryCount), attempt.retryAfter, time.Now())
+		if w.config.NotifyOnSwitch {
+			fmt.Fprintf(w.config.Stderr, "Rate limit reached; waiting %v before retry with '%s'...\n", delay.Round(time.Millisecond), selection.Selected)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			result.Err = ctx.Err()
+			return result
+		case <-timer.C:
+		}
+		currentProfile = selection.Selected
+	}
 }
 
-// runOnce executes the command once with the given profile.
-// Returns exit code, whether rate limit was hit, and any error.
-func (w *Wrapper) runOnce(ctx context.Context, profile string) (int, bool, error) {
-	// Get auth file set for this provider
-	fileSet, ok := AuthFileSetForProvider(w.config.Provider)
-	if !ok {
-		return 1, false, fmt.Errorf("unknown provider: %s", w.config.Provider)
-	}
+type attemptResult struct {
+	exitCode     int
+	started      bool
+	rateLimitHit bool
+	retryAfter   time.Time
+	err          error
+}
 
-	spmConfig, err := config.LoadSPMConfig()
-	if err != nil {
-		return 1, false, fmt.Errorf("load activation safety settings: %w", err)
+func (w *Wrapper) runOnce(ctx context.Context, profile string, stdin io.Reader, fileSet authfile.AuthFileSet, options authfile.SwitchOptions, detector *ratelimit.Detector) attemptResult {
+	attempt := attemptResult{exitCode: 1}
+	if err := ctx.Err(); err != nil {
+		attempt.err = err
+		return attempt
 	}
-	result, err := w.vault.Switch(fileSet, profile, authfile.SwitchOptions{
-		BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
-		MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
-	})
+	result, err := w.vault.Switch(fileSet, profile, options)
 	if err != nil {
-		return 1, false, fmt.Errorf("activate profile %s: %w", profile, err)
+		attempt.err = fmt.Errorf("activate profile %s: %w", profile, err)
+		return attempt
 	}
 	for _, warning := range result.Warnings {
 		fmt.Fprintf(w.config.Stderr, "Warning: %s\n", warning)
 	}
 
-	// Create rate limit detector
-	detector, err := ratelimit.NewDetector(
-		ratelimit.ProviderFromString(w.config.Provider),
-		w.config.CustomPatterns,
-	)
-	if err != nil {
-		return 1, false, fmt.Errorf("create detector: %w", err)
+	detector.Reset()
+	bin := w.config.Bin
+	if bin == "" {
+		bin = binForProvider(w.config.Provider)
 	}
-
-	// Build command
-	bin := binForProvider(w.config.Provider)
 	cmd := ExecCommand(ctx, bin, w.config.Args...)
 
 	if w.config.WorkDir != "" {
 		cmd.Dir = w.config.WorkDir
 	}
+	// Vault activation selects credentials in the native home. Ambient API
+	// keys must not override that account on any attempt. Retain unrelated
+	// caller environment, including explicit command environment additions.
+	cmd.Env = provider.MergeEnvironment(cmd.Environ(), provider.CredentialEnvironment(w.config.Provider, provider.AuthModeOAuth, nil), nil)
 
-	// Set up I/O with rate limit detection
-	cmd.Stdin = os.Stdin
+	cmd.Stdin = stdin
+	// Bound cleanup when a child leaves inherited pipes open after exiting
+	// or cancellation. The caller owns signal handling through ctx.
+	cmd.WaitDelay = time.Second
 
-	// Create tee writers that check for rate limits and forward output
+	outputMu := &sync.Mutex{}
 	stdoutTee := &teeWriter{
 		dest:     w.config.Stdout,
 		detector: detector,
+		outputMu: outputMu,
 	}
 	stderrTee := &teeWriter{
 		dest:     w.config.Stderr,
 		detector: detector,
+		outputMu: outputMu,
 	}
 
 	cmd.Stdout = stdoutTee
 	cmd.Stderr = stderrTee
 
-	// Handle signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	done := make(chan struct{})
-
-	go func() {
-		for {
-			select {
-			case sig := <-sigChan:
-				if cmd.Process != nil {
-					cmd.Process.Signal(sig)
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-	defer close(done)
-	defer signal.Stop(sigChan)
-
-	// Run the command
-	err = cmd.Run()
-
-	// Flush tee writers to ensure all buffered data is checked for patterns
+	if err := cmd.Start(); err != nil {
+		attempt.err = fmt.Errorf("start %s: %w", bin, err)
+		return attempt
+	}
+	attempt.started = true
+	err = cmd.Wait()
 	stdoutTee.Flush()
 	stderrTee.Flush()
-
-	// Check for rate limit detection
-	rateLimitHit := detector.Detected()
-
-	// Determine exit code
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	if ctx.Err() != nil {
+		attempt.err = ctx.Err()
+		return attempt
 	}
+	if outputErr := errors.Join(stdoutTee.Error(), stderrTee.Error()); outputErr != nil {
+		attempt.err = fmt.Errorf("forward process output: %w", outputErr)
+		return attempt
+	}
+	if err == nil {
+		attempt.exitCode = 0 // Successful output mentioning limits is not a failure.
+		return attempt
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		attempt.err = fmt.Errorf("wait for %s: %w", bin, err)
+		return attempt
+	}
+	attempt.exitCode = exitErr.ExitCode()
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		attempt.exitCode = 128 + int(status.Signal())
+	}
+	if attempt.exitCode < 1 {
+		attempt.exitCode = 1
+	}
+	attempt.rateLimitHit = detector.Detected()
+	attempt.retryAfter = detector.RetryAfter()
+	return attempt
+}
 
-	return exitCode, rateLimitHit, nil
+const maxReplayInputBytes = 16 << 20
+
+type preparedInput struct {
+	reader  io.Reader
+	spool   *os.File
+	tracked *countingInput
+	opaque  bool
+}
+
+func prepareInput(ctx context.Context, source io.Reader, replay bool) (*preparedInput, error) {
+	if !replay {
+		if _, ok := source.(*os.File); ok {
+			return &preparedInput{reader: source, opaque: true}, nil
+		}
+		tracked := &countingInput{reader: source}
+		return &preparedInput{reader: tracked, tracked: tracked}, nil
+	}
+	file, err := os.CreateTemp("", "caam-run-stdin-*")
+	if err != nil {
+		return nil, err
+	}
+	input := &preparedInput{reader: file, spool: file}
+	if closer, ok := source.(io.Closer); ok {
+		closed := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() {
+			_ = closer.Close() // Only cancellation closes the caller's source.
+			close(closed)
+		})
+		defer func() {
+			if !stop() {
+				<-closed
+			}
+		}()
+	}
+	n, err := io.Copy(file, io.LimitReader(contextInput{ctx: ctx, reader: source}, maxReplayInputBytes+1))
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err == nil && n > maxReplayInputBytes {
+		err = fmt.Errorf("stdin exceeds the 16 MiB replay limit")
+	}
+	if err != nil {
+		input.Close()
+		return nil, err
+	}
+	return input, nil
+}
+
+func (input *preparedInput) Rewind() error {
+	if input.spool == nil {
+		return nil
+	}
+	_, err := input.spool.Seek(0, io.SeekStart)
+	return err
+}
+
+func (input *preparedInput) CanRetry() bool {
+	return input.spool != nil || (!input.opaque && input.tracked.consumed.Load() == 0)
+}
+
+func (input *preparedInput) Close() {
+	if input.spool != nil {
+		_ = input.spool.Close()
+		_ = os.Remove(input.spool.Name())
+	}
+}
+
+type countingInput struct {
+	reader   io.Reader
+	consumed atomic.Int64
+}
+
+func (input *countingInput) Read(p []byte) (int, error) {
+	n, err := input.reader.Read(p)
+	input.consumed.Add(int64(n))
+	return n, err
+}
+
+type contextInput struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (input contextInput) Read(p []byte) (int, error) {
+	if err := input.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return input.reader.Read(p)
 }
 
 // maxBufferSize is the maximum buffer size before forcing a flush (64KB).
@@ -433,6 +581,8 @@ type teeWriter struct {
 	dest     io.Writer
 	detector *ratelimit.Detector
 	buffer   []byte
+	outputMu *sync.Mutex // Shared when stdout and stderr have the same destination.
+	writeErr error
 }
 
 func (t *teeWriter) Write(p []byte) (n int, err error) {
@@ -455,19 +605,30 @@ func (t *teeWriter) Write(p []byte) (n int, err error) {
 		t.detector.Check(line)
 	}
 
-	// Also check partial buffer in case a rate limit message doesn't end with newline
-	// (e.g., JSON error response or final output)
-	if len(t.buffer) > 0 {
-		t.detector.Check(string(t.buffer))
-	}
-
 	// Enforce buffer limit to prevent OOM on long lines without newlines
 	if len(t.buffer) > maxBufferSize {
+		t.detector.Check(string(t.buffer))
 		t.buffer = nil
 	}
 
-	// Forward to destination
-	return t.dest.Write(p)
+	if t.outputMu != nil {
+		t.outputMu.Lock()
+		defer t.outputMu.Unlock()
+	}
+	n, err = t.dest.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && t.writeErr == nil {
+		t.writeErr = err
+	}
+	return n, err
+}
+
+func (t *teeWriter) Error() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.writeErr
 }
 
 // Flush checks any remaining buffered data for rate limit patterns.

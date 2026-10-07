@@ -1,8 +1,10 @@
 package ratelimit
 
 import (
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewDetector(t *testing.T) {
@@ -205,6 +207,143 @@ func TestDetector_Reason(t *testing.T) {
 	}
 }
 
+func TestDetector_CommonProviders(t *testing.T) {
+	for _, provider := range []Provider{ProviderGrok, ProviderCursor, ProviderOpenCode, ProviderAGY} {
+		t.Run(string(provider), func(t *testing.T) {
+			for _, tc := range []struct {
+				text string
+				want bool
+			}{
+				{"HTTP 429 Too Many Requests", true},
+				{"Error: rate limit exceeded", true},
+				{"RATE_LIMIT_EXCEEDED", true},
+				{"USAGE_LIMIT_EXCEEDED", true},
+				{"Usage-limit reached", true},
+				{"QUOTA_EXCEEDED", true},
+				{"Exceeded the project quota", true},
+				{"RESOURCE_EXHAUSTED", true},
+				{"Too many requests", true},
+				{"Capacity remaining: 90%", false},
+				{"Quota: 10000 tokens remaining", false},
+				{"The quota configuration was saved", false},
+				{"Processed 1429 tokens successfully", false},
+				{"The request completed successfully", false},
+			} {
+				t.Run(tc.text, func(t *testing.T) {
+					d, err := NewDetector(provider, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got := d.Check(tc.text); got != tc.want {
+						t.Fatalf("Check(%q) = %v, want %v", tc.text, got, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestParseRetryAfterHeaders(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		text string
+		want time.Time
+	}{
+		{"seconds", "Retry-After: 120", now.Add(2 * time.Minute)},
+		{"zero seconds", "Retry-After: 0", now},
+		{"case and whitespace", "\tretry-after:\t15 \r", now.Add(15 * time.Second)},
+		{"HTTP date", "Retry-After: " + now.Add(time.Hour).Format(http.TimeFormat), now.Add(time.Hour)},
+		{"expired HTTP date", "Retry-After: " + now.Add(-time.Hour).Format(http.TimeFormat), now.Add(-time.Hour)},
+		{"latest complete header", "HTTP 429\r\nRetry-After: 90\r\nRetry-After: 30\r\n", now.Add(90 * time.Second)},
+		{"empty", "Retry-After:", time.Time{}},
+		{"negative", "Retry-After: -1", time.Time{}},
+		{"signed", "Retry-After: +1", time.Time{}},
+		{"fraction", "Retry-After: 1.5", time.Time{}},
+		{"exponent", "Retry-After: 1e3", time.Time{}},
+		{"duration overflow", "Retry-After: 9223372037", time.Time{}},
+		{"integer overflow", "Retry-After: 18446744073709551616", time.Time{}},
+		{"invalid date", "Retry-After: Wednesday next week", time.Time{}},
+		{"unit suffix", "Retry-After: 60 seconds", time.Time{}},
+		{"other header", "X-RateLimit-Reset: 1791374400", time.Time{}},
+		{"arbitrary prose", "Error429: please retry after 60 seconds", time.Time{}},
+		{"embedded prose", "The Retry-After: 60 field was missing", time.Time{}},
+		{"quoted JSON field", `{"Retry-After":60}`, time.Time{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := parseRetryAfterHeaders(tc.text, now)
+			if !got.Equal(tc.want) {
+				t.Fatalf("deadline = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetector_RetryAfter(t *testing.T) {
+	d, err := NewDetector(ProviderCodex, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A header is not a rate-limit error, even when its value matches a status
+	// code. Headers after a detected error must still update the deadline.
+	if d.Check("Retry-After: 429") {
+		t.Fatal("Retry-After header triggered rate-limit detection")
+	}
+	d.Reset()
+	w := NewObservingWriter(d, nil)
+	w.Write([]byte("HTTP 429 Too Many Requests\nRetry-Af"))
+	if !d.Detected() || !d.RetryAfter().IsZero() {
+		t.Fatal("partial header was interpreted before its value arrived")
+	}
+	before := time.Now()
+	w.Write([]byte("ter: 120\r\n"))
+	deadline := d.RetryAfter()
+	if deadline.Before(before.Add(120*time.Second)) || deadline.After(time.Now().Add(120*time.Second)) {
+		t.Fatalf("deadline = %s, want 120 seconds after the completed header", deadline)
+	}
+	d.Check("Retry-After: malformed")
+	d.Check("Retry-After: 1")
+	if !d.RetryAfter().Equal(deadline) {
+		t.Fatal("invalid or earlier header shortened the server deadline")
+	}
+	d.Reset()
+	if d.Detected() || !d.RetryAfter().IsZero() {
+		t.Fatal("Reset retained detection or server deadline")
+	}
+	w.Write([]byte("Retry-After: 60"))
+	if !d.RetryAfter().IsZero() {
+		t.Fatal("unterminated header interpreted before flush")
+	}
+	w.Flush()
+	if d.RetryAfter().IsZero() || d.Detected() {
+		t.Fatal("flush did not record the standalone header correctly")
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		backoff  time.Duration
+		deadline time.Time
+		want     time.Duration
+	}{
+		{"backoff only", time.Second, time.Time{}, time.Second},
+		{"no delay", 0, time.Time{}, 0},
+		{"expired deadline", time.Second, now.Add(-time.Minute), time.Second},
+		{"backoff is longer", time.Minute, now.Add(time.Second), time.Minute},
+		{"server delay is longer", time.Second, now.Add(time.Hour), time.Hour},
+		{"server delay with zero backoff", 0, now.Add(time.Minute), time.Minute},
+		{"negative backoff", -time.Second, time.Time{}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RetryDelay(tc.backoff, tc.deadline, now); got != tc.want {
+				t.Fatalf("delay = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestObservingWriter(t *testing.T) {
 	d, err := NewDetector(ProviderClaude, nil)
 	if err != nil {
@@ -278,6 +417,14 @@ func TestProviderFromString(t *testing.T) {
 		{"Codex", ProviderCodex},
 		{"gemini", ProviderGemini},
 		{"Gemini", ProviderGemini},
+		{"grok", ProviderGrok},
+		{"Grok", ProviderGrok},
+		{"cursor", ProviderCursor},
+		{"Cursor", ProviderCursor},
+		{"opencode", ProviderOpenCode},
+		{"OpenCode", ProviderOpenCode},
+		{"agy", ProviderAGY},
+		{"AGY", ProviderAGY},
 		{"unknown", ProviderClaude}, // default
 		{"", ProviderClaude},        // default
 	}

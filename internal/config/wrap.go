@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"time"
@@ -35,7 +36,18 @@ type WrapConfig struct {
 
 	// Providers contains per-provider overrides.
 	// Example: {"claude": {"max_retries": 5}}
-	Providers map[string]*WrapConfig `json:"providers,omitempty"`
+	Providers map[string]*WrapOverride `json:"providers,omitempty"`
+}
+
+// WrapOverride holds only the settings explicitly supplied for a provider.
+// Pointers preserve the distinction between an omitted setting and zero/false.
+type WrapOverride struct {
+	MaxRetries        *int      `json:"max_retries,omitempty"`
+	InitialDelay      *Duration `json:"initial_delay,omitempty"`
+	MaxDelay          *Duration `json:"max_delay,omitempty"`
+	BackoffMultiplier *float64  `json:"backoff_multiplier,omitempty"`
+	Jitter            *bool     `json:"jitter,omitempty"`
+	CooldownDuration  *Duration `json:"cooldown_duration,omitempty"`
 }
 
 // DefaultWrapConfig returns a WrapConfig with sensible defaults.
@@ -67,60 +79,91 @@ func (c *WrapConfig) ForProvider(provider string) WrapConfig {
 		return result
 	}
 
-	// Merge non-zero override values
-	if override.MaxRetries > 0 {
-		result.MaxRetries = override.MaxRetries
+	if override.MaxRetries != nil {
+		result.MaxRetries = *override.MaxRetries
 	}
-	if override.InitialDelay > 0 {
-		result.InitialDelay = override.InitialDelay
+	if override.InitialDelay != nil {
+		result.InitialDelay = *override.InitialDelay
 	}
-	if override.MaxDelay > 0 {
-		result.MaxDelay = override.MaxDelay
+	if override.MaxDelay != nil {
+		result.MaxDelay = *override.MaxDelay
 	}
-	if override.BackoffMultiplier > 0 {
-		result.BackoffMultiplier = override.BackoffMultiplier
+	if override.BackoffMultiplier != nil {
+		result.BackoffMultiplier = *override.BackoffMultiplier
 	}
-	// Jitter is a bool - can't distinguish "not set" from "false"
-	// We'll use the override value if providers entry exists
-	result.Jitter = override.Jitter
-	if override.CooldownDuration > 0 {
-		result.CooldownDuration = override.CooldownDuration
+	if override.Jitter != nil {
+		result.Jitter = *override.Jitter
+	}
+	if override.CooldownDuration != nil {
+		result.CooldownDuration = *override.CooldownDuration
 	}
 
 	return result
 }
 
+// Validate checks effective settings after provider and CLI overrides are applied.
+// Zero delays allow immediate retries; max_delay must still cover initial_delay.
+func (c WrapConfig) Validate() error {
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("max_retries must be nonnegative")
+	}
+	if c.InitialDelay < 0 {
+		return fmt.Errorf("initial_delay must be nonnegative")
+	}
+	if c.MaxDelay < 0 {
+		return fmt.Errorf("max_delay must be nonnegative")
+	}
+	if c.CooldownDuration < 0 {
+		return fmt.Errorf("cooldown_duration must be nonnegative")
+	}
+	if c.BackoffMultiplier <= 0 || math.IsNaN(c.BackoffMultiplier) || math.IsInf(c.BackoffMultiplier, 0) {
+		return fmt.Errorf("backoff_multiplier must be finite and positive")
+	}
+	if c.InitialDelay > c.MaxDelay {
+		return fmt.Errorf("initial_delay must not exceed max_delay")
+	}
+	return nil
+}
+
 // NextDelay calculates the delay before the next retry attempt.
 // The delay uses exponential backoff with optional jitter.
 //
-// Formula: delay = min(initial * multiplier^attempt, max)
-// With jitter: delay *= (0.8 + random*0.4) for ±20% variation
+// Formula: min(min(initial * multiplier^attempt, max) * jitter, max).
+// Jitter varies between 0.8 and 1.2; the final delay never exceeds max_delay.
 func (c *WrapConfig) NextDelay(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
 
-	// Calculate base delay with exponential backoff
-	initial := float64(c.InitialDelay.Duration())
+	initial := c.InitialDelay.Duration()
+	maxDelay := c.MaxDelay.Duration()
+	if initial <= 0 || maxDelay <= 0 {
+		return 0
+	}
+
 	multiplier := c.BackoffMultiplier
-	if multiplier <= 0 {
+	if multiplier <= 0 || math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
 		multiplier = 2.0
 	}
 
-	delay := initial * math.Pow(multiplier, float64(attempt))
+	delay := float64(initial) * math.Pow(multiplier, float64(attempt))
 
-	// Cap at max delay
-	maxDelay := float64(c.MaxDelay.Duration())
-	if delay > maxDelay {
-		delay = maxDelay
+	// Clamp overflow from exponential growth before applying jitter.
+	limit := float64(maxDelay)
+	if delay > limit {
+		delay = limit
 	}
 
-	// Apply jitter if enabled (±20%)
 	if c.Jitter {
 		jitterFactor := 0.8 + rand.Float64()*0.4
 		delay *= jitterFactor
 	}
 
+	// Compare before converting: float64(MaxInt64) rounds up past Duration's
+	// range, so converting a capped float directly can produce a negative wait.
+	if delay >= limit {
+		return maxDelay
+	}
 	return time.Duration(delay)
 }
 

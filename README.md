@@ -1251,32 +1251,74 @@ When cooldown enforcement is enabled (`stealth.cooldown.enabled: true`), attempt
 
 ### Automatic Failover with `caam run`
 
-The `caam run` command wraps your AI CLI execution and automatically handles rate limits:
+`caam run` retries headless commands that fail with a detected rate limit. It
+starts with the current saved account, marks a rate-limited account as exhausted,
+selects an eligible alternative, waits for the configured backoff, and launches
+the same command again. Accounts exhausted during the run are not reused, even
+when the cooldown database is unavailable.
 
 ```bash
-# Instead of running claude directly:
-caam run claude -- "explain this code"
+# Native headless forms work from terminals and scripts
+caam run claude -- -p "explain this code"
+caam run codex -- exec "write tests"
+caam run gemini -- -p "summarize this file"
 
-# If Claude hits a rate limit mid-session:
-# 1. Current profile goes into cooldown
-# 2. Next best profile is automatically selected
-# 3. Command is re-executed with new account
+# Each attempt receives the same complete redirected input
+git diff | caam run claude -- -p "review this diff"
+
+# Explicit flags override configured retry and cooldown values
+caam run claude --max-retries 2 --cooldown 90m -- -p "explain this code"
+caam run codex --max-retries 0 -- exec "run once"
 ```
 
-For seamless integration, add shell aliases:
+The default is three retries after the initial launch, with a 30-second initial
+delay, a five-minute maximum delay, a multiplier of two, and jitter. Configure
+these in the `wrap` section of `~/.config/caam/config.json` (or
+`$XDG_CONFIG_HOME/caam/config.json`):
 
-```bash
-alias claude='caam run claude --'
-alias codex='caam run codex --'
-alias gemini='caam run gemini --'
+```json
+{
+  "wrap": {
+    "max_retries": 3,
+    "initial_delay": "30s",
+    "max_delay": "5m",
+    "backoff_multiplier": 2,
+    "jitter": true,
+    "cooldown_duration": "60m",
+    "providers": {
+      "claude": { "max_retries": 5 },
+      "codex": { "max_retries": 0 },
+      "gemini": { "initial_delay": "60s", "jitter": false }
+    }
+  }
+}
 ```
 
-Now you can use `claude "explain this code"` and rate limits are handled transparently.
+Provider settings inherit omitted values and honor explicit zero and false.
+Explicit CLI flags take precedence. A zero cooldown disables persistent cooldown
+recording while accounts remain excluded for that run. Invalid effective retry
+settings fail before precheck or activation.
 
-Configuration options:
-```bash
-caam run claude --max-retries 2 --cooldown 90m --algorithm smart -- "your prompt"
-```
+When CLI output includes an explicit `Retry-After` header, CAAM waits at least
+until that deadline, including when it exceeds `max_delay`. This can only honor
+headers the CLI exposes; CAAM does not intercept its network traffic.
+
+Successful commands are never retried. Ordinary failures retain their exit
+status, and cancellation stops further launches. A retry reruns the command;
+work completed by an earlier attempt remains. Child output stays on its original
+stdout/stderr streams, so output from failed attempts remains visible too.
+
+Redirected input is captured privately before execution and replayed on each
+attempt, up to 16 MiB. Provide headless input through arguments, a pipe, or file
+redirection; headless invocations from a terminal do not collect keystrokes.
+Interactive sessions retain their terminal behavior and are never replayed as
+commands. Existing interactive handoffs use the same retry budget and backoff;
+Claude's native interactive TUI continues to run directly.
+
+For the native headless options, see the
+[Claude CLI documentation](https://code.claude.com/docs/en/headless),
+[Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive),
+and [Gemini headless documentation](https://geminicli.com/docs/cli/headless/).
 
 ### Project-Profile Associations
 

@@ -2,6 +2,9 @@ package config
 
 import (
 	"encoding/json"
+	"math"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +29,9 @@ func TestDefaultWrapConfig(t *testing.T) {
 	}
 	if cfg.CooldownDuration.Duration() != 60*time.Minute {
 		t.Errorf("CooldownDuration = %v, want 60m", cfg.CooldownDuration.Duration())
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default config is invalid: %v", err)
 	}
 }
 
@@ -126,6 +132,57 @@ func TestWrapConfig_NextDelay_ZeroMultiplier(t *testing.T) {
 	}
 }
 
+func TestWrapConfig_NextDelay_ExtremeValues(t *testing.T) {
+	const largestDuration = time.Duration(1<<63 - 1)
+	tests := []struct {
+		name       string
+		initial    time.Duration
+		maximum    time.Duration
+		multiplier float64
+		attempt    int
+		want       time.Duration
+	}{
+		{"largest duration", largestDuration, largestDuration, 2, 0, largestDuration},
+		{"exponent overflow", time.Second, largestDuration, 2, 1024, largestDuration},
+		{"multiplication overflow", 2 * time.Second, time.Hour, math.MaxFloat64, 2, time.Hour},
+		{"zero initial with huge attempt", 0, time.Minute, 2, int(^uint(0) >> 1), 0},
+		{"zero maximum", 0, 0, 2, 1, 0},
+		{"decreasing backoff", 10 * time.Second, time.Minute, 0.5, 3, 1250 * time.Millisecond},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := WrapConfig{
+				InitialDelay:      Duration(tt.initial),
+				MaxDelay:          Duration(tt.maximum),
+				BackoffMultiplier: tt.multiplier,
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("test config is invalid: %v", err)
+			}
+			if got := cfg.NextDelay(tt.attempt); got != tt.want {
+				t.Fatalf("NextDelay(%d) = %v, want %v", tt.attempt, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWrapConfig_NextDelay_JitterNeverExceedsCap(t *testing.T) {
+	for _, maximum := range []time.Duration{time.Second, time.Duration(1<<63 - 1)} {
+		cfg := WrapConfig{
+			InitialDelay:      Duration(maximum),
+			MaxDelay:          Duration(maximum),
+			BackoffMultiplier: 2,
+			Jitter:            true,
+		}
+		for i := 0; i < 128; i++ {
+			got := cfg.NextDelay(1024)
+			if got < 0 || got > maximum {
+				t.Fatalf("jittered delay = %v, want 0 <= delay <= %v", got, maximum)
+			}
+		}
+	}
+}
+
 func TestWrapConfig_ShouldRetry(t *testing.T) {
 	cfg := WrapConfig{MaxRetries: 3}
 
@@ -167,6 +224,8 @@ func TestWrapConfig_ForProvider_NoOverrides(t *testing.T) {
 }
 
 func TestWrapConfig_ForProvider_WithOverrides(t *testing.T) {
+	maxRetries := 5
+	initialDelay := Duration(60 * time.Second)
 	cfg := WrapConfig{
 		MaxRetries:        3,
 		InitialDelay:      Duration(30 * time.Second),
@@ -174,10 +233,10 @@ func TestWrapConfig_ForProvider_WithOverrides(t *testing.T) {
 		BackoffMultiplier: 2.0,
 		Jitter:            true,
 		CooldownDuration:  Duration(60 * time.Minute),
-		Providers: map[string]*WrapConfig{
+		Providers: map[string]*WrapOverride{
 			"claude": {
-				MaxRetries:   5,
-				InitialDelay: Duration(60 * time.Second),
+				MaxRetries:   &maxRetries,
+				InitialDelay: &initialDelay,
 			},
 		},
 	}
@@ -199,14 +258,18 @@ func TestWrapConfig_ForProvider_WithOverrides(t *testing.T) {
 	if result.BackoffMultiplier != 2.0 {
 		t.Errorf("BackoffMultiplier = %f, want 2.0", result.BackoffMultiplier)
 	}
+	if !result.Jitter {
+		t.Error("omitted jitter override disabled inherited jitter")
+	}
 }
 
 func TestWrapConfig_ForProvider_UnknownProvider(t *testing.T) {
+	maxRetries := 5
 	cfg := WrapConfig{
 		MaxRetries:   3,
 		InitialDelay: Duration(30 * time.Second),
-		Providers: map[string]*WrapConfig{
-			"claude": {MaxRetries: 5},
+		Providers: map[string]*WrapOverride{
+			"claude": {MaxRetries: &maxRetries},
 		},
 	}
 
@@ -215,6 +278,101 @@ func TestWrapConfig_ForProvider_UnknownProvider(t *testing.T) {
 
 	if result.MaxRetries != 3 {
 		t.Errorf("MaxRetries = %d, want 3", result.MaxRetries)
+	}
+}
+
+func TestWrapConfig_ForProvider_ExplicitJSONOverrides(t *testing.T) {
+	defaults := DefaultWrapConfig()
+	tests := []struct {
+		name     string
+		override string
+		change   func(*WrapConfig)
+	}{
+		{"empty inherits", `{}`, func(*WrapConfig) {}},
+		{"null inherits", `null`, func(*WrapConfig) {}},
+		{"no retries", `{"max_retries":0}`, func(c *WrapConfig) { c.MaxRetries = 0 }},
+		{"immediate retry", `{"initial_delay":"0s"}`, func(c *WrapConfig) { c.InitialDelay = 0 }},
+		{"disable jitter", `{"jitter":false}`, func(c *WrapConfig) { c.Jitter = false }},
+		{"no cooldown", `{"cooldown_duration":"0s"}`, func(c *WrapConfig) { c.CooldownDuration = 0 }},
+		{"zero delays", `{"initial_delay":"0s","max_delay":"0s"}`, func(c *WrapConfig) {
+			c.InitialDelay = 0
+			c.MaxDelay = 0
+		}},
+		{"partial override inherits jitter", `{"max_retries":7}`, func(c *WrapConfig) { c.MaxRetries = 7 }},
+		{"delay and multiplier", `{"max_delay":"1m","backoff_multiplier":1.5}`, func(c *WrapConfig) {
+			c.MaxDelay = Duration(time.Minute)
+			c.BackoffMultiplier = 1.5
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaults
+			if err := json.Unmarshal([]byte(`{"providers":{"claude":`+tt.override+`}}`), &cfg); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			want := defaults
+			tt.change(&want)
+			got := cfg.ForProvider("claude")
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("effective config = %+v, want %+v", got, want)
+			}
+			if err := got.Validate(); err != nil {
+				t.Fatalf("effective config is invalid: %v", err)
+			}
+			if base := cfg.ForProvider("codex"); !reflect.DeepEqual(base, defaults) {
+				t.Fatalf("provider override changed base settings: %+v", base)
+			}
+		})
+	}
+}
+
+func TestWrapConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*WrapConfig)
+		field  string
+	}{
+		{"negative retries", func(c *WrapConfig) { c.MaxRetries = -1 }, "max_retries"},
+		{"negative initial delay", func(c *WrapConfig) { c.InitialDelay = -1 }, "initial_delay"},
+		{"negative maximum delay", func(c *WrapConfig) { c.MaxDelay = -1 }, "max_delay"},
+		{"negative cooldown", func(c *WrapConfig) { c.CooldownDuration = -1 }, "cooldown_duration"},
+		{"zero multiplier", func(c *WrapConfig) { c.BackoffMultiplier = 0 }, "backoff_multiplier"},
+		{"negative multiplier", func(c *WrapConfig) { c.BackoffMultiplier = -1 }, "backoff_multiplier"},
+		{"NaN multiplier", func(c *WrapConfig) { c.BackoffMultiplier = math.NaN() }, "backoff_multiplier"},
+		{"infinite multiplier", func(c *WrapConfig) { c.BackoffMultiplier = math.Inf(1) }, "backoff_multiplier"},
+		{"negative infinite multiplier", func(c *WrapConfig) { c.BackoffMultiplier = math.Inf(-1) }, "backoff_multiplier"},
+		{"initial above maximum", func(c *WrapConfig) { c.InitialDelay = c.MaxDelay + 1 }, "initial_delay"},
+		{"zero maximum with positive initial", func(c *WrapConfig) { c.MaxDelay = 0 }, "max_delay"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultWrapConfig()
+			tt.change(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("Validate() = %v, want error identifying %s", err, tt.field)
+			}
+		})
+	}
+}
+
+func TestWrapConfig_InvalidProviderOverrideIsNotIgnored(t *testing.T) {
+	for _, override := range []string{
+		`{"max_retries":-1}`,
+		`{"initial_delay":"-1s"}`,
+		`{"max_delay":"-1s"}`,
+		`{"cooldown_duration":"-1s"}`,
+		`{"backoff_multiplier":0}`,
+		`{"initial_delay":"6m"}`,
+	} {
+		cfg := DefaultWrapConfig()
+		if err := json.Unmarshal([]byte(`{"providers":{"claude":`+override+`}}`), &cfg); err != nil {
+			t.Fatalf("decode %s: %v", override, err)
+		}
+		got := cfg.ForProvider("claude")
+		if err := got.Validate(); err == nil {
+			t.Errorf("invalid override %s silently inherited valid defaults", override)
+		}
 	}
 }
 
@@ -262,6 +420,7 @@ func TestDuration_JSON_Roundtrip(t *testing.T) {
 }
 
 func TestWrapConfig_JSON_Roundtrip(t *testing.T) {
+	maxRetries := 10
 	original := WrapConfig{
 		MaxRetries:        5,
 		InitialDelay:      Duration(45 * time.Second),
@@ -269,8 +428,8 @@ func TestWrapConfig_JSON_Roundtrip(t *testing.T) {
 		BackoffMultiplier: 1.5,
 		Jitter:            true,
 		CooldownDuration:  Duration(30 * time.Minute),
-		Providers: map[string]*WrapConfig{
-			"claude": {MaxRetries: 10},
+		Providers: map[string]*WrapOverride{
+			"claude": {MaxRetries: &maxRetries},
 		},
 	}
 
@@ -293,7 +452,22 @@ func TestWrapConfig_JSON_Roundtrip(t *testing.T) {
 	if decoded.BackoffMultiplier != original.BackoffMultiplier {
 		t.Errorf("BackoffMultiplier = %f, want %f", decoded.BackoffMultiplier, original.BackoffMultiplier)
 	}
-	if decoded.Providers["claude"].MaxRetries != 10 {
-		t.Errorf("Providers[claude].MaxRetries = %d, want 10", decoded.Providers["claude"].MaxRetries)
+	if got := decoded.Providers["claude"].MaxRetries; got == nil || *got != 10 {
+		t.Errorf("Providers[claude].MaxRetries = %v, want pointer to 10", got)
+	}
+}
+
+func TestWrapOverride_JSONPreservesOmissionAndZero(t *testing.T) {
+	const input = `{"max_retries":0,"initial_delay":"0s","jitter":false}`
+	var override WrapOverride
+	if err := json.Unmarshal([]byte(input), &override); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != input {
+		t.Fatalf("override round trip = %s, want %s", encoded, input)
 	}
 }

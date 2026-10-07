@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
@@ -18,7 +19,7 @@ func TestGrokPrecheckSwitchesToResetZero(t *testing.T) {
 	if active, err := vault.ActiveProfile(files); err != nil || active != "spent" {
 		t.Fatalf("could not establish spent profile as active: %q, %v", active, err)
 	}
-	if switched := runPrecheck("grok", 0.8, true, nil, rotation.AlgorithmSmart, config.DefaultSPMConfig(), ""); !switched {
+	if switched := runPrecheck(context.Background(), "grok", 0.8, true, nil, rotation.AlgorithmSmart, config.DefaultSPMConfig(), ""); !switched {
 		t.Fatal("precheck did not switch from spent quota to the reset-zero account")
 	}
 	if active, err := vault.ActiveProfile(files); err != nil || active != "fresh" {

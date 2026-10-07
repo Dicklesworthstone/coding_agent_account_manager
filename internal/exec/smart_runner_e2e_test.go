@@ -152,6 +152,7 @@ func TestSmartRunner_E2E(t *testing.T) {
 
 	opts := SmartRunnerOptions{
 		HandoffConfig: &cfg,
+		RetryConfig:   smartRetryPolicy(3, 0),
 		Vault:         vault,
 		DB:            db,
 		Rotation:      selector,
