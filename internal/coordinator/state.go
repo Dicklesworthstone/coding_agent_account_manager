@@ -194,6 +194,21 @@ func (t *PaneTracker) SetErrorMessage(msg string) {
 	t.ErrorMessage = msg
 }
 
+// GetRetryCount returns how many login retries this episode has used.
+func (t *PaneTracker) GetRetryCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.RetryCount
+}
+
+// SetRetryCount sets the login retry count. Reset leaves it unchanged so the
+// budget spans the whole rate-limit episode.
+func (t *PaneTracker) SetRetryCount(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.RetryCount = n
+}
+
 // SetAuthResponse sets the received code and account atomically.
 func (t *PaneTracker) SetAuthResponse(code, account string) {
 	t.mu.Lock()

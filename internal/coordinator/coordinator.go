@@ -87,6 +87,10 @@ type Config struct {
 	// This prevents duplicate resume prompts if the state detection triggers multiple times.
 	ResumeCooldown time.Duration
 
+	// MaxLoginRetries is how many times a failed login is retried (by
+	// injecting /login again) within one rate-limit episode.
+	MaxLoginRetries int
+
 	// PaneClient allows injecting a custom pane client (useful for tests).
 	// If nil, one is selected based on Backend.
 	PaneClient PaneClient
@@ -121,6 +125,7 @@ func DefaultConfig() Config {
 		LoginCooldown:              5 * time.Second,
 		MethodSelectCooldown:       2 * time.Second,
 		ResumeCooldown:             10 * time.Second,
+		MaxLoginRetries:            2,
 		CompactionReminderEnabled:  false, // Opt-in feature
 		CompactionReminderPrompt:   "Reread AGENTS.md so it's still fresh in your mind.\n",
 		CompactionReminderCooldown: 10 * time.Minute,
@@ -546,15 +551,50 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		c.handleResumingState(ctx, tracker, output)
 
 	case StateFailed:
-		// Check for timeout and reset
+		// After the failure has been visible for StateTimeout, retry the
+		// login (a slow agent or an expired code is often transient) up
+		// to MaxLoginRetries times per rate-limit episode, then leave the
+		// pane to a human.
 		if tracker.TimeSinceStateChange() > c.config.StateTimeout {
-			c.logger.Info("resetting failed pane after timeout",
-				"pane_id", tracker.PaneID)
-
 			c.closeRequest(tracker.GetRequestID(), RequestFailed)
-			tracker.Reset()
+			c.retryOrGiveUp(ctx, tracker)
 		}
 	}
+}
+
+// retryOrGiveUp re-injects /login into a failed pane while its retry budget
+// lasts, otherwise returns it to IDLE.
+func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker) {
+	retries := tracker.GetRetryCount()
+	if retries >= c.config.MaxLoginRetries {
+		c.logger.Warn("login retries exhausted; leaving pane for manual recovery",
+			"pane_id", tracker.PaneID,
+			"retries", retries,
+			"action", "give_up")
+		tracker.Reset()
+		return
+	}
+
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateFailed.String(),
+			"inject_type", "login_retry",
+			"error", err,
+			"action", "inject_failed")
+		tracker.Reset()
+		return
+	}
+
+	tracker.Reset()
+	tracker.SetRetryCount(retries + 1)
+	tracker.SetState(StateRateLimited)
+	tracker.SetCooldown("login", c.config.LoginCooldown)
+	c.logger.Info("retrying login after failure",
+		"pane_id", tracker.PaneID,
+		"retry", retries+1,
+		"max_retries", c.config.MaxLoginRetries,
+		"action", "login_retry")
 }
 
 func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker, output string) {
@@ -569,6 +609,8 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			"reset_time", metadata["reset_time"],
 			"action", "transition")
 		tracker.SetState(StateRateLimited)
+		// A new rate-limit episode gets a fresh retry budget.
+		tracker.SetRetryCount(0)
 
 		// Check login cooldown before injecting
 		if tracker.IsOnCooldown("login") {

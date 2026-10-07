@@ -13,6 +13,7 @@ func TestAuthRequestLeakOnTimeout(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.AuthTimeout = 10 * time.Millisecond
 	cfg.StateTimeout = 10 * time.Millisecond
+	cfg.MaxLoginRetries = 0 // exercise the give-up path that resets to IDLE
 	cfg.PaneClient = &fakePaneClient{
 		panes: []Pane{{PaneID: 1}},
 	}

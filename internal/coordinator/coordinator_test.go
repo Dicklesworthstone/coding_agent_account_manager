@@ -1422,3 +1422,57 @@ func TestFileConfigApply(t *testing.T) {
 		}
 	}
 }
+
+func TestFailedLoginIsRetriedWithinBudget(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}, output: "Paste code here if prompted > abc\nInvalid code"}
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	cfg.StateTimeout = time.Millisecond
+	cfg.MaxLoginRetries = 2
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.LastOutput = client.output
+	coord.trackers[1] = tracker
+	fail := func() {
+		tracker.SetState(StateFailed)
+		tracker.mu.Lock()
+		tracker.StateEntered = time.Now().Add(-time.Second)
+		tracker.mu.Unlock()
+		coord.processPaneState(context.Background(), client.panes[0])
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		fail()
+		if tracker.GetState() != StateRateLimited || tracker.GetRetryCount() != attempt {
+			t.Fatalf("attempt %d: state=%v retries=%d, want RATE_LIMITED/%d", attempt, tracker.GetState(), tracker.GetRetryCount(), attempt)
+		}
+	}
+	logins := 0
+	for _, s := range client.sentText() {
+		if s == "/login\n" {
+			logins++
+		}
+	}
+	if logins != 2 {
+		t.Fatalf("/login injected %d times, want 2", logins)
+	}
+
+	// Budget exhausted: the pane is left for a human.
+	fail()
+	if tracker.GetState() != StateIdle {
+		t.Fatalf("state after exhausted retries = %v, want IDLE", tracker.GetState())
+	}
+	for _, s := range client.sentText()[logins:] {
+		if s == "/login\n" {
+			t.Fatal("no further /login once retries are exhausted")
+		}
+	}
+
+	// A fresh rate limit starts a new episode with a full budget.
+	client.output = "...\nYou've hit your limit · resets 9pm"
+	coord.processPaneState(context.Background(), client.panes[0])
+	if tracker.GetState() != StateRateLimited || tracker.GetRetryCount() != 0 {
+		t.Fatalf("new episode: state=%v retries=%d", tracker.GetState(), tracker.GetRetryCount())
+	}
+}

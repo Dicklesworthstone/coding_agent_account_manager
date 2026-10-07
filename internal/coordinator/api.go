@@ -183,6 +183,7 @@ type PaneStatusResponse struct {
 	RequestID    string    `json:"request_id,omitempty"`
 	Account      string    `json:"account,omitempty"`
 	Error        string    `json:"error,omitempty"`
+	Retries      int       `json:"retries,omitempty"` // login retries used this rate-limit episode
 }
 
 func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +200,7 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			RequestID:    t.RequestID,
 			Account:      t.UsedAccount,
 			Error:        t.ErrorMessage,
+			Retries:      t.RetryCount,
 		})
 		t.mu.RUnlock()
 	}
