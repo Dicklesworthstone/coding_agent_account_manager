@@ -80,6 +80,24 @@ func TestDetector_Check(t *testing.T) {
 			want:     true,
 		},
 		{
+			name:     "claude named limit",
+			provider: ProviderClaude,
+			texts:    []string{"  ⎿  You've hit your session limit · resets 3pm (America/New_York)"},
+			want:     true,
+		},
+		{
+			name:     "claude weekly limit",
+			provider: ProviderClaude,
+			texts:    []string{"You've hit your weekly limit · resets Oct 9, 3pm"},
+			want:     true,
+		},
+		{
+			name:     "claude out of usage credits",
+			provider: ProviderClaude,
+			texts:    []string{"You're out of usage credits · resets 6pm"},
+			want:     true,
+		},
+		{
 			name:     "claude 429",
 			provider: ProviderClaude,
 			texts:    []string{"HTTP 429 Too Many Requests"},

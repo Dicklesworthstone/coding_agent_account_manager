@@ -337,10 +337,15 @@ var Patterns = struct {
 	// Claude Code's limit banners, followed by their reset time on the same
 	// line (which keeps conversation text about limits from matching):
 	//   "You've hit your limit · resets 2pm (America/New_York)"
+	//   "You've hit your session limit · resets 2pm" (also usage, weekly, Opus,
+	//   Sonnet, Fable, usage credit, and spend limits; Claude Code 2.1+)
+	//   "You're out of usage credits · resets 2pm"
 	//   "Claude usage limit reached. Your limit will reset at 2pm (Europe/Paris)."
 	//   "5-hour limit reached ∙ resets 2pm" / "Weekly limit reached ∙ resets Oct 9"
-	// Tolerant of case and of a curly or missing apostrophe.
-	RateLimit: regexp.MustCompile(`(?i)(you['’]?ve hit your limit|usage limit reached|\b(?:5-hour|five-hour|weekly|opus|sonnet)\b[^\n]{0,20}\blimit reached)[^\n]{0,120}\breset`),
+	// The forms naming a limit must start their line (after any TUI glyphs),
+	// so Claude's own prose ("it looks like you've hit your rate limit…")
+	// does not match. Tolerant of case and of a curly or missing apostrophe.
+	RateLimit: regexp.MustCompile(`(?im)(you['’]?ve hit your limit|^[^\w\n]*you['’]?ve hit your (?:[\w'’-]+ ){1,4}?limit|^[^\w\n]*you['’]?re out of usage credits|usage limit reached|\b(?:5-hour|five-hour|weekly|opus|sonnet)\b[^\n]{0,20}\blimit reached)[^\n]{0,120}\breset`),
 
 	// "Select login method:"
 	SelectMethod: regexp.MustCompile(`(?i)select login method:`),

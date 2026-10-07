@@ -384,7 +384,8 @@ var (
 		regexp.MustCompile(`(?i)google\s+ai`),
 	}
 	rateLimitMarkers = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)you'?ve hit your limit`),
+		regexp.MustCompile(`(?i)you['’]?ve hit your (?:[\w'’-]+ ){0,4}?limit`),
+		regexp.MustCompile(`(?i)you['’]?re out of usage credits`),
 		regexp.MustCompile(`(?i)usage limit`),
 		regexp.MustCompile(`(?i)rate limit`),
 		regexp.MustCompile(`(?i)too many requests`),

@@ -1518,6 +1518,15 @@ func TestRateLimitBannerVariants(t *testing.T) {
 		{"5-hour limit reached ∙ resets 3:30pm", "3:30pm"},
 		{"Weekly limit reached ∙ resets Oct 9", ""},
 		{"Opus weekly limit reached ∙ resets 9am", "9am"},
+		// Claude Code 2.1 names the limit that was hit.
+		{"  ⎿  You've hit your session limit · resets 3pm (America/New_York)", "3pm"},
+		{"You've hit your usage limit · resets 4pm", "4pm"},
+		{"⏺ You've hit your weekly limit · resets Oct 9, 3pm", ""},
+		{"You've hit your Opus limit · resets 9am · progress saved", "9am"},
+		{"You've hit your Fable limit · resets 10am", "10am"},
+		{"You've hit your usage credit limit · resets 8pm", "8pm"},
+		{"You've hit your monthly spend limit · raise it at claude.ai/settings · your session limit resets 3pm", "3pm"},
+		{"You're out of usage credits · resets 6pm", "6pm"},
 	} {
 		state, meta := DetectState(tc.text)
 		if state != StateRateLimited {
@@ -1535,6 +1544,10 @@ func TestRateLimitBannerVariants(t *testing.T) {
 		"> handle the case where the usage limit reached its maximum",
 		"We hit a rate limit (429) from the API; retrying",
 		"Opus limit reached? Let me check the docs.",
+		"⏺ It looks like you've hit your rate limit with the API; it resets hourly.",
+		"> why does it say you're out of usage credits even after the reset?",
+		// Fast mode's own limit falls back by itself; no login needed.
+		"Fast limit reached and temporarily disabled · resets in 5m",
 	} {
 		if state, _ := DetectState(text); state == StateRateLimited {
 			t.Errorf("DetectState(%q) = RATE_LIMITED, want no rate limit", text)

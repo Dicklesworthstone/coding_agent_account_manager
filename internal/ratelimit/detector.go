@@ -39,6 +39,9 @@ func DefaultPatterns() map[Provider][]string {
 		ProviderClaude: {
 			`(?i)rate.?limit`,
 			`(?i)usage.?limit`,
+			// "You've hit your session limit · resets 3pm" (weekly, Opus, …)
+			`(?i)you['’]?ve hit your (?:[\w'’-]+ ){0,4}?limit`,
+			`(?i)you['’]?re out of usage credits`,
 			`(?i)capacity`,
 			`\b429\b`,
 			`(?i)too.?many.?requests`,

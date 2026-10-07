@@ -342,7 +342,7 @@ scrollback the most recent one decides the state.
 
 | Pattern | Matches (case-insensitive) | Leads to |
 |---------|----------------------------|----------|
-| `RateLimit` | `You've hit your limit · resets …`, `Claude usage limit reached … reset at …`, `5-hour/Weekly/Opus limit reached ∙ resets …`, with the reset on the same line | inject `/login` |
+| `RateLimit` | `You've hit your limit · resets …`; `You've hit your session/usage/weekly/Opus/Sonnet/Fable/usage credit limit · resets …` and `You're out of usage credits · resets …` at the start of a line (Claude Code 2.1+); `Claude usage limit reached … reset at …`; `5-hour/Weekly/Opus limit reached ∙ resets …`. The reset must be on the same line. | inject `/login` |
 | `SelectMethod` | `Select login method:` | press `1` alone (the menu acts on the digit; an Enter would reach the code prompt that follows); if the menu stays with option 1 highlighted (`OptionOne`), press Enter |
 | `OAuthURL` | `https://claude.ai/oauth/authorize?…` (the newest one) | publish auth request |
 | `PastePrompt` | `Paste code here if prompted` | wait for the code |

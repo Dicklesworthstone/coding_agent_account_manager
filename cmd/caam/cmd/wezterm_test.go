@@ -44,9 +44,16 @@ func TestMatchWeztermPaneOverride(t *testing.T) {
 }
 
 func TestMatchWeztermPaneRateLimit(t *testing.T) {
-	match := matchWeztermPane("claude", "You've hit your limit · resets 2pm", nil)
-	if !match.Matched || match.Reason != "rate_limit" {
-		t.Fatalf("expected rate limit match, got: %+v", match)
+	for _, text := range []string{
+		"You've hit your limit · resets 2pm",
+		"  ⎿  You've hit your session limit · resets 3pm (America/New_York)",
+		"You've hit your weekly limit · resets Oct 9, 3pm",
+		"You're out of usage credits · resets 6pm",
+	} {
+		match := matchWeztermPane("claude", text, nil)
+		if !match.Matched || match.Reason != "rate_limit" {
+			t.Errorf("matchWeztermPane(%q) = %+v, want a rate limit match", text, match)
+		}
 	}
 }
 
