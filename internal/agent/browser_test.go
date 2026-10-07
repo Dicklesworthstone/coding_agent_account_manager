@@ -930,7 +930,7 @@ func TestCompleteOAuthInChromeSelectsPreferredAccount(t *testing.T) {
 
 	start := time.Now()
 	code, account, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-42", "b@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-42", []string{"b@example.com"})
 	if err != nil {
 		t.Fatalf("CompleteOAuth: %v (after %v)", err, time.Since(start))
 	}
@@ -955,25 +955,64 @@ func TestCompleteOAuthInChromeSelectsPreferredAccount(t *testing.T) {
 	}
 }
 
-func TestCompleteOAuthInChromeReportsAccountActuallyUsed(t *testing.T) {
+func TestCompleteOAuthInChromeFallsBackWithinConfiguredAccounts(t *testing.T) {
 	fixture := &oauthFixture{}
 	b := fixtureBrowser(t, fixture)
 
-	// The preferred account is not signed in to this profile: the first
-	// account is used, and that is what must be reported (and recorded).
+	// The preferred account is not signed in to this profile: the next
+	// configured account is used, and that is what must be reported.
 	code, account, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-7", "zoe@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-7", []string{"zoe@example.com", "b@example.com"})
 	if err != nil {
 		t.Fatalf("CompleteOAuth: %v", err)
 	}
 	if code != "fixture-code-123#st-7" {
 		t.Errorf("code = %q", code)
 	}
-	if got := fixture.choices(); len(got) != 1 || got[0] != "a@example.com" {
-		t.Fatalf("accounts chosen = %q, want the first account", got)
+	if got := fixture.choices(); len(got) != 1 || got[0] != "b@example.com" {
+		t.Fatalf("accounts chosen = %q, want the next configured account", got)
+	}
+	if account != "b@example.com" {
+		t.Errorf("account = %q, want the account actually chosen (b@example.com)", account)
+	}
+}
+
+func TestCompleteOAuthInChromeNeverUsesUnconfiguredAccounts(t *testing.T) {
+	fixture := &oauthFixture{}
+	b := fixtureBrowser(t, fixture)
+
+	// The chooser offers a@ and b@, neither configured.
+	_, _, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-u", []string{"zoe@example.com"})
+	if err == nil || !strings.Contains(err.Error(), "zoe@example.com") || !strings.Contains(err.Error(), "caam auth-agent signin") {
+		t.Fatalf("err = %v, want none of the configured accounts signed in", err)
+	}
+	if got := fixture.choices(); len(got) != 0 {
+		t.Fatalf("signed in with %q, an account that was not configured", got)
+	}
+
+	// A Claude session for an unconfigured account is never approved.
+	fixture = &oauthFixture{claudeSessionAs: "a@example.com"}
+	b = fixtureBrowser(t, fixture)
+	if _, _, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-v", []string{"zoe@example.com"}); err == nil {
+		t.Fatal("CompleteOAuth succeeded without any configured account")
+	}
+	if got := fixture.approvals(); len(got) != 0 {
+		t.Fatalf("approved %q, an account that was not configured", got)
+	}
+}
+
+func TestCompleteOAuthInChromeWithoutAccountsUsesFirstOffered(t *testing.T) {
+	fixture := &oauthFixture{}
+	b := fixtureBrowser(t, fixture)
+	_, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-f", nil)
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
 	}
 	if account != "a@example.com" {
-		t.Errorf("account = %q, want the account actually chosen (a@example.com)", account)
+		t.Errorf("account = %q, want the first offered (a@example.com)", account)
 	}
 }
 
@@ -982,7 +1021,7 @@ func TestCompleteOAuthInChromeExplainsSignedOutProfile(t *testing.T) {
 	b := fixtureBrowser(t, fixture)
 
 	_, _, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=secret-state", "a@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=secret-state", []string{"a@example.com"})
 	if err == nil {
 		t.Fatal("CompleteOAuth succeeded without any signed-in Google account")
 	}
@@ -1019,7 +1058,7 @@ func TestCompleteOAuthInChromeSwitchesFromAnotherClaudeAccount(t *testing.T) {
 	b := fixtureBrowser(t, fixture)
 
 	code, account, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-9", "b@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-9", []string{"b@example.com"})
 	if err != nil {
 		t.Fatalf("CompleteOAuth: %v", err)
 	}
@@ -1039,7 +1078,7 @@ func TestCompleteOAuthInChromeKeepsMatchingClaudeSession(t *testing.T) {
 	b := fixtureBrowser(t, fixture)
 
 	code, account, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-3", "b@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-3", []string{"b@example.com"})
 	if err != nil {
 		t.Fatalf("CompleteOAuth: %v", err)
 	}
@@ -1104,7 +1143,7 @@ func TestProfileSessionsReadsRealChromeProfile(t *testing.T) {
 	fixture := &oauthFixture{claudeSessionAs: "b@example.com"}
 	b := fixtureBrowser(t, fixture)
 	if _, _, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-p", "b@example.com"); err != nil {
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-p", []string{"b@example.com"}); err != nil {
 		t.Fatalf("CompleteOAuth: %v", err)
 	}
 	// Chrome closed gracefully, so the claude.ai session cookie the fixture
@@ -1138,7 +1177,7 @@ func TestCompleteOAuthInChromeClicksThroughGoogleConsent(t *testing.T) {
 	fixture := &oauthFixture{googleConsent: true}
 	b := fixtureBrowser(t, fixture)
 	code, account, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-g", "b@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-g", []string{"b@example.com"})
 	if err != nil {
 		t.Fatalf("CompleteOAuth: %v", err)
 	}
@@ -1154,7 +1193,7 @@ func TestCompleteOAuthInChromeNeverSignsUpForClaude(t *testing.T) {
 	fixture := &oauthFixture{noClaudeAccount: "b@example.com"}
 	b := fixtureBrowser(t, fixture)
 	_, _, err := b.CompleteOAuth(context.Background(),
-		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-n", "b@example.com")
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-n", []string{"b@example.com"})
 	if err == nil {
 		t.Fatal("CompleteOAuth succeeded through a sign-up page")
 	}

@@ -737,13 +737,15 @@ func (a *MultiAgent) runOAuth(ctx context.Context, authURL, requested string, on
 	defer a.oauthMu.Unlock()
 
 	account = requested
+	accounts := []string{requested}
 	if account == "" {
 		account = a.selectAccount()
+		accounts = accountOrder(account, a.config.Accounts)
 	}
 	if onStart != nil {
 		onStart(account)
 	}
-	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, account)
+	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, accounts)
 	if usedAccount != "" {
 		a.touchAccount(usedAccount)
 	} else {

@@ -566,10 +566,13 @@ code (at most 10 steps, 90 seconds):
    `code#state` is read from the page; no other page is ever scraped.
 2. **Claude login** (`claude.ai/login`, when the profile's Claude session is
    missing or expired): clicks "Continue with Google".
-3. **Google account chooser**: clicks the account the strategy prefers
-   (by its `data-identifier`); if that account is not signed in to
-   the profile, the first offered account is used and reported as the one
-   used, so usage tracking stays truthful.
+3. **Google account chooser**: clicks the account the strategy prefers (by
+   its `data-identifier`), else the next configured account it offers, and
+   reports the one used. It never signs in with an account outside
+   `accounts`: when the chooser offers none of them the flow fails with the
+   remedy (`caam auth-agent signin`), and Claude's authorize page is never
+   approved for an unconfigured Claude account. Only with no `accounts`
+   configured is the first offered account used.
 4. **Consent**: clicks the approve button only on Claude's authorize page and
    Google's "Sign in to claude.ai" consent page; any other page (a Claude
    sign-up or onboarding page, say) gets no clicks and the flow fails naming

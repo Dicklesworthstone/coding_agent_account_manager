@@ -24,7 +24,7 @@ type fakeOAuth struct {
 	calls         atomic.Int32
 }
 
-func (f *fakeOAuth) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
+func (f *fakeOAuth) CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error) {
 	f.calls.Add(1)
 	if f.err != nil {
 		return "", "", f.err
@@ -375,5 +375,15 @@ func TestRandomStrategySpreadsAcrossAccounts(t *testing.T) {
 				t.Errorf("%s: picked unknown account %q", name, acc)
 			}
 		}
+	}
+}
+
+func TestAccountOrder(t *testing.T) {
+	if got := accountOrder("", []string{"a@x", "b@x"}); got != nil {
+		t.Fatalf("no selection = %q, want any account (nil)", got)
+	}
+	got := accountOrder("b@x", []string{"a@x", "B@x", "c@x"})
+	if strings.Join(got, ",") != "b@x,a@x,c@x" {
+		t.Fatalf("accountOrder = %q, want the selection first, then the others once", got)
 	}
 }

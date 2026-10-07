@@ -437,7 +437,7 @@ var testAuthCmd = &cobra.Command{
 		defer browser.Close()
 
 		fmt.Println("Opening browser for OAuth...")
-		code, account, err := browser.CompleteOAuth(cmd.Context(), url, "")
+		code, account, err := browser.CompleteOAuth(cmd.Context(), url, nil)
 		if err != nil {
 			return fmt.Errorf("OAuth failed: %w", err)
 		}

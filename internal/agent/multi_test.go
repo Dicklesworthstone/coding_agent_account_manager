@@ -880,7 +880,11 @@ type trackingOAuth struct {
 	accounts []string
 }
 
-func (f *trackingOAuth) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
+func (f *trackingOAuth) CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error) {
+	preferredAccount := ""
+	if len(accounts) > 0 {
+		preferredAccount = accounts[0]
+	}
 	f.mu.Lock()
 	f.active++
 	if f.active > f.maxSeen {

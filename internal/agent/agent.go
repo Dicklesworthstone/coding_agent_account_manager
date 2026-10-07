@@ -84,7 +84,25 @@ type AccountUsage struct {
 // oauthCompleter completes an OAuth flow and returns the challenge code and
 // the account that was used. *Browser is the production implementation.
 type oauthCompleter interface {
-	CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error)
+	// CompleteOAuth signs in with one of accounts (most preferred first,
+	// any account when empty) and returns the code and the account used.
+	CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error)
+}
+
+// accountOrder lists the accounts a flow may use: the selected one first,
+// then the rest in configured order as fallbacks. With no selection (no
+// accounts configured) it is empty, meaning any account.
+func accountOrder(selected string, configured []string) []string {
+	if selected == "" {
+		return nil
+	}
+	order := []string{selected}
+	for _, account := range configured {
+		if !strings.EqualFold(account, selected) {
+			order = append(order, account)
+		}
+	}
+	return order
 }
 
 // deliveryPolicy bounds acknowledged delivery of auth results.
@@ -519,13 +537,15 @@ func (a *Agent) runOAuth(ctx context.Context, authURL, requested string, onStart
 	defer a.oauthMu.Unlock()
 
 	account = requested
+	accounts := []string{requested}
 	if account == "" {
 		account = a.selectAccount()
+		accounts = accountOrder(account, a.config.Accounts)
 	}
 	if onStart != nil {
 		onStart(account)
 	}
-	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, account)
+	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, accounts)
 	if usedAccount != "" {
 		a.touchAccount(usedAccount)
 	} else {

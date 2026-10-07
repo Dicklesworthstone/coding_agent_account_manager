@@ -200,9 +200,15 @@ func (b *Browser) Close() {
 }
 
 // CompleteOAuth navigates to the OAuth URL and extracts the challenge code.
-// If preferredAccount is set, it will try to select that Google account.
-// Returns the code, the account actually used, and any error.
-func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
+// accounts are the Google accounts it may sign in with, most preferred
+// first; it never uses another one. With no accounts, whichever account is
+// offered first is used. Returns the code, the account actually used, and
+// any error.
+func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error) {
+	preferredAccount := ""
+	if len(accounts) > 0 {
+		preferredAccount = accounts[0]
+	}
 	// Only log URL details at debug level to avoid exposing tokens
 	b.logger.Debug("starting OAuth flow",
 		"url_prefix", truncateURL(oauthURL, 60),
@@ -348,6 +354,10 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 				}
 				b.logger.Debug("could not sign out of Claude", "error", err)
 			}
+			// Never approve a Claude account outside the configured list.
+			if len(accounts) > 0 && len(shown) > 0 && !anyContainsFold(shown, accounts) {
+				return "", "", fmt.Errorf("claude is signed in as %s, which is not among the configured accounts", shown[0])
+			}
 			if usedAccount == "" && len(shown) == 1 {
 				usedAccount = shown[0]
 			}
@@ -367,19 +377,34 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			continue
 		}
 
-		// Google account chooser: pick the preferred account, else the first.
+		// Google account chooser: the first allowed account it offers, in
+		// preference order; never an account outside the list.
 		if onGoogleSignIn(currentURL) && !onGoogleConsent(currentURL) {
-			if preferredAccount != "" {
-				if _, _, err := b.clickFirstVisible(taskCtx, preferredAccountSelectors(preferredAccount)); err == nil {
-					usedAccount = preferredAccount
-					b.logger.Debug("selected preferred account")
+			if len(accounts) > 0 {
+				picked := ""
+				for _, account := range accounts {
+					if _, _, err := b.clickFirstVisible(taskCtx, preferredAccountSelectors(account)); err == nil {
+						picked = account
+						break
+					}
+				}
+				if picked != "" {
+					usedAccount = picked
+					b.logger.Debug("selected account", "preferred", picked == preferredAccount)
 					time.Sleep(b.stepDelay)
 					continue
 				}
-				b.logger.Debug("preferred account not offered, trying any account")
+				// Accounts are listed, none of them ours: stop rather than
+				// sign in with an account the user did not choose.
+				if _, _, err := b.firstVisible(taskCtx, anyAccountSelectors); err == nil {
+					return "", "", fmt.Errorf("none of the configured accounts (%s) is signed in to the agent's Chrome profile; add them with 'caam auth-agent signin'",
+						strings.Join(accounts, ", "))
+				}
+				time.Sleep(b.stepDelay) // still loading, or a sign-in form
+				continue
 			}
-			// Report the account actually chosen so usage tracking stays
-			// truthful when the preferred one is not signed in.
+			// No accounts configured: whichever account is offered first,
+			// reported as the account used.
 			if _, identity, err := b.clickFirstVisible(taskCtx, anyAccountSelectors); err == nil {
 				usedAccount = identity
 				b.logger.Debug("selected first offered account")
@@ -475,6 +500,16 @@ func shownAccounts(text string) []string {
 		}
 	}
 	return out
+}
+
+// anyContainsFold reports whether any of values is in list (case-insensitive).
+func anyContainsFold(values, list []string) bool {
+	for _, v := range values {
+		if containsFold(list, v) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsFold(list []string, s string) bool {
@@ -615,6 +650,21 @@ const visibleMatchScript = `((selectors) => {
 // selector matches: clicking an absent selector would stall the whole flow
 // until its deadline.
 func (b *Browser) clickFirstVisible(ctx context.Context, selectors []string) (selector, identity string, err error) {
+	selector, identity, err = b.firstVisible(ctx, selectors)
+	if err != nil {
+		return "", "", err
+	}
+	clickCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := chromedp.Run(clickCtx, chromedp.Click(selector, chromedp.ByQuery, chromedp.NodeVisible)); err != nil {
+		return "", "", fmt.Errorf("click %s: %w", selector, err)
+	}
+	return selector, identity, nil
+}
+
+// firstVisible returns the first selector matching a visible element, with
+// that element's data-identifier or data-email, without clicking it.
+func (b *Browser) firstVisible(ctx context.Context, selectors []string) (selector, identity string, err error) {
 	list, err := json.Marshal(selectors)
 	if err != nil {
 		return "", "", err
@@ -628,11 +678,6 @@ func (b *Browser) clickFirstVisible(ctx context.Context, selectors []string) (se
 	}
 	if found.Selector == "" {
 		return "", "", errNoVisibleMatch
-	}
-	clickCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := chromedp.Run(clickCtx, chromedp.Click(found.Selector, chromedp.ByQuery, chromedp.NodeVisible)); err != nil {
-		return "", "", fmt.Errorf("click %s: %w", found.Selector, err)
 	}
 	return found.Selector, found.Identity, nil
 }
