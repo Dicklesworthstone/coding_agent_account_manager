@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,15 @@ type PaneTracker struct {
 	ContinueSent bool                 // Enter sent to dismiss the post-login screen this cycle
 	SelectSends  int                  // login-method selections sent this cycle
 	GaveUp       bool                 // retries spent this rate-limit episode; left to a human (survives Reset)
+	// LimitedAccount and LimitReset describe this episode's limit: the
+	// account Claude Code was signed in with and the banner's reset. They
+	// survive Reset, so retried logins still report them.
+	LimitedAccount string
+	LimitReset     string
+	// HoldUntil is when the agent will have an account again after it
+	// declined because all were at their limit; no login is started in the
+	// pane before then. It survives Reset.
+	HoldUntil time.Time
 	LastOutput   string               // Cached output for duplicate detection
 	Cooldowns    map[string]time.Time // action -> cooldown expiry
 	mu           sync.RWMutex
@@ -134,6 +144,35 @@ func (t *PaneTracker) CountSelectSend() int {
 	defer t.mu.Unlock()
 	t.SelectSends++
 	return t.SelectSends
+}
+
+// SetLimit records the account that hit the limit and when it resets.
+func (t *PaneTracker) SetLimit(account, reset string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.LimitedAccount = account
+	t.LimitReset = reset
+}
+
+// GetLimit returns the account that hit the limit and when it resets.
+func (t *PaneTracker) GetLimit() (account, reset string) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.LimitedAccount, t.LimitReset
+}
+
+// SetHoldUntil keeps logins out of the pane until t.
+func (t *PaneTracker) SetHoldUntil(until time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.HoldUntil = until
+}
+
+// GetHoldUntil returns when logins may start in the pane again.
+func (t *PaneTracker) GetHoldUntil() time.Time {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.HoldUntil
 }
 
 // SetGaveUp records whether the pane was left for manual recovery.
@@ -319,6 +358,7 @@ var Patterns = struct {
 	LoginFailed      *regexp.Regexp
 	OptionOne        *regexp.Regexp
 	UsageLimitReset  *regexp.Regexp
+	LimitReset       *regexp.Regexp
 	CompactingBanner *regexp.Regexp
 	PressEnter       *regexp.Regexp
 	RateLimitMenu    *regexp.Regexp
@@ -368,6 +408,10 @@ var Patterns = struct {
 
 	// Extract reset time from rate limit message
 	UsageLimitReset: regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(\d+(?::\d+)?\s*[ap]m)`),
+
+	// The whole reset of a limit banner, up to the next "·" separator:
+	// "3pm (America/New_York)", "Oct 9, 3pm", "in 2h 13m"
+	LimitReset: regexp.MustCompile(`(?i)\bresets?\s+(?:at\s+)?([^\n·∙•]{1,60})`),
 
 	// "Conversation compacted · ctrl+o for history" or similar variants
 	// Matches with optional box-drawing characters, middot/bullet separators,
@@ -423,8 +467,22 @@ func DetectState(output string) (PaneState, map[string]string) {
 		if matches := Patterns.UsageLimitReset.FindAllStringSubmatch(normalizedOutput, -1); len(matches) > 0 {
 			metadata["reset_time"] = matches[len(matches)-1][1]
 		}
+		if reset := limitResetText(normalizedOutput[latest:]); reset != "" {
+			metadata["reset_text"] = reset
+		}
 	}
 	return state, metadata
+}
+
+// limitResetText returns the reset of the limit banner that starts output,
+// as Claude Code wrote it ("3pm (America/New_York)"), or "".
+func limitResetText(output string) string {
+	line, _, _ := strings.Cut(output, "\n")
+	m := Patterns.LimitReset.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(m[1]), ".")
 }
 
 // lastMatchStart returns the start of the last match of re in s, or -1.

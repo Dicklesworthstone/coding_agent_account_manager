@@ -550,3 +550,35 @@ func TestFixture_ClaudeInvalid(t *testing.T) {
 		t.Error("expected error for invalid JSON fixture")
 	}
 }
+
+func TestClaudeSignedInEmail(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	if got := ClaudeSignedInEmail(); got != "" {
+		t.Fatalf("no state file: got %q, want empty", got)
+	}
+
+	write := func(path, email string) {
+		t.Helper()
+		body := `{"numStartups": 3, "oauthAccount": {"accountUuid": "u", "emailAddress": "` + email + `"}}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(home, ".claude.json"), "home@example.com")
+	if got := ClaudeSignedInEmail(); got != "home@example.com" {
+		t.Fatalf("~/.claude.json: got %q", got)
+	}
+
+	// CLAUDE_CONFIG_DIR moves the state file into that directory.
+	cfg := filepath.Join(home, "alt")
+	if err := os.MkdirAll(cfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(filepath.Join(cfg, ".claude.json"), "alt@example.com")
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	if got := ClaudeSignedInEmail(); got != "alt@example.com" {
+		t.Fatalf("CLAUDE_CONFIG_DIR: got %q", got)
+	}
+}

@@ -374,11 +374,15 @@ GET /health                      (no token required)
 
 GET /auth/pending                (agents only: fetching claims each request)
   Response: [{ "id": "uuid", "pane_id": 123, "url": "...", "created_at": "...",
-               "claimed_at": "...", "status": "pending" }]
+               "claimed_at": "...", "status": "pending",
+               "limited_account": "alice@gmail.com",           (when known)
+               "limit_reset": "3pm (America/New_York)" }]
 
 POST /auth/complete              (alias: /auth/submit)
   Request: { "request_id": "uuid", "code": "XXXX-XXXX", "account": "alice@gmail.com" }
        or: { "request_id": "uuid", "error": "why the browser flow failed" }
+       or: { "request_id": "uuid", "error": "...", "retry_after": "2026-10-07T19:00:00Z" }
+           (declined: every account is at its limit; the pane is left until then)
   Response: 200 { "status": "accepted", "request_id": "uuid" }   (also for identical redelivery)
             400 invalid body, 401 bad token, 404 unknown request,
             409 different response already accepted, 410 request closed
@@ -557,6 +561,36 @@ config first and is idempotent.
 Account strategies: `lru` (default; never-used accounts first), `round_robin`,
 and `random`.
 
+#### Accounts at their limit
+
+When the coordinator detects a limit, it reads the account Claude Code is
+signed in with on that host: `oauthAccount.emailAddress` in
+`$CLAUDE_CONFIG_DIR/.claude.json`, or `~/.claude.json`. It sends that account
+and the banner's reset (for example `3pm (America/New_York)`) with the auth
+request as `limited_account` and `limit_reset`. The agent holds that account
+until the reset and never chooses it or falls back to it while held.
+- Resets it can read: a time with an optional date and zone, or `in 2h 13m`.
+  A time without a zone is read in the agent's local zone.
+- Otherwise the hold is five hours, Claude's session window. Holds are capped
+  at eight days.
+- Holds are kept with the account usage (`limited_until`), so they survive a
+  restart.
+
+When every configured account is held, the agent signs nothing in and opens no
+browser. It fails the request with `retry_after` set to the end of the first
+hold. The coordinator then:
+1. Closes Claude Code's login screen with Esc.
+2. Leaves the pane at its prompt, where Claude Code may continue on its own
+   once its limit resets.
+3. Starts no login there until `retry_after`.
+
+Without this, an exhausted set of accounts would be signed in over and over,
+each login hitting the limit again.
+
+A pane running with its own `CLAUDE_CONFIG_DIR` that the coordinator does not
+share is not covered. The coordinator reads its own state file, so it reports
+that file's account, which may not be the one that hit the limit.
+
 #### Responsibilities
 
 1. **HTTP Server**: Listen for auth requests from coordinator
@@ -569,10 +603,11 @@ and `random`.
 
 ```go
 type AccountUsage struct {
-    Email      string
-    LastUsed   time.Time
-    UseCount   int
-    LastResult string  // "success", "rate_limited", "error"
+    Email        string
+    LastUsed     time.Time
+    UseCount     int
+    LastResult   string    // "success", "failed", "undelivered"
+    LimitedUntil time.Time // passed over until then (usage limit)
 }
 
 // Storage: ~/.config/caam/account_usage.json

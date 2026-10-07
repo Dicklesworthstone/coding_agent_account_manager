@@ -653,6 +653,8 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 		a.processing[p.ID] = true
 		a.procMu.Unlock()
 
+		a.noteLimit(coord, p)
+
 		// Process in goroutine to not block other coordinators
 		a.inflight.Add(1)
 		go func(requestID, authURL string) {
@@ -665,6 +667,23 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 			a.procMu.Unlock()
 		}(p.ID, p.URL)
 	}
+}
+
+// noteLimit holds the account a request reports at its usage limit.
+func (a *MultiAgent) noteLimit(coord *CoordinatorEndpoint, p pendingRequest) {
+	if p.LimitedAccount == "" {
+		return
+	}
+	until := limitResetTime(p.LimitReset, time.Now())
+	a.mu.Lock()
+	held := holdAccount(a.accountUsage, a.config.Accounts, p.LimitedAccount, until)
+	a.mu.Unlock()
+	a.logger.Info("account at its usage limit; passing over it",
+		"coordinator", coord.Name,
+		"request_id", p.ID,
+		"account", held,
+		"until", until.Format(time.RFC3339))
+	go a.saveUsage()
 }
 
 // processAuthRequest completes one auth request from a coordinator and
@@ -689,7 +708,7 @@ func (a *MultiAgent) processAuthRequest(ctx context.Context, coord *CoordinatorE
 
 		// Report the failure so the pane stops waiting for a code.
 		if derr := deliverCompletion(ctx, coord.httpClient(), coord.URL, coord.Token,
-			completion{RequestID: requestID, Error: err.Error()}, a.delivery, a.logger.With("coordinator", coord.Name)); derr != nil {
+			failureCompletion(requestID, err), a.delivery, a.logger.With("coordinator", coord.Name)); derr != nil {
 			a.logger.Warn("failed to report OAuth failure",
 				"coordinator", coord.Name,
 				"request_id", requestID,
@@ -739,8 +758,19 @@ func (a *MultiAgent) runOAuth(ctx context.Context, authURL, requested string, on
 	account = requested
 	accounts := []string{requested}
 	if account == "" {
+		// Accounts at their usage limit are neither chosen nor fallen back
+		// to; with all of them there, signing in would only hit a limit.
+		a.mu.RLock()
+		available := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
+		if len(a.config.Accounts) > 0 && len(available) == 0 {
+			err = allLimitedError(a.config.Accounts, a.accountUsage)
+		}
+		a.mu.RUnlock()
+		if err != nil {
+			return "", "", "", err
+		}
 		account = a.selectAccount()
-		accounts = accountOrder(account, a.config.Accounts)
+		accounts = accountOrder(account, available)
 	}
 	if onStart != nil {
 		onStart(account)
@@ -769,12 +799,13 @@ func (a *MultiAgent) touchAccount(email string) {
 	usage.LastUsed = time.Now()
 }
 
-// selectAccount chooses which account to use based on strategy.
+// selectAccount chooses which account to use based on strategy, among the
+// accounts not at their usage limit.
 func (a *MultiAgent) selectAccount() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	accounts := a.config.Accounts
+	accounts := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
 	if len(accounts) == 0 {
 		return ""
 	}

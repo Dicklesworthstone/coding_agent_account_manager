@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +82,169 @@ type AccountUsage struct {
 	LastUsed   time.Time `json:"last_used"`
 	UseCount   int       `json:"use_count"`
 	LastResult string    `json:"last_result"` // success, failed
+	// LimitedUntil is when the account's usage limit lifts; until then it
+	// is not signed in again (signing a pane in with it would only hit the
+	// limit again).
+	LimitedUntil time.Time `json:"limited_until,omitzero"`
+}
+
+// defaultLimitHold is how long an account at its usage limit is passed over
+// when the limit's reset cannot be read: Claude's five-hour session window.
+const defaultLimitHold = 5 * time.Hour
+
+// maxLimitHold caps a hold; the longest limit, the weekly one, lifts within
+// a week.
+const maxLimitHold = 8 * 24 * time.Hour
+
+var (
+	resetZoneRe  = regexp.MustCompile(`\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+|UTC|GMT)\)`)
+	resetClockRe = regexp.MustCompile(`(?i)\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b`)
+	resetDateRe  = regexp.MustCompile(`(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b`)
+	resetInRe    = regexp.MustCompile(`(?i)^in\s+(?:(\d+)\s*d\w*\s*)?(?:(\d+)\s*h\w*\s*)?(?:(\d+)\s*m\w*)?\s*$`)
+)
+
+// limitResetTime returns when a usage limit lifts, from the reset Claude Code
+// printed in its banner: "3pm (America/New_York)", "Oct 9, 3:30pm
+// (Europe/Paris)", "Oct 9", "in 2h 13m". A time without a zone is read in
+// the agent's local zone. Text it cannot read gives now+defaultLimitHold. The
+// result is never before now nor more than maxLimitHold after it.
+func limitResetTime(reset string, now time.Time) time.Time {
+	reset = strings.TrimSpace(reset)
+	t, ok := parseLimitReset(reset, now)
+	switch {
+	case !ok:
+		return now.Add(defaultLimitHold)
+	case t.Before(now):
+		return now
+	case t.After(now.Add(maxLimitHold)):
+		return now.Add(maxLimitHold)
+	}
+	return t
+}
+
+func parseLimitReset(reset string, now time.Time) (time.Time, bool) {
+	if m := resetInRe.FindStringSubmatch(reset); m != nil && (m[1] != "" || m[2] != "" || m[3] != "") {
+		d := time.Duration(atoiOr0(m[1]))*24*time.Hour + time.Duration(atoiOr0(m[2]))*time.Hour + time.Duration(atoiOr0(m[3]))*time.Minute
+		return now.Add(d), true
+	}
+
+	loc := time.Local
+	if m := resetZoneRe.FindStringSubmatch(reset); m != nil {
+		if l, err := time.LoadLocation(m[1]); err == nil {
+			loc = l
+		}
+	}
+	local := now.In(loc)
+
+	clock := resetClockRe.FindStringSubmatch(reset)
+	hour, minute := 0, 0
+	if clock != nil {
+		hour = atoiOr0(clock[1]) % 12
+		minute = atoiOr0(clock[2])
+		if strings.EqualFold(clock[3], "p") {
+			hour += 12
+		}
+		if minute > 59 {
+			return time.Time{}, false
+		}
+	}
+
+	if date := resetDateRe.FindStringSubmatch(reset); date != nil {
+		month, err := time.Parse("Jan", strings.ToUpper(date[1][:1])+strings.ToLower(date[1][1:3]))
+		day := atoiOr0(date[2])
+		if err != nil || day < 1 || day > 31 {
+			return time.Time{}, false
+		}
+		t := time.Date(local.Year(), month.Month(), day, hour, minute, 0, 0, loc)
+		// "Jan 2" read in late December is next year's.
+		if t.Before(local.Add(-48 * time.Hour)) {
+			t = t.AddDate(1, 0, 0)
+		}
+		return t, true
+	}
+
+	if clock == nil {
+		return time.Time{}, false
+	}
+	t := time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, loc)
+	if !t.After(local) {
+		t = t.AddDate(0, 0, 1)
+	}
+	return t, true
+}
+
+func atoiOr0(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
+}
+
+// unheldAccounts returns, in order, the accounts not held at their usage
+// limit at now.
+func unheldAccounts(accounts []string, usage map[string]*AccountUsage, now time.Time) []string {
+	var out []string
+	for _, acc := range accounts {
+		if u, ok := usage[acc]; ok && u.LimitedUntil.After(now) {
+			continue
+		}
+		out = append(out, acc)
+	}
+	return out
+}
+
+// holdAccount records that email is at its usage limit until until, keeping
+// a later hold already recorded. A configured account matching email in any
+// case is the one held.
+func holdAccount(usage map[string]*AccountUsage, configured []string, email string, until time.Time) string {
+	for _, acc := range configured {
+		if strings.EqualFold(acc, email) {
+			email = acc
+			break
+		}
+	}
+	u, ok := usage[email]
+	if !ok {
+		u = &AccountUsage{Email: email}
+		usage[email] = u
+	}
+	if until.After(u.LimitedUntil) {
+		u.LimitedUntil = until
+	}
+	return email
+}
+
+// accountsLimitedError is the agent declining a sign-in: every configured
+// account is at its usage limit, the first until Until.
+type accountsLimitedError struct {
+	Accounts int
+	Until    time.Time
+}
+
+func (e *accountsLimitedError) Error() string {
+	return fmt.Sprintf("all %d configured accounts are at their usage limit (the first lifts at %s); not signing in",
+		e.Accounts, e.Until.Local().Format("Jan 2 15:04 MST"))
+}
+
+// allLimitedError reports that every configured account is held, and when
+// the first hold lifts.
+func allLimitedError(accounts []string, usage map[string]*AccountUsage) error {
+	var first time.Time
+	for _, acc := range accounts {
+		if u, ok := usage[acc]; ok && (first.IsZero() || u.LimitedUntil.Before(first)) {
+			first = u.LimitedUntil
+		}
+	}
+	return &accountsLimitedError{Accounts: len(accounts), Until: first}
+}
+
+// failureCompletion reports err for a request; a decline because every
+// account is at its limit says when to ask again.
+func failureCompletion(requestID string, err error) completion {
+	c := completion{RequestID: requestID, Error: err.Error()}
+	var limited *accountsLimitedError
+	if errors.As(err, &limited) {
+		c.RetryAfter = limited.Until
+	}
+	return c
 }
 
 // oauthCompleter completes an OAuth flow and returns the challenge code and
@@ -130,6 +296,8 @@ type completion struct {
 	Code      string `json:"code,omitempty"`
 	Account   string `json:"account,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// RetryAfter, with Error, is when an account frees up again.
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 // DeliveryRejectedError is a final coordinator rejection of an auth result,
@@ -239,6 +407,10 @@ type pendingRequest struct {
 	PaneID    int       `json:"pane_id"`
 	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"created_at"`
+	// LimitedAccount hit its usage limit in the pane, which LimitReset
+	// lifts ("3pm (America/New_York)"); both are empty when unknown.
+	LimitedAccount string `json:"limited_account,omitempty"`
+	LimitReset     string `json:"limit_reset,omitempty"`
 }
 
 // fetchPending lists a coordinator's pending auth requests.
@@ -473,8 +645,25 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		a.noteLimit(p)
 		a.processAuthRequest(ctx, p.ID, p.URL)
 	}
+}
+
+// noteLimit holds the account a request reports at its usage limit.
+func (a *Agent) noteLimit(p pendingRequest) {
+	if p.LimitedAccount == "" {
+		return
+	}
+	until := limitResetTime(p.LimitReset, time.Now())
+	a.mu.Lock()
+	held := holdAccount(a.accountUsage, a.config.Accounts, p.LimitedAccount, until)
+	a.mu.Unlock()
+	a.logger.Info("account at its usage limit; passing over it",
+		"request_id", p.ID,
+		"account", held,
+		"until", until.Format(time.RFC3339))
+	go a.saveUsage()
 }
 
 // processAuthRequest completes one auth request and delivers the result.
@@ -496,7 +685,7 @@ func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL strin
 
 		// Report the failure so the pane stops waiting for a code.
 		if derr := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
-			completion{RequestID: requestID, Error: err.Error()}, a.delivery, a.logger); derr != nil {
+			failureCompletion(requestID, err), a.delivery, a.logger); derr != nil {
 			a.logger.Warn("failed to report OAuth failure", "request_id", requestID, "error", derr)
 		}
 
@@ -539,8 +728,19 @@ func (a *Agent) runOAuth(ctx context.Context, authURL, requested string, onStart
 	account = requested
 	accounts := []string{requested}
 	if account == "" {
+		// Accounts at their usage limit are neither chosen nor fallen back
+		// to; with all of them there, signing in would only hit a limit.
+		a.mu.RLock()
+		available := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
+		if len(a.config.Accounts) > 0 && len(available) == 0 {
+			err = allLimitedError(a.config.Accounts, a.accountUsage)
+		}
+		a.mu.RUnlock()
+		if err != nil {
+			return "", "", "", err
+		}
 		account = a.selectAccount()
-		accounts = accountOrder(account, a.config.Accounts)
+		accounts = accountOrder(account, available)
 	}
 	if onStart != nil {
 		onStart(account)
@@ -569,12 +769,13 @@ func (a *Agent) touchAccount(email string) {
 	usage.LastUsed = time.Now()
 }
 
-// selectAccount chooses which account to use based on strategy.
+// selectAccount chooses which account to use based on strategy, among the
+// accounts not at their usage limit.
 func (a *Agent) selectAccount() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	accounts := a.config.Accounts
+	accounts := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
 	if len(accounts) == 0 {
 		return "" // Will use whatever account is currently logged in
 	}

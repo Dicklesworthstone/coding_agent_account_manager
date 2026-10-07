@@ -235,10 +235,11 @@ func (a *APIServer) handleGetPending(w http.ResponseWriter, r *http.Request) {
 
 // CompleteRequest is the request body for /auth/complete.
 type CompleteRequest struct {
-	RequestID string `json:"request_id"`
-	Code      string `json:"code"`
-	Account   string `json:"account"`
-	Error     string `json:"error,omitempty"`
+	RequestID  string    `json:"request_id"`
+	Code       string    `json:"code"`
+	Account    string    `json:"account"`
+	Error      string    `json:"error,omitempty"`
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 // CompleteAck acknowledges an accepted (or identically redelivered) response.

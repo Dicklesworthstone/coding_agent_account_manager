@@ -137,6 +137,27 @@ func fillFromClaudeSettings(identity *Identity, candidates []string) {
 	}
 }
 
+// ClaudeSignedInEmail returns the email of the account Claude Code is signed
+// in with, from the oauthAccount block of its state file:
+// $CLAUDE_CONFIG_DIR/.claude.json when that is set, ~/.claude.json otherwise.
+// It returns "" when the file or the block is missing.
+func ClaudeSignedInEmail() string {
+	path := ""
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		path = filepath.Join(dir, claudeSettingsFile)
+	} else if home, err := os.UserHomeDir(); err == nil {
+		path = filepath.Join(home, claudeSettingsFile)
+	}
+	if path == "" {
+		return ""
+	}
+	account, ok := readClaudeOAuthAccount(path)
+	if !ok {
+		return ""
+	}
+	return account.EmailAddress
+}
+
 // readClaudeOAuthAccount returns the oauthAccount block of the .claude.json
 // at path. ok is false when the file is missing, unparseable, or has no
 // oauthAccount.

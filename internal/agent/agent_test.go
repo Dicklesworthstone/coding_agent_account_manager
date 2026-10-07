@@ -387,3 +387,38 @@ func TestAccountOrder(t *testing.T) {
 		t.Fatalf("accountOrder = %q, want the selection first, then the others once", got)
 	}
 }
+
+func TestLimitResetTime(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip("no tz database")
+	}
+	paris, _ := time.LoadLocation("Europe/Paris")
+	now := time.Date(2026, 10, 7, 10, 0, 0, 0, ny)
+	for _, tc := range []struct {
+		reset string
+		now   time.Time
+		want  time.Time
+	}{
+		{"3pm (America/New_York)", now, time.Date(2026, 10, 7, 15, 0, 0, 0, ny)},
+		// A time already past today is tomorrow's.
+		{"9am (America/New_York)", now, time.Date(2026, 10, 8, 9, 0, 0, 0, ny)},
+		{"12:30am (America/New_York)", now, time.Date(2026, 10, 8, 0, 30, 0, 0, ny)},
+		{"Oct 9, 3:30pm (Europe/Paris)", now, time.Date(2026, 10, 9, 15, 30, 0, 0, paris)},
+		{"Oct 9 (America/New_York)", now, time.Date(2026, 10, 9, 0, 0, 0, 0, ny)},
+		// "Jan 2" read at the end of December is next year's.
+		{"Jan 2, 3pm (America/New_York)", time.Date(2026, 12, 30, 12, 0, 0, 0, ny), time.Date(2027, 1, 2, 15, 0, 0, 0, ny)},
+		{"in 2h 13m", now, now.Add(2*time.Hour + 13*time.Minute)},
+		{"in 45m", now, now.Add(45 * time.Minute)},
+		// Unreadable: the session window.
+		{"", now, now.Add(defaultLimitHold)},
+		{"soon", now, now.Add(defaultLimitHold)},
+		// A reset already past holds nothing; one far off is capped.
+		{"Oct 6, 3pm (America/New_York)", now, now},
+		{"Dec 1, 3pm (America/New_York)", now, now.Add(maxLimitHold)},
+	} {
+		if got := limitResetTime(tc.reset, tc.now); !got.Equal(tc.want) {
+			t.Errorf("limitResetTime(%q) = %v, want %v", tc.reset, got, tc.want)
+		}
+	}
+}

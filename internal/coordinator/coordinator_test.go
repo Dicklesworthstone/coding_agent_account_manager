@@ -1883,6 +1883,59 @@ func TestUsageLimitMenuIsClosedNotAnswered(t *testing.T) {
 	}
 }
 
+func TestDetectStateReadsTheBannersReset(t *testing.T) {
+	for _, tc := range []struct{ text, reset string }{
+		{"  ⎿  You've hit your session limit · resets 3pm (America/New_York)", "3pm (America/New_York)"},
+		{"You've hit your weekly limit · resets Oct 9, 3pm (Europe/Paris) · progress saved", "Oct 9, 3pm (Europe/Paris)"},
+		{"Claude usage limit reached. Your limit will reset at 5pm (Europe/Paris).", "5pm (Europe/Paris)"},
+		{"You've hit your monthly spend limit · raise it at claude.ai/settings · your session limit resets 3pm", "3pm"},
+		// The latest banner counts, not one further up.
+		{"You've hit your limit · resets 1pm\n> continue\nYou've hit your session limit · resets 6pm", "6pm"},
+	} {
+		state, meta := DetectState(tc.text)
+		if state != StateRateLimited || meta["reset_text"] != tc.reset {
+			t.Errorf("DetectState(%q) = %v, reset %q; want RATE_LIMITED, %q", tc.text, state, meta["reset_text"], tc.reset)
+		}
+	}
+}
+
+// TestAuthRequestNamesTheLimitedAccount: the request tells the agent which
+// account hit its limit and when that resets, also after a retried login.
+func TestAuthRequestNamesTheLimitedAccount(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}, output: "  ⎿  You've hit your session limit · resets 3pm (America/New_York)"}
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	cfg.LoginCooldown = time.Millisecond
+	coord := New(cfg)
+	coord.signedInAccount = func() string { return "limited@example.com" }
+	ctx := context.Background()
+
+	coord.pollPanes(ctx)
+	tracker := coord.trackers[1]
+	// A retry resets the tracker; the episode's limit must survive it.
+	tracker.Reset()
+	tracker.SetState(StateRateLimited)
+
+	client.output = "Browse to https://claude.ai/oauth/authorize?code=true&state=s\nPaste code here if prompted >"
+	coord.pollPanes(ctx)
+	coord.pollPanes(ctx)
+
+	pending := coord.ClaimPendingRequests()
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d requests, want 1", len(pending))
+	}
+	if got := pending[0]; got.LimitedAccount != "limited@example.com" || got.LimitReset != "3pm (America/New_York)" {
+		t.Fatalf("request limit = %q / %q", got.LimitedAccount, got.LimitReset)
+	}
+	data, err := json.Marshal(pending[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"limited_account":"limited@example.com"`) || !strings.Contains(string(data), `"limit_reset":"3pm (America/New_York)"`) {
+		t.Fatalf("pending JSON lacks the limit: %s", data)
+	}
+}
+
 // TestTmuxDeliversLoginKeys: the control keys reach a raw-mode program as the
 // bytes the keyboard sends, each in order.
 func TestTmuxDeliversLoginKeys(t *testing.T) {

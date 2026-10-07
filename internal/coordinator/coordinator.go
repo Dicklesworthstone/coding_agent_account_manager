@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/google/uuid"
 )
 
@@ -266,6 +267,11 @@ type AuthRequest struct {
 	// ClaimedAt is when an agent first fetched the request. AuthTimeout runs
 	// from here: until an agent is around, the request simply waits.
 	ClaimedAt time.Time `json:"claimed_at,omitzero"`
+	// LimitedAccount is the account Claude Code was signed in with when the
+	// pane hit its limit, and LimitReset the banner's reset ("3pm
+	// (America/New_York)"); the agent passes over that account until then.
+	LimitedAccount string `json:"limited_account,omitempty"`
+	LimitReset     string `json:"limit_reset,omitempty"`
 
 	// response is the first valid response accepted for this request.
 	response *AuthResponse
@@ -278,6 +284,10 @@ type AuthResponse struct {
 	Code      string `json:"code"`
 	Account   string `json:"account"`
 	Error     string `json:"error,omitempty"`
+	// RetryAfter, with an Error, is when the agent will have an account
+	// again: it declined because every account it may use is at its usage
+	// limit. The pane is left alone until then.
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 // Coordinator manages pane monitoring and auth recovery.
@@ -293,6 +303,10 @@ type Coordinator struct {
 	doneCh     chan struct{}
 	running    bool
 	runID      string // Correlation ID for this coordinator run
+
+	// signedInAccount reports the account Claude Code is signed in with on
+	// this host, so a request can tell the agent which account hit its limit.
+	signedInAccount func() string
 
 	// Callbacks
 	OnAuthRequest  func(req *AuthRequest)
@@ -353,6 +367,8 @@ func New(config Config) *Coordinator {
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		runID:      runID,
+
+		signedInAccount: identity.ClaudeSignedInEmail,
 	}
 }
 
@@ -546,6 +562,13 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		c.handleResumingState(ctx, tracker, output)
 
 	case StateFailed:
+		// The agent has no account until the hold ends: close the login
+		// screen and leave the pane at its prompt (where Claude Code may
+		// itself continue once its limit resets) instead of retrying.
+		if until := tracker.GetHoldUntil(); time.Now().Before(until) {
+			c.standDown(ctx, tracker, until)
+			return
+		}
 		// After the failure has been visible for StateTimeout, retry the
 		// login (a slow agent or an expired code is often transient) up
 		// to MaxLoginRetries times per rate-limit episode, then leave the
@@ -555,6 +578,25 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 			c.retryOrGiveUp(ctx, tracker, output)
 		}
 	}
+}
+
+// standDown closes Claude Code's login screen in a pane the agent cannot sign
+// in before until, and returns the pane to IDLE. Esc cancels the login;
+// Claude Code shows "Esc to cancel" on each of its screens.
+func (c *Coordinator) standDown(ctx context.Context, tracker *PaneTracker, until time.Time) {
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, KeyEscape, true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateFailed.String(),
+			"inject_type", "cancel_login",
+			"error", err,
+			"action", "inject_failed")
+	}
+	tracker.Reset()
+	c.logger.Warn("no account available; leaving the pane until the first limit lifts",
+		"pane_id", tracker.PaneID,
+		"until", until.Format(time.RFC3339),
+		"action", "stand_down")
 }
 
 // retryOrGiveUp re-injects /login into a failed pane while its retry budget
@@ -618,6 +660,15 @@ func atBottom(output string, re *regexp.Regexp) bool {
 func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
 
+	if detected == StateRateLimited && time.Now().Before(tracker.GetHoldUntil()) {
+		// No account until the hold ends. Look at the pane again on the next
+		// poll even if its screen stays the same, so the login starts then.
+		tracker.mu.Lock()
+		tracker.LastOutput = ""
+		tracker.mu.Unlock()
+		return
+	}
+
 	if detected == StateRateLimited {
 		c.logger.Info("state transition",
 			"pane_id", tracker.PaneID,
@@ -630,6 +681,14 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 		// A new rate-limit episode gets a fresh retry budget.
 		tracker.SetRetryCount(0)
 		tracker.SetGaveUp(false)
+		// Tell the agent which account hit its limit, so it is not the one
+		// signed in again.
+		limited := c.signedInAccount()
+		tracker.SetLimit(limited, metadata["reset_text"])
+		c.logger.Info("usage limit",
+			"pane_id", tracker.PaneID,
+			"account", limited,
+			"resets", metadata["reset_text"])
 
 		// Check login cooldown before injecting
 		if tracker.IsOnCooldown("login") {
@@ -914,12 +973,15 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 
 	if oauthURL != "" && tracker.GetRequestID() == "" {
 		// Create auth request for local agent
+		limited, reset := tracker.GetLimit()
 		req := &AuthRequest{
-			ID:        uuid.New().String(),
-			PaneID:    tracker.PaneID,
-			URL:       oauthURL,
-			CreatedAt: time.Now(),
-			Status:    RequestPending,
+			ID:             uuid.New().String(),
+			PaneID:         tracker.PaneID,
+			URL:            oauthURL,
+			CreatedAt:      time.Now(),
+			Status:         RequestPending,
+			LimitedAccount: limited,
+			LimitReset:     reset,
 		}
 
 		c.mu.Lock()
@@ -1200,6 +1262,8 @@ func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
 	resp.Code = strings.TrimSpace(resp.Code)
 	resp.Account = strings.TrimSpace(resp.Account)
 	resp.Error = strings.TrimSpace(resp.Error)
+	// One instant, one value: a redelivered response compares equal.
+	resp.RetryAfter = resp.RetryAfter.UTC().Truncate(time.Second)
 	if resp.RequestID == "" || (resp.Code == "") == (resp.Error == "") {
 		return ErrInvalidAuthResponse
 	}
@@ -1239,6 +1303,9 @@ func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
 	req.response = &accepted
 	if resp.Error != "" {
 		tracker.SetErrorMessage(resp.Error)
+		if !resp.RetryAfter.IsZero() {
+			tracker.SetHoldUntil(resp.RetryAfter)
+		}
 		tracker.SetState(StateFailed)
 		c.closeRequestLocked(resp.RequestID, RequestFailed)
 	} else {

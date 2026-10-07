@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -488,6 +489,8 @@ func (p *scriptedPane) SendText(ctx context.Context, paneID int, text string, no
 	switch {
 	case text == "/login\n":
 		p.loggedIn = true
+	case text == coordinator.KeyEscape:
+		p.loggedIn = false // Esc cancels the login
 	case p.loggedIn && strings.HasPrefix(text, "CODE"):
 		p.codes = append(p.codes, text)
 	}
@@ -1197,4 +1200,146 @@ func TestRecoveryEndToEndInRealTmuxPane(t *testing.T) {
 			t.Errorf("pane received %s = %q, want %q", name, got, want)
 		}
 	}
+}
+
+// recordingOAuth records the accounts each flow was offered.
+type recordingOAuth struct {
+	mu      sync.Mutex
+	offered [][]string
+}
+
+func (r *recordingOAuth) CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.offered = append(r.offered, append([]string(nil), accounts...))
+	return "CODE-x", accounts[0], nil
+}
+
+// TestAccountAtItsLimitIsPassedOver: the account a pane reports at its limit
+// is neither chosen nor offered as a fallback until its reset.
+func TestAccountAtItsLimitIsPassedOver(t *testing.T) {
+	mcfg := DefaultMultiConfig()
+	mcfg.Accounts = []string{"a@example.com", "b@example.com", "c@example.com"}
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+	oauth := &recordingOAuth{}
+	ma.oauth = oauth
+
+	// Reported in another case than configured.
+	ma.noteLimit(&CoordinatorEndpoint{Name: "remote"}, pendingRequest{ID: "r1", LimitedAccount: "A@Example.com", LimitReset: "in 1h"})
+
+	for range 4 {
+		if _, _, _, err := ma.runOAuth(context.Background(), "https://claude.ai/oauth/authorize?x", "", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, offered := range oauth.offered {
+		if slices.Contains(offered, "a@example.com") || len(offered) != 2 {
+			t.Fatalf("flow offered %q; the limited account must not be among them", offered)
+		}
+	}
+
+	// The hold is saved with the usage, so a restarted agent keeps it.
+	ma.mu.RLock()
+	until := ma.accountUsage["a@example.com"].LimitedUntil
+	ma.mu.RUnlock()
+	if d := time.Until(until); d < 50*time.Minute || d > 70*time.Minute {
+		t.Fatalf("hold lasts %v, want about an hour", d)
+	}
+	data, err := json.Marshal(ma.accountUsage["a@example.com"])
+	if err != nil || !strings.Contains(string(data), `"limited_until"`) {
+		t.Fatalf("usage JSON %s lacks the hold (%v)", data, err)
+	}
+}
+
+// TestDeclineWhenEveryAccountIsLimitedLeavesThePane: with every account at
+// its limit the agent signs nothing in, tells the coordinator when an account
+// frees up, and the coordinator closes the login and leaves the pane alone
+// instead of retrying /login against the limit.
+func TestDeclineWhenEveryAccountIsLimitedLeavesThePane(t *testing.T) {
+	pane := &scriptedPane{}
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = pane
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LoginCooldown = time.Millisecond
+	cfg.StateTimeout = 20 * time.Millisecond
+	cfg.Logger = discardLogger()
+	coord := coordinator.New(cfg)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardLogger())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coord.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	endpoint := &CoordinatorEndpoint{Name: "remote", URL: "http://" + listener.Addr().String()}
+	var pending []pendingRequest
+	for deadline := time.Now().Add(5 * time.Second); len(pending) == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("coordinator never published an auth request")
+		}
+		if pending, err = fetchPending(ctx, endpoint.httpClient(), endpoint.URL, endpoint.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mcfg := DefaultMultiConfig()
+	mcfg.Accounts = []string{"a@example.com", "b@example.com"}
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+	ma.delivery = fastDelivery
+	oauth := &fakeOAuth{code: "CODE-1", account: "a@example.com"}
+	ma.oauth = oauth
+	ma.noteLimit(endpoint, pendingRequest{ID: "earlier", LimitedAccount: "a@example.com", LimitReset: "in 2h"})
+	ma.noteLimit(endpoint, pendingRequest{ID: "earlier", LimitedAccount: "b@example.com", LimitReset: "in 1h"})
+	var declined error
+	ma.OnAuthFailed = func(c, account string, err error) { declined = err }
+
+	ma.processAuthRequest(ctx, endpoint, pending[0].ID, pending[0].URL)
+
+	if oauth.calls.Load() != 0 {
+		t.Fatal("Chrome was opened although every account is at its limit")
+	}
+	var limited *accountsLimitedError
+	if !errors.As(declined, &limited) || time.Until(limited.Until) > 70*time.Minute {
+		t.Fatalf("decline = %v; want an accountsLimitedError lifting in about an hour (the earliest hold)", declined)
+	}
+
+	// The coordinator closes the login screen and does not try again while
+	// no account is free.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		pane.mu.Lock()
+		closed := slices.Contains(pane.sent, coordinator.KeyEscape) && !pane.loggedIn
+		pane.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("login screen never closed; sent %q", pane.sent)
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // many polls, with the limit banner back on screen
+	pane.mu.Lock()
+	defer pane.mu.Unlock()
+	if logins := countSent(pane.sent, "/login\n"); logins != 1 {
+		t.Fatalf("/login typed %d times; a pane with no free account must be left alone (sent %q)", logins, pane.sent)
+	}
+}
+
+func countSent(sent []string, text string) int {
+	n := 0
+	for _, s := range sent {
+		if s == text {
+			n++
+		}
+	}
+	return n
 }
