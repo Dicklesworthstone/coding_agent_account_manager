@@ -751,19 +751,25 @@ func tunnelProxy(t *testing.T, handler http.Handler) string {
 	return proxy.URL
 }
 
-// oauthFixture plays the Claude Code OAuth flow for a browser that is not
-// signed in to Claude: authorize -> Claude login -> "Continue with Google"
-// -> Google account chooser -> consent -> code callback. Its markup follows
-// the real pages where it matters: the login page's return URL mentions
-// "authorize" and its submit button belongs to the email form, Google marks
-// accounts with data-identifier only, and the consent button is not a
-// submit button. With googleSignedOut, Google asks for an email instead of
-// offering accounts.
+// oauthFixture plays the Claude Code OAuth flow: authorize -> (no Claude
+// session) Claude login -> "Continue with Google" -> Google account chooser
+// -> Claude session for the chosen account -> consent -> code callback.
+// Claude sessions are a real cookie, so clearing claude.ai cookies signs the
+// browser out of Claude. Its markup follows the real pages where it matters:
+// the login page's return URL mentions "authorize" and its submit button
+// belongs to the email form, Google marks accounts with data-identifier
+// only, the consent page names the signed-in account (next to a support
+// address), and its button is not a submit button. With googleSignedOut,
+// Google asks for an email instead of offering accounts; claudeSessionAs is
+// a Claude session the browser already has on its first visit.
 type oauthFixture struct {
 	googleSignedOut bool
+	claudeSessionAs string
 
 	mu          sync.Mutex
-	chosen      []string
+	sessionUsed bool
+	chosen      []string // accounts picked in Google's chooser
+	approved    []string // accounts whose consent was granted
 	emailSubmit int
 }
 
@@ -771,6 +777,28 @@ func (f *oauthFixture) choices() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.chosen...)
+}
+
+func (f *oauthFixture) approvals() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.approved...)
+}
+
+// claudeSession returns the request's Claude account, starting the
+// preexisting session on the first visit.
+func (f *oauthFixture) claudeSession(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie("sessionKey"); err == nil && c.Value != "" {
+		return c.Value
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.claudeSessionAs == "" || f.sessionUsed {
+		return ""
+	}
+	f.sessionUsed = true
+	http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: f.claudeSessionAs, Path: "/", Secure: true})
+	return f.claudeSessionAs
 }
 
 func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -783,7 +811,14 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	switch host + r.URL.Path {
 	case "claude.ai/oauth/authorize":
-		http.Redirect(w, r, "https://claude.ai/login?returnTo="+url.QueryEscape("/oauth/authorize?state="+q.Get("state")), http.StatusFound)
+		account := f.claudeSession(w, r)
+		if account == "" {
+			http.Redirect(w, r, "https://claude.ai/login?returnTo="+url.QueryEscape("/oauth/authorize?state="+q.Get("state")), http.StatusFound)
+			return
+		}
+		fmt.Fprintf(w, `<html><body><p>Claude Code would like to connect to your Claude account.</p>
+<p>Signed in as %s</p><p>Questions? Contact support@anthropic.com</p>
+<button type="button" aria-label="Allow access" onclick="location.href='/oauth/approve?state=%s'">Authorize</button></body></html>`, account, state)
 	case "claude.ai/login":
 		ret, _ := url.Parse(q.Get("returnTo"))
 		state := url.QueryEscape(ret.Query().Get("state"))
@@ -797,6 +832,13 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.emailSubmit++
 		f.mu.Unlock()
 		fmt.Fprint(w, `<html><body>Check your email</body></html>`)
+	case "claude.ai/login/google/callback":
+		account := q.Get("account")
+		f.mu.Lock()
+		f.chosen = append(f.chosen, account)
+		f.mu.Unlock()
+		http.SetCookie(w, &http.Cookie{Name: "sessionKey", Value: account, Path: "/", Secure: true})
+		http.Redirect(w, r, "/oauth/authorize?state="+state, http.StatusFound)
 	case "accounts.google.com/v3/signin/identifier":
 		fmt.Fprint(w, `<html><body><h1>Sign in</h1><input type="email" aria-label="Email or phone"><button type="button">Next</button></body></html>`)
 	case "accounts.google.com/v3/signin/accountchooser":
@@ -807,14 +849,14 @@ func (f *oauthFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><body><h1>Choose an account</h1><ul>
 <li><div role="link" data-identifier="a@example.com" onclick="pick(this)">Alice a@example.com</div></li>
 <li><div role="link" data-identifier="b@example.com" onclick="pick(this)">Bob b@example.com</div></li>
-</ul><script>function pick(el){location.href="https://claude.ai/oauth/consent?state=%s&account="+encodeURIComponent(el.dataset.identifier)}</script></body></html>`, state)
-	case "claude.ai/oauth/consent":
-		f.mu.Lock()
-		f.chosen = append(f.chosen, q.Get("account"))
-		f.mu.Unlock()
-		fmt.Fprintf(w, `<html><body><p>Claude Code would like to connect to your Claude account.</p>
-<button type="button" aria-label="Allow access" onclick="location.href='/oauth/approve?state=%s'">Authorize</button></body></html>`, state)
+</ul><script>function pick(el){location.href="https://claude.ai/login/google/callback?state=%s&account="+encodeURIComponent(el.dataset.identifier)}</script></body></html>`, state)
 	case "claude.ai/oauth/approve":
+		c, _ := r.Cookie("sessionKey")
+		f.mu.Lock()
+		if c != nil {
+			f.approved = append(f.approved, c.Value)
+		}
+		f.mu.Unlock()
 		http.Redirect(w, r, "https://console.anthropic.com/oauth/code/callback?code=fixture-code-123&state="+state, http.StatusFound)
 	case "console.anthropic.com/oauth/code/callback":
 		fmt.Fprint(w, `<html><body><p>Paste this into Claude Code</p></body></html>`)
@@ -922,5 +964,54 @@ func TestStuckFlowError(t *testing.T) {
 		if strings.Contains(msg, "state=") {
 			t.Errorf("stuckFlowError(%q) leaks the query: %q", raw, msg)
 		}
+	}
+}
+
+func TestCompleteOAuthInChromeSwitchesFromAnotherClaudeAccount(t *testing.T) {
+	// The profile is still signed in to Claude as a@, which would approve
+	// a@ again (likely the account that just hit its limit).
+	fixture := &oauthFixture{claudeSessionAs: "a@example.com"}
+	b := fixtureBrowser(t, fixture)
+
+	code, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-9", "b@example.com")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
+	}
+	if code != "fixture-code-123#st-9" || account != "b@example.com" {
+		t.Fatalf("code=%q account=%q, want b@example.com's code", code, account)
+	}
+	if got := fixture.approvals(); len(got) != 1 || got[0] != "b@example.com" {
+		t.Fatalf("consent granted for %q, want only b@example.com", got)
+	}
+	if got := fixture.choices(); len(got) != 1 || got[0] != "b@example.com" {
+		t.Fatalf("Google chooser picks = %q", got)
+	}
+}
+
+func TestCompleteOAuthInChromeKeepsMatchingClaudeSession(t *testing.T) {
+	fixture := &oauthFixture{claudeSessionAs: "b@example.com"}
+	b := fixtureBrowser(t, fixture)
+
+	code, account, err := b.CompleteOAuth(context.Background(),
+		"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st-3", "b@example.com")
+	if err != nil {
+		t.Fatalf("CompleteOAuth: %v", err)
+	}
+	if code != "fixture-code-123#st-3" || account != "b@example.com" {
+		t.Fatalf("code=%q account=%q", code, account)
+	}
+	if got := fixture.choices(); len(got) != 0 {
+		t.Fatalf("signed in again (%q) although Claude already had the selected account", got)
+	}
+	if got := fixture.approvals(); len(got) != 1 || got[0] != "b@example.com" {
+		t.Fatalf("approvals = %q", got)
+	}
+}
+
+func TestShownAccounts(t *testing.T) {
+	text := "Signed in as Bob.Smith@Example.com\nNeed help? support@anthropic.com or privacy@claude.ai\nbob.smith@example.com"
+	if got := shownAccounts(text); len(got) != 1 || got[0] != "bob.smith@example.com" {
+		t.Fatalf("shownAccounts = %q, want the one account, without Anthropic addresses", got)
 	}
 }

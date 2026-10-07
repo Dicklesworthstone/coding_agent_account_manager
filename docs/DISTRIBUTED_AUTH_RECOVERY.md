@@ -573,7 +573,12 @@ code (at most 10 steps, 90 seconds):
    (by its `data-identifier`); if that account is not signed in to
    the profile, the first offered account is used and reported as the one
    used, so usage tracking stays truthful.
-4. **Consent page**: clicks the approve button.
+4. **Consent page**: clicks the approve button. Claude's authorize page
+   approves whatever Claude account the profile is signed in to, without
+   asking Google, so when it names a different account than the strategy
+   chose, the agent first deletes the claude.ai cookies (Google sessions
+   stay) and signs in again through Google with the chosen account, once
+   per flow. The account the page names is reported as the one used.
 
 Each click first checks that a matching element is visible, so an absent
 selector costs one page evaluation rather than the flow's deadline. A flow

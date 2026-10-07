@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
@@ -228,6 +229,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 
 	// Check current state and handle accordingly
 	var lastURL string
+	switchedClaudeAccount := false
 	for attempt := 0; attempt < 10; attempt++ {
 		var currentURL string
 		var pageHTML string
@@ -258,6 +260,31 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			if code = extractChallengeCode(pageHTML); code != "" {
 				b.logger.Info("extracted challenge code from code page")
 				return code, usedAccount, nil
+			}
+		}
+
+		// Claude's authorize page approves whichever Claude account the
+		// profile is signed in to, without asking Google. When that is not
+		// the account the strategy chose, drop the Claude session (Google
+		// sessions stay) and sign in again through Google, once per flow.
+		if onClaudeAuthorize(currentURL) {
+			shown := b.pageAccounts(taskCtx)
+			if preferredAccount != "" && usedAccount == "" && !switchedClaudeAccount &&
+				len(shown) > 0 && !containsFold(shown, preferredAccount) {
+				err := b.signOutOf(taskCtx, currentURL)
+				if err == nil {
+					switchedClaudeAccount = true
+					b.logger.Info("Claude is signed in to another account; signing in again with the selected account")
+					if err := chromedp.Run(taskCtx, chromedp.Navigate(oauthURL)); err != nil {
+						return "", "", fmt.Errorf("navigate: %w", err)
+					}
+					time.Sleep(b.stepDelay)
+					continue
+				}
+				b.logger.Debug("could not sign out of Claude", "error", err)
+			}
+			if usedAccount == "" && len(shown) == 1 {
+				usedAccount = shown[0]
 			}
 		}
 
@@ -332,15 +359,90 @@ func stuckFlowError(lastURL string) error {
 	return fmt.Errorf("could not complete OAuth flow: no authorization code found (last page %s)", page)
 }
 
+// onClaudeAuthorize reports whether rawURL is Claude's OAuth authorize
+// (consent) page.
+func onClaudeAuthorize(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return isClaudeHost(u.Hostname()) && strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/oauth/authorize")
+}
+
+func isClaudeHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "claude.ai" || host == "claude.com" || strings.HasSuffix(host, ".claude.ai") || strings.HasSuffix(host, ".claude.com")
+}
+
+// emailPattern matches an email address in page text.
+var emailPattern = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`)
+
+// shownAccounts returns the distinct account emails in page text, ignoring
+// Anthropic's own addresses (support and legal links).
+func shownAccounts(text string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range emailPattern.FindAllString(text, -1) {
+		email := strings.ToLower(m)
+		domain := email[strings.LastIndex(email, "@")+1:]
+		if domain == "anthropic.com" || strings.HasSuffix(domain, ".anthropic.com") || isClaudeHost(domain) {
+			continue
+		}
+		if !seen[email] {
+			seen[email] = true
+			out = append(out, email)
+		}
+	}
+	return out
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// pageAccounts returns the account emails visible on the current page.
+func (b *Browser) pageAccounts(ctx context.Context) []string {
+	var text string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.body ? document.body.innerText : ""`, &text)); err != nil {
+		return nil
+	}
+	return shownAccounts(text)
+}
+
+// signOutOf deletes the cookies of rawURL's site (the Claude session), leaving
+// every other site's sessions, Google's included, in place.
+func (b *Browser) signOutOf(ctx context.Context, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	origin := u.Scheme + "://" + u.Host + "/"
+	return chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		cookies, err := network.GetCookies().WithURLs([]string{origin}).Do(ctx)
+		if err != nil {
+			return err
+		}
+		for _, c := range cookies {
+			if err := network.DeleteCookies(c.Name).WithDomain(c.Domain).WithPath(c.Path).Do(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+}
+
 // onClaudeLogin reports whether rawURL is the Claude web login page.
 func onClaudeLogin(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
-	return (host == "claude.ai" || host == "claude.com" || strings.HasSuffix(host, ".claude.ai") || strings.HasSuffix(host, ".claude.com")) &&
-		strings.HasPrefix(u.Path, "/login")
+	return isClaudeHost(u.Hostname()) && strings.HasPrefix(u.Path, "/login")
 }
 
 // clickByText clicks the first visible tag element whose text contains text.
