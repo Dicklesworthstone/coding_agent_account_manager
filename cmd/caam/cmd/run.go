@@ -275,7 +275,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			SwitchOptions:     &switchOptions,
 			Bin:               prov.DefaultBin(),
 			Stdin:             stdin,
-			ReplayStdin:       !stdinTerminal,
+			ReplayStdin:       !stdinTerminal && runInputReplayable(stdin),
 			Stdout:            cmd.OutOrStdout(),
 			Stderr:            cmd.ErrOrStderr(),
 		}
@@ -429,6 +429,20 @@ func loadRunRetryConfig(cmd *cobra.Command, tool string) (config.WrapConfig, err
 func runInputIsTerminal(input io.Reader) bool {
 	file, ok := input.(interface{ Fd() uintptr })
 	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+// runInputReplayable reports whether non-terminal stdin is known to be finite:
+// an in-memory reader or a regular file. Only that input is spooled for replay
+// on retry. A pipe may never close (ssh without -n, a harness that keeps its
+// end open, streaming input), so it is passed through as in v0.1.22 instead of
+// being read to EOF before the CLI starts (#120).
+func runInputReplayable(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return true
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode().IsRegular()
 }
 
 // runUsesHeadless recognizes native batch forms even when launched from a

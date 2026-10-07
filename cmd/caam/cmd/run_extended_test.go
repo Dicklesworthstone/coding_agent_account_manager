@@ -54,9 +54,12 @@ func TestHelperProcess_Run(t *testing.T) {
 	if json.Unmarshal(data, &auth) != nil || auth.OAuth.AccessToken == "" {
 		os.Exit(91)
 	}
-	input, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		os.Exit(92)
+	var input []byte
+	if os.Getenv("MOCK_SKIP_STDIN") != "1" { // e.g. `codex exec`, which never reads stdin
+		input, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			os.Exit(92)
+		}
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -365,6 +368,28 @@ func TestRunCommand_Extended(t *testing.T) {
 			require.NotContains(t, stdout.String(), "Waiting")
 		})
 	}
+}
+
+// A stdin pipe that stays open (ssh without -n, a harness that keeps its
+// end open, streaming input) must not block `caam run` before the CLI starts.
+// v0.1.22 passed such input straight through (#120).
+func TestRunDoesNotWaitForOpenStdinPipe(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{}`, "success")
+	t.Setenv("MOCK_SKIP_STDIN", "1")
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close() })
+	cmd.SetIn(r)
+	cmd.SetArgs([]string{"claude", "--quiet", "--", "-p", "test prompt"})
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "stderr: %s", stderr)
+	case <-time.After(30 * time.Second):
+		t.Fatal("caam run read stdin to EOF before starting the CLI")
+	}
+	require.Len(t, readRunInvocations(t, logPath), 1)
 }
 
 func setupHeadlessRun(t *testing.T, settings, mode string) (*cobra.Command, *bytes.Buffer, *bytes.Buffer, string, string) {

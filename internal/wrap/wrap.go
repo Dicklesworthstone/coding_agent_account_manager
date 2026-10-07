@@ -342,7 +342,7 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 			return result
 		}
 		if !input.CanRetry() {
-			result.Err = fmt.Errorf("cannot safely retry consumed or untracked stdin; pipe input to enable replay")
+			result.Err = fmt.Errorf("cannot safely retry consumed or untracked stdin; redirect input from a file (< file) to enable replay")
 			return result
 		}
 		profiles, err = w.vault.List(w.config.Provider)
