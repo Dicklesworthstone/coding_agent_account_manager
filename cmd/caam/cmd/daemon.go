@@ -125,6 +125,13 @@ func runDaemonForeground(interval, threshold time.Duration, verbose, usePool boo
 		Verbose:          verbose,
 		UseAuthPool:      usePool,
 	}
+	// The daemon's own output is its log; alerts go to the configured
+	// desktop and webhook channels.
+	if spmCfg, err := config.LoadSPMConfig(); err == nil {
+		cfg.Notifier = configuredNotifier(spmCfg, notifierChannels{External: true})
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: alerts disabled (load config: %v)\n", err)
+	}
 
 	d := daemon.New(v, hs, cfg)
 

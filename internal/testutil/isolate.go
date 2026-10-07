@@ -30,13 +30,15 @@ var secretEnv = []string{
 	"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
 }
 
-// stubbedBinaries are the agent CLIs and desktop openers that production code
-// launches. Tests get no-op stand-ins first on PATH, so a test that reaches a
-// login or spawn path can neither start a real CLI (which rewrites its own
-// config and begins an OAuth flow) nor open a browser window.
+// stubbedBinaries are the agent CLIs, desktop openers, and notification
+// commands that production code launches. Tests get no-op stand-ins first on
+// PATH, so a test that reaches a login, spawn, or alert path can neither
+// start a real CLI (which rewrites its own config and begins an OAuth flow),
+// open a browser window, nor post a desktop notification.
 var stubbedBinaries = []string{
 	"claude", "codex", "gemini", "agy", "grok", "opencode", "cursor", "npx",
 	"open", "xdg-open", "sensible-browser", "x-www-browser",
+	"notify-send", "osascript",
 }
 
 // IsolatedMain is the TestMain body for every package in this module:

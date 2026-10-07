@@ -16,7 +16,6 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
@@ -214,11 +213,14 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		runner = exec.NewRunner(registry)
 	}
 
-	// Initialize Notifier
-	var notifier notify.Notifier
+	// Initialize Notifier: account switches reach the terminal (unless
+	// --quiet) and the configured desktop/webhook channels, which matter
+	// most when the session is running in a window the user isn't watching.
+	channels := notifierChannels{External: true}
 	if !quiet {
-		notifier = notify.NewTerminalNotifier(cmd.ErrOrStderr(), true)
+		channels.Terminal = cmd.ErrOrStderr()
 	}
+	notifier := configuredNotifier(spmCfg, channels)
 
 	// Create SmartRunner
 	opts := exec.SmartRunnerOptions{

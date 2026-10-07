@@ -91,10 +91,11 @@ type SmartRunnerOptions struct {
 
 // NewSmartRunner creates a new SmartRunner.
 func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
-	// Use default notifier if none provided
+	// Without a notifier, alerts are dropped. (A zero TerminalNotifier has no
+	// writer and would panic on the first handoff.)
 	notifier := opts.Notifier
 	if notifier == nil {
-		notifier = &notify.TerminalNotifier{}
+		notifier = notify.Nop()
 	}
 	if opts.Vault != nil && opts.Rotation != nil {
 		opts.Rotation.SetVaultPath(opts.Vault.BasePath())

@@ -1519,6 +1519,30 @@ claude "explain this authentication flow"
 
 ---
 
+## Alerts
+
+caam alerts you when `caam run` switches accounts after a rate limit, and when
+the daemon cannot refresh a credential, a provider rejects a login (re-login
+required), or a Cursor session is about to expire. Repeats of the same daemon
+alert are suppressed for an hour. Channels live in `~/.caam/config.yaml`:
+
+```yaml
+alerts:
+  enabled: true            # master switch for desktop and webhook alerts
+  notifications:
+    terminal: true         # print alerts in the running command (caam run)
+    desktop: true          # notify-send on Linux, Notification Center on macOS
+    webhook: ""            # POST JSON here; includes "text"/"content" for Slack and Discord
+```
+
+```bash
+caam config set alerts.notifications.webhook https://hooks.slack.com/services/...
+caam notify test                    # send a test alert through each enabled channel
+caam notify test --channel desktop  # test one channel
+```
+
+---
+
 ## TUI Configuration
 
 Customize the TUI appearance and behavior through `~/.caam/config.yaml`:

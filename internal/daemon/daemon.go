@@ -17,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
@@ -47,7 +48,20 @@ type Config struct {
 	// MaxConcurrentRefreshes limits concurrent refresh operations when using AuthPool.
 	// Default: 3
 	MaxConcurrentRefreshes int
+
+	// Notifier receives alerts for credentials that need attention (failed
+	// refreshes, rejected logins, expiring sessions). Repeats of the same
+	// alert are suppressed for AlertInterval. Nil disables alerts.
+	Notifier notify.Notifier
+
+	// AlertInterval is the minimum time between identical alerts.
+	// Default: 1h
+	AlertInterval time.Duration
 }
+
+// DefaultAlertInterval keeps a condition that persists across checks from
+// re-alerting every check interval.
+const DefaultAlertInterval = time.Hour
 
 // DefaultConfig returns the default daemon configuration.
 func DefaultConfig() *Config {
@@ -66,6 +80,7 @@ type Daemon struct {
 	logger      *log.Logger
 	logFile     *os.File // Log file handle for cleanup
 	pidFile     *os.File // PID file handle for locking
+	notifier    notify.Notifier
 
 	// backupScheduler handles automatic backups (may be nil if disabled)
 	backupScheduler *BackupScheduler
@@ -164,12 +179,22 @@ func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemo
 		}
 	}
 
+	notifier := notify.Nop()
+	if cfg.Notifier != nil {
+		interval := cfg.AlertInterval
+		if interval <= 0 {
+			interval = DefaultAlertInterval
+		}
+		notifier = notify.NewThrottled(cfg.Notifier, interval)
+	}
+
 	d := &Daemon{
 		config:      cfg,
 		vault:       vault,
 		healthStore: healthStore,
 		logger:      logger,
 		logFile:     logFile,
+		notifier:    notifier,
 	}
 
 	// Initialize backup scheduler from global config
@@ -699,6 +724,8 @@ func (d *Daemon) checkProfile(provider, profile string) {
 			d.stats.RefreshErrors++
 			d.mu.Unlock()
 			d.logger.Printf("%s/%s: refresh preflight failed: %v", provider, profile, err)
+			d.alert(notify.Warning, "Credential check failed", provider, profile, err.Error(),
+				fmt.Sprintf("run 'caam doctor' or log in again and 'caam backup %s %s'", provider, profile))
 		}
 		return
 	}
@@ -743,6 +770,7 @@ func (d *Daemon) checkProfile(provider, profile string) {
 		d.mu.Unlock()
 
 		d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
+		d.alertRefreshFailure(provider, profile, err)
 	} else {
 		d.stats.RefreshCount++
 		d.mu.Unlock()
@@ -755,6 +783,42 @@ func (d *Daemon) checkProfile(provider, profile string) {
 			d.logger.Printf("%s/%s: credential delivery warning: %v", provider, profile, err)
 		}
 	}
+}
+
+// alert sends a notification; the notifier suppresses repeats.
+func (d *Daemon) alert(level notify.AlertLevel, title, provider, profile, message, action string) {
+	if d.notifier == nil {
+		return
+	}
+	label := provider
+	if profile != "" {
+		label = provider + "/" + profile
+	}
+	if err := d.notifier.Notify(&notify.Alert{
+		Level:     level,
+		Title:     title,
+		Message:   message,
+		Profile:   label,
+		Action:    action,
+		Timestamp: time.Now(),
+	}); err != nil {
+		d.logger.Printf("%s: alert delivery failed: %v", label, err)
+	}
+}
+
+// alertRefreshFailure distinguishes a rejected login, which needs a human,
+// from a failure that may clear on a later check.
+func (d *Daemon) alertRefreshFailure(provider, profile string, err error) {
+	var rejected *refresh.RefreshRejectedError
+	var reused *refresh.RefreshTokenReusedError
+	if errors.As(err, &rejected) || errors.As(err, &reused) {
+		d.alert(notify.Critical, "Login required", provider, profile,
+			fmt.Sprintf("the %s provider rejected this login", provider),
+			fmt.Sprintf("log in to %s again, then run 'caam backup %s %s'", provider, provider, profile))
+		return
+	}
+	d.alert(notify.Warning, "Token refresh failed", provider, profile, err.Error(),
+		"caam retries on the next check; run 'caam refresh "+provider+" "+profile+"' to retry now")
 }
 
 // logRefreshSkip reports a reason once per profile without suppressing future
@@ -981,8 +1045,11 @@ func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth, now
 	ttl := ph.TokenExpiresAt.Sub(now)
 	if ttl <= 0 {
 		d.logger.Printf("cursor/%s: session EXPIRED; %s", profile, action)
+		d.alert(notify.Critical, "Session expired", "cursor", profile, "the Cursor session has expired", action)
 	} else {
 		d.logger.Printf("cursor/%s: session expires in %v; %s", profile, ttl.Round(time.Minute), action)
+		d.alert(notify.Warning, "Session expiring", "cursor", profile,
+			fmt.Sprintf("the Cursor session expires in %v", ttl.Round(time.Minute)), action)
 	}
 }
 

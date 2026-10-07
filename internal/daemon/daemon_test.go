@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
@@ -2309,4 +2311,85 @@ func TestCursorSessionDaemonWarnsOnceWithoutRefresh(t *testing.T) {
 	if strings.Count(logs.String(), ": session ") != 3 || d.stats.RefreshErrors != 0 || d.stats.RefreshCount != 0 {
 		t.Fatalf("API-backed token attempted refresh or warned: %s %+v", logs.String(), d.stats)
 	}
+}
+
+type recordingAlerts struct {
+	mu     sync.Mutex
+	alerts []*notify.Alert
+}
+
+func (r *recordingAlerts) Name() string    { return "recording" }
+func (r *recordingAlerts) Available() bool { return true }
+func (r *recordingAlerts) Notify(a *notify.Alert) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.alerts = append(r.alerts, a)
+	return nil
+}
+
+func (r *recordingAlerts) snapshot() []*notify.Alert {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]*notify.Alert(nil), r.alerts...)
+}
+
+func TestRefreshFailureAlerts(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := &recordingAlerts{}
+	d := New(authfile.NewVault(tmpDir), health.NewStorage(filepath.Join(tmpDir, "health.json")),
+		&Config{Notifier: rec, LogPath: filepath.Join(tmpDir, "daemon.log")})
+	defer d.logFile.Close()
+
+	d.alertRefreshFailure("codex", "work", &refresh.RefreshRejectedError{Provider: "codex", StatusCode: 401, Code: "refresh_token_invalidated"})
+	d.alertRefreshFailure("codex", "home", fmt.Errorf("wrapped: %w", &refresh.RefreshTokenReusedError{Provider: "codex", Profile: "home"}))
+	d.alertRefreshFailure("gemini", "work", context.DeadlineExceeded)
+	// The same transient failure on the next check is not re-announced.
+	d.alertRefreshFailure("gemini", "work", context.DeadlineExceeded)
+
+	got := rec.snapshot()
+	if len(got) != 3 {
+		t.Fatalf("alerts = %d, want 3", len(got))
+	}
+	for i, want := range []struct {
+		level   notify.AlertLevel
+		title   string
+		profile string
+	}{
+		{notify.Critical, "Login required", "codex/work"},
+		{notify.Critical, "Login required", "codex/home"},
+		{notify.Warning, "Token refresh failed", "gemini/work"},
+	} {
+		if got[i].Level != want.level || got[i].Title != want.title || got[i].Profile != want.profile {
+			t.Errorf("alert %d = %+v, want %+v", i, got[i], want)
+		}
+		if got[i].Action == "" {
+			t.Errorf("alert %d has no suggested action", i)
+		}
+	}
+}
+
+func TestCursorSessionAlertsOncePerLogin(t *testing.T) {
+	tmpDir := t.TempDir()
+	rec := &recordingAlerts{}
+	d := New(authfile.NewVault(tmpDir), health.NewStorage(filepath.Join(tmpDir, "health.json")),
+		&Config{Notifier: rec, LogPath: filepath.Join(tmpDir, "daemon.log")})
+	defer d.logFile.Close()
+
+	now := time.Now()
+	ph := &health.ProfileHealth{TokenExpiresAt: now.Add(time.Hour), CredentialFingerprint: "login-1"}
+	d.warnCursorSession("work", ph, now)
+	d.warnCursorSession("work", ph, now.Add(time.Minute))
+
+	got := rec.snapshot()
+	if len(got) != 1 || got[0].Title != "Session expiring" || got[0].Profile != "cursor/work" {
+		t.Fatalf("alerts = %+v, want one expiring-session alert", got)
+	}
+}
+
+func TestDaemonWithoutNotifierDropsAlerts(t *testing.T) {
+	tmpDir := t.TempDir()
+	d := New(authfile.NewVault(tmpDir), health.NewStorage(filepath.Join(tmpDir, "health.json")),
+		&Config{LogPath: filepath.Join(tmpDir, "daemon.log")})
+	defer d.logFile.Close()
+	d.alertRefreshFailure("codex", "work", context.DeadlineExceeded) // must not panic
 }

@@ -36,13 +36,22 @@ func (n *WebhookNotifier) Notify(alert *Alert) error {
 		return nil
 	}
 
+	timestamp := alert.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+	summary := Summary(alert)
 	payload := map[string]interface{}{
 		"level":     alert.Level.String(),
 		"title":     alert.Title,
 		"message":   alert.Message,
 		"profile":   alert.Profile,
-		"timestamp": alert.Timestamp.Format(time.RFC3339),
+		"timestamp": timestamp.Format(time.RFC3339),
 		"action":    alert.Action,
+		// Rendered one-liners so Slack ("text") and Discord ("content")
+		// incoming webhooks display the alert without an adapter.
+		"text":    summary,
+		"content": summary,
 	}
 
 	body, err := json.Marshal(payload)
