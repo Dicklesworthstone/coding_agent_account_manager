@@ -258,6 +258,7 @@ type Agent struct {
 	server       *http.Server
 	browser      *Browser
 	oauth        oauthCompleter
+	oauthMu      sync.Mutex // serializes browser flows (see runOAuth)
 	client       *http.Client
 	delivery     deliveryPolicy
 	accountUsage map[string]*AccountUsage
@@ -463,13 +464,11 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL string) {
 	a.logger.Info("processing auth request", "request_id", requestID)
 
-	// Select account
-	account := a.selectAccount()
-	if a.OnAuthStart != nil {
-		a.OnAuthStart(authURL, account)
-	}
-
-	code, usedAccount, err := a.oauth.CompleteOAuth(ctx, authURL, account)
+	account, code, usedAccount, err := a.runOAuth(ctx, authURL, "", func(account string) {
+		if a.OnAuthStart != nil {
+			a.OnAuthStart(authURL, account)
+		}
+	})
 	if err != nil {
 		a.logger.Error("OAuth failed",
 			"request_id", requestID,
@@ -509,6 +508,44 @@ func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL strin
 	if a.OnAuthComplete != nil {
 		a.OnAuthComplete(usedAccount, code)
 	}
+}
+
+// runOAuth selects an account (unless one is requested) and completes one
+// OAuth flow. Flows are serialized because they share one Chrome profile
+// directory, and each selection must see the account the previous flow used.
+func (a *Agent) runOAuth(ctx context.Context, authURL, requested string, onStart func(account string)) (account, code, usedAccount string, err error) {
+	a.oauthMu.Lock()
+	defer a.oauthMu.Unlock()
+
+	account = requested
+	if account == "" {
+		account = a.selectAccount()
+	}
+	if onStart != nil {
+		onStart(account)
+	}
+	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, account)
+	if usedAccount != "" {
+		a.touchAccount(usedAccount)
+	} else {
+		a.touchAccount(account)
+	}
+	return account, code, usedAccount, err
+}
+
+// touchAccount marks an account as just used without recording an outcome.
+func (a *Agent) touchAccount(email string) {
+	if email == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	usage, ok := a.accountUsage[email]
+	if !ok {
+		usage = &AccountUsage{Email: email}
+		a.accountUsage[email] = usage
+	}
+	usage.LastUsed = time.Now()
 }
 
 // selectAccount chooses which account to use based on strategy.
@@ -733,12 +770,7 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := req.Account
-	if account == "" {
-		account = a.selectAccount()
-	}
-
-	code, usedAccount, err := a.oauth.CompleteOAuth(r.Context(), req.URL, account)
+	account, code, usedAccount, err := a.runOAuth(r.Context(), req.URL, req.Account, nil)
 	if err != nil {
 		a.recordUsage(account, "failed")
 		w.Header().Set("Content-Type", "application/json")

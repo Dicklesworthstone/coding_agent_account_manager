@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -865,5 +866,70 @@ func TestAgentFileConfigRoundTripKeepsTransport(t *testing.T) {
 	c := got.Coordinators[0]
 	if c.Token != "tok" || c.SSH == nil || *c.SSH != *fc.Coordinators[0].SSH || got.ChromeUserDataDir() != "/profiles/work" {
 		t.Fatalf("round trip lost data: %+v ssh=%+v", got, c.SSH)
+	}
+}
+
+// trackingOAuth records concurrency and the accounts it was asked to use.
+type trackingOAuth struct {
+	mu       sync.Mutex
+	active   int
+	maxSeen  int
+	accounts []string
+}
+
+func (f *trackingOAuth) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount string) (string, string, error) {
+	f.mu.Lock()
+	f.active++
+	if f.active > f.maxSeen {
+		f.maxSeen = f.active
+	}
+	f.accounts = append(f.accounts, preferredAccount)
+	f.mu.Unlock()
+
+	time.Sleep(20 * time.Millisecond) // a browser flow takes a while
+
+	f.mu.Lock()
+	f.active--
+	f.mu.Unlock()
+	return "CODE-" + preferredAccount, preferredAccount, nil
+}
+
+func TestConcurrentRequestsSerializeBrowserAndSpreadAccounts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"accepted"}`))
+	}))
+	defer srv.Close()
+
+	accounts := []string{"a@example.com", "b@example.com", "c@example.com"}
+	mcfg := DefaultMultiConfig()
+	mcfg.Accounts = accounts
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+	// Start from a clean usage history regardless of earlier tests.
+	ma.accountUsage = map[string]*AccountUsage{}
+	ma.delivery = fastDelivery
+	oauth := &trackingOAuth{}
+	ma.oauth = oauth
+	endpoint := &CoordinatorEndpoint{Name: "remote", URL: srv.URL}
+
+	var wg sync.WaitGroup
+	for i := 0; i < len(accounts); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ma.processAuthRequest(context.Background(), endpoint, fmt.Sprintf("req-%d", i), "https://claude.ai/oauth/authorize?x")
+		}(i)
+	}
+	wg.Wait()
+
+	if oauth.maxSeen != 1 {
+		t.Fatalf("max concurrent browser flows = %d, want 1 (they share a Chrome profile)", oauth.maxSeen)
+	}
+	seen := map[string]bool{}
+	for _, acc := range oauth.accounts {
+		seen[acc] = true
+	}
+	if len(seen) != len(accounts) {
+		t.Fatalf("simultaneous rate limits used accounts %v, want each of %v once", oauth.accounts, accounts)
 	}
 }
