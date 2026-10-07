@@ -83,8 +83,10 @@ func pushClaudeKeychain(fileSet AuthFileSet) error {
 	if err != nil {
 		return err
 	}
-	read := claudeRetirementMirror(fileSet, credPath)
-	current, err := read()
+	current, err := readClaudeKeychainForPublication()
+	if errors.Is(err, keychain.ErrNoKeychain) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -99,13 +101,19 @@ func prepareClaudeKeychainPublication(fileSet AuthFileSet) (*claudeRestoreAuthor
 	if path == "" {
 		return nil, nil
 	}
-	authority, err := prepareClaudeRestoreAuthority(path, claudeRetirementMirror(fileSet, path), func(data []byte) error {
+	authority, err := prepareClaudeRestoreAuthority(path, readClaudeKeychainForPublication, func(data []byte) error {
 		keychain.ForgetMirrors()
 		if data == nil {
 			return keychain.DeleteClaude()
 		}
 		return keychain.WriteClaude(data)
 	})
+	if errors.Is(err, keychain.ErrNoKeychain) {
+		// An isolated HOME can use file-backed credentials without a login
+		// keychain. Only initial preparation may omit the publication authority.
+		keychain.ForgetMirrors()
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +121,20 @@ func prepareClaudeKeychainPublication(fileSet AuthFileSet) (*claudeRestoreAuthor
 	// mirror when the authoritative grant rotated since that inspection.
 	keychain.ForgetMirrors()
 	return authority, nil
+}
+
+// A missing item is an available, empty authority that can receive a login.
+// Keep an unavailable keychain typed so later checks on a captured authority
+// cannot mistake its disappearance for proof that the item is still absent.
+func readClaudeKeychainForPublication() ([]byte, error) {
+	data, err := keychain.ReadClaude()
+	if errors.Is(err, keychain.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Claude keychain for credential publication: %w", err)
+	}
+	return data, nil
 }
 
 // Retirement preflight reads, but does not mirror or mutate, the authoritative

@@ -289,6 +289,207 @@ func TestBridgeIsInertWhenDisabled(t *testing.T) {
 	}
 }
 
+func fakeMissingLoginKeychain(t *testing.T) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "security")
+	const script = `#!/bin/sh
+echo "security: A default keychain could not be found." >&2
+exit 44
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_KEYCHAIN_BIN", bin)
+	keychain.ForgetMirrors()
+}
+
+func TestClaudeActivationKeychainAvailability(t *testing.T) {
+	for _, operation := range []string{"Restore", "Switch"} {
+		for _, tc := range []struct {
+			name        string
+			wantReadErr error
+			wantErr     error
+		}{
+			{name: "no_login_keychain", wantReadErr: keychain.ErrNoKeychain},
+			{name: "missing_item", wantReadErr: keychain.ErrNotFound},
+			{name: "access_denied", wantReadErr: keychain.ErrDenied, wantErr: keychain.ErrDenied},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				f := newKeychainFixture(t)
+				t.Setenv("CLAUDE_CONFIG_DIR", "")
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+				incoming := keychainCreds("incoming")
+				outgoing := keychainCreds("outgoing")
+				writeFixtureFile(t, f.credPath, incoming)
+				writeFixtureFile(t, f.statePath, keychainState("incoming@example.com"))
+				if err := f.vault.Backup(f.fileSet, "incoming"); err != nil {
+					t.Fatalf("prepare incoming profile: %v", err)
+				}
+				const liveState = `{"numStartups":91,"theme":"native","oauthAccount":{"emailAddress":"outgoing@example.com","accountUuid":"acct-outgoing@example.com"}}`
+				writeFixtureFile(t, f.credPath, outgoing)
+				writeFixtureFile(t, f.statePath, liveState)
+				switch tc.name {
+				case "no_login_keychain":
+					fakeMissingLoginKeychain(t)
+				case "access_denied":
+					f.storeToken(outgoing)
+					t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+				}
+				if _, err := keychain.ReadClaude(); !errors.Is(err, tc.wantReadErr) {
+					t.Fatalf("fixture keychain error = %v, want %v", err, tc.wantReadErr)
+				}
+				var result *SwitchResult
+				var err error
+				if operation == "Restore" {
+					err = f.vault.Restore(f.fileSet, "incoming")
+				} else {
+					result, err = f.vault.Switch(f.fileSet, "incoming", SwitchOptions{BackupMode: "always"})
+				}
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("%s error = %v, want %v", operation, err, tc.wantErr)
+					}
+					if result != nil && result.RestoreStarted {
+						t.Fatal("denied keychain reached credential restoration")
+					}
+					if readFixtureFile(t, f.credPath) != outgoing || readFixtureFile(t, f.statePath) != liveState {
+						t.Fatal("denied keychain changed live credentials or native settings")
+					}
+					if got, ok := f.storedToken(); !ok || got != outgoing {
+						t.Fatal("denied keychain changed the outgoing item")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("%s: %v", operation, err)
+				}
+				if got := readFixtureFile(t, f.credPath); got != incoming {
+					t.Fatalf("%s did not install the incoming file-backed credential", operation)
+				}
+				var state struct {
+					NumStartups  int    `json:"numStartups"`
+					Theme        string `json:"theme"`
+					OAuthAccount struct {
+						Email string `json:"emailAddress"`
+					} `json:"oauthAccount"`
+				}
+				if err := json.Unmarshal([]byte(readFixtureFile(t, f.statePath)), &state); err != nil {
+					t.Fatal(err)
+				}
+				// MergeLegacy shares allowlisted workflow fields such as theme.
+				// Unshared state such as numStartups comes from the target snapshot.
+				if state.NumStartups != 3 || state.Theme != "native" || state.OAuthAccount.Email != "incoming@example.com" {
+					t.Fatalf("activation did not preserve native policy and select incoming profile state: %+v", state)
+				}
+				stored, exists := f.storedToken()
+				if tc.name == "missing_item" {
+					if !exists || stored != incoming {
+						t.Fatal("available keychain did not receive its missing Claude item")
+					}
+				} else if exists {
+					t.Fatal("file-backed activation unexpectedly created a keychain item")
+				}
+				if operation == "Switch" {
+					if result == nil || !result.RestoreStarted || result.AutoBackup == "" {
+						t.Fatalf("Switch did not preserve outgoing recovery: %+v", result)
+					}
+					recovery := filepath.Join(f.vault.ProfilePath("claude", result.AutoBackup), ".credentials.json")
+					if got := readFixtureFile(t, recovery); got != outgoing {
+						t.Fatal("Switch recovery does not contain the outgoing file-backed credential")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeKeychainPublicationRejectsLaterUnavailability(t *testing.T) {
+	f := newKeychainFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	authority, err := prepareClaudeKeychainPublication(f.fileSet)
+	if err != nil || authority == nil {
+		t.Fatalf("prepare empty available authority: %v", err)
+	}
+	defer authority.cleanup()
+	fakeMissingLoginKeychain(t)
+	if err := authority.stage(); !errors.Is(err, keychain.ErrNoKeychain) {
+		t.Fatalf("captured authority accepted a disappearing keychain: %v", err)
+	}
+}
+
+func TestClaudeKeychainPublicationRetainsRecoveryAfterUnavailableReadback(t *testing.T) {
+	f := newKeychainFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	outgoing := keychainCreds("outgoing")
+	incoming := keychainCreds("incoming")
+	f.storeToken(outgoing)
+	authority, err := prepareClaudeKeychainPublication(f.fileSet)
+	if err != nil || authority == nil {
+		t.Fatalf("prepare keychain authority: %v", err)
+	}
+	defer authority.cleanup()
+	authority.want = []byte(incoming)
+	if err := authority.stage(); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, f.credPath, incoming)
+	write := authority.write
+	authority.write = func(data []byte) error {
+		if err := write(data); err != nil {
+			return err
+		}
+		fakeMissingLoginKeychain(t)
+		return nil
+	}
+	if err := authority.publish(); !errors.Is(err, keychain.ErrNoKeychain) {
+		t.Fatalf("unavailable readback error = %v, want ErrNoKeychain", err)
+	}
+	authority.cleanup()
+	if !authority.keepBackup || authority.backup == "" {
+		t.Fatal("uncertain publication did not retain its recovery copy")
+	}
+	if got := readFixtureFile(t, authority.backup); got != outgoing {
+		t.Fatal("uncertain publication lost the outgoing keychain credential")
+	}
+	if got, ok := f.storedToken(); !ok || got != incoming {
+		t.Fatal("unavailable readback replayed the outgoing keychain item")
+	}
+}
+
+func TestClaudeKeychainPostconditionDistinguishesUnavailableAndMissing(t *testing.T) {
+	for _, mode := range []string{"no_login_keychain", "missing_item", "access_denied"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newKeychainFixture(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			incoming := keychainCreds("incoming")
+			writeFixtureFile(t, f.credPath, incoming)
+			switch mode {
+			case "no_login_keychain":
+				fakeMissingLoginKeychain(t)
+			case "access_denied":
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			err := pushClaudeKeychain(f.fileSet)
+			if mode == "no_login_keychain" {
+				if err != nil {
+					t.Fatalf("file-backed postcondition: %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("missing or denied authoritative item passed the postcondition")
+			} else if mode == "access_denied" && !errors.Is(err, keychain.ErrDenied) {
+				t.Fatalf("denial error = %v, want ErrDenied", err)
+			}
+			if _, ok := f.storedToken(); ok {
+				t.Fatal("postcondition wrote an item to the keychain")
+			}
+			if got := readFixtureFile(t, f.credPath); got != incoming {
+				t.Fatal("postcondition changed the live credential")
+			}
+		})
+	}
+}
+
 func (f *keychainFixture) active() string {
 	f.t.Helper()
 	name, err := f.vault.ActiveProfile(f.fileSet)
