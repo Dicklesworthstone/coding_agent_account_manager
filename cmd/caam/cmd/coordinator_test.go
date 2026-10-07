@@ -143,3 +143,48 @@ func TestCoordinatorStatusUsesConfigAddressAndToken(t *testing.T) {
 		t.Fatalf("unexpected status output:\n%s", out.String())
 	}
 }
+
+func TestCheckCoordinatorsUsesConfiguredEndpoints(t *testing.T) {
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = &fakeCoordinatorPanes{}
+	cfg.AuthToken = "local-token"
+	coord := coordinator.New(cfg)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, nil)
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordPath := filepath.Join(configDir, "caam", "coordinator.json")
+	if err := os.MkdirAll(filepath.Dir(coordPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(coordPath, []byte(`{"port":`+port+`,"auth_token":"local-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(coordPath) })
+
+	coords := checkCoordinators()
+	if len(coords) != 1 {
+		t.Fatalf("coords = %+v", coords)
+	}
+	c := coords[0]
+	if c.Source != "local" || !c.Healthy || c.Backend != "fake" || c.Transport != "direct" || c.Error != "" {
+		t.Fatalf("local coordinator = %+v", c)
+	}
+}
+
+type fakeCoordinatorPanes struct{}
+
+func (fakeCoordinatorPanes) ListPanes(context.Context) ([]coordinator.Pane, error) { return nil, nil }
+func (fakeCoordinatorPanes) GetText(context.Context, int, int) (string, error)    { return "", nil }
+func (fakeCoordinatorPanes) SendText(context.Context, int, string, bool) error    { return nil }
+func (fakeCoordinatorPanes) IsAvailable(context.Context) bool                     { return true }
+func (fakeCoordinatorPanes) Backend() string                                      { return "fake" }

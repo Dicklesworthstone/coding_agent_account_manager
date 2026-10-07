@@ -933,3 +933,34 @@ func TestConcurrentRequestsSerializeBrowserAndSpreadAccounts(t *testing.T) {
 		t.Fatalf("simultaneous rate limits used accounts %v, want each of %v once", oauth.accounts, accounts)
 	}
 }
+
+func TestCoordinatorEndpointProbe(t *testing.T) {
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = &scriptedPane{}
+	cfg.AuthToken = "tok"
+	cfg.Logger = discardLogger()
+	coord := coordinator.New(cfg)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardLogger())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+
+	good := &CoordinatorEndpoint{Name: "c", URL: "http://" + listener.Addr().String(), Token: "tok"}
+	probe := good.Probe(context.Background())
+	if !probe.Healthy || probe.Backend != "scripted" || probe.Error != "" {
+		t.Fatalf("probe = %+v", probe)
+	}
+
+	bad := &CoordinatorEndpoint{Name: "c", URL: good.URL, Token: "wrong"}
+	if probe := bad.Probe(context.Background()); probe.Healthy || !strings.Contains(probe.Error, "401") {
+		t.Fatalf("probe with wrong token = %+v", probe)
+	}
+
+	down := &CoordinatorEndpoint{Name: "c", URL: "http://127.0.0.1:1"}
+	if probe := down.Probe(context.Background()); probe.Healthy || probe.Error == "" {
+		t.Fatalf("probe of a closed port = %+v", probe)
+	}
+}

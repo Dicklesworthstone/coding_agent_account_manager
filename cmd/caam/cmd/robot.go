@@ -2,19 +2,22 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
@@ -137,12 +140,16 @@ type RobotAuthPath struct {
 
 // RobotCoordinator contains coordinator status.
 type RobotCoordinator struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Healthy bool   `json:"healthy"`
-	Latency int64  `json:"latency_ms,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Pending int    `json:"pending_auth_requests"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Transport string `json:"transport"`
+	Source    string `json:"source"` // local (this host's coordinator) or agent (auth-agent config)
+	Healthy   bool   `json:"healthy"`
+	Latency   int64  `json:"latency_ms,omitempty"`
+	Backend   string `json:"backend,omitempty"`
+	Panes     int    `json:"panes"`
+	Error     string `json:"error,omitempty"`
+	Pending   int    `json:"pending_auth_requests"`
 }
 
 // RobotNextData contains recommended next action.
@@ -671,48 +678,69 @@ func robotFormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dd", days)
 }
 
+// checkCoordinators probes this host's coordinator (from its config file,
+// with its token) and every coordinator in the local auth-agent config
+// (through its SSH tunnel when configured), concurrently.
 func checkCoordinators() []RobotCoordinator {
-	// Check known coordinator endpoints
-	// This is a simplified version - in production, this would read from config
-	endpoints := []struct {
-		name string
-		url  string
-	}{
-		{"local", "http://localhost:7890"},
+	type target struct {
+		source   string
+		endpoint *agent.CoordinatorEndpoint
 	}
+	var targets []target
 
-	var coords []RobotCoordinator
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	for _, ep := range endpoints {
-		coord := RobotCoordinator{
-			Name: ep.name,
-			URL:  ep.url,
+	if dir, err := os.UserConfigDir(); err == nil {
+		if fc, err := coordinator.LoadFileConfig(filepath.Join(dir, "caam", "coordinator.json")); err == nil {
+			bind := strings.TrimSpace(fc.Bind)
+			if bind == "" || bind == "0.0.0.0" || bind == "::" {
+				bind = coordinator.DefaultBindAddress
+			}
+			port := fc.Port
+			if port == 0 {
+				port = 7890
+			}
+			targets = append(targets, target{"local", &agent.CoordinatorEndpoint{
+				Name: "local", URL: "http://" + coordinator.ListenAddress(bind, port), Token: fc.AuthToken,
+			}})
 		}
-
-		start := time.Now()
-		resp, err := client.Get(ep.url + "/status")
-		coord.Latency = time.Since(start).Milliseconds()
-
-		if err != nil {
-			coord.Error = err.Error()
-			coord.Healthy = false
-		} else {
-			resp.Body.Close()
-			coord.Healthy = resp.StatusCode == http.StatusOK
-
-			// Try to get pending count
-			if pendResp, err := client.Get(ep.url + "/auth/pending"); err == nil {
-				var pending []interface{}
-				json.NewDecoder(pendResp.Body).Decode(&pending)
-				pendResp.Body.Close()
-				coord.Pending = len(pending)
+	}
+	if fc, err := agent.LoadFileConfig(agent.DefaultConfigPath()); err == nil {
+		for _, c := range fc.Coordinators {
+			if c != nil {
+				targets = append(targets, target{"agent", c})
 			}
 		}
-
-		coords = append(coords, coord)
+		if len(fc.Coordinators) == 0 && (fc.CoordinatorURL != "" || fc.Coordinator != "") {
+			url := firstNonEmpty(fc.CoordinatorURL, fc.Coordinator)
+			targets = append(targets, target{"agent", &agent.CoordinatorEndpoint{Name: "coordinator", URL: url, Token: fc.CoordinatorToken}})
+		}
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	coords := make([]RobotCoordinator, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t target) {
+			defer wg.Done()
+			defer t.endpoint.Close()
+			probe := t.endpoint.Probe(ctx)
+			coords[i] = RobotCoordinator{
+				Name:      t.endpoint.Name,
+				URL:       t.endpoint.URL,
+				Transport: t.endpoint.Transport(),
+				Source:    t.source,
+				Healthy:   probe.Healthy,
+				Latency:   probe.Latency.Milliseconds(),
+				Backend:   probe.Backend,
+				Panes:     probe.PaneCount,
+				Pending:   probe.PendingAuths,
+				Error:     probe.Error,
+			}
+		}(i, t)
+	}
+	wg.Wait()
 	return coords
 }
 

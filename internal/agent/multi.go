@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -105,6 +106,60 @@ func (c *CoordinatorEndpoint) close() {
 	if tunnel != nil {
 		tunnel.Close()
 	}
+}
+
+// CoordinatorProbe is the result of a one-off coordinator health check.
+type CoordinatorProbe struct {
+	Healthy      bool
+	Latency      time.Duration
+	Backend      string
+	PaneCount    int
+	PendingAuths int
+	Error        string
+}
+
+// Probe calls the coordinator's authenticated /status through the endpoint's
+// transport (including its SSH tunnel), as the agent would reach it.
+func (c *CoordinatorEndpoint) Probe(ctx context.Context) CoordinatorProbe {
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.URL, "/")+"/status", nil)
+	if err != nil {
+		return CoordinatorProbe{Error: err.Error()}
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.httpClient().Do(req)
+	probe := CoordinatorProbe{Latency: time.Since(start)}
+	if err != nil {
+		probe.Error = err.Error()
+		return probe
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		probe.Error = fmt.Sprintf("status %d: %s", resp.StatusCode, coordinatorErrorMessage(data))
+		return probe
+	}
+	var status struct {
+		Backend      string `json:"backend"`
+		PaneCount    int    `json:"pane_count"`
+		PendingAuths int    `json:"pending_auths"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&status); err != nil {
+		probe.Error = fmt.Sprintf("decode status: %v", err)
+		return probe
+	}
+	probe.Healthy = true
+	probe.Backend = status.Backend
+	probe.PaneCount = status.PaneCount
+	probe.PendingAuths = status.PendingAuths
+	return probe
+}
+
+// Close releases the endpoint's SSH connection, if any.
+func (c *CoordinatorEndpoint) Close() {
+	c.close()
 }
 
 // sshTunnel dials coordinator connections over one shared SSH connection and
