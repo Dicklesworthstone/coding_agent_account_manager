@@ -476,6 +476,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		r.failWithManual("context cancelled before handoff: %v", err)
 		return
 	}
+	// Expiry, provider verdicts, and cooldowns can change during the wait.
+	// Recheck the chosen target before consuming a retry or changing live auth.
+	if _, err := r.rotation.Select(r.loginHandler.Provider(), []string{nextProfile}, ""); err != nil {
+		r.failWithManual("selected profile is no longer launchable: %v", err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		r.failWithManual("context cancelled before handoff: %v", err)
+		return
+	}
 	// Charge attempts before changing auth, including failed swaps and logins.
 	// Never select a failed handoff target again after rollback in this session.
 	r.mu.Lock()

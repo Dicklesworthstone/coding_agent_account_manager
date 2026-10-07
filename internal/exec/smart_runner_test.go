@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
@@ -738,6 +739,56 @@ func TestSmartRunner_CancelBackoffBeforeChangingAuth(t *testing.T) {
 			for name, want := range credentials {
 				assertSmartSwitchFile(t, sr.vault.BackupPath("codex", name, "auth.json"), want)
 			}
+		})
+	}
+}
+
+func TestSmartRunner_RechecksEligibilityAfterBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		backoff    time.Duration
+		retryAfter string
+	}{
+		{"configured delay", time.Minute, ""},
+		{"server delay with zero backoff", 0, "Retry-After: 60"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sr, livePath, credentials := newSmartRetryRunner(t, []string{"alice", "bob"}, smartRetryPolicy(3, tc.backoff))
+				// Bob is usable at selection, but its nonrenewable token expires
+				// halfway through the wait. Fake time makes the boundary exact.
+				payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":"user-bob","exp":%d}`, time.Now().Add(30*time.Second).Unix())))
+				credentials["bob"] = []byte(fmt.Sprintf(`{"tokens":{"access_token":%q}}`, "e30."+payload+".synthetic"))
+				writeSmartSwitchFile(t, sr.vault.BackupPath("codex", "bob", "auth.json"), credentials["bob"])
+				called := false
+				sr.loginHandler = &smartSwitchLoginHandler{
+					LoginHandler: handoff.GetHandler("codex"),
+					trigger: func() error {
+						called = true
+						sr.loginDone <- loginResult{success: true}
+						return nil
+					},
+				}
+				if tc.retryAfter != "" {
+					sr.detector.Check(tc.retryAfter)
+				}
+				start := time.Now()
+				sr.handleRateLimit(context.Background())
+				if elapsed := time.Since(start); elapsed != time.Minute {
+					t.Fatalf("handoff elapsed %v, want the full one-minute backoff", elapsed)
+				}
+				if called || sr.handoffAttempts != 0 || sr.triedProfiles["bob"] || sr.currentProfile != "alice" || sr.getState() != HandoffFailed {
+					t.Fatal("credential that expired during backoff advanced handoff or consumed a retry")
+				}
+				assertSmartSwitchFile(t, livePath, credentials["alice"])
+				for name, want := range credentials {
+					assertSmartSwitchFile(t, sr.vault.BackupPath("codex", name, "auth.json"), want)
+				}
+				profiles, err := sr.vault.List("codex")
+				if err != nil || !reflect.DeepEqual(profiles, []string{"alice", "bob"}) {
+					t.Fatalf("ineligible handoff changed vault inventory: profiles=%v err=%v", profiles, err)
+				}
+			})
 		})
 	}
 }
