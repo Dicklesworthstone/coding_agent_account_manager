@@ -1509,3 +1509,37 @@ func TestDetectStateRecognizesLoginSuccessVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestRateLimitBannerVariants(t *testing.T) {
+	for _, tc := range []struct {
+		text, reset string
+	}{
+		{"You've hit your limit · resets 2pm (America/New_York)", "2pm"},
+		{"You’ve hit your limit · resets 11am", "11am"},
+		{"Claude usage limit reached. Your limit will reset at 5pm (Europe/Paris).", "5pm"},
+		{"5-hour limit reached ∙ resets 3:30pm", "3:30pm"},
+		{"Weekly limit reached ∙ resets Oct 9", ""},
+		{"Opus weekly limit reached ∙ resets 9am", "9am"},
+	} {
+		state, meta := DetectState(tc.text)
+		if state != StateRateLimited {
+			t.Errorf("DetectState(%q) = %v, want RATE_LIMITED", tc.text, state)
+			continue
+		}
+		if meta["reset_time"] != tc.reset {
+			t.Errorf("reset_time for %q = %q, want %q", tc.text, meta["reset_time"], tc.reset)
+		}
+	}
+
+	// Conversation about limits is not a limit banner: injecting /login
+	// into a working session would interrupt it.
+	for _, text := range []string{
+		"> handle the case where the usage limit reached its maximum",
+		"We hit a rate limit (429) from the API; retrying",
+		"Opus limit reached? Let me check the docs.",
+	} {
+		if state, _ := DetectState(text); state == StateRateLimited {
+			t.Errorf("DetectState(%q) = RATE_LIMITED, want no rate limit", text)
+		}
+	}
+}

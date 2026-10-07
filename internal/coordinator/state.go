@@ -325,9 +325,13 @@ var Patterns = struct {
 	// "Login successful. Press Enter to continue…"
 	PressEnter: regexp.MustCompile(`(?i)press\s+enter\s+to\s+continue`),
 
-	// "You've hit your limit · resets 2pm (America/New_York)"; tolerant of
-	// case and of a curly or missing apostrophe.
-	RateLimit: regexp.MustCompile(`(?i)you['’]?ve hit your limit.*resets`),
+	// Claude Code's limit banners, followed by their reset time on the same
+	// line (which keeps conversation text about limits from matching):
+	//   "You've hit your limit · resets 2pm (America/New_York)"
+	//   "Claude usage limit reached. Your limit will reset at 2pm (Europe/Paris)."
+	//   "5-hour limit reached ∙ resets 2pm" / "Weekly limit reached ∙ resets Oct 9"
+	// Tolerant of case and of a curly or missing apostrophe.
+	RateLimit: regexp.MustCompile(`(?i)(you['’]?ve hit your limit|usage limit reached|\b(?:5-hour|five-hour|weekly|opus|sonnet)\b[^\n]{0,20}\blimit reached)[^\n]{0,120}\breset`),
 
 	// "Select login method:"
 	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
@@ -348,7 +352,7 @@ var Patterns = struct {
 	OptionOne: regexp.MustCompile(`[❯>]\s*1\.\s*Claude account`),
 
 	// Extract reset time from rate limit message
-	UsageLimitReset: regexp.MustCompile(`resets\s+(\d+[ap]m)`),
+	UsageLimitReset: regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(\d+(?::\d+)?\s*[ap]m)`),
 
 	// "Conversation compacted · ctrl+o for history" or similar variants
 	// Matches with optional box-drawing characters, middot/bullet separators,
