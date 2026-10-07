@@ -1525,6 +1525,36 @@ claude "explain this authentication flow"
 
 ---
 
+## Distributed Auth Recovery
+
+When Claude Code sessions run on remote machines (WezTerm SSH domains or tmux)
+and hit their limit, caam can log them back in without you touching them: a
+**coordinator** on each remote host watches the panes, sends `/login`, and
+publishes the OAuth URL; the **auth agent** on your local machine completes
+the login in its own Chrome profile and sends the code back over SSH; the
+coordinator pastes it and resumes the session.
+
+```bash
+# One time, on the machine with the browser:
+caam setup distributed            # deploy coordinators to your WezTerm SSH domains
+caam auth-agent signin            # sign in to the Google accounts to rotate through
+caam auth-agent service install   # run the agent at login (launchd / systemd --user)
+
+# Day to day:
+caam robot status --include-coordinators  # coordinator health and panes (JSON)
+caam auth-coordinator status              # one coordinator, run on its host
+caam update --remotes                     # keep coordinators on this version
+```
+
+The coordinator API listens on loopback with a per-host token and is reached
+only through the agent's SSH connection; codes are delivered until the
+coordinator acknowledges them and are pasted exactly once. For manual control
+of panes, see `caam wezterm recover` and `caam wezterm login-all`. Design,
+configuration keys, API, and troubleshooting:
+[docs/DISTRIBUTED_AUTH_RECOVERY.md](docs/DISTRIBUTED_AUTH_RECOVERY.md).
+
+---
+
 ## Alerts
 
 caam alerts you when `caam run` switches accounts after a rate limit, and when
