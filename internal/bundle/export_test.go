@@ -317,6 +317,58 @@ func TestVaultExporter_Export_SkipsSystemProfiles(t *testing.T) {
 	}
 }
 
+func TestVaultExporterOmitsPrivateRecoveryPayloads(t *testing.T) {
+	root := t.TempDir()
+	vault := filepath.Join(root, "vault")
+	private := "_caam-vault-backup~synthetic"
+	for _, entry := range []struct {
+		path string
+		data string
+	}{
+		{path: "codex/work/auth.json", data: `{"accessToken":"synthetic-selected"}`},
+		{path: "codex/" + private + "/previous/auth.json", data: `{"accessToken":"synthetic-previous"}`},
+		{path: "codex/" + private + "/prepared/auth.json", data: `{"accessToken":"synthetic-staged"}`},
+	} {
+		path := filepath.Join(vault, filepath.FromSlash(entry.path))
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(entry.data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exporter := &VaultExporter{VaultPath: vault, DataPath: root}
+	for _, filter := range [][]string{nil, {private}} {
+		result, err := exporter.Export(&ExportOptions{OutputDir: root, ProfileFilter: filter})
+		if len(filter) > 0 {
+			if err == nil {
+				t.Fatal("explicit profile filter exported private recovery")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		profiles := result.Manifest.Contents.Vault.Profiles["codex"]
+		if len(profiles) != 1 || profiles[0] != "work" {
+			t.Fatalf("recovery directory entered bundle manifest: %v", profiles)
+		}
+		archive, err := zip.OpenReader(result.OutputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range archive.File {
+			if strings.Contains(entry.Name, private) {
+				archive.Close()
+				t.Fatalf("bundle contains private recovery payload: %s", entry.Name)
+			}
+		}
+		if err := archive.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestVaultExporter_Export_VerboseFilename(t *testing.T) {
 	tmpDir := t.TempDir()
 	vaultDir := filepath.Join(tmpDir, "vault")

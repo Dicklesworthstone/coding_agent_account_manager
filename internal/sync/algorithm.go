@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
@@ -365,9 +366,24 @@ func filterProfiles(profiles []ProfileRef, provider, profile string) []ProfileRe
 	return out
 }
 
+func validateSyncProfileRef(p ProfileRef) error {
+	for _, name := range []string{p.Provider, p.Profile} {
+		if authfile.IsPrivateVaultEntry(name) {
+			return fmt.Errorf("private vault recovery directories cannot be synchronized")
+		}
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || filepath.IsAbs(name) || filepath.VolumeName(name) != "" {
+			return fmt.Errorf("sync provider and profile must be directory names")
+		}
+	}
+	return nil
+}
+
 // SyncProfileWithMachine syncs a specific profile with a specific machine.
 // This is useful for queue processing where we only want to retry the failed machine.
 func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile string, m *Machine) (*SyncResult, error) {
+	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
+		return nil, err
+	}
 	if m == nil {
 		return nil, fmt.Errorf("machine is nil")
 	}
@@ -446,6 +462,9 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 
 // SyncProfile synchronizes a specific profile with all machines.
 func (s *Syncer) SyncProfile(ctx context.Context, provider, profile string) ([]*SyncResult, error) {
+	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
+		return nil, err
+	}
 	if s.state.Pool == nil || s.state.Pool.IsEmpty() {
 		return nil, nil
 	}
@@ -552,6 +571,9 @@ func (s *Syncer) SyncAll(ctx context.Context) ([]*SyncResult, error) {
 
 // determineSyncOperation determines what sync operation is needed for a profile.
 func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p ProfileRef) (*SyncOperation, error) {
+	if err := validateSyncProfileRef(p); err != nil {
+		return nil, err
+	}
 	mode := s.policy.ModeFor(p.Provider, p.Profile)
 	if mode == ModeHostLocal {
 		return s.determineHostLocalOperation(client, m, p)
@@ -733,6 +755,9 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 // metadataOnly (host-local policy), only allowlisted metadata files are
 // written; credential payload never leaves this machine.
 func (s *Syncer) pushProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
+	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
+		return err
+	}
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
 	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
@@ -764,6 +789,9 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string, metada
 // metadataOnly (host-local policy), only allowlisted metadata files are
 // fetched; the remote credential payload is never copied here.
 func (s *Syncer) pullProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
+	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
+		return err
+	}
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
 	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
@@ -897,6 +925,9 @@ func (s *Syncer) readLocalProfileFiles(profilePath string) (map[string][]byte, e
 
 // getLocalFreshness gets the freshness of a local profile.
 func (s *Syncer) getLocalFreshness(p ProfileRef) (*TokenFreshness, error) {
+	if err := validateSyncProfileRef(p); err != nil {
+		return nil, err
+	}
 	profilePath := filepath.Join(s.vaultPath, p.Provider, p.Profile)
 
 	// Check if directory exists
@@ -922,6 +953,9 @@ func (s *Syncer) getLocalFreshness(p ProfileRef) (*TokenFreshness, error) {
 
 // getRemoteFreshness gets the freshness of a remote profile.
 func (s *Syncer) getRemoteFreshness(client *SSHClient, p ProfileRef) (*TokenFreshness, error) {
+	if err := validateSyncProfileRef(p); err != nil {
+		return nil, err
+	}
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
 	remotePath := posixJoin(s.remoteVaultPath, p.Provider, p.Profile)
 
@@ -987,7 +1021,7 @@ func (s *Syncer) listLocalProfiles() ([]ProfileRef, error) {
 		}
 
 		for _, entry := range entries {
-			if entry.IsDir() {
+			if entry.IsDir() && !authfile.IsPrivateVaultEntry(entry.Name()) {
 				profiles = append(profiles, ProfileRef{
 					Provider: provider,
 					Profile:  entry.Name(),
@@ -1016,7 +1050,7 @@ func (s *Syncer) listRemoteProfiles(client *SSHClient) ([]ProfileRef, error) {
 		}
 
 		for _, entry := range entries {
-			if entry.IsDir() {
+			if entry.IsDir() && !authfile.IsPrivateVaultEntry(entry.Name()) {
 				profiles = append(profiles, ProfileRef{
 					Provider: provider,
 					Profile:  entry.Name(),

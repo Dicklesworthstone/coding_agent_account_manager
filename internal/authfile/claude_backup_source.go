@@ -31,6 +31,13 @@ func readClaudeBackupSource(path string, fields []string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return projectClaudeBackupSource(data, fields)
+}
+
+// projectClaudeBackupSource validates already captured bytes without rereading
+// native files. Nil fields preserves a raw credential losslessly; named fields
+// retain only nonblank cache strings, with no cache represented by a nil result.
+func projectClaudeBackupSource(data []byte, fields []string) ([]byte, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
 		return nil, fmt.Errorf("backup source must contain a JSON object")

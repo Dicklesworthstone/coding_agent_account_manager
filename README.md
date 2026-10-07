@@ -851,6 +851,27 @@ When `stealth.cooldown.enabled` is true in config, `caam activate` warns if the 
 
 When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically falls back to rotation if the default profile is in cooldown.
 
+### Replacing a Saved Credential Snapshot
+
+`caam backup <tool> <profile>` captures and validates a complete snapshot before
+replacing a saved profile. Optional credential files that no longer exist are
+absent from the new snapshot, so an old OAuth login cannot survive a later
+API-key or helper-based backup. Claude Desktop backups retain only nonblank
+credential cache fields and leave native application settings unchanged.
+
+Replacing a profile preserves its descriptions, tags and browser preferences;
+account identity is derived from the newly captured credentials. The complete
+previous directory remains recoverable at the `previous_snapshot` path recorded
+in the new profile's `meta.json`, including unknown files and old metadata.
+Private recovery directories are excluded from account listing, bundle export
+and sync, and cannot be selected as ordinary profiles.
+
+Preparation and publication stay on the destination provider's filesystem,
+including when the vault points to another mounted volume. Capture or validation
+failure leaves the previous profile unchanged. If publication fails, CAAM
+attempts to restore the previous directory and reports its retained recovery
+path if rollback cannot complete.
+
 ### Preserving Credentials During Account Switches
 
 Account switching uses the same preservation operation from `activate`, `next`,

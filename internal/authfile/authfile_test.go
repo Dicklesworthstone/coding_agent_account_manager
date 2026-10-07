@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -422,6 +424,223 @@ func TestVaultBackup(t *testing.T) {
 			t.Fatal("Backup() should fail when no files to backup")
 		}
 	})
+}
+
+func TestVaultBackupReplacesExactSnapshotAndPreservesOperatorMetadata(t *testing.T) {
+	root := t.TempDir()
+	vault := NewVault(filepath.Join(root, "vault"))
+	live := filepath.Join(root, "live", "auth.json")
+	optional := filepath.Join(root, "live", "optional.json")
+	set := AuthFileSet{Tool: "testtool", Files: []AuthFileSpec{{Path: live, Required: true}, {Path: optional}}}
+	writeClaudeSettingsTestFile(t, live, `{"token":"new-account"}`)
+	writeSwitchProfile(t, vault, "testtool", "work", map[string]string{
+		"auth.json":          `{"token":"previous-account"}`,
+		"optional.json":      `{"token":"retired-source"}`,
+		"operator-notes.txt": "retain this separate file",
+		"meta.json":          `{"description":"client account","tags":["work"],"browser_command":"browser","browser_profile_dir":"Profile 2","identity":"old@example.invalid","identity_keys":["uuid:old"],"account_uuid":"old","cached_usage":{"value":99},"unknown":{"retained":true}}`,
+	})
+	oldMetadata := readFixtureFile(t, vault.BackupPath("testtool", "work", "meta.json"))
+	if err := vault.Backup(set, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFixtureFile(t, vault.BackupPath("testtool", "work", "auth.json")); got != `{"token":"new-account"}` {
+		t.Fatalf("new snapshot retained the previous credential: %s", got)
+	}
+	for _, name := range []string{"optional.json", "operator-notes.txt"} {
+		if _, err := os.Stat(vault.BackupPath("testtool", "work", name)); !os.IsNotExist(err) {
+			t.Fatalf("old file %s survived in the selected snapshot: %v", name, err)
+		}
+	}
+	meta := readJSONMap(t, vault.BackupPath("testtool", "work", "meta.json"))
+	for key, want := range map[string]interface{}{
+		"description": "client account", "tags": []interface{}{"work"},
+		"browser_command": "browser", "browser_profile_dir": "Profile 2", "files": float64(1),
+	} {
+		if !reflect.DeepEqual(meta[key], want) {
+			t.Fatalf("metadata %s = %#v, want %#v", key, meta[key], want)
+		}
+	}
+	for _, key := range []string{"identity", "identity_keys", "account_uuid", "cached_usage"} {
+		if _, exists := meta[key]; exists {
+			t.Fatalf("previous account metadata survived replacement: %s", key)
+		}
+	}
+	previousPath, _ := meta["previous_snapshot"].(string)
+	if previousPath == "" {
+		t.Fatal("previous snapshot is absent")
+	}
+	if _, err := vault.safeProfileDir("testtool", filepath.Base(filepath.Dir(previousPath))); err == nil {
+		t.Fatalf("private recovery directory can be addressed as a profile: %q", previousPath)
+	}
+	if got := readFixtureFile(t, filepath.Join(previousPath, "operator-notes.txt")); got != "retain this separate file" {
+		t.Fatalf("lost unknown operator file: %q", got)
+	}
+	if got := readFixtureFile(t, filepath.Join(previousPath, "meta.json")); got != oldMetadata {
+		t.Fatal("retained previous metadata changed")
+	}
+	all, err := vault.ListAll()
+	if err != nil || !reflect.DeepEqual(all, map[string][]string{"testtool": {"work"}}) {
+		t.Fatalf("transaction directories entered profile listing: %#v, %v", all, err)
+	}
+}
+
+func TestVaultBackupWorksAcrossFilesystemVaultSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation may require elevated Windows privileges")
+	}
+	root := t.TempDir()
+	var mounted string
+	for _, candidate := range []string{"/dev/shm", "/tmp", "/dev"} {
+		dir, err := os.MkdirTemp(candidate, "caam-backup-filesystem-test-*")
+		if err != nil {
+			continue
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		probe := filepath.Join(root, "filesystem-probe")
+		if err := os.WriteFile(probe, []byte("synthetic filesystem probe"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(probe, filepath.Join(dir, "probe")); errors.Is(err, syscall.EXDEV) {
+			mounted = filepath.Join(dir, "vault")
+			break
+		}
+	}
+	if mounted == "" {
+		t.Skip("two writable filesystems are needed for the cross-device regression")
+	}
+	if err := os.Mkdir(mounted, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "vault")
+	if err := os.Symlink(mounted, link); err != nil {
+		t.Fatal(err)
+	}
+	vault := NewVault(link)
+	live := filepath.Join(root, "live", "auth.json")
+	files := AuthFileSet{Tool: "testtool", Files: []AuthFileSpec{{Path: live, Required: true}}}
+	writeClaudeSettingsTestFile(t, live, `{"token":"synthetic-original"}`)
+	if err := vault.Backup(files, "work"); err != nil {
+		t.Fatalf("initial backup into a vault on another filesystem: %v", err)
+	}
+	writeClaudeSettingsTestFile(t, live, `{"token":"synthetic-replacement"}`)
+	if err := vault.Backup(files, "work"); err != nil {
+		t.Fatalf("replace backup in a vault on another filesystem: %v", err)
+	}
+	if got := readFixtureFile(t, vault.BackupPath("testtool", "work", "auth.json")); got != `{"token":"synthetic-replacement"}` {
+		t.Fatal("replacement was not published on the vault filesystem")
+	}
+	metadata := readJSONMap(t, vault.BackupPath("testtool", "work", "meta.json"))
+	previous, _ := metadata["previous_snapshot"].(string)
+	if previous == "" || readFixtureFile(t, filepath.Join(previous, "auth.json")) != `{"token":"synthetic-original"}` {
+		t.Fatal("previous credentials on the vault filesystem are not recoverable")
+	}
+	profiles, err := vault.List("testtool")
+	if err != nil || !reflect.DeepEqual(profiles, []string{"work"}) {
+		t.Fatalf("recovery directory entered profile discovery: %v, %v", profiles, err)
+	}
+}
+
+func TestPrivateVaultEntriesDoNotHideLegitimateProfiles(t *testing.T) {
+	vault := NewVault(t.TempDir())
+	for _, name := range []string{"work", "_caam-vault-backup-old", ".caam-vault-backup-old", vaultBackupPrefix + "synthetic"} {
+		if err := os.MkdirAll(vault.ProfilePath("codex", name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profiles, err := vault.List("codex")
+	want := []string{".caam-vault-backup-old", "_caam-vault-backup-old", "work"}
+	if err != nil || !reflect.DeepEqual(profiles, want) {
+		t.Fatalf("private exclusion hid a valid name or exposed a transaction: %v, %v", profiles, err)
+	}
+	if _, err := vault.safeProfileDir("codex", vaultBackupPrefix+"synthetic"); err == nil {
+		t.Fatal("private transaction is addressable as a vault profile")
+	}
+}
+
+func TestVaultBackupCaptureAndValidationFailurePreservePreviousSnapshot(t *testing.T) {
+	for _, failure := range []string{"late required file missing", "late source is a directory", "empty primary", "malformed metadata"} {
+		t.Run(failure, func(t *testing.T) {
+			root := t.TempDir()
+			vault := NewVault(filepath.Join(root, "vault"))
+			live := filepath.Join(root, "live", "auth.json")
+			later := filepath.Join(root, "live", "required.json")
+			set := AuthFileSet{Tool: "testtool", Files: []AuthFileSpec{{Path: live, Required: true}, {Path: later, Required: true}}}
+			writeClaudeSettingsTestFile(t, live, `{"token":"new-account"}`)
+			if failure == "late source is a directory" {
+				if err := os.Mkdir(later, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else if failure != "late required file missing" {
+				writeClaudeSettingsTestFile(t, later, `{"token":"companion"}`)
+			}
+			if failure == "empty primary" {
+				writeClaudeSettingsTestFile(t, live, "")
+			}
+			metadata := `{"description":"keep notes","tags":["work"]}`
+			if failure == "malformed metadata" {
+				metadata = "broken metadata requiring recovery"
+			}
+			writeSwitchProfile(t, vault, "testtool", "work", map[string]string{"auth.json": "old credential", "required.json": "old companion", "meta.json": metadata})
+			before, err := os.Stat(vault.ProfilePath("testtool", "work"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := vault.Backup(set, "work"); err == nil {
+				t.Fatal("invalid capture replaced a working snapshot")
+			}
+			after, err := os.Stat(vault.ProfilePath("testtool", "work"))
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("failed backup replaced the original directory: %v", err)
+			}
+			for name, want := range map[string]string{"auth.json": "old credential", "required.json": "old companion", "meta.json": metadata} {
+				if got := readFixtureFile(t, vault.BackupPath("testtool", "work", name)); got != want {
+					t.Fatalf("failed backup changed %s: %q", name, got)
+				}
+			}
+		})
+	}
+}
+
+func TestPublishBackupSnapshotRollbackAndConcurrentDestination(t *testing.T) {
+	for _, scenario := range []string{"publish failure", "rollback failure", "concurrent destination"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			destination, stage, previous := filepath.Join(root, "target"), filepath.Join(root, "stage"), filepath.Join(root, "previous")
+			writeClaudeSettingsTestFile(t, filepath.Join(destination, "auth.json"), "old credential")
+			writeClaudeSettingsTestFile(t, filepath.Join(stage, "auth.json"), "new credential")
+			expected, err := os.Stat(destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rename := func(from, to string) error {
+				if from == stage {
+					if scenario == "concurrent destination" {
+						writeClaudeSettingsTestFile(t, filepath.Join(destination, "auth.json"), "concurrent credential")
+					}
+					return errors.New("synthetic publication failure")
+				}
+				if from == previous && scenario == "rollback failure" {
+					return errors.New("synthetic rollback failure")
+				}
+				return os.Rename(from, to)
+			}
+			if err := publishBackupSnapshot(stage, destination, previous, expected, rename); err == nil {
+				t.Fatal("publication failure was reported as success")
+			}
+			oldPath := destination
+			if scenario != "publish failure" {
+				oldPath = previous
+			}
+			if got := readFixtureFile(t, filepath.Join(oldPath, "auth.json")); got != "old credential" {
+				t.Fatalf("publication failure lost the old snapshot: %q", got)
+			}
+			if scenario == "concurrent destination" {
+				if got := readFixtureFile(t, filepath.Join(destination, "auth.json")); got != "concurrent credential" {
+					t.Fatal("rollback overwrote a concurrently recreated destination")
+				}
+			}
+		})
+	}
 }
 
 func TestVaultRestore(t *testing.T) {
@@ -1932,6 +2151,14 @@ func TestVaultLabelsSurviveBackup(t *testing.T) {
 	if err != nil || got.Description != "Client A" || len(got.Tags) != 2 {
 		t.Fatalf("labels after re-backup = %+v, %v", got, err)
 	}
+	metaPath := filepath.Join(tmpDir, "vault", "testtool", "work", "meta.json")
+	snapshotMetadata := readJSONMap(t, metaPath)
+	previousPath, _ := snapshotMetadata["previous_snapshot"].(string)
+	if previousPath == "" {
+		t.Fatal("re-backup did not record the retained snapshot")
+	}
+	previousMetaPath := filepath.Join(previousPath, "meta.json")
+	previousMetadata := readFixtureFile(t, previousMetaPath)
 
 	// Clearing removes the keys entirely.
 	if err := v.SetLabels("testtool", "work", ProfileLabels{}); err != nil {
@@ -1940,5 +2167,13 @@ func TestVaultLabelsSurviveBackup(t *testing.T) {
 	meta, _ = os.ReadFile(filepath.Join(tmpDir, "vault", "testtool", "work", "meta.json"))
 	if strings.Contains(string(meta), "description") || strings.Contains(string(meta), "tags") {
 		t.Fatalf("cleared labels still present: %s", meta)
+	}
+	delete(snapshotMetadata, "description")
+	delete(snapshotMetadata, "tags")
+	if got := readJSONMap(t, metaPath); !reflect.DeepEqual(got, snapshotMetadata) {
+		t.Fatalf("clearing labels changed snapshot metadata: got %#v, want %#v", got, snapshotMetadata)
+	}
+	if got := readFixtureFile(t, previousMetaPath); got != previousMetadata {
+		t.Fatalf("clearing labels changed the retained snapshot: got %s, want %s", got, previousMetadata)
 	}
 }

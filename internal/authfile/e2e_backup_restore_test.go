@@ -14,6 +14,64 @@ import (
 // E2E Tests: Profile Backup and Restore Workflow
 // =============================================================================
 
+// Replacing an OAuth snapshot with a helper-only login must retire the old
+// credential, including when another OAuth account is live at activation time.
+func TestE2E_BackupOAuthToHelperThenActivate(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "selected-claude"))
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	vault := NewVault(filepath.Join(root, "vault"))
+	set := ClaudeAuthFiles()
+	credentials := set.Files[0].Path
+	settings := set.Files[3].Path
+	oldOAuth := `{"claudeAiOauth":{"accessToken":"synthetic-old-access","refreshToken":"synthetic-old-refresh","accountId":"old-account"}}`
+	writeClaudeSettingsTestFile(t, credentials, oldOAuth)
+	writeClaudeSettingsTestFile(t, settings, `{"model":"original-policy"}`)
+	if err := vault.Backup(set, "work"); err != nil {
+		t.Fatal(err)
+	}
+	// Model a native logout followed by helper/API-key enrollment.
+	if err := os.Rename(credentials, filepath.Join(root, "retired-native-credential")); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettingsTestFile(t, settings, `{"apiKeyHelper":"selected-helper","env":{"ANTHROPIC_API_KEY":"synthetic-selected-key"},"model":"old-policy"}`)
+	if err := vault.Backup(set, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vault.BackupPath("claude", "work", ".credentials.json")); !os.IsNotExist(err) {
+		t.Fatalf("retired OAuth credential survived helper backup: %v", err)
+	}
+	if err := vault.ValidateProfileCredentials(set, "work"); err != nil {
+		t.Fatalf("exact helper snapshot is not usable: %v", err)
+	}
+	meta := readJSONMap(t, vault.BackupPath("claude", "work", "meta.json"))
+	previous, _ := meta["previous_snapshot"].(string)
+	if got := readFixtureFile(t, filepath.Join(previous, ".credentials.json")); got != oldOAuth {
+		t.Fatal("replaced OAuth source is not recoverable")
+	}
+	writeClaudeSettingsTestFile(t, credentials, `{"claudeAiOauth":{"accessToken":"synthetic-other-access","refreshToken":"synthetic-other-refresh","accountId":"other-account"}}`)
+	writeClaudeSettingsTestFile(t, settings, `{"apiKeyHelper":"other-helper","model":"latest-policy","permissions":{"deny":["Bash(rm *)"]}}`)
+	result, err := vault.Switch(set, "work", SwitchOptions{BackupMode: "never"})
+	if err != nil || result == nil || !result.RestoreStarted {
+		t.Fatalf("activate exact helper snapshot: %+v, %v", result, err)
+	}
+	if _, err := os.Stat(credentials); !os.IsNotExist(err) {
+		t.Fatalf("activation retained another account's OAuth credential: %v", err)
+	}
+	current := readJSONMap(t, settings)
+	if current["apiKeyHelper"] != "selected-helper" || current["model"] != "latest-policy" || current["permissions"] == nil {
+		t.Fatalf("activation did not select the helper and retain current workflow policy: %#v", current)
+	}
+	env, _ := current["env"].(map[string]interface{})
+	if env["ANTHROPIC_API_KEY"] != "synthetic-selected-key" {
+		t.Fatalf("selected API-key settings did not survive activation: %#v", env)
+	}
+}
+
 // TestE2E_FullBackupWorkflow tests the complete backup workflow:
 // - Create temp HOME directory
 // - Place mock auth files for a provider

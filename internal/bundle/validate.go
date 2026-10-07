@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
@@ -65,6 +66,9 @@ func ValidateManifest(m *ManifestV1) error {
 	}
 	providers := make(map[string]bool)
 	for provider, profiles := range m.Contents.Vault.Profiles {
+		if authfile.IsPrivateVaultEntry(provider) {
+			return fmt.Errorf("private vault recovery directories cannot be imported as providers")
+		}
 		if err := validatePathSegment(provider); err != nil {
 			return fmt.Errorf("invalid vault provider %q: %w", provider, err)
 		}
@@ -75,6 +79,9 @@ func ValidateManifest(m *ManifestV1) error {
 		providers[key] = true
 		seen := make(map[string]bool)
 		for _, profile := range profiles {
+			if authfile.IsPrivateVaultEntry(profile) {
+				return fmt.Errorf("private vault recovery directories cannot be imported as profiles")
+			}
 			if err := validatePathSegment(profile); err != nil {
 				return fmt.Errorf("invalid vault profile %q: %w", profile, err)
 			}

@@ -115,6 +115,38 @@ func TestVaultImporterRejectsManifestTraversalBeforeAnyChanges(t *testing.T) {
 	}
 }
 
+func TestVaultImporterCannotReplacePrivateRecovery(t *testing.T) {
+	const private = "_caam-vault-backup~synthetic"
+	for _, dryRun := range []bool{false, true} {
+		for _, names := range [][2]string{{"codex", private}, {private, "work"}, {"codex", strings.ToUpper(private)}, {strings.ToUpper(private), "work"}} {
+			t.Run(names[0]+"/"+names[1]+"/dry="+fmt.Sprint(dryRun), func(t *testing.T) {
+				root := t.TempDir()
+				vault := filepath.Join(root, "vault")
+				recovery := filepath.Join(vault, names[0], names[1], "previous", "auth.json")
+				current := filepath.Join(vault, "codex", "current", "auth.json")
+				writeRecoveryFile(t, recovery, "synthetic-previous-credential")
+				writeRecoveryFile(t, current, "synthetic-current-credential")
+				manifest := NewManifest()
+				manifest.AddProfile(names[0], names[1])
+				manifest.AddProfile("codex", "current")
+				bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+					"vault/" + names[0] + "/" + names[1] + "/previous/auth.json": "synthetic-recovery-replacement",
+					"vault/codex/current/auth.json":                              "synthetic-current-replacement",
+				})
+				result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, Mode: ImportModeReplace, Force: true, DryRun: dryRun})
+				if err == nil {
+					t.Fatal("bundle can overwrite private recovery storage")
+				}
+				if result != nil && len(result.ProfileActions) != 0 {
+					t.Fatal("private recovery was exposed in an import preview")
+				}
+				requireRecoveryFile(t, recovery, "synthetic-previous-credential")
+				requireRecoveryFile(t, current, "synthetic-current-credential")
+			})
+		}
+	}
+}
+
 func TestVaultImporterForceCannotBypassCorruption(t *testing.T) {
 	for _, dryRun := range []bool{false, true} {
 		t.Run(fmt.Sprint(dryRun), func(t *testing.T) {

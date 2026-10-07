@@ -122,6 +122,91 @@ func TestClaudeBackupInvalidSourceDoesNotChangeExistingSnapshots(t *testing.T) {
 	}
 }
 
+func TestClaudeBackupProjectsCapturedDesktopCaches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		document string
+		want     string
+		invalid  bool
+	}{
+		{name: "empty caches", document: `{"theme":"live-policy","oauth:tokenCache":"","oauth:tokenCacheV2":""}`},
+		{name: "whitespace caches", document: `{"theme":"live-policy","oauth:tokenCache":" \t ","oauth:tokenCacheV2":"\n"}`},
+		{name: "valid cache with blank sibling", document: `{"theme":"live-policy","oauth:tokenCache":" ","oauth:tokenCacheV2":"synthetic-selected-cache","futureCounter":9007199254740993}`, want: `{"oauth:tokenCacheV2":"synthetic-selected-cache"}`},
+		{name: "null cache", document: `{"theme":"live-policy","oauth:tokenCache":null,"oauth:tokenCacheV2":"synthetic-secret"}`, invalid: true},
+		{name: "numeric cache", document: `{"theme":"live-policy","oauth:tokenCache":17,"oauth:tokenCacheV2":"synthetic-secret"}`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			files := ClaudeAuthFiles()
+			vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+			credentials := claudeFileSetPath(files, ".credentials.json")
+			desktop := claudeDesktopConfigPath(home)
+			authSourceTestWrite(t, credentials, keychainCreds("old-account"))
+			authSourceTestWrite(t, desktop, `{"theme":"old-policy","oauth:tokenCacheV2":"synthetic-old-cache"}`)
+			if err := vault.Backup(files, "work"); err != nil {
+				t.Fatal(err)
+			}
+			profileDir := vault.ProfilePath("claude", "work")
+			before, err := os.Stat(profileDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous := make(map[string]string)
+			for _, name := range []string{".credentials.json", "config.json", "meta.json"} {
+				previous[name] = readFixtureFile(t, filepath.Join(profileDir, name))
+			}
+			authSourceTestWrite(t, credentials, keychainCreds("new-account"))
+			authSourceTestWrite(t, desktop, tc.document)
+			err = vault.Backup(files, "work")
+			if tc.invalid {
+				if err == nil || strings.Contains(err.Error(), "synthetic-secret") {
+					t.Fatalf("malformed cache was accepted or exposed: %v", err)
+				}
+				after, statErr := os.Stat(profileDir)
+				if statErr != nil || !os.SameFile(before, after) {
+					t.Fatalf("malformed cache replaced the prior directory: %v", statErr)
+				}
+				for name, want := range previous {
+					if got := readFixtureFile(t, filepath.Join(profileDir, name)); got != want {
+						t.Fatalf("malformed cache changed previous %s", name)
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot := filepath.Join(profileDir, "config.json")
+				if tc.want == "" {
+					if _, err := os.Lstat(snapshot); !os.IsNotExist(err) {
+						t.Fatalf("blank Desktop cache survived in the new snapshot: %v", err)
+					}
+				} else if got := readFixtureFile(t, snapshot); got != tc.want {
+					t.Fatalf("Desktop snapshot copied blank caches or policy: %s", got)
+				}
+				if err := vault.ValidateProfileCredentials(files, "work"); err != nil {
+					t.Fatalf("new credential snapshot is unusable: %v", err)
+				}
+				metadata := readJSONMap(t, filepath.Join(profileDir, "meta.json"))
+				retained, _ := metadata["previous_snapshot"].(string)
+				if retained == "" || readFixtureFile(t, filepath.Join(retained, "config.json")) != previous["config.json"] {
+					t.Fatal("previous Desktop credential is not recoverable")
+				}
+			}
+			if got := readFixtureFile(t, desktop); got != tc.document {
+				t.Fatal("backup changed live Desktop preferences or credentials")
+			}
+			if got := readFixtureFile(t, credentials); got != keychainCreds("new-account") {
+				t.Fatal("backup changed the live Code credential")
+			}
+		})
+	}
+}
+
 func TestClaudeBackupCapturesKeychainBeforeClassifyingMissingSources(t *testing.T) {
 	f := newKeychainFixture(t)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")

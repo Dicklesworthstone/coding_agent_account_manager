@@ -429,6 +429,15 @@ func IsSystemProfile(name string) bool {
 	return strings.HasPrefix(strings.TrimSpace(name), "_")
 }
 
+const vaultBackupPrefix = "_caam-vault-backup~"
+
+// IsPrivateVaultEntry identifies backup transaction directories. The tilde is
+// forbidden in profile names, so these entries cannot collide with any valid
+// account. The underscore also keeps them out of system-excluding consumers.
+func IsPrivateVaultEntry(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), vaultBackupPrefix)
+}
+
 var errProtectedSystemProfile = fmt.Errorf("protected system profile")
 
 // ErrNoCredentials means a profile has no complete, locally restorable auth
@@ -478,8 +487,13 @@ func (v *Vault) BackupPath(tool, profile, filename string) string {
 	return filepath.Join(v.ProfilePath(tool, profile), filename)
 }
 
-// Backup saves the current auth files to the vault.
+// Backup publishes an exact snapshot of the current auth files. Replacing a
+// named snapshot retains the complete previous directory in private recovery
+// storage; absent live credentials never survive in the new snapshot.
 func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
+	switchMu.Lock()
+	defer switchMu.Unlock()
+
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -488,206 +502,199 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	tool := strings.TrimSpace(fileSet.Tool)
 	profile = strings.TrimSpace(profile)
 
-	// System profiles are immutable safety artifacts; never overwrite them.
-	if IsSystemProfile(profile) {
-		st, err := os.Stat(profileDir)
-		if err == nil {
-			if st.IsDir() {
-				return fmt.Errorf("%w: refusing to overwrite %s/%s", errProtectedSystemProfile, tool, profile)
-			}
-			return fmt.Errorf("profile path exists and is not a directory: %s", profileDir)
+	previous, err := os.Lstat(profileDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect previous snapshot: %w", err)
+	}
+	if previous != nil {
+		if !previous.IsDir() || previous.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("profile path is not a regular directory: %s", profileDir)
 		}
-		if err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("stat profile dir: %w", err)
+		if IsSystemProfile(profile) {
+			return fmt.Errorf("%w: refusing to overwrite %s/%s", errProtectedSystemProfile, tool, profile)
 		}
 	}
-
-	settingsSnapshots, err := readClaudeSettingsForBackup(fileSet)
+	meta, err := backupOperatorMetadata(profileDir)
 	if err != nil {
 		return err
 	}
-
-	// On macOS the live Claude credentials are in the login keychain, not on
-	// disk. Mirror them out before the walk below, or the snapshot captures
-	// settings with no token in them (issue #98). A refused keychain is fatal
-	// here: a token-less profile is worse than a failed backup.
-	if err := pullClaudeKeychain(fileSet); err != nil {
+	// Validate policy before mirroring a keychain-only login into its live
+	// credential path. Validate the captured settings again below, since native
+	// files can change after this check.
+	if _, err := readClaudeSettingsForBackup(fileSet); err != nil {
 		return err
 	}
-	if fileSet.Tool == "claude" || fileSet.Tool == "cursor" {
-		if err := validateCredentialFiles(fileSet, ""); err != nil {
-			return fmt.Errorf("cannot back up %s/%s: %w", fileSet.Tool, profile, err)
+
+	captured, err := readSwitchStateLimited(fileSet, "", MaxDiscoveryFileBytes)
+	if err != nil {
+		return fmt.Errorf("capture %s credentials: %w", tool, err)
+	}
+	if captured.identityConflict {
+		return fmt.Errorf("%w: captured credentials contain conflicting account identities", ErrInvalidCredentials)
+	}
+	toolDir := filepath.Dir(profileDir)
+	if err := os.MkdirAll(toolDir, 0700); err != nil {
+		return fmt.Errorf("create vault directory: %w", err)
+	}
+	parent, err := os.Lstat(toolDir)
+	if err != nil || !parent.IsDir() || parent.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("vault provider path is not a regular directory")
+	}
+	// Keep atomic renames on the provider's filesystem, even when the vault is
+	// a mount point or a symlink to another volume. Private entries are excluded
+	// from profile discovery, bundle export and sync, and cannot be activated.
+	work, err := os.MkdirTemp(toolDir, vaultBackupPrefix+"*")
+	if err != nil {
+		return fmt.Errorf("create snapshot transaction: %w", err)
+	}
+	retainPrevious := false
+	defer func() {
+		if !retainPrevious {
+			_ = os.RemoveAll(work)
 		}
+	}()
+	stage := filepath.Join(work, "prepared")
+	if err := os.Mkdir(stage, 0700); err != nil {
+		return fmt.Errorf("create prepared snapshot: %w", err)
 	}
-
-	// Create profile directory
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		return fmt.Errorf("create profile dir: %w", err)
-	}
-
-	backedUp := 0
-	requiredFound := false
-	optionalFound := false
-	var missingRequired []string
+	stagedSet := fileSet
+	stagedSet.Files = make([]AuthFileSpec, 0, len(fileSet.Files))
 	var originalPaths []string
+	seen := make(map[string]bool)
 	for _, spec := range fileSet.Files {
-		if snapshot, ok := settingsSnapshots[spec.Path]; ok {
-			destPath := filepath.Join(profileDir, filepath.Base(spec.Path))
-			if snapshot.data == nil {
-				if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("remove obsolete settings snapshot: %w", err)
-				}
-				if spec.Required {
-					missingRequired = append(missingRequired, spec.Path)
-				}
+		name := filepath.Base(spec.Path)
+		if name == "meta.json" || name == "." || name == string(filepath.Separator) || seen[name] {
+			return fmt.Errorf("invalid or duplicate snapshot filename: %s", name)
+		}
+		seen[name] = true
+		stagedSpec := spec
+		stagedSpec.Path = filepath.Join(stage, name)
+		stagedSet.Files = append(stagedSet.Files, stagedSpec)
+		data, present := captured.files[name]
+		if !present {
+			continue
+		}
+		// Project captured bytes while the original path still identifies Desktop
+		// configuration. The flattened staging path cannot identify that source.
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			data, err = projectClaudeBackupSource(data, claudeDesktopTokenKeys)
+			if err != nil {
+				return fmt.Errorf("%w: captured Claude Desktop configuration: %v", ErrInvalidCredentials, err)
+			}
+			if data == nil {
 				continue
 			}
-			if err := writeJSONFileAtomic(destPath, json.RawMessage(snapshot.data), 0600); err != nil {
-				return fmt.Errorf("backup %s: %w", spec.Path, err)
-			}
-			backedUp++
-			if spec.Required {
-				requiredFound = requiredFound || snapshot.hasAuth
-			} else {
-				optionalFound = optionalFound || snapshot.hasAuth
-			}
-			originalPaths = append(originalPaths, spec.Path)
-			continue
 		}
-		// Claude Desktop config: capture ONLY the oauth:tokenCache* fields, so we
-		// never persist (or later clobber) unrelated desktop settings (PR #44).
-		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
-			fields, ok, err := claudeDesktopTokenCache(spec.Path)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				continue // no token cache present — nothing to back up
-			}
-			destPath := filepath.Join(profileDir, filepath.Base(spec.Path))
-			if err := writeJSONFileAtomic(destPath, fields, 0600); err != nil {
-				return fmt.Errorf("backup %s: %w", spec.Path, err)
-			}
-			backedUp++
-			optionalFound = true
-			originalPaths = append(originalPaths, spec.Path)
-			continue
-		}
-
-		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
-			if spec.Required {
-				missingRequired = append(missingRequired, spec.Path)
-			}
-			continue // Skip optional files that don't exist
-		}
-
-		// Copy file to vault
-		filename := filepath.Base(spec.Path)
-		destPath := filepath.Join(profileDir, filename)
-
-		if err := copyFile(spec.Path, destPath); err != nil {
-			return fmt.Errorf("backup %s: %w", spec.Path, err)
-		}
-		backedUp++
-		if spec.Required {
-			requiredFound = true
-		} else {
-			optionalFound = true
+		if err := writeSwitchFile(stagedSpec.Path, data, true); err != nil {
+			return fmt.Errorf("stage %s: %w", spec.Path, err)
 		}
 		originalPaths = append(originalPaths, spec.Path)
 	}
-
-	if backedUp == 0 {
-		return fmt.Errorf("no auth files found to backup for %s; ensure you're logged in first with '%s' or 'caam add %s'", tool, tool, tool)
+	if _, err := readClaudeSettingsForBackup(stagedSet); err != nil {
+		return err
 	}
-	if len(missingRequired) > 0 {
-		if !(fileSet.AllowOptionalOnly && !requiredFound && optionalFound) {
-			return fmt.Errorf("required auth file not found: %s", missingRequired[0])
-		}
+	if err := validateCredentialFiles(fileSet, stage); err != nil {
+		return fmt.Errorf("cannot back up %s/%s: %w", tool, profile, err)
 	}
 
-	// Write metadata. User labels (description, tags) belong to the profile,
-	// not the snapshot, so they survive re-backing up the account.
-	metaPath := filepath.Join(profileDir, "meta.json")
-	labels := readProfileLabels(metaPath)
-	meta := struct {
-		Tool          string   `json:"tool"`
-		Profile       string   `json:"profile"`
-		Description   string   `json:"description,omitempty"` // Free-form notes about profile purpose
-		Tags          []string `json:"tags,omitempty"`
-		BackedUpAt    string   `json:"backed_up_at"`
-		Files         int      `json:"files"`
-		Type          string   `json:"type,omitempty"`       // user|system
-		CreatedBy     string   `json:"created_by,omitempty"` // user|auto|first-activate
-		OriginalPaths []string `json:"original_paths,omitempty"`
-		Identity      string   `json:"identity,omitempty"`      // Human-readable account identity (email when known)
-		IdentityKeys  []string `json:"identity_keys,omitempty"` // Namespaced identity keys used for matching (issue #73)
-	}{
-		Tool:          tool,
-		Profile:       profile,
-		Description:   labels.Description,
-		Tags:          labels.Tags,
-		BackedUpAt:    time.Now().Format(time.RFC3339),
-		Files:         backedUp,
-		Type:          "user",
-		CreatedBy:     "user",
-		OriginalPaths: originalPaths,
-	}
-	// Record a rotation-stable account identity next to the snapshot so
-	// ActiveProfile can still recognize this profile after the tool rotates
-	// its tokens — even if the snapshot's settings file goes missing or
-	// unparseable later (issue #73). Claude only: the other tools carry their
-	// identity inside the credential file itself.
+	meta["tool"], meta["profile"] = tool, profile
+	meta["backed_up_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	meta["files"], meta["original_paths"] = len(originalPaths), originalPaths
+	meta["type"], meta["created_by"] = "user", "user"
+	// Derive account metadata only from the captured new source. Operator
+	// preferences may survive replacement; the previous account's identity may not.
 	if tool == "claude" {
-		if keys := claudeLiveIdentityKeys(fileSet); len(keys) > 0 {
-			meta.Identity = claudeIdentityLabel(keys)
-			meta.IdentityKeys = keys
+		var settings map[string]interface{}
+		_ = json.Unmarshal(captured.files[claudeSettingsFile], &settings)
+		if keys := claudeIdentityKeys(settings); len(keys) > 0 {
+			meta["identity"], meta["identity_keys"] = claudeIdentityLabel(keys), keys
 		}
 	}
 	if IsSystemProfile(profile) {
-		meta.Type = "system"
-		meta.CreatedBy = "auto"
+		meta["type"], meta["created_by"] = "system", "auto"
 		if profile == originalProfileName {
-			meta.CreatedBy = "first-activate"
+			meta["created_by"] = "first-activate"
 		}
 	}
-	raw, err := json.Marshal(meta)
+	previousPath := filepath.Join(work, "previous")
+	if previous != nil {
+		meta["previous_snapshot"] = previousPath
+	}
+	if err := writeJSONFileAtomic(filepath.Join(stage, "meta.json"), meta, 0600); err != nil {
+		return fmt.Errorf("stage snapshot metadata: %w", err)
+	}
+	current, err := readSwitchStateLimited(fileSet, "", MaxDiscoveryFileBytes)
+	if err != nil || !sameSwitchFiles(captured.files, current.files) {
+		return fmt.Errorf("native %s files changed during backup; retry after the CLI finishes writing", tool)
+	}
+	currentParent, err := os.Lstat(toolDir)
+	if err != nil || !os.SameFile(parent, currentParent) {
+		return fmt.Errorf("vault provider directory changed during backup; retry")
+	}
+	if err := publishBackupSnapshot(stage, profileDir, previousPath, previous, os.Rename); err != nil {
+		// A failed rollback must retain the only complete previous snapshot.
+		_, retainedErr := os.Lstat(previousPath)
+		retainPrevious = retainedErr == nil || !os.IsNotExist(retainedErr)
+		return err
+	}
+	retainPrevious = previous != nil
+	return nil
+}
+
+// Preserve deliberate preferences, not stale identity, token or activity caches.
+// Unknown files and metadata remain recoverable in the previous directory.
+func backupOperatorMetadata(profileDir string) (map[string]interface{}, error) {
+	meta := make(map[string]interface{})
+	path := filepath.Join(profileDir, "meta.json")
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return meta, nil
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("previous snapshot metadata is not a regular file")
+	}
+	data, err := readSwitchSource(path, info, MaxDiscoveryFileBytes)
 	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+		return nil, fmt.Errorf("read previous snapshot metadata: %w", err)
 	}
-
-	// Atomic write: write to temp file, fsync, then rename
-	dir := filepath.Dir(metaPath)
-	f, err := os.CreateTemp(dir, "meta.json.tmp.*")
-	if err != nil {
-		return fmt.Errorf("create temp metadata file: %w", err)
+	var previous map[string]json.RawMessage
+	if err := json.Unmarshal(data, &previous); err != nil || previous == nil {
+		return nil, fmt.Errorf("previous snapshot metadata must contain a JSON object")
 	}
-	tmpPath := f.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := f.Write(raw); err != nil {
-		f.Close()
-		return fmt.Errorf("write temp metadata file: %w", err)
+	for _, key := range []string{"description", "tags", "notes", "alias", "aliases", "browser", "browser_command", "browser_profile", "browser_profile_dir", "browser_profile_name"} {
+		if value, exists := previous[key]; exists {
+			meta[key] = value
+		}
 	}
+	return meta, nil
+}
 
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		return fmt.Errorf("chmod temp metadata file: %w", err)
+func publishBackupSnapshot(stage, destination, previousPath string, expected os.FileInfo, rename func(string, string) error) error {
+	current, err := os.Lstat(destination)
+	if expected == nil {
+		if err == nil || !os.IsNotExist(err) {
+			return fmt.Errorf("snapshot destination appeared during backup; retry")
+		}
+	} else {
+		if err != nil || !os.SameFile(expected, current) {
+			return fmt.Errorf("previous snapshot changed during backup; retry")
+		}
+		if err := rename(destination, previousPath); err != nil {
+			return fmt.Errorf("retain previous snapshot: %w", err)
+		}
 	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("sync temp metadata file: %w", err)
+	if err := rename(stage, destination); err != nil {
+		if expected != nil {
+			// Never replace an independently recreated target while rolling back.
+			if _, currentErr := os.Lstat(destination); !os.IsNotExist(currentErr) {
+				return fmt.Errorf("publish snapshot: %v; destination changed; previous snapshot retained at %s", err, previousPath)
+			}
+			if restoreErr := rename(previousPath, destination); restoreErr != nil {
+				return fmt.Errorf("publish snapshot: %v; restore previous snapshot: %v; previous snapshot retained at %s", err, restoreErr, previousPath)
+			}
+		}
+		return fmt.Errorf("publish snapshot: %w", err)
 	}
-
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close temp metadata file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, metaPath); err != nil {
-		return fmt.Errorf("rename metadata file: %w", err)
-	}
-
 	return nil
 }
 
@@ -1368,7 +1375,7 @@ func (v *Vault) List(tool string) ([]string, error) {
 
 	var profiles []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !IsPrivateVaultEntry(e.Name()) {
 			profiles = append(profiles, e.Name())
 		}
 	}
@@ -1388,7 +1395,7 @@ func (v *Vault) ListAll() (map[string][]string, error) {
 	}
 
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !IsPrivateVaultEntry(e.Name()) {
 			profiles, err := v.List(e.Name())
 			if err != nil {
 				continue
@@ -2736,6 +2743,10 @@ func (v *Vault) Labels(tool, profile string) (ProfileLabels, error) {
 // SetLabels replaces the labels of a vault profile, keeping every other
 // meta.json field. Callers validate tag syntax.
 func (v *Vault) SetLabels(tool, profile string, labels ProfileLabels) error {
+	// Serialize metadata edits with Backup's snapshot capture and publication.
+	switchMu.Lock()
+	defer switchMu.Unlock()
+
 	profileDir, err := v.existingProfileDir(tool, profile)
 	if err != nil {
 		return err
