@@ -253,7 +253,7 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runDaemonLogs(cmd *cobra.Command, args []string) error {
+func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 	lines, _ := cmd.Flags().GetInt("lines")
 	follow, _ := cmd.Flags().GetBool("follow")
 
@@ -267,13 +267,13 @@ func runDaemonLogs(cmd *cobra.Command, args []string) error {
 	}
 
 	// Use tail to show logs
-	args = []string{"-n", fmt.Sprintf("%d", lines)}
+	tailArgs := []string{"-n", fmt.Sprintf("%d", lines)}
 	if follow {
-		args = append(args, "-f")
+		tailArgs = append(tailArgs, "-f")
 	}
-	args = append(args, logPath)
+	tailArgs = append(tailArgs, logPath)
 
-	tailCmd := exec.Command("tail", args...)
+	tailCmd := exec.Command("tail", tailArgs...)
 	tailCmd.Stdout = os.Stdout
 	tailCmd.Stderr = os.Stderr
 

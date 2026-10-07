@@ -78,7 +78,9 @@ set +e
 ` + setup + `
 ` + body
 	cmd := exec.Command(bashPath(t), "-c", script)
-	cmd.Env = append([]string{"INSTALL_SH=" + repoInstallScript(t), "NO_COLOR=1", "HOME=" + t.TempDir()}, env...)
+	// The child has a deliberately minimal environment, so give mktemp its own
+	// test directory instead of falling back to the machine's shared /tmp.
+	cmd.Env = append([]string{"INSTALL_SH=" + repoInstallScript(t), "NO_COLOR=1", "HOME=" + t.TempDir(), "TMPDIR=" + t.TempDir()}, env...)
 	if !hasPath(env) {
 		cmd.Env = append(cmd.Env, "PATH="+os.Getenv("PATH"))
 	}

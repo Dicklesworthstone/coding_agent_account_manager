@@ -2,15 +2,260 @@ package authpool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
+
+type poolRefreshFunc func(context.Context, string, string) (time.Time, error)
+
+func (f poolRefreshFunc) Refresh(ctx context.Context, provider, name string) (time.Time, error) {
+	return f(ctx, provider, name)
+}
+
+func TestMonitorColdStartAndLaterVaultArrival(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	pool := NewAuthPool(WithVault(vault), WithHealthStorage(health.NewStorage(filepath.Join(root, "health.json"))))
+	writePoolCredential(t, vault.BasePath(), "codex", "first", "auth.json", poolCodexCredential(time.Now().Add(-time.Hour), "synthetic-first"))
+	completed := make(chan string, 4)
+	refresher := poolRefreshFunc(func(ctx context.Context, provider, name string) (time.Time, error) {
+		expiry := time.Now().Add(time.Hour).Truncate(time.Second)
+		body, err := json.Marshal(poolCodexCredential(expiry, "synthetic-renewed-"+name))
+		if err == nil {
+			err = os.WriteFile(filepath.Join(vault.ProfilePath(provider, name), "auth.json"), body, 0600)
+		}
+		return expiry, err
+	})
+	monitor := NewMonitor(pool, refresher, MonitorConfig{
+		CheckInterval: 10 * time.Millisecond,
+		OnRefreshComplete: func(provider, name string, expiry time.Time, err error) {
+			if err != nil {
+				t.Errorf("automatic renewal failed: %v", err)
+			}
+			completed <- name
+		},
+	})
+	if err := monitor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer monitor.Stop()
+	for _, want := range []string{"first", "later"} {
+		if want == "later" {
+			writePoolCredential(t, vault.BasePath(), "codex", "later", "auth.json", poolCodexCredential(time.Now().Add(-time.Hour), "synthetic-later"))
+		}
+		select {
+		case got := <-completed:
+			if got != want {
+				t.Fatalf("renewed %q, want %q", got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("monitor never renewed %s from the actual vault", want)
+		}
+	}
+	monitor.Stop()
+	if pool.Count() != 2 || len(pool.GetReadyProfiles("codex")) != 2 || len(pool.GetProfilesNeedingRefresh("")) != 0 {
+		t.Fatalf("completed renewals were not reconciled: %+v", pool.GetAllProfiles(""))
+	}
+}
+
+func TestMonitorStopCancelsBlockedRefreshAndRestarts(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	writePoolCredential(t, vault.BasePath(), "codex", "work", "auth.json", poolCodexCredential(time.Now().Add(-time.Hour), "synthetic-old"))
+	pool := NewAuthPool(WithVault(vault), WithHealthStorage(health.NewStorage(filepath.Join(root, "health.json"))))
+	entered := make(chan struct{}, 2)
+	refresher := poolRefreshFunc(func(ctx context.Context, _, _ string) (time.Time, error) {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return time.Time{}, ctx.Err()
+	})
+	monitor := NewMonitor(pool, refresher, MonitorConfig{CheckInterval: time.Hour})
+	for range 2 {
+		if err := monitor.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("monitor did not enter refresh")
+		}
+		stopped := make(chan struct{})
+		go func() { monitor.Stop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop joined a blocked refresh without first canceling it")
+		}
+		if p := pool.GetProfile("codex", "work"); p.inFlight || p.ErrorCount != 0 || p.Status != PoolStatusExpired || !p.LastRefresh.IsZero() {
+			t.Fatalf("shutdown poisoned/reported success for a canceled renewal: %+v", p)
+		}
+		if monitor.IsRunning() || monitor.Stats().ActiveRefreshes != 0 {
+			t.Fatal("Stop returned before workers completed")
+		}
+	}
+}
+
+func TestMonitorRefreshAllJoinsBoundedRealVaultBatch(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	pool := NewAuthPool(WithVault(vault), WithHealthStorage(health.NewStorage(filepath.Join(root, "health.json"))))
+	for _, name := range []string{"a", "b", "c"} {
+		writePoolCredential(t, vault.BasePath(), "codex", name, "auth.json", poolCodexCredential(time.Now().Add(8*time.Hour), "synthetic-"+name))
+	}
+	writePoolCredential(t, vault.BasePath(), "cursor", "session", "auth.json", map[string]any{"accessToken": "synthetic-session"})
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	var calls, active, peak atomic.Int32
+	refresher := poolRefreshFunc(func(ctx context.Context, provider, name string) (time.Time, error) {
+		calls.Add(1)
+		n := active.Add(1)
+		defer active.Add(-1)
+		for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+		}
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		}
+		expiry := time.Now().Add(12 * time.Hour).Truncate(time.Second)
+		body, err := json.Marshal(poolCodexCredential(expiry, "synthetic-new-"+name))
+		if err == nil {
+			err = os.WriteFile(filepath.Join(vault.ProfilePath(provider, name), "auth.json"), body, 0600)
+		}
+		return expiry, err
+	})
+	monitor := NewMonitor(pool, refresher, MonitorConfig{MaxConcurrent: 2})
+	defer monitor.Stop()
+	type batchResult struct {
+		results []RefreshResult
+		err     error
+	}
+	done := make(chan batchResult, 1)
+	go func() {
+		results, err := monitor.RefreshAll(context.Background())
+		done <- batchResult{results, err}
+	}()
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(3 * time.Second):
+			close(release)
+			t.Fatal("batch did not fill its available worker slots")
+		}
+	}
+	select {
+	case <-done:
+		close(release)
+		t.Fatal("batch returned while refreshes were blocked")
+	default:
+	}
+	close(release)
+	select {
+	case result := <-done:
+		if result.err != nil || len(result.results) != 4 || calls.Load() != 3 || active.Load() != 0 || peak.Load() != 2 {
+			t.Fatalf("batch did not join all outcomes: %+v, calls=%d active=%d peak=%d", result, calls.Load(), active.Load(), peak.Load())
+		}
+		for i, outcome := range result.results {
+			if i < 3 && (outcome.Err != nil || outcome.Expiry.IsZero()) {
+				t.Errorf("renewal failed: %+v", outcome)
+			}
+			if i == 3 && !refresh.IsSkipped(outcome.Err) {
+				t.Errorf("native session was not a skipped outcome: %+v", outcome)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("batch did not finish after all workers were released")
+	}
+}
+
+func TestMonitorStopJoinsBatchBetweenJobsBeforeRestart(t *testing.T) {
+	pool := NewAuthPool()
+	for _, name := range []string{"a", "b"} {
+		pool.AddProfile("codex", name)
+		if err := pool.SetStatus("codex", name, PoolStatusReady); err != nil {
+			t.Fatal(err)
+		}
+	}
+	completed := make(chan struct{}, 1)
+	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	refresher := NewMockRefresher()
+	monitor := NewMonitor(pool, refresher, MonitorConfig{
+		MaxConcurrent: 1,
+		OnRefreshComplete: func(_, name string, _ time.Time, _ error) {
+			if name == "a" {
+				completed <- struct{}{}
+				<-releaseCallback
+			}
+		},
+	})
+	poolLocked := false
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseCallback) })
+		if poolLocked {
+			pool.mu.Unlock()
+		}
+		monitor.Stop()
+	})
+	batchDone := make(chan error, 1)
+	go func() {
+		_, err := monitor.RefreshAll(context.Background())
+		batchDone <- err
+	}()
+	select {
+	case <-completed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first batch job did not complete")
+	}
+	// The first ForceRefresh can finish, but the batch cannot collect its
+	// result while this lock is held. Stop must join that between-job work.
+	pool.mu.Lock()
+	poolLocked = true
+	releaseOnce.Do(func() { close(releaseCallback) })
+	stopped := make(chan struct{})
+	go func() { monitor.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		pool.mu.Unlock()
+		poolLocked = false
+		t.Fatal("Stop returned while an old batch still owned pending work")
+	case <-time.After(100 * time.Millisecond):
+	}
+	pool.mu.Unlock()
+	poolLocked = false
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop did not join the released batch")
+	}
+	select {
+	case err := <-batchDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stopped batch did not retain lifecycle cancellation: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stopped batch did not return")
+	}
+	if err := monitor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	monitor.Stop()
+	if calls := refresher.Calls(); len(calls) != 1 || calls[0] != "codex/a" {
+		t.Fatalf("old batch dispatched after shutdown or restart: %v", calls)
+	}
+}
 
 // MockRefresher implements Refresher for testing.
 type MockRefresher struct {
@@ -24,10 +269,44 @@ type MockRefresher struct {
 type preflightTestRefresher struct {
 	*MockRefresher
 	preflightErr error
+	before       func()
 }
 
 func (r *preflightTestRefresher) Preflight(provider, profile string) error {
+	if r.before != nil {
+		r.before()
+	}
 	return r.preflightErr
+}
+
+func TestMonitorRechecksCooldownBeforeReservation(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		t.Run(fmt.Sprintf("automatic=%t", automatic), func(t *testing.T) {
+			pool := NewAuthPool()
+			pool.AddProfile("codex", "work")
+			if err := pool.SetStatus("codex", "work", PoolStatusExpired); err != nil {
+				t.Fatal(err)
+			}
+			refresher := &preflightTestRefresher{
+				MockRefresher: NewMockRefresher(),
+				// A rate-limit signal arrives after candidate selection and
+				// the manual request's initial check, before reservation.
+				before: func() { pool.SetCooldown("codex", "work", time.Hour) },
+			}
+			monitor := NewMonitor(pool, refresher, DefaultMonitorConfig())
+			defer monitor.Stop()
+			if automatic {
+				monitor.checkAndRefresh(context.Background())
+				monitor.refreshWg.Wait()
+			} else if err := monitor.ForceRefresh(context.Background(), "codex", "work"); !refresh.IsSkipped(err) {
+				t.Fatalf("new cooldown was not a skipped request: %v", err)
+			}
+			p := pool.GetProfile("codex", "work")
+			if refresher.CallCount() != 0 || p.inFlight || p.Status != PoolStatusCooldown || p.ErrorCount != 0 || !p.LastRefresh.IsZero() {
+				t.Fatalf("queued refresh bypassed a newer cooldown: %+v, calls=%d", p, refresher.CallCount())
+			}
+		})
+	}
 }
 
 func TestMonitorPreflightPreservesEligibilityAndRetries(t *testing.T) {
@@ -137,14 +416,17 @@ func TestMonitorLateSkipPreservesConcurrentCooldown(t *testing.T) {
 				pool.SetCooldown("codex", "work", time.Hour)
 			}
 			previous, reserved := pool.TryMarkRefreshing("codex", "work")
-			if !reserved {
+			if cooldownBeforeReservation && reserved {
+				t.Fatal("a preexisting cooldown must prevent reservation")
+			}
+			if !cooldownBeforeReservation && !reserved {
 				t.Fatal("refresh reservation failed")
 			}
 			if !cooldownBeforeReservation {
 				pool.SetCooldown("codex", "work", time.Hour)
-			}
-			if err := monitor.doRefresh(context.Background(), "codex", "work", previous); !refresh.IsSkipped(err) {
-				t.Fatalf("expected a stale skip: %v", err)
+				if err := monitor.doRefresh(context.Background(), "codex", "work", previous, pool.GetProfile("codex", "work").reservation); !refresh.IsSkipped(err) {
+					t.Fatalf("expected a stale skip: %v", err)
+				}
 			}
 			p := pool.GetProfile("codex", "work")
 			if p.Status != PoolStatusCooldown || time.Until(p.CooldownUntil) < 59*time.Minute || p.ErrorCount != 0 {
@@ -641,10 +923,10 @@ func TestMonitor_RefreshAll(t *testing.T) {
 	pool.SetStatus("claude", "b", PoolStatusExpired)
 
 	ctx := context.Background()
-	monitor.RefreshAll(ctx)
-
-	// Wait for async refreshes
-	time.Sleep(100 * time.Millisecond)
+	results, err := monitor.RefreshAll(ctx)
+	if err != nil || len(results) != 2 {
+		t.Fatalf("RefreshAll results = %+v, error = %v", results, err)
+	}
 
 	if refresher.CallCount() < 2 {
 		t.Errorf("RefreshAll should have triggered refreshes, got %d calls", refresher.CallCount())

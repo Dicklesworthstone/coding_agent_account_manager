@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -28,8 +29,8 @@ daemon (--pool flag) for automatic background refresh.
 Examples:
   caam pool status             # Show pool status
   caam pool status --json      # Show pool status as JSON
-  caam pool refresh claude/work # Force refresh a profile
-  caam pool refresh --all      # Force refresh all profiles`,
+  caam pool refresh codex/work # Refresh one eligible profile
+  caam pool refresh --all      # Refresh eligible profiles and await results`,
 }
 
 var poolStatusCmd = &cobra.Command{
@@ -40,7 +41,7 @@ var poolStatusCmd = &cobra.Command{
 
 var poolRefreshCmd = &cobra.Command{
 	Use:   "refresh [provider/profile]",
-	Short: "Force refresh a profile or all profiles",
+	Short: "Refresh eligible credentials and report completed results",
 	RunE:  runPoolRefresh,
 }
 
@@ -71,7 +72,7 @@ func init() {
 
 func getPool() (*authpool.AuthPool, error) {
 	vault := authfile.NewVault(authfile.DefaultVaultPath())
-	pool := authpool.NewAuthPool(authpool.WithVault(vault))
+	pool := authpool.NewAuthPool(authpool.WithVault(vault), authpool.WithHealthStorage(health.NewStorage(health.DefaultHealthPath())))
 
 	// Load persisted state (errors logged but not fatal - state file may not exist)
 	opts := authpool.PersistOptions{}
@@ -135,27 +136,53 @@ func runPoolRefresh(cmd *cobra.Command, args []string) error {
 	if !refreshAll && len(args) == 0 {
 		return fmt.Errorf("specify a profile (provider/name) or use --all")
 	}
+	if timeout <= 0 {
+		return fmt.Errorf("refresh timeout must be positive")
+	}
 
 	vault := authfile.NewVault(authfile.DefaultVaultPath())
 	healthStore := health.NewStorage(health.DefaultHealthPath())
-	pool := authpool.NewAuthPool(authpool.WithVault(vault))
+	pool := authpool.NewAuthPool(authpool.WithVault(vault), authpool.WithHealthStorage(healthStore))
 
 	// Load profiles
-	ctx := context.Background()
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := pool.LoadFromVault(ctx); err != nil {
 		return fmt.Errorf("load profiles: %w", err)
 	}
 
 	refresher := daemon.NewPoolRefresher(vault, healthStore)
-	monitor := authpool.NewMonitor(pool, refresher, authpool.DefaultMonitorConfig())
+	config := authpool.DefaultMonitorConfig()
+	config.RefreshTimeout = timeout
+	monitor := authpool.NewMonitor(pool, refresher, config)
+	defer monitor.Stop()
+	out := cmd.OutOrStdout()
+	var failures []error
+	report := func(provider, profile string, err error) {
+		switch {
+		case refresh.IsDeliveryIncomplete(err):
+			fmt.Fprintf(out, "%s/%s: refreshed with a delivery warning: %v\n", provider, profile, err)
+		case refresh.IsSkipped(err):
+			fmt.Fprintf(out, "%s/%s: skipped: %v\n", provider, profile, err)
+		case err != nil:
+			fmt.Fprintf(out, "%s/%s: error: %v\n", provider, profile, err)
+			failures = append(failures, fmt.Errorf("%s/%s: %w", provider, profile, err))
+		default:
+			fmt.Fprintf(out, "%s/%s: refreshed\n", provider, profile)
+		}
+	}
 
 	if refreshAll {
-		fmt.Println("Refreshing all profiles...")
-		ctx, cancel := context.WithTimeout(context.Background(), timeout*time.Duration(pool.Count()))
-		defer cancel()
-		monitor.RefreshAll(ctx)
-		fmt.Println("Refresh triggered for all profiles")
-		return nil
+		results, err := monitor.RefreshAll(ctx)
+		for _, result := range results {
+			report(result.Provider, result.Profile, result.Err)
+		}
+		if err != nil {
+			failures = append(failures, err)
+		}
+		return errors.Join(failures...)
 	}
 
 	// Parse provider/profile from args
@@ -165,21 +192,13 @@ func runPoolRefresh(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		fmt.Printf("Refreshing %s/%s...\n", provider, profile)
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err = monitor.ForceRefresh(ctx, provider, profile)
+		attempt, cancel := context.WithTimeout(ctx, timeout)
+		err = monitor.ForceRefresh(attempt, provider, profile)
 		cancel()
-
-		if refresh.IsDeliveryIncomplete(err) {
-			fmt.Printf("  Refreshed with a delivery warning: %v\n", err)
-		} else if err != nil {
-			fmt.Printf("  Error: %v\n", err)
-		} else {
-			fmt.Printf("  Success\n")
-		}
+		report(provider, profile, err)
 	}
 
-	return nil
+	return errors.Join(failures...)
 }
 
 func runPoolList(cmd *cobra.Command, args []string) error {

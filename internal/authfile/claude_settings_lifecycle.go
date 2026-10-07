@@ -84,7 +84,7 @@ func readClaudeSettingsForBackup(fileSet AuthFileSet) (map[string]claudeSettings
 		}
 		data, err := readClaudeBackupSource(spec.Path, fields)
 		if err != nil {
-			return nil, fmt.Errorf("capture Claude backup source %s: %w", spec.Path, err)
+			return nil, fmt.Errorf("%w: capture Claude backup source %s: %w", ErrInvalidCredentials, spec.Path, err)
 		}
 		hasAuth, err := claudeCredentialMaterial(data, filename)
 		if err != nil {

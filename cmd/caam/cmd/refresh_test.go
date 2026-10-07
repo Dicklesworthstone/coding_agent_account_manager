@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,10 +16,176 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
+
+func TestPoolRefreshAllWaitsForEveryOutcome(t *testing.T) {
+	for _, partialFailure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("partial_failure=%t", partialFailure), func(t *testing.T) {
+			t.Setenv("CAAM_HOME", t.TempDir())
+			t.Setenv("CODEX_HOME", t.TempDir())
+			v := authfile.NewVault(authfile.DefaultVaultPath())
+			for _, name := range []string{"a", "b"} {
+				path := filepath.Join(v.ProfilePath("codex", name), "auth.json")
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				claims := fmt.Sprintf(`{"sub":"synthetic-%s","exp":%d}`, name, time.Now().Add(8*time.Hour).Unix())
+				jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".synthetic"
+				body := fmt.Sprintf(`{"tokens":{"access_token":%q,"refresh_token":%q}}`, jwt, "synthetic-"+name)
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cursorPath := filepath.Join(v.ProfilePath("cursor", "native"), "auth.json")
+			if err := os.MkdirAll(filepath.Dir(cursorPath), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(cursorPath, []byte(`{"accessToken":"synthetic-session"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			entered := make(chan string, 2)
+			release := make(chan struct{})
+			wantErr := errors.New("synthetic endpoint unavailable")
+			original := refresh.RefreshCodexToken
+			refresh.RefreshCodexToken = func(ctx context.Context, token string) (*refresh.TokenResponse, error) {
+				entered <- token
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				if partialFailure && token == "synthetic-b" {
+					return nil, wantErr
+				}
+				return &refresh.TokenResponse{AccessToken: "synthetic-fresh-access", RefreshToken: "synthetic-fresh-" + token, ExpiresIn: 3600}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshCodexToken = original })
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cmd := &cobra.Command{}
+			cmd.SetContext(ctx)
+			cmd.Flags().Bool("all", true, "")
+			cmd.Flags().Duration("timeout", 5*time.Second, "")
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			done := make(chan error, 1)
+			go func() { done <- runPoolRefresh(cmd, nil) }()
+			for range 2 {
+				select {
+				case <-entered:
+				case <-time.After(3 * time.Second):
+					cancel()
+					<-done
+					t.Fatal("--all did not begin both unexpired renewable grants")
+				}
+			}
+			select {
+			case err := <-done:
+				close(release)
+				t.Fatalf("CLI returned before renewal completed: %v", err)
+			default:
+			}
+			close(release)
+			select {
+			case err := <-done:
+				if (err != nil) != partialFailure || (partialFailure && !errors.Is(err, wantErr)) {
+					t.Fatalf("batch error=%v, partial failure=%t", err, partialFailure)
+				}
+			case <-time.After(3 * time.Second):
+				cancel()
+				<-done
+				t.Fatal("CLI did not join released renewals")
+			}
+			for _, want := range []string{"codex/a: refreshed", "cursor/native: skipped"} {
+				if !strings.Contains(output.String(), want) {
+					t.Errorf("missing %q in completed output: %s", want, output.String())
+				}
+			}
+			want := "codex/b: refreshed"
+			if partialFailure {
+				want = "codex/b: error"
+			}
+			if !strings.Contains(output.String(), want) {
+				t.Errorf("missing %q in completed output: %s", want, output.String())
+			}
+			body, err := os.ReadFile(filepath.Join(v.ProfilePath("codex", "a"), "auth.json"))
+			if err != nil || !bytes.Contains(body, []byte("synthetic-fresh-access")) {
+				t.Fatalf("CLI exited before credential publication: %v", err)
+			}
+		})
+	}
+}
+
+func TestPoolRefreshRejectsInvalidCredentialsWithoutExchange(t *testing.T) {
+	for _, kind := range []string{"malformed", "missing access", "provider rejected"} {
+		for _, all := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/all=%t", kind, all), func(t *testing.T) {
+				t.Setenv("CAAM_HOME", t.TempDir())
+				t.Setenv("CODEX_HOME", t.TempDir())
+				v := authfile.NewVault(authfile.DefaultVaultPath())
+				path := filepath.Join(v.ProfilePath("codex", "broken"), "auth.json")
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				body := `{`
+				if kind == "missing access" {
+					body = `{"tokens":{"refresh_token":"synthetic-refresh"}}`
+				} else if kind == "provider rejected" {
+					claims := fmt.Sprintf(`{"sub":"synthetic-account","exp":%d}`, time.Now().Add(time.Hour).Unix())
+					jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".synthetic"
+					body = fmt.Sprintf(`{"tokens":{"access_token":%q,"refresh_token":"synthetic-refresh"}}`, jwt)
+				}
+				if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "provider rejected" {
+					store := health.NewStorage(health.DefaultHealthPath())
+					store.SetVaultPath(v.BasePath())
+					h, err := store.GetProfile("codex", "broken")
+					if err != nil || h == nil {
+						t.Fatalf("read current credentials: %+v %v", h, err)
+					}
+					if err := store.RecordProviderVerification("codex", "broken", health.ProviderVerification{Reason: "refresh_token_invalidated", Fingerprint: h.CredentialFingerprint}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var calls atomic.Int32
+				original := refresh.RefreshCodexToken
+				refresh.RefreshCodexToken = func(context.Context, string) (*refresh.TokenResponse, error) {
+					calls.Add(1)
+					return nil, errors.New("invalid source must not reach token exchange")
+				}
+				t.Cleanup(func() { refresh.RefreshCodexToken = original })
+				cmd := &cobra.Command{}
+				cmd.SetContext(context.Background())
+				cmd.Flags().Bool("all", all, "")
+				cmd.Flags().Duration("timeout", time.Second, "")
+				var output bytes.Buffer
+				cmd.SetOut(&output)
+				args := []string{"codex/broken"}
+				if all {
+					args = nil
+				}
+				err := runPoolRefresh(cmd, args)
+				if err == nil || refresh.IsSkipped(err) || calls.Load() != 0 {
+					t.Fatalf("invalid credential reported as success/skip or exchanged: err=%v calls=%d", err, calls.Load())
+				}
+				if !strings.Contains(output.String(), "codex/broken: error:") || strings.Contains(output.String(), ": skipped:") {
+					t.Fatalf("invalid credential outcome is misleading: %s", output.String())
+				}
+				after, readErr := os.ReadFile(path)
+				if readErr != nil || string(after) != body {
+					t.Fatalf("rejected credential source changed: %v", readErr)
+				}
+			})
+		}
+	}
+}
 
 func TestRefreshCLIReportsPreflightSkips(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)

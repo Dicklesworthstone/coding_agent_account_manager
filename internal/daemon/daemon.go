@@ -194,6 +194,7 @@ func (d *Daemon) initAuthPool() {
 	// Create pool with callbacks for logging
 	d.authPool = authpool.NewAuthPool(
 		authpool.WithVault(d.vault),
+		authpool.WithHealthStorage(d.healthStore),
 		authpool.WithRefreshThreshold(d.config.RefreshThreshold),
 		authpool.WithOnStateChange(func(profile *authpool.PooledProfile, oldStatus, newStatus authpool.PoolStatus) {
 			if d.isVerbose() {
@@ -222,6 +223,10 @@ func (d *Daemon) initAuthPool() {
 		CheckInterval:    d.config.CheckInterval,
 		RefreshThreshold: d.config.RefreshThreshold,
 		MaxConcurrent:    maxConcurrent,
+		RefreshTimeout:   30 * time.Second,
+		OnReconcileError: func(err error) {
+			d.logger.Printf("Pool: vault reconciliation failed: %v", err)
+		},
 		OnRefreshStart: func(provider, profile string) {
 			d.logger.Printf("Pool: starting refresh for %s/%s", provider, profile)
 		},
@@ -371,6 +376,9 @@ func (d *Daemon) Stop() error {
 	}
 	d.running = false
 	d.mu.Unlock()
+	if d.cancel != nil {
+		d.cancel()
+	}
 
 	// Stop pool monitor if running
 	if d.poolMonitor != nil {
@@ -384,10 +392,6 @@ func (d *Daemon) Stop() error {
 				d.logger.Printf("Warning: failed to save pool state: %v", err)
 			}
 		}
-	}
-
-	if d.cancel != nil {
-		d.cancel()
 	}
 
 	// Wait for goroutines to finish with timeout

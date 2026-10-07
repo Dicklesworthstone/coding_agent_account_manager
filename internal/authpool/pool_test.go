@@ -1,10 +1,216 @@
 package authpool
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
+
+func writePoolCredential(t *testing.T, root, provider, name, file string, value any) string {
+	t.Helper()
+	path := filepath.Join(root, provider, name, file)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func poolCodexCredential(expiry time.Time, generation string) map[string]any {
+	claims := fmt.Sprintf(`{"exp":%d,"sub":"synthetic-account"}`, expiry.Unix())
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".synthetic"
+	return map[string]any{"tokens": map[string]any{"access_token": jwt, "refresh_token": generation}}
+}
+
+func TestPoolReconcilesRealVaultCredentialsAndMembership(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	store := health.NewStorage(filepath.Join(root, "custom-health.json"))
+	pool := NewAuthPool(WithVault(vault), WithHealthStorage(store))
+	expired := time.Now().Add(-time.Hour).Truncate(time.Second)
+	future := time.Now().Add(time.Hour).Truncate(time.Second)
+	path := writePoolCredential(t, vault.BasePath(), "codex", "renewable", "auth.json", poolCodexCredential(expired, "synthetic-old"))
+	writePoolCredential(t, vault.BasePath(), "codex", "_original", "auth.json", poolCodexCredential(expired, "synthetic-system"))
+	writePoolCredential(t, vault.BasePath(), "unrecognized", "ignored", "auth.json", poolCodexCredential(expired, "synthetic-other"))
+	writePoolCredential(t, vault.BasePath(), "codex", "api", "auth.json", map[string]any{"OPENAI_API_KEY": "synthetic-api"})
+	writePoolCredential(t, vault.BasePath(), "codex", "broken", "auth.json", map[string]any{"policy": true})
+	writePoolCredential(t, vault.BasePath(), "gemini", "renewable", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expired.Unix()})
+	writePoolCredential(t, vault.BasePath(), "claude", "native", ".credentials.json", map[string]any{"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": expired.UnixMilli()}})
+	writePoolCredential(t, vault.BasePath(), "grok", "native", "auth.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expired.Unix()})
+	jwt := poolCodexCredential(expired, "unused")["tokens"].(map[string]any)["access_token"]
+	writePoolCredential(t, vault.BasePath(), "cursor", "session", "auth.json", map[string]any{"accessToken": jwt, "refreshToken": "synthetic-session-alias"})
+	writePoolCredential(t, vault.BasePath(), "cursor", "api", "auth.json", map[string]any{"accessToken": jwt, "apiKey": "synthetic-key"})
+	// A malformed ancillary file must not override canonical Cursor auth.
+	writePoolCredential(t, vault.BasePath(), "cursor", "api", "cli-config.json", false)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.LoadFromVault(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]PoolStatus{
+		"codex:renewable": PoolStatusExpired, "codex:api": PoolStatusReady,
+		"codex:broken": PoolStatusError, "gemini:renewable": PoolStatusExpired,
+		"claude:native": PoolStatusReady, "grok:native": PoolStatusReady,
+		"cursor:session": PoolStatusExpired, "cursor:api": PoolStatusReady,
+	} {
+		pool.mu.RLock()
+		got := pool.profiles[key].Clone()
+		pool.mu.RUnlock()
+		if got == nil || got.Status != want {
+			t.Errorf("%s = %+v, want %s", key, got, want)
+		}
+	}
+	if pool.Count() != 8 || len(pool.GetProfilesNeedingRefresh("")) != 2 {
+		t.Fatalf("membership/renewal candidates are wrong: %+v / %+v", pool.GetAllProfiles(""), pool.GetProfilesNeedingRefresh(""))
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("read-only reconciliation changed vault credentials")
+	}
+	// Preserve operational state while the source remains the same, then
+	// recover from a new grant without replaying stale error/cached expiry.
+	pool.SetCooldown("codex", "renewable", time.Hour)
+	pool.SetError("codex", "renewable", fmt.Errorf("synthetic transient failure"))
+	if err := pool.LoadFromVault(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p := pool.GetProfile("codex", "renewable"); p.Status != PoolStatusCooldown || p.ErrorCount != 1 {
+		t.Fatalf("reconciliation discarded current cooldown/error state: %+v", p)
+	}
+	writePoolCredential(t, vault.BasePath(), "codex", "renewable", "auth.json", poolCodexCredential(future, "synthetic-replacement"))
+	if err := pool.LoadFromVault(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p := pool.GetProfile("codex", "renewable"); p.Status != PoolStatusCooldown || p.ErrorCount != 0 || !p.TokenExpiry.Equal(future) {
+		t.Fatalf("replacement lost cooldown or retained old credential facts: %+v", p)
+	}
+	if err := os.Rename(filepath.Dir(path), filepath.Join(root, "removed-profile")); err != nil {
+		t.Fatal(err)
+	}
+	writePoolCredential(t, vault.BasePath(), "codex", "added", "auth.json", poolCodexCredential(expired, "synthetic-added"))
+	if err := pool.LoadFromVault(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pool.GetProfile("codex", "renewable") != nil || pool.GetStatus("codex", "added") != PoolStatusExpired {
+		t.Fatal("later reconciliation did not apply membership changes")
+	}
+}
+
+func TestPoolCurrentProviderRejectionAndInvalidSource(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	store := health.NewStorage(filepath.Join(root, "health.json"))
+	pool := NewAuthPool(WithVault(vault), WithHealthStorage(store))
+	path := writePoolCredential(t, vault.BasePath(), "codex", "work", "auth.json", poolCodexCredential(time.Now().Add(-time.Minute), "synthetic-rejected"))
+	h, err := store.GetProfile("codex", "work")
+	if err != nil || h == nil {
+		t.Fatalf("read health: %v %+v", err, h)
+	}
+	if err := store.RecordProviderVerification("codex", "work", health.ProviderVerification{Reason: "refresh_token_invalidated", Fingerprint: h.CredentialFingerprint}); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"", "{", `{"tokens":{"refresh_token":"synthetic-rejected"}}`} {
+		if body != "" {
+			if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := pool.LoadFromVault(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		p := pool.GetProfile("codex", "work")
+		if p.Status != PoolStatusError || len(pool.GetProfilesNeedingRefresh("")) != 0 {
+			t.Fatalf("rejected/invalid source was eligible: %+v", p)
+		}
+		if body != "" && !p.TokenExpiry.IsZero() {
+			t.Fatal("invalid source retained cached expiry")
+		}
+	}
+	writePoolCredential(t, vault.BasePath(), "codex", "work", "auth.json", poolCodexCredential(time.Now().Add(time.Hour), "synthetic-new-login"))
+	if err := pool.LoadFromVault(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p := pool.GetProfile("codex", "work"); p.Status != PoolStatusReady || p.ErrorMessage != "" {
+		t.Fatalf("new login did not recover rejected profile: %+v", p)
+	}
+}
+
+func TestPoolAcceptsCompleteRefreshOnlyGeminiADC(t *testing.T) {
+	for _, filename := range []string{"oauth_creds.json", "oauth_credentials.json", "settings.json"} {
+		t.Run(filename, func(t *testing.T) {
+			root := t.TempDir()
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			pool := NewAuthPool(WithVault(vault), WithHealthStorage(health.NewStorage(filepath.Join(root, "health.json"))))
+			path := writePoolCredential(t, vault.BasePath(), "gemini", "adc", filename, map[string]any{
+				"client_id": "synthetic-id", "client_secret": "synthetic-secret", "refresh_token": "synthetic-refresh", "type": "authorized_user",
+			})
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			p := pool.GetProfile("gemini", "adc")
+			if p == nil || p.Status != PoolStatusReady || !p.refreshable || !p.TokenExpiry.IsZero() {
+				t.Fatalf("complete ADC grant was not eligible: %+v", p)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("passive ADC reconciliation changed source: %v", err)
+			}
+			writePoolCredential(t, vault.BasePath(), "gemini", "adc", filename, map[string]any{"refresh_token": "synthetic-incomplete"})
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if p := pool.GetProfile("gemini", "adc"); p.Status != PoolStatusError || p.refreshable {
+				t.Fatalf("incomplete refresh-only source was accepted as ADC: %+v", p)
+			}
+		})
+	}
+}
+
+func TestPoolOldReservationCannotCompleteReplacement(t *testing.T) {
+	pool := NewAuthPool()
+	pool.AddProfile("codex", "work")
+	previous, old, ok := pool.reserveRefresh("codex", "work")
+	if !ok {
+		t.Fatal("reserve original")
+	}
+	pool.RemoveProfile("codex", "work")
+	pool.AddProfile("codex", "work")
+	_, current, ok := pool.reserveRefresh("codex", "work")
+	if !ok || current == old {
+		t.Fatal("replacement reservation was reused")
+	}
+	pool.finishRefresh("codex", "work", old, previous, time.Now().Add(time.Hour), true, nil)
+	pool.finishRefresh("codex", "work", old, previous, time.Time{}, true, fmt.Errorf("old failure"))
+	if p := pool.GetProfile("codex", "work"); !p.inFlight || p.Status != PoolStatusRefreshing || p.ErrorCount != 0 || !p.LastRefresh.IsZero() {
+		t.Fatalf("old result changed replacement reservation: %+v", p)
+	}
+	pool.SetCooldown("codex", "work", time.Hour)
+	pool.finishRefresh("codex", "work", current, PoolStatusUnknown, time.Now().Add(time.Hour), true, nil)
+	if p := pool.GetProfile("codex", "work"); p.inFlight || p.Status != PoolStatusCooldown || p.LastRefresh.IsZero() {
+		t.Fatalf("valid completion lost concurrent cooldown: %+v", p)
+	}
+}
 
 func TestNewAuthPool(t *testing.T) {
 	p := NewAuthPool()

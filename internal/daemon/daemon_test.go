@@ -1970,6 +1970,85 @@ func TestPoolRenewalWithUnknownExpiryPreservesSuccess(t *testing.T) {
 	}
 }
 
+func TestDaemonPoolRenewsRealColdVaultWithoutCachedState(t *testing.T) {
+	t.Setenv("CAAM_HOME", t.TempDir())
+	t.Setenv("CODEX_HOME", t.TempDir())
+	vault := authfile.NewVault(t.TempDir())
+	store := health.NewStorage(filepath.Join(t.TempDir(), "custom-health.json"))
+	path := filepath.Join(vault.ProfilePath("codex", "work"), "auth.json")
+	writeDaemonCodexAuth(t, path, "synthetic-cold-grant", time.Now(), time.Now().Add(-time.Hour))
+	writeDaemonCursorAuth(t, filepath.Join(vault.ProfilePath("cursor", "session"), "auth.json"), time.Now().Add(-time.Hour), "synthetic-session", "")
+	calls := 0
+	original := refresh.RefreshCodexToken
+	refresh.RefreshCodexToken = func(ctx context.Context, token string) (*refresh.TokenResponse, error) {
+		calls++
+		if token != "synthetic-cold-grant" {
+			return nil, fmt.Errorf("unexpected synthetic grant")
+		}
+		return &refresh.TokenResponse{AccessToken: "synthetic-fresh-access", RefreshToken: "synthetic-fresh-grant", ExpiresIn: 3600}, nil
+	}
+	t.Cleanup(func() { refresh.RefreshCodexToken = original })
+	d := New(vault, store, &Config{UseAuthPool: true, RefreshThreshold: 10 * time.Minute})
+	defer d.poolMonitor.Stop()
+	results, err := d.poolMonitor.RefreshAll(context.Background())
+	if err != nil || len(results) != 2 || calls != 1 {
+		t.Fatalf("cold vault was not renewed: results=%+v calls=%d err=%v", results, calls, err)
+	}
+	if p := d.authPool.GetProfile("codex", "work"); p == nil || p.Status != authpool.PoolStatusReady || p.TokenExpiry.Before(time.Now().Add(50*time.Minute)) || p.LastRefresh.IsZero() {
+		t.Fatalf("renewal did not publish current ready state: %+v", p)
+	}
+	if p := d.authPool.GetProfile("cursor", "session"); p == nil || p.Status != authpool.PoolStatusExpired || !p.LastRefresh.IsZero() {
+		t.Fatalf("native session was lost or falsely refreshed: %+v", p)
+	}
+	if stats := d.GetStats(); stats.RefreshCount != 1 || stats.RefreshErrors != 0 {
+		t.Fatalf("skipped native grant changed renewal stats: %+v", stats)
+	}
+	h, err := store.GetProfile("codex", "work")
+	if err != nil || h == nil || h.ProviderVerifiedAt().IsZero() || !h.TokenRenewable {
+		t.Fatalf("daemon did not bind its custom health storage to current vault: %+v, %v", h, err)
+	}
+}
+
+func TestDaemonPoolRenewsCompleteGeminiADCWithoutAccessToken(t *testing.T) {
+	for _, filename := range []string{"oauth_creds.json", "oauth_credentials.json", "settings.json"} {
+		t.Run(filename, func(t *testing.T) {
+			t.Setenv("CAAM_HOME", t.TempDir())
+			t.Setenv("GEMINI_HOME", t.TempDir())
+			vault := authfile.NewVault(t.TempDir())
+			store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+			dir := vault.ProfilePath("gemini", "adc")
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, filename), []byte(`{"client_id":"synthetic-id","client_secret":"synthetic-secret","refresh_token":"synthetic-refresh","type":"authorized_user"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			original := refresh.RefreshGeminiToken
+			refresh.RefreshGeminiToken = func(ctx context.Context, id, secret, token string) (*refresh.GoogleTokenResponse, error) {
+				calls++
+				if id != "synthetic-id" || secret != "synthetic-secret" || token != "synthetic-refresh" {
+					return nil, fmt.Errorf("unexpected synthetic ADC grant")
+				}
+				return &refresh.GoogleTokenResponse{AccessToken: "synthetic-fresh-access", ExpiresIn: 3600}, nil
+			}
+			t.Cleanup(func() { refresh.RefreshGeminiToken = original })
+			d := New(vault, store, &Config{UseAuthPool: true})
+			defer d.poolMonitor.Stop()
+			results, err := d.poolMonitor.RefreshAll(context.Background())
+			if err != nil || len(results) != 1 || results[0].Err != nil || calls != 1 {
+				t.Fatalf("complete ADC grant was not renewed: results=%+v calls=%d err=%v", results, calls, err)
+			}
+			if p := d.authPool.GetProfile("gemini", "adc"); p == nil || p.Status != authpool.PoolStatusReady || p.TokenExpiry.Before(time.Now().Add(50*time.Minute)) || p.LastRefresh.IsZero() {
+				t.Fatalf("ADC renewal did not publish current ready state: %+v", p)
+			}
+			if stats := d.GetStats(); stats.RefreshCount != 1 || stats.RefreshErrors != 0 {
+				t.Fatalf("ADC renewal accounting was incorrect: %+v", stats)
+			}
+		})
+	}
+}
+
 func writeDaemonCursorAuth(t *testing.T, path string, expiry time.Time, session, apiKey string) {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": session})

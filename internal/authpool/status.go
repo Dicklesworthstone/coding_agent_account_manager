@@ -87,6 +87,15 @@ type PooledProfile struct {
 
 	// Priority is a weight for selection (higher = preferred).
 	Priority int `json:"priority,omitempty"`
+
+	// Current-vault evidence and reservations are deliberately not persisted.
+	// A saved "refreshing" status is not a live worker after restart.
+	vaultChecked     bool
+	refreshable      bool
+	credentialStatus PoolStatus
+	generation       string
+	inFlight         bool
+	reservation      uint64
 }
 
 // Key returns a unique identifier for this profile.

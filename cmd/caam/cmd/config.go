@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
 
@@ -234,7 +234,7 @@ func getConfigValue(cfg *config.SPMConfig, key string) (string, error) {
 func resolveYAMLPath(v reflect.Value, parts []string, fullKey string) (reflect.Value, error) {
 	for i, part := range parts {
 		// Deref pointers as we descend.
-		for v.Kind() == reflect.Ptr {
+		for v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				return reflect.Value{}, fmt.Errorf("unknown key: %s", fullKey)
 			}
@@ -332,7 +332,7 @@ func formatConfigScalar(v reflect.Value, key string) (string, error) {
 		return fmt.Sprintf("%.2f", v.Float()), nil
 	case reflect.String:
 		return v.String(), nil
-	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array, reflect.Ptr:
+	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array, reflect.Pointer:
 		// Composite node: serialize the subtree as YAML (same engine `show`
 		// uses) so `get <section>` and `get <section>.<sub>` both work.
 		data, err := yaml.Marshal(v.Interface())
@@ -377,7 +377,7 @@ func setConfigValue(cfg *config.SPMConfig, key, value string) error {
 // from a bad nested one ("unknown key"), mirroring resolveYAMLPath's messages.
 func assignYAMLPath(v reflect.Value, parts []string, fullKey, raw string, depth int) error {
 	// Deref pointers as we descend.
-	for v.Kind() == reflect.Ptr {
+	for v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return fmt.Errorf("unknown key: %s", fullKey)
 		}

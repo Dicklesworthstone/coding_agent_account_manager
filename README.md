@@ -1122,6 +1122,32 @@ The default daemon also refreshes an already-expired access token when its
 credential is renewable. Sessions requiring a new login and credentials
 renewed by their own CLI remain outside CAAM's refresh path.
 
+#### Proactive authentication pool
+
+The pool reads current credentials from the selected vault when it starts and
+before each refresh pass. It recognizes new profiles, removed profiles and
+replaced credentials without relying on a previously saved pool state. Existing
+cooldowns remain in effect while the inventory changes.
+
+```bash
+caam pool status --json
+caam pool refresh codex/work
+caam pool refresh --all --timeout 30s
+caam daemon start --pool
+```
+
+Manual refresh waits for completed results, with bounded concurrency and a
+timeout for each exchange. A malformed, incomplete or provider-rejected
+credential produces an error and a nonzero command exit. Native renewal,
+session logins, API keys and profiles in cooldown are reported as skipped.
+Codex and Gemini OAuth credentials use CAAM's renewal path, including complete
+Gemini ADC grants that have no cached access token yet.
+
+Stopping the pool cancels queued work and waits for active refreshes and batches
+to finish. Restarting it cannot resume work from the stopped instance. If a
+profile is deleted and recreated while an old refresh is finishing, that old
+result cannot change the replacement profile's state.
+
 #### Cursor session expiry
 
 Cursor browser/session logins have a fixed expiry in the `accessToken` JWT
