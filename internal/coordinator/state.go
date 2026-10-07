@@ -275,7 +275,7 @@ var Patterns = struct {
 	PastePrompt: regexp.MustCompile(`(?i)paste code here if prompted`),
 
 	// "Logged in as user@example.com" or similar success patterns
-	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|successfully authenticated|welcome back)`),
+	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|login successful|successfully (authenticated|logged in)|welcome back)`),
 
 	// Login failure patterns
 	LoginFailed: regexp.MustCompile(`(?i)(login failed|authentication error|invalid code|expired|error signing)`),

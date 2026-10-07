@@ -1497,3 +1497,15 @@ func TestDetectStateReportsLatestResetTime(t *testing.T) {
 		t.Fatalf("reset_time = %q, want 7pm", meta["reset_time"])
 	}
 }
+
+func TestDetectStateRecognizesLoginSuccessVariants(t *testing.T) {
+	for _, out := range []string{
+		"Paste code here if prompted > abc#def\nLogin successful. Press Enter to continue…",
+		"Paste code here if prompted > abc#def\nSuccessfully logged in",
+		"Paste code here if prompted > abc#def\nLogged in as a@example.com",
+	} {
+		if got, _ := DetectState(out); got != StateResuming {
+			t.Errorf("DetectState(%q) = %v, want RESUMING", out, got)
+		}
+	}
+}
