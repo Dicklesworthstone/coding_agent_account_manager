@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -140,6 +141,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/profiles", s.authMiddleware(s.handleProfiles))
 	mux.HandleFunc("/api/v1/profiles/", s.authMiddleware(s.handleProfileAction))
 	mux.HandleFunc("/api/v1/usage", s.authMiddleware(s.handleUsage))
+	mux.HandleFunc("/api/v1/activity", s.authMiddleware(s.handleActivity))
 	mux.HandleFunc("/api/v1/coordinators", s.authMiddleware(s.handleCoordinators))
 	mux.HandleFunc("/api/v1/actions/activate", s.authMiddleware(s.handleActivate))
 	mux.HandleFunc("/api/v1/actions/backup", s.authMiddleware(s.handleBackup))
@@ -386,6 +388,23 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.jsonResponse(w, usage)
+}
+
+// handleActivity returns recent activity and active cooldowns.
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	activity, err := s.handlers.GetActivity(limit)
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, activity)
 }
 
 // handleCoordinators returns coordinator status.

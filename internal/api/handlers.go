@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
@@ -323,6 +324,93 @@ func (h *Handlers) DeleteProfile(tool, name string) error {
 		return fmt.Errorf("cannot delete system profile: %s/%s", tool, name)
 	}
 	return h.vault.Delete(tool, name)
+}
+
+// ActivityResponse is the response for GET /activity.
+type ActivityResponse struct {
+	Events    []ActivityEvent `json:"events"`
+	Cooldowns []CooldownInfo  `json:"cooldowns"`
+}
+
+// ActivityEvent is one entry of caam's activity log: an activation, switch,
+// refresh, login, or error.
+type ActivityEvent struct {
+	Timestamp       string         `json:"timestamp"`
+	Type            string         `json:"type"`
+	Tool            string         `json:"tool"`
+	Profile         string         `json:"profile"`
+	Details         map[string]any `json:"details,omitempty"`
+	DurationSeconds int64          `json:"duration_seconds,omitempty"`
+}
+
+// CooldownInfo is a profile resting after it hit a limit.
+type CooldownInfo struct {
+	Tool    string `json:"tool"`
+	Profile string `json:"profile"`
+	HitAt   string `json:"hit_at"`
+	Until   string `json:"until"`
+	Notes   string `json:"notes,omitempty"`
+}
+
+// maxActivity bounds one /activity response.
+const maxActivity = 200
+
+// GetActivity returns the most recent activity log entries (newest first)
+// and the profiles currently cooling down after a limit.
+func (h *Handlers) GetActivity(limit int) (*ActivityResponse, error) {
+	resp := &ActivityResponse{Events: []ActivityEvent{}, Cooldowns: []CooldownInfo{}}
+	if h.db == nil {
+		return resp, nil
+	}
+	if limit <= 0 || limit > maxActivity {
+		limit = 50
+	}
+	events, err := h.db.ListRecentEvents(limit)
+	if err != nil {
+		return nil, fmt.Errorf("read activity: %w", err)
+	}
+	for _, e := range events {
+		resp.Events = append(resp.Events, ActivityEvent{
+			Timestamp:       e.Timestamp.UTC().Format(time.RFC3339),
+			Type:            e.Type,
+			Tool:            e.Provider,
+			Profile:         e.ProfileName,
+			Details:         redactDetails(e.Details),
+			DurationSeconds: int64(e.Duration / time.Second),
+		})
+	}
+	cooldowns, err := h.db.ListActiveCooldowns(time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("read cooldowns: %w", err)
+	}
+	for _, c := range cooldowns {
+		resp.Cooldowns = append(resp.Cooldowns, CooldownInfo{
+			Tool:    c.Provider,
+			Profile: c.ProfileName,
+			HitAt:   c.HitAt.UTC().Format(time.RFC3339),
+			Until:   c.CooldownUntil.UTC().Format(time.RFC3339),
+			Notes:   c.Notes,
+		})
+	}
+	return resp, nil
+}
+
+// redactDetails drops event details whose key names a secret; the API never
+// returns credentials.
+func redactDetails(details map[string]any) map[string]any {
+	if len(details) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(details))
+	for k, v := range details {
+		lower := strings.ToLower(k)
+		if strings.Contains(lower, "token") || strings.Contains(lower, "secret") ||
+			strings.Contains(lower, "password") || strings.Contains(lower, "code") || strings.Contains(lower, "key") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // GetUsage returns usage statistics.

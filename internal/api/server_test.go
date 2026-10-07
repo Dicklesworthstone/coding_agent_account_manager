@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 )
 
 func TestSplitPath(t *testing.T) {
@@ -370,5 +372,79 @@ func TestDefaultTokenPath(t *testing.T) {
 	path = defaultTokenPath()
 	if !strings.Contains(path, ".config/caam/.api_token") {
 		t.Errorf("without CAAM_HOME: path = %s, expected .config/caam/.api_token", path)
+	}
+}
+
+func TestActivityEndpointReportsEventsAndCooldowns(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := caamdb.OpenAt(filepath.Join(tmpDir, "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	now := time.Now()
+	for _, e := range []caamdb.Event{
+		{Type: caamdb.EventActivate, Provider: "claude", ProfileName: "work", Timestamp: now.Add(-2 * time.Minute)},
+		{Type: caamdb.EventSwitch, Provider: "claude", ProfileName: "home", Timestamp: now.Add(-time.Minute),
+			Details: map[string]any{"from": "work", "reason": "rate_limit", "access_token": "sk-secret", "authCode": "c0de"}},
+	} {
+		if err := db.LogEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.SetCooldown("claude", "work", now, time.Hour, "session limit"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+	server, err := NewServer(cfg, NewHandlers(nil, nil, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.authMiddleware(server.handleActivity)
+	get := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/activity?limit=10", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		handler(w, req)
+		return w
+	}
+	if w := get(""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("without a token: %d", w.Code)
+	}
+
+	w := get(server.Token())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var body ActivityResponse
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Events) != 2 || body.Events[0].Type != caamdb.EventSwitch || body.Events[0].Profile != "home" {
+		t.Fatalf("events = %+v, want newest first", body.Events)
+	}
+	details := body.Events[0].Details
+	if details["from"] != "work" || details["reason"] != "rate_limit" {
+		t.Fatalf("details = %v", details)
+	}
+	if _, ok := details["access_token"]; ok {
+		t.Fatal("a token-named detail reached the API")
+	}
+	if _, ok := details["authCode"]; ok {
+		t.Fatal("a code-named detail reached the API")
+	}
+	if len(body.Cooldowns) != 1 || body.Cooldowns[0].Profile != "work" || body.Cooldowns[0].Notes != "session limit" {
+		t.Fatalf("cooldowns = %+v", body.Cooldowns)
+	}
+}
+
+func TestActivityWithoutDatabaseIsEmpty(t *testing.T) {
+	got, err := NewHandlers(nil, nil, nil).GetActivity(0)
+	if err != nil || got.Events == nil || len(got.Events) != 0 || got.Cooldowns == nil {
+		t.Fatalf("GetActivity = %+v, %v; want empty lists", got, err)
 	}
 }

@@ -8,48 +8,25 @@ test.describe("App Boot", () => {
     await expect(page).toHaveTitle(/CAAM Dashboard/);
   });
 
-  test("renders the dashboard content", async ({ page }) => {
+  test("asks to connect to caam without a token", async ({ page }) => {
     await page.goto("/");
 
-    // Check for main heading
-    await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-
-    // Check for stat cards
-    await expect(page.getByText("Active Profiles")).toBeVisible();
-    await expect(page.getByText("API Calls Today")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Connect to caam" })).toBeVisible();
+    await expect(page.getByLabel("API token")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Connect" })).toBeDisabled();
 
     // Check for sidebar navigation
-    await expect(page.getByRole("link", { name: "Dashboard" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Profiles" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
+    for (const name of ["Dashboard", "Profiles", "Coordinators", "Activity", "Usage", "Settings"]) {
+      await expect(page.getByRole("link", { name })).toBeVisible();
+    }
   });
 
-  test("sidebar navigation highlights current page", async ({ page }) => {
+  test("search jumps to the profiles page", async ({ page }) => {
     await page.goto("/");
 
-    // Dashboard link should be highlighted (has active styling)
-    const dashboardLink = page.getByRole("link", { name: "Dashboard" });
-    await expect(dashboardLink).toBeVisible();
-  });
-
-  test("search input is accessible", async ({ page }) => {
-    await page.goto("/");
-
-    // Check for search input
-    const searchInput = page.getByPlaceholder("Search profiles, commands...");
-    await expect(searchInput).toBeVisible();
-
-    // Type in search
-    await searchInput.fill("test query");
-    await expect(searchInput).toHaveValue("test query");
-  });
-
-  test("quick actions are clickable", async ({ page }) => {
-    await page.goto("/");
-
-    // Find quick action buttons
-    const switchProfileBtn = page.getByRole("button", { name: "Switch Profile" });
-    await expect(switchProfileBtn).toBeVisible();
-    await expect(switchProfileBtn).toBeEnabled();
+    const searchInput = page.getByPlaceholder("Search profiles…");
+    await searchInput.fill("work");
+    await searchInput.press("Enter");
+    await expect(page).toHaveURL(/\/profiles\?q=work$/);
   });
 });

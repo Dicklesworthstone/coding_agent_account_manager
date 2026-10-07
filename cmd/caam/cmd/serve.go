@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +30,7 @@ ENDPOINTS:
   GET  /api/v1/profiles/X/Y     Get profile details
   DELETE /api/v1/profiles/X/Y   Delete a profile
   GET  /api/v1/usage            Usage statistics
+  GET  /api/v1/activity         Recent activity (?limit=N) and active cooldowns
   GET  /api/v1/coordinators     Coordinator status
   POST /api/v1/actions/activate Activate a profile
   POST /api/v1/actions/backup   Backup current auth to a profile
@@ -51,6 +54,7 @@ Examples:
   caam serve --port 8080            # Use custom port
   caam serve --verbose              # Debug logging
   caam serve --show-token           # Print the API token
+  caam serve --dashboard-url http://localhost:3000   # Link that connects the web dashboard
 
 Querying the API:
   TOKEN=$(cat ~/.config/caam/.api_token)
@@ -62,11 +66,21 @@ on the same machine. /api/v1/coordinators reports the agent's coordinators.`,
 }
 
 var (
-	servePort      int
-	serveVerbose   bool
-	serveShowToken bool
-	serveJSONLogs  bool
+	servePort         int
+	serveVerbose      bool
+	serveShowToken    bool
+	serveJSONLogs     bool
+	serveDashboardURL string
 )
+
+// dashboardConnectURL is a dashboard link that hands it the API address and
+// token in the URL fragment, which the browser never sends to a server.
+func dashboardConnectURL(dashboard, apiBase, token string) string {
+	values := url.Values{}
+	values.Set("token", token)
+	values.Set("api", apiBase)
+	return strings.TrimRight(dashboard, "/") + "/#" + values.Encode()
+}
 
 func init() {
 	rootCmd.AddCommand(serveCmd)
@@ -74,6 +88,7 @@ func init() {
 	serveCmd.Flags().IntVar(&servePort, "port", api.DefaultConfig().Port, "API server port")
 	serveCmd.Flags().BoolVar(&serveVerbose, "verbose", false, "Enable debug logging")
 	serveCmd.Flags().BoolVar(&serveShowToken, "show-token", false, "Print API token and exit")
+	serveCmd.Flags().StringVar(&serveDashboardURL, "dashboard-url", "", "Print a link that connects the web dashboard at this address (e.g. http://localhost:3000) and exit")
 	serveCmd.Flags().BoolVar(&serveJSONLogs, "json", false, "Output logs in JSON format")
 }
 
@@ -117,6 +132,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		fmt.Println(server.Token())
 		return nil
 	}
+	if serveDashboardURL != "" {
+		fmt.Println(dashboardConnectURL(serveDashboardURL, fmt.Sprintf("http://127.0.0.1:%d", server.Port()), server.Token()))
+		return nil
+	}
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -141,6 +160,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("  GET  /api/v1/status       - Overall status")
 	fmt.Println("  GET  /api/v1/profiles     - List profiles")
 	fmt.Println("  GET  /api/v1/usage        - Usage statistics")
+	fmt.Println("  GET  /api/v1/activity     - Recent activity and cooldowns")
 	fmt.Println("  GET  /api/v1/events       - SSE live updates")
 	fmt.Println("  POST /api/v1/actions/*    - Actions (activate, backup)")
 	fmt.Println()

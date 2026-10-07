@@ -14,7 +14,13 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        // A preinstalled Chromium of another build than this Playwright's.
+        ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+          ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } }
+          : {}),
+      },
     },
   ],
   webServer: {

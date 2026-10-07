@@ -1,9 +1,11 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Activity, Home, Key, type LucideIcon, RefreshCw, Settings, Users } from "lucide-react";
+import { Activity, BarChart3, Home, type LucideIcon, Network, Settings, Users } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { api } from "@/lib/api";
+import { useApi } from "@/lib/connection";
 
 interface NavItem {
   label: string;
@@ -14,14 +16,16 @@ interface NavItem {
 const navItems: NavItem[] = [
   { label: "Dashboard", href: "/", icon: Home },
   { label: "Profiles", href: "/profiles", icon: Users },
-  { label: "Credentials", href: "/credentials", icon: Key },
-  { label: "Sync", href: "/sync", icon: RefreshCw },
+  { label: "Coordinators", href: "/coordinators", icon: Network },
   { label: "Activity", href: "/activity", icon: Activity },
+  { label: "Usage", href: "/usage", icon: BarChart3 },
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
+  const status = useApi(api.status, 30_000);
+  const loggedIn = status.data?.tools.filter((t) => t.logged_in) ?? [];
 
   return (
     <aside className="flex h-screen w-64 flex-col border-r border-border bg-surface">
@@ -43,6 +47,7 @@ export function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              aria-current={isActive ? "page" : undefined}
               className="relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-surface-muted"
             >
               {isActive && (
@@ -64,18 +69,22 @@ export function Sidebar() {
       {/* Footer */}
       <div className="border-t border-border p-4">
         <div className="rounded-lg bg-surface-muted p-3">
-          <p className="text-xs text-muted">Connected Providers</p>
-          <div className="mt-2 flex gap-2">
-            <span className="inline-flex h-6 items-center rounded bg-accent/10 px-2 text-xs font-medium text-accent">
-              Claude
-            </span>
-            <span className="inline-flex h-6 items-center rounded bg-success/10 px-2 text-xs font-medium text-success">
-              Codex
-            </span>
-            <span className="inline-flex h-6 items-center rounded bg-warning/10 px-2 text-xs font-medium text-warning">
-              Gemini
-            </span>
+          <p className="text-xs text-muted">Logged in</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {loggedIn.length === 0 ? (
+              <span className="text-xs text-muted">{status.data ? "no tools" : "—"}</span>
+            ) : (
+              loggedIn.map((t) => (
+                <span
+                  key={t.tool}
+                  className="inline-flex h-6 items-center rounded bg-accent/10 px-2 text-xs font-medium capitalize text-accent"
+                >
+                  {t.tool}
+                </span>
+              ))
+            )}
           </div>
+          {status.data && <p className="mt-2 text-xs text-muted">caam {status.data.version}</p>}
         </div>
       </div>
     </aside>

@@ -1603,6 +1603,25 @@ configuration keys, API, and troubleshooting:
 
 ---
 
+## Web Dashboard
+
+`caam serve` runs a localhost-only API (token-protected, localhost origins
+only). The dashboard in [`web/dashboard`](web/dashboard) runs on top of it and
+shows:
+- which tools are logged in;
+- saved profiles, which you can activate, or save the current login as one;
+- coordinator health;
+- recent activity and cooldowns;
+- per-profile errors.
+
+```bash
+caam serve                                        # API on 127.0.0.1:7892
+(cd web/dashboard && pnpm install && pnpm dev)    # dashboard on localhost:3000
+caam serve --dashboard-url http://localhost:3000  # prints a link that connects it
+```
+
+---
+
 ## Alerts
 
 caam alerts you when `caam run` switches accounts after a rate limit, and when

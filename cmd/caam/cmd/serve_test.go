@@ -119,3 +119,11 @@ func TestServeShowTokenCreatesToken(t *testing.T) {
 	// Reset show token flag
 	serveShowToken = false
 }
+
+func TestDashboardConnectURL(t *testing.T) {
+	got := dashboardConnectURL("http://localhost:3000/", "http://127.0.0.1:7892", "tok+/=")
+	want := "http://localhost:3000/#api=http%3A%2F%2F127.0.0.1%3A7892&token=tok%2B%2F%3D"
+	if got != want {
+		t.Fatalf("dashboardConnectURL = %q, want %q", got, want)
+	}
+}
