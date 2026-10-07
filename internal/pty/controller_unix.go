@@ -153,9 +153,12 @@ func (c *unixController) Start() error {
 	return nil
 }
 
-// InjectCommand types a command into the PTY followed by a newline.
+// InjectCommand types a command into the PTY and presses Enter. Enter is a
+// carriage return: raw-mode TUIs (Claude Code, Codex, Gemini) submit on it,
+// and treat a line feed (Ctrl+J) as a newline inside the input instead;
+// cooked-mode programs still receive a newline through ICRNL.
 func (c *unixController) InjectCommand(cmd string) error {
-	return c.InjectRaw([]byte(cmd + "\n"))
+	return c.InjectRaw([]byte(cmd + "\r"))
 }
 
 // InjectRaw writes raw bytes to the PTY.

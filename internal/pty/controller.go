@@ -28,8 +28,8 @@ type Controller interface {
 	// Must be called before InjectCommand or ReadOutput.
 	Start() error
 
-	// InjectCommand types a command into the PTY as if a user typed it.
-	// The command string is written followed by a newline.
+	// InjectCommand types a command into the PTY as if a user typed it and
+	// pressed Enter (a carriage return).
 	InjectCommand(cmd string) error
 
 	// InjectRaw writes raw bytes to the PTY without adding a newline.

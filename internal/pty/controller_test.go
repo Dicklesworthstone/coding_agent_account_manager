@@ -4,7 +4,9 @@ package pty
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -889,5 +891,35 @@ func TestPlatformSupport(t *testing.T) {
 
 	default:
 		t.Skipf("[TEST] Platform %s not explicitly tested", runtime.GOOS)
+	}
+}
+
+// TestInjectCommandPressesEnterForRawModePrograms: a raw-mode program (like
+// Claude Code's input) must receive the carriage return the Enter key sends;
+// a line feed would insert a newline instead of submitting.
+func TestInjectCommandPressesEnterForRawModePrograms(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "bytes")
+	ctrl, err := NewControllerFromArgs("sh", []string{"-c", "stty raw -echo; head -c 7 > '" + out + "'"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+	if err := ctrl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // let stty take effect
+	if err := ctrl.InjectCommand("/login"); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got, _ = os.ReadFile(out); len(got) == 7 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if string(got) != "/login\r" {
+		t.Fatalf("raw-mode program received %q, want %q", got, "/login\r")
 	}
 }
