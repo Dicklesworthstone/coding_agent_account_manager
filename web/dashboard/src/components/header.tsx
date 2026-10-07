@@ -9,9 +9,8 @@ export function Header() {
   const router = useRouter();
   const { conn } = useConnection();
   const [query, setQuery] = useState("");
-
   return (
-    <header className="flex h-16 items-center justify-between border-b border-border bg-surface px-6">
+    <header className="flex min-h-16 shrink-0 items-center justify-between gap-4 border-b border-border bg-surface px-4 py-3 sm:px-6">
       {/* Search jumps to the matching profiles */}
       <form
         role="search"
@@ -36,12 +35,12 @@ export function Header() {
       </form>
 
       {/* Connection */}
-      <div className="flex items-center gap-2 text-sm text-muted">
+      <div className="flex min-w-0 items-center gap-2 text-xs text-muted">
         <span
           className={`h-2 w-2 rounded-full ${conn ? "bg-success" : "bg-border"}`}
           aria-hidden="true"
         />
-        <span>{conn ? conn.baseUrl.replace(/^https?:\/\//, "") : "not connected"}</span>
+        <span className="truncate">{conn ? conn.baseUrl.replace(/^https?:\/\//, "") : "not connected"}</span>
       </div>
     </header>
   );

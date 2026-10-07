@@ -2,7 +2,7 @@
 
 import { AlertCircle, ArrowLeftRight, LogIn, Power, RefreshCw } from "lucide-react";
 import { DashboardLayout } from "@/components";
-import { EmptyState, ErrorBanner, Loading, PageHeader, Panel, timeAgo } from "@/components/ui";
+import { EmptyState, ErrorBanner, Loading, PageHeader, Panel, RefreshButton, timeAgo } from "@/components/ui";
 import { describeEvent } from "@/lib/activity";
 import { api } from "@/lib/api";
 import { useApi } from "@/lib/connection";
@@ -22,10 +22,11 @@ function Activity() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Activity" subtitle="Switches, refreshes, logins, and errors caam recorded" />
-      <ErrorBanner error={activity.error} />
+      <PageHeader title="Activity" subtitle="Switches, refreshes, logins, and errors caam recorded"
+        action={<RefreshButton loading={activity.loading} reload={activity.reload} />} />
+      <ErrorBanner error={activity.error} stale={!!activity.data} />
 
-      {cooldowns.length > 0 && (
+      {activity.data?.available && cooldowns.length > 0 && (
         <Panel title="Cooling down">
           <ul className="divide-y divide-border">
             {cooldowns.map((c) => (
@@ -44,7 +45,9 @@ function Activity() {
 
       <Panel title="Recent activity">
         {!activity.data ? (
-          <Loading />
+          activity.loading ? <Loading /> : <EmptyState>Recent activity could not be loaded.</EmptyState>
+        ) : !activity.data.available ? (
+          <EmptyState>Activity database unavailable. Recent events and cooldowns cannot be measured right now.</EmptyState>
         ) : events.length === 0 ? (
           <EmptyState>Nothing recorded yet.</EmptyState>
         ) : (

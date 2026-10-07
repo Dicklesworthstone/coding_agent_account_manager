@@ -121,9 +121,36 @@ func TestServeShowTokenCreatesToken(t *testing.T) {
 }
 
 func TestDashboardConnectURL(t *testing.T) {
-	got := dashboardConnectURL("http://localhost:3000/", "http://127.0.0.1:7892", "tok+/=")
+	got, err := dashboardConnectURL("http://localhost:3000/", "http://127.0.0.1:7892", "tok+/=")
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "http://localhost:3000/#api=http%3A%2F%2F127.0.0.1%3A7892&token=tok%2B%2F%3D"
 	if got != want {
 		t.Fatalf("dashboardConnectURL = %q, want %q", got, want)
+	}
+}
+
+func TestDashboardConnectURLRejectsNonLocalDestinations(t *testing.T) {
+	for _, dashboard := range []string{
+		"https://example.com", "http://localhost.example.com:3000",
+		"http://localhost:3000@example.com", "http://user:password@localhost:3000",
+		"javascript:alert(1)", "//localhost:3000", "http://localhost:3000/redirect",
+		"http://localhost:3000?next=https://example.com", "http://localhost:3000?",
+		"http://localhost:3000/#token=existing", "http://localhost:3000\nInjected: value",
+	} {
+		t.Run(dashboard, func(t *testing.T) {
+			link, err := dashboardConnectURL(dashboard, "http://127.0.0.1:7892", "synthetic-dashboard-token")
+			if err == nil || link != "" {
+				t.Fatalf("unsafe dashboard URL produced a token link: %q, %v", link, err)
+			}
+		})
+	}
+	for _, dashboard := range []string{"http://127.0.0.1:3000", "https://[::1]:3000"} {
+		t.Run(dashboard, func(t *testing.T) {
+			if _, err := dashboardConnectURL(dashboard, "http://127.0.0.1:7892", "synthetic-dashboard-token"); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

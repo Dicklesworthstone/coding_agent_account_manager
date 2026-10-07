@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,13 +13,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 func TestCursorAPIHealthReadsCurrentCustomVault(t *testing.T) {
@@ -171,7 +177,7 @@ func TestGetUsageWithNilDeps(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
 	// Should return empty usage without error
-	usage, err := h.GetUsage("")
+	usage, err := h.GetUsage(context.Background(), "", "")
 	if err != nil {
 		t.Fatalf("GetUsage() error = %v", err)
 	}
@@ -180,6 +186,177 @@ func TestGetUsageWithNilDeps(t *testing.T) {
 	}
 	if len(usage.Usage) != 0 {
 		t.Errorf("GetUsage() with nil deps should return empty, got %d entries", len(usage.Usage))
+	}
+	if usage.Available {
+		t.Fatal("missing database reported available activity")
+	}
+}
+
+func TestGetUsageReadsActivityWithoutHealthOrVault(t *testing.T) {
+	d, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "activity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, e := range []caamdb.Event{
+		{Timestamp: now.Add(-2 * time.Hour), Type: caamdb.EventActivate, Provider: "grok", ProfileName: "work"},
+		{Timestamp: now.Add(-30 * time.Minute), Type: caamdb.EventSwitch, Provider: "grok", ProfileName: "work"},
+		{Timestamp: now.Add(-20 * time.Minute), Type: caamdb.EventError, Provider: "grok", ProfileName: "work", Details: map[string]any{"access_token": "synthetic-do-not-export"}},
+		{Timestamp: now.Add(-10 * time.Minute), Type: caamdb.EventDeactivate, Provider: "grok", ProfileName: "work", Duration: 5 * time.Minute},
+		{Timestamp: now.Add(-2 * time.Minute), Type: caamdb.EventActivate, Provider: "opencode", ProfileName: "personal"},
+		{Timestamp: now.Add(-time.Minute), Type: caamdb.EventActivate, Provider: "grok", ProfileName: "_original"},
+		{Timestamp: now.Add(-time.Minute), Type: caamdb.EventActivate, Provider: "unknown", ProfileName: "unsupported"},
+	} {
+		if err := d.LogEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := NewHandlers(nil, nil, d)
+	got, err := h.GetUsage(context.Background(), "", "24h")
+	if err != nil || got == nil || !got.Available || len(got.Usage) != 2 {
+		t.Fatalf("usage = %+v, err = %v", got, err)
+	}
+	grok := got.Usage[0]
+	if grok.Tool != "grok" || grok.Profile != "work" || grok.Activations != 2 || grok.ErrorCount != 1 || grok.ActiveSeconds != 300 || grok.LastActivity != now.Add(-10*time.Minute).Format(time.RFC3339) {
+		t.Errorf("grok activity = %+v", grok)
+	}
+	if got.Usage[1].Tool != "opencode" || got.Usage[1].Activations != 1 {
+		t.Errorf("OpenCode omitted from activity: %+v", got.Usage)
+	}
+	since, err := time.Parse(time.RFC3339, got.Since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	until, err := time.Parse(time.RFC3339, got.Until)
+	if err != nil || until.Sub(since) != 24*time.Hour {
+		t.Fatalf("invalid interval: %+v, err = %v", got, err)
+	}
+	short, err := h.GetUsage(context.Background(), "grok", "1h")
+	if err != nil || len(short.Usage) != 1 || short.Usage[0].Activations != 1 {
+		t.Fatalf("time/provider filters = %+v, err = %v", short, err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"synthetic-do-not-export", "access_token", "total_calls", "last_used"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Errorf("usage exposed %q: %s", forbidden, encoded)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.GetUsage(context.Background(), "", "24h"); err == nil {
+		t.Fatal("database failure was reported as empty data")
+	}
+}
+
+func TestGetUsageAvailableEmptyPeriod(t *testing.T) {
+	d, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "activity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	h := NewHandlers(nil, nil, d)
+	for _, period := range []string{"", "1h", "24h", "7d", "30d"} {
+		got, err := h.GetUsage(context.Background(), "", period)
+		if err != nil || got == nil || !got.Available || got.Usage == nil || len(got.Usage) != 0 {
+			t.Fatalf("period %q: %+v, err = %v", period, got, err)
+		}
+	}
+}
+
+func TestAPIIncludesEveryVaultProvider(t *testing.T) {
+	vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+	writeAPIActivationFile(t, vault.BackupPath("agy", "work", "antigravity-oauth-token"), []byte("synthetic-private-value"))
+	for _, tool := range []string{"grok", "opencode"} {
+		writeAPIActivationFile(t, vault.BackupPath(tool, "work", "auth.json"), []byte(`{"access_token":"synthetic-private-value"}`))
+	}
+	h := NewHandlers(vault, nil, nil)
+	status, err := h.GetStatus()
+	if err != nil || status.Version != version.Short() {
+		t.Fatalf("status = %+v, err = %v", status, err)
+	}
+	var names []string
+	for _, tool := range status.Tools {
+		names = append(names, tool.Tool)
+	}
+	if strings.Join(names, ",") != "agy,claude,codex,cursor,gemini,grok,opencode" {
+		t.Fatalf("provider status coverage/order = %v", names)
+	}
+	profiles, err := h.GetProfiles("")
+	if err != nil || profiles.Count != 3 || profiles.Profiles[0].Tool != "agy" || profiles.Profiles[1].Tool != "grok" || profiles.Profiles[2].Tool != "opencode" {
+		t.Fatalf("profiles = %+v, err = %v", profiles, err)
+	}
+	for _, tool := range []string{"agy", "grok", "opencode"} {
+		if profile, err := h.GetProfile(tool, "work"); err != nil || profile.Tool != tool {
+			t.Fatalf("provider %s: %+v, err = %v", tool, profile, err)
+		}
+	}
+	encoded, err := json.Marshal(profiles)
+	if err != nil || strings.Contains(string(encoded), "synthetic-private-value") {
+		t.Fatalf("profile serialization leaked credentials: %s, err = %v", encoded, err)
+	}
+}
+
+func TestAPIBackupRequiresExplicitOverwrite(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	saved := []byte(`{"tokens":{"access_token":"synthetic-old","refresh_token":"old-refresh"}}`)
+	live := []byte(`{"tokens":{"access_token":"synthetic-new","refresh_token":"new-refresh"}}`)
+	writeAPIActivationFile(t, filepath.Join(root, "codex", "auth.json"), live)
+	writeAPIActivationFile(t, vault.BackupPath("codex", "work", "auth.json"), saved)
+	h := NewHandlers(vault, nil, nil)
+	result, err := h.Backup(BackupRequest{Tool: "codex", Profile: "work"})
+	if err != nil || result.Success || !strings.Contains(result.Message, "already exists") {
+		t.Fatalf("unconfirmed overwrite = %+v, err = %v", result, err)
+	}
+	got, err := os.ReadFile(vault.BackupPath("codex", "work", "auth.json"))
+	if err != nil || !bytes.Equal(got, saved) {
+		t.Fatalf("unconfirmed overwrite changed saved login: %s, err = %v", got, err)
+	}
+	result, err = h.Backup(BackupRequest{Tool: "codex", Profile: "work", Overwrite: true})
+	if err != nil || !result.Success {
+		t.Fatalf("confirmed backup = %+v, err = %v", result, err)
+	}
+	got, err = os.ReadFile(vault.BackupPath("codex", "work", "auth.json"))
+	if err != nil || !bytes.Equal(got, live) {
+		t.Fatalf("confirmed backup did not save current login: %s, err = %v", got, err)
+	}
+	if _, err := h.Backup(BackupRequest{Tool: "codex", Profile: "_original", Overwrite: true}); err == nil {
+		t.Fatal("API allowed a system profile to be replaced")
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan bool, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Separate handlers/vault instances still share managed switch exclusion.
+			other := NewHandlers(authfile.NewVault(vault.BasePath()), nil, nil)
+			r, err := other.Backup(BackupRequest{Tool: "codex", Profile: "new"})
+			if err != nil {
+				t.Errorf("concurrent backup: %v", err)
+				results <- false
+				return
+			}
+			results <- r.Success
+		}()
+	}
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	for success := range results {
+		if success {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("concurrent unconfirmed backups succeeded %d times, want exactly one", succeeded)
 	}
 }
 
@@ -622,5 +799,173 @@ func TestGetCoordinatorsWithoutAgentConfig(t *testing.T) {
 	h.agentConfigPath = bad
 	if _, err := h.GetCoordinators(); err == nil {
 		t.Fatal("a corrupt agent config must be reported")
+	}
+}
+
+func TestCoordinatorResponsesDoNotExposeURLOrTransportSecrets(t *testing.T) {
+	endpoint := "http://synthetic-user:synthetic-password@localhost:7890/private-path?token=synthetic-query#synthetic-fragment"
+	agentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{
+			"name": "remote", "last_check": time.Now().UTC().Format(time.RFC3339),
+			"last_error": "Get " + endpoint + ": connection refused; synthetic-bearer",
+		}})
+	}))
+	defer agentSrv.Close()
+	_, portText, _ := net.SplitHostPort(agentSrv.Listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	path := filepath.Join(t.TempDir(), "agent.json")
+	h := NewHandlers(nil, nil, nil)
+	h.agentConfigPath = path
+	for _, fc := range []agent.FileConfig{
+		{Port: port, CoordinatorURL: endpoint},
+		{Port: port, Coordinators: []*agent.CoordinatorEndpoint{{Name: "remote", URL: endpoint, Token: "synthetic-bearer"}}},
+	} {
+		if err := agent.WriteFileConfig(path, fc); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := h.GetCoordinators()
+		if err != nil || len(resp.Coordinators) != 1 || resp.Coordinators[0].Endpoint != "http://localhost:7890" {
+			t.Fatalf("coordinators = %+v, err = %v", resp, err)
+		}
+		body, err := json.Marshal(resp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"synthetic-", "private-path"} {
+			if strings.Contains(string(body), secret) {
+				t.Fatal("coordinator response exposed configured or transport credentials")
+			}
+		}
+	}
+	if got := coordinatorDisplayEndpoint("http://user:secret@host:invalid"); got != "invalid coordinator URL" {
+		t.Fatalf("malformed endpoint was exposed: %q", got)
+	}
+	if got := coordinatorErrorSummary("upstream body contains synthetic-bearer"); strings.Contains(got, "synthetic-") {
+		t.Fatal("unknown transport error was passed through")
+	}
+}
+
+func TestProfileReadsLeaveGeminiLegacySnapshotsUntouched(t *testing.T) {
+	for _, withCurrent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("current=%v", withCurrent), func(t *testing.T) {
+			vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+			legacy := []byte(`{"email":"legacy@example.com","access_token":"synthetic-legacy"}`)
+			current := []byte(`{"email":"current@example.com","access_token":"synthetic-current"}`)
+			legacyPath := vault.BackupPath("gemini", "work", "oauth_credentials.json")
+			currentPath := vault.BackupPath("gemini", "work", "oauth_creds.json")
+			writeAPIActivationFile(t, legacyPath, legacy)
+			if withCurrent {
+				writeAPIActivationFile(t, currentPath, current)
+			}
+			h := NewHandlers(vault, nil, nil)
+			profile, err := h.GetProfile("gemini", "work")
+			wantEmail := "legacy@example.com"
+			if withCurrent {
+				wantEmail = "current@example.com"
+			}
+			if err != nil || profile.Identity == nil || profile.Identity.Email != wantEmail {
+				t.Fatalf("profile = %+v, err = %v", profile, err)
+			}
+			if _, err := h.GetProfiles(""); err != nil {
+				t.Fatal(err)
+			}
+			assertAPIActivationFile(t, legacyPath, legacy)
+			if withCurrent {
+				assertAPIActivationFile(t, currentPath, current)
+			} else if _, err := os.Lstat(currentPath); !os.IsNotExist(err) {
+				t.Fatalf("GET migrated legacy snapshot: %v", err)
+			}
+		})
+	}
+}
+
+func TestAPIReadsClaudeKeychainWithoutWritingMirror(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	items := testutil.FakeKeychain(t)
+	credential := []byte(`{"claudeAiOauth":{"accessToken":"synthetic-keychain","refreshToken":"synthetic-refresh","expiresAt":1893456000000}}`)
+	testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), string(credential))
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	writeAPIActivationFile(t, vault.BackupPath("claude", "work", ".credentials.json"), credential)
+	h := NewHandlers(vault, nil, nil)
+	status, err := h.GetStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tool := range status.Tools {
+		if tool.Tool == "claude" {
+			found = tool.LoggedIn && tool.ActiveProfile == "work"
+		}
+	}
+	if !found {
+		t.Fatalf("status did not recognize the authoritative keychain: %+v", status.Tools)
+	}
+	for _, tool := range []string{"", "claude"} {
+		if _, err := h.GetProfiles(tool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile, err := h.GetProfile("claude", "work")
+	if err != nil || !profile.Active {
+		t.Fatalf("profile = %+v, err = %v", profile, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "home", ".claude", ".credentials.json")); !os.IsNotExist(err) {
+		t.Fatalf("GET created a live keychain mirror: %v", err)
+	}
+	if got, ok := testutil.FakeKeychainRead(t, items, keychain.ClaudeService); !ok || got != string(credential) {
+		t.Fatal("GET changed the authoritative keychain")
+	}
+	assertAPIActivationFile(t, vault.BackupPath("claude", "work", ".credentials.json"), credential)
+}
+
+func TestActivityMetadataDoesNotTrustDiagnosticValues(t *testing.T) {
+	profiles := map[[2]string]bool{
+		{"claude", "work"}:                   true,
+		{"codex", "only-other-provider"}:     true,
+		{"claude", strings.Repeat("x", 257)}: true,
+	}
+	for _, tc := range []struct {
+		name  string
+		key   string
+		value any
+		want  string
+	}{
+		{"known profile reference", "from", "work", "work"},
+		{"profile syntax is not enough", "from", "synthetic-sensitive-value", ""},
+		{"other provider is not enough", "previous_profile", "only-other-provider", ""},
+		{"oversized profile is bounded", "switched_to", strings.Repeat("x", 257), ""},
+		{"nested profile is not a reference", "from", map[string]any{"profile": "work"}, ""},
+		{"known reason", "reason", "refresh_token_expired", "refresh_token_expired"},
+		{"reason prefix is not enough", "reason", "refresh_token_expired_sensitive", ""},
+		{"provider reason can be a credential", "reason", "synthetic-sensitive-value", ""},
+		{"nested reason", "reason", []any{"rate_limit"}, ""},
+		{"null operation", "operation", nil, ""},
+		{"known algorithm", "algorithm", "smart", "smart"},
+		{"arbitrary message", "message", "rate_limit", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactDetails(map[string]any{tc.key: tc.value}, "claude", profiles)
+			if tc.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("diagnostic metadata reached response: %v", got)
+				}
+			} else if len(got) != 1 || got[tc.key] != tc.want {
+				t.Fatalf("safe metadata = %v, want %s=%q", got, tc.key, tc.want)
+			}
+		})
+	}
+}
+
+func TestActivityDistinguishesEmptyAvailableDatabase(t *testing.T) {
+	db, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	got, err := NewHandlers(nil, nil, db).GetActivity(0)
+	if err != nil || got == nil || !got.Available || got.Events == nil || len(got.Events) != 0 || got.Cooldowns == nil || len(got.Cooldowns) != 0 {
+		t.Fatalf("GetActivity = %+v, %v; want available empty lists", got, err)
 	}
 }

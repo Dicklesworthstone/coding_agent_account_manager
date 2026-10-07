@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -35,6 +36,70 @@ type ProfileStats struct {
 	TotalActiveSeconds int
 	LastActivated      time.Time
 	LastError          time.Time
+}
+
+// ActivitySummary contains only activity CAAM recorded in the requested
+// interval. Activations include automatic switches. ActiveSeconds is the sum
+// of completed-session durations recorded in that interval, including time
+// before the interval when a session began earlier. It is not provider API
+// usage or a measurement of sessions that are still running.
+type ActivitySummary struct {
+	Provider      string
+	ProfileName   string
+	Activations   int
+	Errors        int
+	ActiveSeconds int64
+	LastActivity  time.Time
+}
+
+// SummarizeActivity aggregates an inclusive-start, exclusive-end interval in
+// one query. An empty provider selects all providers. Event details are never
+// loaded: they can contain sensitive diagnostics and do not belong in a
+// dashboard response.
+func (d *DB) SummarizeActivity(ctx context.Context, provider string, since, until time.Time) ([]ActivitySummary, error) {
+	if d == nil || d.conn == nil {
+		return nil, fmt.Errorf("db is not open")
+	}
+	if since.IsZero() || until.IsZero() || !since.Before(until) {
+		return nil, fmt.Errorf("activity interval requires start before end")
+	}
+	provider = strings.TrimSpace(provider)
+	rows, err := d.conn.QueryContext(ctx,
+		`SELECT provider, profile_name,
+		        SUM(CASE WHEN event_type IN (?, ?) THEN 1 ELSE 0 END),
+		        SUM(CASE WHEN event_type = ? THEN 1 ELSE 0 END),
+		        SUM(CASE WHEN event_type = ? THEN MAX(COALESCE(duration_seconds, 0), 0) ELSE 0 END),
+		        MAX(datetime(timestamp))
+		 FROM activity_log
+		 WHERE datetime(timestamp) >= datetime(?) AND datetime(timestamp) < datetime(?)
+		   AND (? = '' OR provider = ?)
+		 GROUP BY provider, profile_name
+		 ORDER BY provider, profile_name`,
+		EventActivate, EventSwitch, EventError, EventDeactivate,
+		formatSQLiteTime(since), formatSQLiteTime(until), provider, provider,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query activity summary: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]ActivitySummary, 0)
+	for rows.Next() {
+		var entry ActivitySummary
+		var last string
+		if err := rows.Scan(&entry.Provider, &entry.ProfileName, &entry.Activations, &entry.Errors, &entry.ActiveSeconds, &last); err != nil {
+			return nil, fmt.Errorf("scan activity summary: %w", err)
+		}
+		entry.LastActivity, err = parseSQLiteTime(last)
+		if err != nil {
+			return nil, fmt.Errorf("parse last activity: %w", err)
+		}
+		out = append(out, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate activity summary: %w", err)
+	}
+	return out, nil
 }
 
 type EventLogger interface {

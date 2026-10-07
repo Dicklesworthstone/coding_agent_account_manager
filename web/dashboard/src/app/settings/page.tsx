@@ -1,17 +1,19 @@
 "use client";
 
 import { DashboardLayout } from "@/components";
-import { PageHeader, Panel } from "@/components/ui";
+import { ErrorBanner, PageHeader, Panel, RefreshButton } from "@/components/ui";
 import { api } from "@/lib/api";
 import { disconnect, useApi, useConnection } from "@/lib/connection";
 
 function Settings() {
   const { conn } = useConnection();
-  const status = useApi(api.status, 60_000);
+  const status = useApi(api.status);
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Settings" subtitle="How this dashboard reaches caam" />
+      <PageHeader title="Settings" subtitle="How this dashboard reaches caam"
+        action={<RefreshButton loading={status.loading} reload={status.reload} />} />
+      <ErrorBanner error={status.error} stale={!!status.data} />
       <Panel title="Connection">
         <dl className="grid grid-cols-[10rem_1fr] gap-x-4 gap-y-3 px-6 py-4 text-sm">
           <dt className="text-muted">API address</dt>
@@ -19,7 +21,7 @@ function Settings() {
           <dt className="text-muted">caam version</dt>
           <dd>{status.data?.version ?? "—"}</dd>
           <dt className="text-muted">Token</dt>
-          <dd className="text-muted">stored in this browser only</dd>
+          <dd className="text-muted">held only in this tab&apos;s memory; cleared on disconnect or reload</dd>
         </dl>
         <div className="border-t border-border px-6 py-4">
           <button

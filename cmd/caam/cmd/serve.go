@@ -29,7 +29,7 @@ ENDPOINTS:
   GET  /api/v1/profiles?tool=X  List profiles for a specific tool
   GET  /api/v1/profiles/X/Y     Get profile details
   DELETE /api/v1/profiles/X/Y   Delete a profile
-  GET  /api/v1/usage            Usage statistics
+  GET  /api/v1/usage            Recorded CAAM activity (default: last 24 hours)
   GET  /api/v1/activity         Recent activity (?limit=N) and active cooldowns
   GET  /api/v1/coordinators     Coordinator status
   POST /api/v1/actions/activate Activate a profile
@@ -42,6 +42,15 @@ AUTHENTICATION:
   (or $CAAM_HOME/.api_token if CAAM_HOME is set).
 
   Include the header: Authorization: Bearer <token>
+
+ACTIVITY AND BACKUPS:
+  /api/v1/usage accepts period=1h, 24h, 7d, or 30d and an optional tool filter.
+  It reports logged activations, errors, and completed-session duration, not
+  provider API calls or quota. Sessions count in full when they complete.
+  available=false means the activity database is unavailable.
+
+  Backup actions require a new profile name by default. Replacing an existing
+  snapshot requires an explicit "overwrite": true in the JSON request.
 
 SECURITY:
   - Server binds to 127.0.0.1 only (localhost)
@@ -75,11 +84,17 @@ var (
 
 // dashboardConnectURL is a dashboard link that hands it the API address and
 // token in the URL fragment, which the browser never sends to a server.
-func dashboardConnectURL(dashboard, apiBase, token string) string {
+func dashboardConnectURL(dashboard, apiBase, token string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(dashboard))
+	if err != nil || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") ||
+		(u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" && u.Hostname() != "::1") ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", fmt.Errorf("dashboard URL must be a loopback HTTP(S) origin without a path, credentials, query, or fragment")
+	}
 	values := url.Values{}
 	values.Set("token", token)
 	values.Set("api", apiBase)
-	return strings.TrimRight(dashboard, "/") + "/#" + values.Encode()
+	return u.Scheme + "://" + u.Host + "/#" + values.Encode(), nil
 }
 
 func init() {
@@ -133,7 +148,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	if serveDashboardURL != "" {
-		fmt.Println(dashboardConnectURL(serveDashboardURL, fmt.Sprintf("http://127.0.0.1:%d", server.Port()), server.Token()))
+		link, err := dashboardConnectURL(serveDashboardURL, fmt.Sprintf("http://127.0.0.1:%d", server.Port()), server.Token())
+		if err != nil {
+			return err
+		}
+		fmt.Println(link)
 		return nil
 	}
 
@@ -159,7 +178,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("  GET  /health              - Health check")
 	fmt.Println("  GET  /api/v1/status       - Overall status")
 	fmt.Println("  GET  /api/v1/profiles     - List profiles")
-	fmt.Println("  GET  /api/v1/usage        - Usage statistics")
+	fmt.Println("  GET  /api/v1/usage        - Recorded CAAM activity")
 	fmt.Println("  GET  /api/v1/activity     - Recent activity and cooldowns")
 	fmt.Println("  GET  /api/v1/events       - SSE live updates")
 	fmt.Println("  POST /api/v1/actions/*    - Actions (activate, backup)")

@@ -487,13 +487,28 @@ func (v *Vault) BackupPath(tool, profile, filename string) string {
 	return filepath.Join(v.ProfilePath(tool, profile), filename)
 }
 
+// BackupOptions controls deliberate replacement of a saved profile.
+type BackupOptions struct {
+	Overwrite bool
+}
+
+// BackupWithOptions serializes a requested backup with other managed switches
+// and discoveries in this process. The default refuses to replace any existing
+// destination, so browser actions must explicitly authorize an overwrite.
+func (v *Vault) BackupWithOptions(fileSet AuthFileSet, profile string, opts BackupOptions) error {
+	switchMu.Lock()
+	defer switchMu.Unlock()
+	return v.backup(fileSet, profile, opts.Overwrite)
+}
+
 // Backup publishes an exact snapshot of the current auth files. Replacing a
 // named snapshot retains the complete previous directory in private recovery
 // storage; absent live credentials never survive in the new snapshot.
 func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
-	switchMu.Lock()
-	defer switchMu.Unlock()
+	return v.BackupWithOptions(fileSet, profile, BackupOptions{Overwrite: true})
+}
 
+func (v *Vault) backup(fileSet AuthFileSet, profile string, overwrite bool) error {
 	profileDir, err := v.safeProfileDir(fileSet.Tool, profile)
 	if err != nil {
 		return err
@@ -507,6 +522,9 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		return fmt.Errorf("inspect previous snapshot: %w", err)
 	}
 	if previous != nil {
+		if !overwrite {
+			return fmt.Errorf("profile %s/%s already exists: %w", tool, profile, os.ErrExist)
+		}
 		if !previous.IsDir() || previous.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("profile path is not a regular directory: %s", profileDir)
 		}
@@ -631,7 +649,13 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	if err != nil || !os.SameFile(parent, currentParent) {
 		return fmt.Errorf("vault provider directory changed during backup; retry")
 	}
-	if err := publishBackupSnapshot(stage, profileDir, previousPath, previous, os.Rename); err != nil {
+	rename := os.Rename
+	if !overwrite {
+		// Keep the whole prepared snapshot atomic without replacing even an
+		// empty directory created after our final destination check.
+		rename = renameBackupNoReplace
+	}
+	if err := publishBackupSnapshot(stage, profileDir, previousPath, previous, rename); err != nil {
 		// A failed rollback must retain the only complete previous snapshot.
 		_, retainedErr := os.Lstat(previousPath)
 		retainPrevious = retainedErr == nil || !os.IsNotExist(retainedErr)
@@ -672,8 +696,11 @@ func backupOperatorMetadata(profileDir string) (map[string]interface{}, error) {
 func publishBackupSnapshot(stage, destination, previousPath string, expected os.FileInfo, rename func(string, string) error) error {
 	current, err := os.Lstat(destination)
 	if expected == nil {
-		if err == nil || !os.IsNotExist(err) {
-			return fmt.Errorf("snapshot destination appeared during backup; retry")
+		if err == nil {
+			return fmt.Errorf("snapshot destination appeared during backup: %w", os.ErrExist)
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect snapshot destination before publication: %w", err)
 		}
 	} else {
 		if err != nil || !os.SameFile(expected, current) {

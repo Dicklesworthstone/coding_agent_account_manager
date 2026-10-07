@@ -220,6 +220,48 @@ func (v *Vault) CurrentProfile(fileSet AuthFileSet) (string, error) {
 	return owner, err
 }
 
+// HasAuthFilesReadOnly checks live credential presence without creating a
+// keychain mirror, migrating filenames, or changing native settings. It applies
+// the same credential validation as restore, not an online provider check.
+func HasAuthFilesReadOnly(fileSet AuthFileSet) bool {
+	if fileSet.Tool != "claude" {
+		// Cursor's validator preserves its native metadata-only fallback, but
+		// only when the authoritative auth.json is genuinely absent.
+		return validateCredentialFiles(fileSet, "") == nil
+	}
+
+	// Captured keychain bytes override an existing mirror. A denied read is
+	// not permission to report an older on-disk credential as the live login.
+	live, err := readSwitchState(fileSet, "")
+	if err != nil {
+		return false
+	}
+	required, optional, missingRequired := false, false, false
+	for _, spec := range fileSet.Files {
+		name := filepath.Base(spec.Path)
+		data, present := live.files[name]
+		hasAuth, err := claudeCredentialMaterial(data, name)
+		if err != nil {
+			return false
+		}
+		// An explicitly empty primary artifact cannot be rescued by settings
+		// or helpers, matching validateCredentialFiles's authority rules.
+		if present && !hasAuth && (name == claudeCredentialsFile || name == "auth.json") {
+			return false
+		}
+		if !hasAuth {
+			missingRequired = missingRequired || spec.Required
+			continue
+		}
+		if spec.Required {
+			required = true
+		} else {
+			optional = true
+		}
+	}
+	return (required || optional) && (!missingRequired || (fileSet.AllowOptionalOnly && !required && optional))
+}
+
 type switchAccount struct {
 	account string
 	subject string

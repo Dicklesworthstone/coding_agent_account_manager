@@ -84,6 +84,85 @@ func keychainState(email string) string {
 	return string(raw)
 }
 
+func TestHasAuthFilesReadOnlyKeychain(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		credential      string
+		mirror          string
+		denied          bool
+		disabled        bool
+		explicitConfig  bool
+		missingKeychain bool
+		want            bool
+	}{
+		{name: "keychain only", credential: keychainCreds("live"), want: true},
+		{name: "keychain supersedes stale mirror", credential: keychainCreds("live"), mirror: keychainCreds("old"), want: true},
+		{name: "keychain supersedes malformed mirror", credential: keychainCreds("live"), mirror: `{`, want: true},
+		{name: "missing item without mirror"},
+		{name: "missing item uses file", mirror: keychainCreds("file"), want: true},
+		{name: "missing keychain uses file", mirror: keychainCreds("file"), missingKeychain: true, want: true},
+		{name: "denial cannot use stale mirror", credential: keychainCreds("live"), mirror: keychainCreds("old"), denied: true},
+		{name: "malformed keychain cannot use stale mirror", credential: `{`, mirror: keychainCreds("old")},
+		{name: "null keychain grant", credential: `{"claudeAiOauth":null}`, mirror: keychainCreds("old")},
+		{name: "null access token", credential: `{"claudeAiOauth":{"accessToken":null}}`},
+		{name: "refresh token alone", credential: `{"claudeAiOauth":{"refreshToken":"refresh"}}`},
+		{name: "malformed refresh token", credential: `{"claudeAiOauth":{"accessToken":"access","refreshToken":3}}`},
+		{name: "malformed expiry", credential: `{"claudeAiOauth":{"accessToken":"access","expiresAt":"later"}}`},
+		{name: "disabled keychain uses file", credential: `{`, mirror: keychainCreds("file"), disabled: true, want: true},
+		{name: "explicit config ignores default keychain", credential: keychainCreds("other-account"), explicitConfig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newKeychainFixture(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			if tc.credential != "" {
+				f.storeToken(tc.credential)
+			}
+			if tc.mirror != "" {
+				writeFixtureFile(t, f.credPath, tc.mirror)
+			}
+			state := keychainState("unproven-label@example.com")
+			writeFixtureFile(t, f.statePath, state)
+			if tc.denied {
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			if tc.disabled {
+				t.Setenv("CAAM_KEYCHAIN", "0")
+			}
+			if tc.explicitConfig {
+				t.Setenv("CLAUDE_CONFIG_DIR", filepath.Dir(f.credPath))
+			}
+			if tc.missingKeychain {
+				fakeMissingLoginKeychain(t)
+			}
+
+			// Repeated dashboard polling must keep using the authoritative
+			// source without publishing or memoizing a credential mirror.
+			for range 2 {
+				if got := HasAuthFilesReadOnly(f.fileSet); got != tc.want {
+					t.Fatalf("read-only presence = %v, want %v", got, tc.want)
+				}
+			}
+			if tc.mirror == "" {
+				if _, err := os.Lstat(f.credPath); !os.IsNotExist(err) {
+					t.Fatalf("read-only presence created a mirror: %v", err)
+				}
+			} else if got := readFixtureFile(t, f.credPath); got != tc.mirror {
+				t.Fatal("read-only presence changed the existing credential mirror")
+			}
+			if got := readFixtureFile(t, f.statePath); got != state {
+				t.Fatal("read-only presence changed native settings")
+			}
+			if got, present := f.storedToken(); present != (tc.credential != "") || got != tc.credential {
+				t.Fatal("read-only presence changed the keychain item")
+			}
+			if _, err := os.Lstat(f.vaultDir); !os.IsNotExist(err) {
+				t.Fatalf("read-only presence created a vault: %v", err)
+			}
+		})
+	}
+}
+
 func TestExplicitClaudeConfigDoesNotUseDefaultKeychain(t *testing.T) {
 	f := newKeychainFixture(t)
 	f.storeToken(keychainCreds("default-host-account"))

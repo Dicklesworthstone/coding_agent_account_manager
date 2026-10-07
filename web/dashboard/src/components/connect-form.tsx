@@ -2,13 +2,14 @@
 
 import { PlugZap } from "lucide-react";
 import { useState } from "react";
-import { DEFAULT_API_BASE, normalizeBaseUrl } from "@/lib/api";
+import { DEFAULT_API_BASE } from "@/lib/api";
 import { connect } from "@/lib/connection";
 
 /** Asks for the `caam serve` address and API token. */
-export function ConnectForm({ rejected }: { rejected: boolean }) {
+export function ConnectForm({ rejected, connectionError }: { rejected: boolean; connectionError?: string }) {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_API_BASE);
   const [token, setToken] = useState("");
+  const [error, setError] = useState("");
 
   return (
     <div className="mx-auto mt-16 max-w-lg rounded-xl border border-border bg-surface p-8">
@@ -23,7 +24,7 @@ export function ConnectForm({ rejected }: { rejected: boolean }) {
         with:
       </p>
       <pre className="mt-2 rounded-lg bg-surface-muted px-3 py-2 font-mono text-sm">
-        caam serve --show-token
+        caam serve{"\n"}caam serve --show-token
       </pre>
       <p className="mt-2 text-sm text-muted">
         Or open the link <code className="font-mono">caam serve --dashboard-url {"<this address>"}</code>{" "}
@@ -31,15 +32,21 @@ export function ConnectForm({ rejected }: { rejected: boolean }) {
       </p>
       {rejected && (
         <p role="alert" className="mt-4 rounded-lg bg-danger/10 px-3 py-2 text-sm text-danger">
-          caam rejected the saved token. Paste the current one.
+          caam rejected the token. Paste the current one.
         </p>
       )}
+      {(error || connectionError) && <p role="alert" className="mt-4 text-sm text-danger">{error || connectionError}</p>}
       <form
         className="mt-6 space-y-4"
         onSubmit={(e) => {
           e.preventDefault();
           if (token.trim()) {
-            connect({ baseUrl: normalizeBaseUrl(baseUrl), token: token.trim() });
+            try {
+              connect({ baseUrl, token });
+              setToken("");
+            } catch (err) {
+              setError(err instanceof Error ? err.message : "Check the connection details.");
+            }
           }
         }}
       >
@@ -48,6 +55,8 @@ export function ConnectForm({ rejected }: { rejected: boolean }) {
           <input
             value={baseUrl}
             onChange={(e) => setBaseUrl(e.target.value)}
+            autoComplete="off"
+            spellCheck={false}
             className="mt-1 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </label>
@@ -58,6 +67,7 @@ export function ConnectForm({ rejected }: { rejected: boolean }) {
             value={token}
             onChange={(e) => setToken(e.target.value)}
             autoComplete="off"
+            spellCheck={false}
             className="mt-1 h-10 w-full rounded-lg border border-border bg-background px-3 font-mono text-sm focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </label>
@@ -69,6 +79,7 @@ export function ConnectForm({ rejected }: { rejected: boolean }) {
           Connect
         </button>
       </form>
+      <p className="mt-4 text-xs text-muted">Only loopback API addresses are accepted. The token stays in this tab&apos;s memory and is cleared when you disconnect or reload.</p>
     </div>
   );
 }

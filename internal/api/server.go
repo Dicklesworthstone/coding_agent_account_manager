@@ -7,10 +7,12 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -129,8 +131,7 @@ func (s *Server) Token() string {
 	return s.token
 }
 
-// Start starts the server.
-func (s *Server) Start() error {
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// Health check (no auth required)
@@ -147,9 +148,11 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/actions/backup", s.authMiddleware(s.handleBackup))
 	mux.HandleFunc("/api/v1/events", s.authMiddleware(s.handleSSE))
 
-	// CORS middleware for localhost only
-	handler := s.corsMiddleware(mux)
+	return s.corsMiddleware(mux)
+}
 
+// Start starts the server.
+func (s *Server) Start() error {
 	// Bind to localhost only
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	listener, err := net.Listen("tcp", addr)
@@ -158,7 +161,7 @@ func (s *Server) Start() error {
 	}
 
 	s.httpServer = &http.Server{
-		Handler:      handler,
+		Handler:      s.handler(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -226,23 +229,15 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// Only allow localhost origins
-		allowedOrigins := []string{
-			"http://localhost",
-			"http://127.0.0.1",
-			"http://localhost:3000",
-			"http://127.0.0.1:3000",
-		}
-
-		allowed := false
-		for _, ao := range allowedOrigins {
-			if origin == ao || (len(origin) > len(ao) && origin[:len(ao)+1] == ao+":") {
-				allowed = true
-				break
-			}
-		}
+		// Compare parsed origins, not prefixes. In particular, userinfo and
+		// suffixes must not turn a remote host into an allowed localhost origin.
+		u, err := url.Parse(origin)
+		allowed := err == nil && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" &&
+			(u.Scheme == "http" || u.Scheme == "https") &&
+			(u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
 
 		if allowed {
+			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -286,6 +281,7 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // jsonError writes a JSON error response.
 func (s *Server) jsonError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
@@ -293,6 +289,7 @@ func (s *Server) jsonError(w http.ResponseWriter, status int, message string) {
 // jsonResponse writes a JSON response.
 func (s *Server) jsonResponse(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(data); err != nil {
@@ -381,9 +378,13 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tool := r.URL.Query().Get("tool")
-	usage, err := s.handlers.GetUsage(tool)
+	usage, err := s.handlers.GetUsage(r.Context(), tool, r.URL.Query().Get("period"))
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidUsageQuery) {
+			status = http.StatusBadRequest
+		}
+		s.jsonError(w, status, err.Error())
 		return
 	}
 
@@ -400,7 +401,7 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	activity, err := s.handlers.GetActivity(limit)
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.jsonError(w, http.StatusInternalServerError, "activity data could not be read")
 		return
 	}
 
@@ -442,12 +443,13 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Emit event
-	s.Emit(Event{
-		Type:      "profile_activated",
-		Timestamp: time.Now(),
-		Data:      result,
-	})
+	if result.Success {
+		s.Emit(Event{
+			Type:      "profile_activated",
+			Timestamp: time.Now(),
+			Data:      result,
+		})
+	}
 
 	s.jsonResponse(w, result)
 }
@@ -471,12 +473,13 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Emit event
-	s.Emit(Event{
-		Type:      "profile_backed_up",
-		Timestamp: time.Now(),
-		Data:      result,
-	})
+	if result.Success {
+		s.Emit(Event{
+			Type:      "profile_backed_up",
+			Timestamp: time.Now(),
+			Data:      result,
+		})
+	}
 
 	s.jsonResponse(w, result)
 }

@@ -1571,6 +1571,57 @@ claude "explain this authentication flow"
 
 ---
 
+## Web Dashboard
+
+The local dashboard shows saved accounts, current logins, credential health,
+recorded CAAM activity, and distributed coordinator status. It supports Claude,
+Codex, Cursor, Gemini, Antigravity, Grok, and OpenCode profiles.
+
+Start the API on the same machine as your browser:
+
+```bash
+caam serve
+```
+
+In another terminal, print the connection token with `caam serve --show-token`.
+From a repository checkout, start the dashboard:
+
+```bash
+cd web/dashboard
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+Open `http://localhost:3000`, connect to `http://127.0.0.1:7892`, and paste the
+token. You can also print a connection link:
+
+```bash
+caam serve --dashboard-url http://localhost:3000
+```
+
+Both services bind to loopback. The link carries the token in its URL fragment,
+which the dashboard removes from the address bar. The dashboard keeps the token
+in tab memory and clears it on disconnect or reload.
+
+Search and filter accounts, inspect health and cooldowns, and confirm activation
+of a named profile. Backup copies the current live login into a new saved
+snapshot; replacing an existing snapshot requires a separate opt-in and a
+confirmation naming that account. Failed or uncertain actions remain visible,
+and successful actions refresh the displayed state.
+
+Recorded activity reports logged activations, errors, and completed-session
+duration for the last hour, day, week, or month. A session counts in full when
+its completion is recorded. Provider quota and API-call totals are separate
+from this local activity history. Unavailable history and stale data are marked
+explicitly. Read-only sections refresh every 15 seconds and on demand.
+The recent activity page also lists switches, logins, refreshes, errors, and
+active cooldowns.
+
+See [web/dashboard/README.md](web/dashboard/README.md) for production startup,
+connection behavior, and validation commands.
+
+---
+
 ## Distributed Auth Recovery
 
 When Claude Code sessions run on remote machines (WezTerm SSH domains or tmux)
@@ -1601,25 +1652,6 @@ coordinator acknowledges them and are pasted exactly once. For manual control
 of panes, see `caam wezterm recover` and `caam wezterm login-all`. Design,
 configuration keys, API, and troubleshooting:
 [docs/DISTRIBUTED_AUTH_RECOVERY.md](docs/DISTRIBUTED_AUTH_RECOVERY.md).
-
----
-
-## Web Dashboard
-
-`caam serve` runs a localhost-only API (token-protected, localhost origins
-only). The dashboard in [`web/dashboard`](web/dashboard) runs on top of it and
-shows:
-- which tools are logged in;
-- saved profiles, which you can activate, or save the current login as one;
-- coordinator health;
-- recent activity and cooldowns;
-- per-profile errors.
-
-```bash
-caam serve                                        # API on 127.0.0.1:7892
-(cd web/dashboard && pnpm install && pnpm dev)    # dashboard on localhost:3000
-caam serve --dashboard-url http://localhost:3000  # prints a link that connects it
-```
 
 ---
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 )
 
@@ -250,6 +252,15 @@ func TestCORSMiddleware(t *testing.T) {
 			wantCORS:   false,
 			wantStatus: http.StatusOK,
 		},
+		{name: "IPv6 loopback", origin: "http://[::1]:3000", wantCORS: true, wantStatus: http.StatusOK},
+		{name: "HTTPS localhost", origin: "https://localhost:3000", wantCORS: true, wantStatus: http.StatusOK},
+		{name: "userinfo host confusion", origin: "http://localhost:3000@evil.example", wantStatus: http.StatusOK},
+		{name: "loopback prefix", origin: "http://127.0.0.1.evil.example:3000", wantStatus: http.StatusOK},
+		{name: "localhost suffix", origin: "http://localhost.evil.example", wantStatus: http.StatusOK},
+		{name: "opaque origin", origin: "null", wantStatus: http.StatusOK},
+		{name: "origin with path", origin: "http://localhost:3000/path", wantStatus: http.StatusOK},
+		{name: "origin with query", origin: "http://localhost:3000?host=evil.example", wantStatus: http.StatusOK},
+		{name: "origin with invalid port", origin: "http://localhost:not-a-port", wantStatus: http.StatusOK},
 		{
 			name:       "OPTIONS request",
 			origin:     "http://localhost:3000",
@@ -283,6 +294,124 @@ func TestCORSMiddleware(t *testing.T) {
 				t.Errorf("unexpected CORS header: %s", corsHeader)
 			}
 		})
+	}
+}
+
+func TestDashboardAPIUsesAuthenticatedRealDataAndActions(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	live := []byte(`{"tokens":{"access_token":"synthetic-live-secret","refresh_token":"live-refresh"}}`)
+	target := []byte(`{"tokens":{"access_token":"synthetic-target-secret","refresh_token":"target-refresh"}}`)
+	writeAPIActivationFile(t, filepath.Join(root, "codex", "auth.json"), live)
+	writeAPIActivationFile(t, vault.BackupPath("codex", "work", "auth.json"), target)
+	d, err := caamdb.OpenAt(filepath.Join(root, "activity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if err := d.LogEvent(caamdb.Event{Timestamp: time.Now().Add(-time.Minute), Type: caamdb.EventActivate, Provider: "codex", ProfileName: "work"}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(Config{TokenPath: filepath.Join(root, "api-token")}, NewHandlers(vault, nil, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.handler())
+	t.Cleanup(ts.Close)
+	request := func(method, path, body string, authorized bool) (*http.Response, map[string]any) {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Origin", "http://localhost:3000")
+		if authorized {
+			req.Header.Set("Authorization", "Bearer "+server.Token())
+		}
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var result map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Header.Get("Cache-Control") != "no-store" {
+			t.Error("authenticated state may be cached")
+		}
+		if resp.Header.Get("Access-Control-Allow-Origin") != "http://localhost:3000" {
+			t.Error("local dashboard origin cannot read response")
+		}
+		encoded, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{server.Token(), "synthetic-live-secret", "synthetic-target-secret"} {
+			if bytes.Contains(encoded, []byte(secret)) {
+				t.Errorf("API response exposed a credential on %s", path)
+			}
+		}
+		return resp, result
+	}
+	resp, _ := request(http.MethodGet, "/api/v1/profiles", "", false)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated profiles status = %d", resp.StatusCode)
+	}
+	resp, profiles := request(http.MethodGet, "/api/v1/profiles", "", true)
+	if resp.StatusCode != http.StatusOK || profiles["count"] != float64(1) {
+		t.Fatalf("profiles = %v, status = %d", profiles, resp.StatusCode)
+	}
+	resp, usage := request(http.MethodGet, "/api/v1/usage?period=1h&tool=codex", "", true)
+	rows, ok := usage["usage"].([]any)
+	if resp.StatusCode != http.StatusOK || usage["available"] != true || !ok || len(rows) != 1 || rows[0].(map[string]any)["activations"] != float64(1) {
+		t.Fatalf("actual usage = %v, status = %d", usage, resp.StatusCode)
+	}
+	for _, query := range []string{"period=invalid", "period=-1h", "period=24h&tool=unknown"} {
+		resp, _ := request(http.MethodGet, "/api/v1/usage?"+query, "", true)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("query %q status = %d", query, resp.StatusCode)
+		}
+	}
+	resp, backup := request(http.MethodPost, "/api/v1/actions/backup", `{"tool":"codex","profile":"work"}`, true)
+	if resp.StatusCode != http.StatusOK || backup["success"] != false || len(server.eventCh) != 0 {
+		t.Fatalf("unconfirmed backup = %v, events = %d", backup, len(server.eventCh))
+	}
+	resp, activation := request(http.MethodPost, "/api/v1/actions/activate", `{"tool":"codex","profile":"work"}`, false)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthorized activation accepted: %v", activation)
+	}
+	before, err := os.ReadFile(filepath.Join(root, "codex", "auth.json"))
+	if err != nil || !bytes.Equal(before, live) {
+		t.Fatalf("unauthorized request changed live credentials: err = %v", err)
+	}
+	resp, activation = request(http.MethodPost, "/api/v1/actions/activate", `{"tool":"codex","profile":"work"}`, true)
+	if resp.StatusCode != http.StatusOK || activation["success"] != true {
+		t.Fatalf("activation = %v, status = %d", activation, resp.StatusCode)
+	}
+	after, err := os.ReadFile(filepath.Join(root, "codex", "auth.json"))
+	if err != nil || !bytes.Equal(after, target) {
+		t.Fatalf("successful activation did not publish selected credential: err = %v", err)
+	}
+	stats, err := d.GetStats("codex", "work")
+	if err != nil || stats.TotalActivations != 2 {
+		t.Fatalf("API activation not recorded: %+v, err = %v", stats, err)
+	}
+	if len(server.eventCh) != 1 || (<-server.eventCh).Type != "profile_activated" {
+		t.Fatal("successful activation did not emit the correct event")
+	}
+	resp, backup = request(http.MethodPost, "/api/v1/actions/backup", `{"tool":"codex","profile":"saved-current"}`, true)
+	if resp.StatusCode != http.StatusOK || backup["success"] != true {
+		t.Fatalf("new backup = %v, status = %d", backup, resp.StatusCode)
+	}
+	saved, err := os.ReadFile(vault.BackupPath("codex", "saved-current", "auth.json"))
+	if err != nil || !bytes.Equal(saved, target) {
+		t.Fatalf("backup did not preserve current credentials: err = %v", err)
+	}
+	if len(server.eventCh) != 1 || (<-server.eventCh).Type != "profile_backed_up" {
+		t.Fatal("successful backup did not emit the correct event")
 	}
 }
 
@@ -402,14 +531,14 @@ func TestActivityEndpointReportsEventsAndCooldowns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := server.authMiddleware(server.handleActivity)
+	handler := server.handler()
 	get := func(token string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/activity?limit=10", nil)
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		w := httptest.NewRecorder()
-		handler(w, req)
+		handler.ServeHTTP(w, req)
 		return w
 	}
 	if w := get(""); w.Code != http.StatusUnauthorized {
@@ -420,11 +549,14 @@ func TestActivityEndpointReportsEventsAndCooldowns(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
+	if w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("activity response must not be cached: %v", w.Header())
+	}
 	var body ActivityResponse
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body.Events) != 2 || body.Events[0].Type != caamdb.EventSwitch || body.Events[0].Profile != "home" {
+	if !body.Available || len(body.Events) != 2 || body.Events[0].Type != caamdb.EventSwitch || body.Events[0].Profile != "home" {
 		t.Fatalf("events = %+v, want newest first", body.Events)
 	}
 	details := body.Events[0].Details
@@ -444,7 +576,99 @@ func TestActivityEndpointReportsEventsAndCooldowns(t *testing.T) {
 
 func TestActivityWithoutDatabaseIsEmpty(t *testing.T) {
 	got, err := NewHandlers(nil, nil, nil).GetActivity(0)
-	if err != nil || got.Events == nil || len(got.Events) != 0 || got.Cooldowns == nil {
+	if err != nil || got == nil || got.Available || got.Events == nil || len(got.Events) != 0 || got.Cooldowns == nil {
 		t.Fatalf("GetActivity = %+v, %v; want empty lists", got, err)
+	}
+}
+
+func TestActivityEndpointHidesDiagnosticText(t *testing.T) {
+	const diagnostic = "synthetic-activity-sensitive-value"
+	tmpDir := t.TempDir()
+	db, err := caamdb.OpenAt(filepath.Join(tmpDir, "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := db.LogEvent(caamdb.Event{
+		Type: caamdb.EventError, Provider: "claude", ProfileName: "work", Timestamp: now,
+		Details: map[string]any{
+			"operation": "refresh", "reason": diagnostic, "from": diagnostic,
+			"previous_profile": map[string]any{"profile": diagnostic},
+			"switched_to":      []any{diagnostic},
+			"selection_source": "rotation " + diagnostic, "algorithm": diagnostic,
+			"error": "Bearer " + diagnostic, "message": "https://example.test/" + diagnostic,
+			"context": map[string]any{"response": diagnostic}, "access_token": diagnostic,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SetCooldown("claude", "work", now, time.Hour, "session limit "+diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents, err := db.ListRecentEvents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCooldowns, err := db.ListActiveCooldowns(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := json.Marshal([]any{beforeEvents, beforeCooldowns})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+	server, err := NewServer(cfg, NewHandlers(nil, nil, db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/activity", nil)
+		req.Header.Set("Authorization", "Bearer "+server.Token())
+		w := httptest.NewRecorder()
+		server.handler().ServeHTTP(w, req)
+		return w
+	}
+	w := get()
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), diagnostic) {
+		t.Fatalf("unsafe activity response: status=%d body=%s", w.Code, w.Body)
+	}
+	var body ActivityResponse
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Available || len(body.Events) != 1 || len(body.Events[0].Details) != 1 || body.Events[0].Details["operation"] != "refresh" {
+		t.Fatalf("safe event context was lost: %+v", body)
+	}
+	if len(body.Cooldowns) != 1 || body.Cooldowns[0].Notes != "" || body.Cooldowns[0].Until != now.Add(time.Hour).Format(time.RFC3339) {
+		t.Fatalf("cooldown timing must remain usable without diagnostic notes: %+v", body.Cooldowns)
+	}
+	afterEvents, err := db.ListRecentEvents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCooldowns, err := db.ListActiveCooldowns(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := json.Marshal([]any{afterEvents, afterCooldowns})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("GET /activity changed stored events or cooldowns")
+	}
+
+	// Database parsing failures can also include raw stored values. The HTTP
+	// error must not echo them into the dashboard.
+	if _, err := db.Conn().Exec("UPDATE activity_log SET timestamp = ?", diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	w = get()
+	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), diagnostic) || !strings.Contains(w.Body.String(), "activity data could not be read") {
+		t.Fatalf("unsafe activity error: status=%d body=%s", w.Code, w.Body)
 	}
 }

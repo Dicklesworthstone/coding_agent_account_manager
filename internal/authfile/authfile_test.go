@@ -24,6 +24,35 @@ func TestNewVault(t *testing.T) {
 	}
 }
 
+func TestBackupNewProfilePreservesConcurrentCreation(t *testing.T) {
+	f := newKeychainFixture(t)
+	f.storeToken(keychainCreds("live-account"))
+	profileDir := f.vault.ProfilePath("claude", "work")
+	concurrentCredential := keychainCreds("concurrent-account")
+	t.Setenv("CAAM_TEST_BACKUP_RACE_DEST", profileDir)
+	t.Setenv("CAAM_TEST_BACKUP_RACE_CREDENTIAL", concurrentCredential)
+	t.Setenv("CAAM_TEST_BACKUP_RACE_ORIGINAL", os.Getenv("CAAM_KEYCHAIN_BIN"))
+	// Another process creates the profile after the existence check, while
+	// the backup is capturing its live native credential. This deterministically
+	// exercises the gap that a process-local mutex cannot protect.
+	bin := filepath.Join(t.TempDir(), "security-concurrent-writer")
+	script := `#!/bin/sh
+mkdir -p "$CAAM_TEST_BACKUP_RACE_DEST" || exit 1
+printf '%s' "$CAAM_TEST_BACKUP_RACE_CREDENTIAL" > "$CAAM_TEST_BACKUP_RACE_DEST/.credentials.json" || exit 1
+exec "$CAAM_TEST_BACKUP_RACE_ORIGINAL" "$@"
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_KEYCHAIN_BIN", bin)
+	if err := f.vault.BackupWithOptions(f.fileSet, "work", BackupOptions{}); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("concurrent destination must reject unconfirmed replacement: %v", err)
+	}
+	if got := readFixtureFile(t, filepath.Join(profileDir, ".credentials.json")); got != concurrentCredential {
+		t.Fatal("backup replaced a profile created by another process")
+	}
+}
+
 func TestDefaultVaultPath(t *testing.T) {
 	// Save and restore environment
 	origCaamHome := os.Getenv("CAAM_HOME")
@@ -2175,5 +2204,167 @@ func TestVaultLabelsSurviveBackup(t *testing.T) {
 	}
 	if got := readFixtureFile(t, previousMetaPath); got != previousMetadata {
 		t.Fatalf("clearing labels changed the retained snapshot: got %s, want %s", got, previousMetadata)
+	}
+}
+
+func TestRenameBackupNoReplace(t *testing.T) {
+	supported := runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin" || runtime.GOOS == "ios" || runtime.GOOS == "windows"
+	for _, kind := range []string{"absent", "empty directory", "nonempty directory", "file", "symlink", "dangling symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			source := filepath.Join(root, "prepared")
+			destination := filepath.Join(root, "destination")
+			referent := filepath.Join(root, "referent")
+			if err := os.Mkdir(source, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeFixtureFile(t, filepath.Join(source, "auth.json"), "synthetic-prepared-credential")
+			sourceBefore, err := os.Lstat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "empty directory":
+				if err := os.Mkdir(destination, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "nonempty directory":
+				if err := os.Mkdir(destination, 0700); err != nil {
+					t.Fatal(err)
+				}
+				writeFixtureFile(t, filepath.Join(destination, "auth.json"), "synthetic-existing-credential")
+			case "file":
+				writeFixtureFile(t, destination, "synthetic-existing-file")
+			case "symlink", "dangling symlink":
+				if kind == "symlink" {
+					if err := os.Mkdir(referent, 0700); err != nil {
+						t.Fatal(err)
+					}
+					writeFixtureFile(t, filepath.Join(referent, "auth.json"), "synthetic-referent-credential")
+				}
+				if err := os.Symlink(referent, destination); err != nil {
+					t.Skipf("symlink creation unavailable: %v", err)
+				}
+			}
+			destinationBefore, err := os.Lstat(destination)
+			if kind != "absent" && err != nil {
+				t.Fatal(err)
+			}
+
+			err = renameBackupNoReplace(source, destination)
+			if kind == "absent" && supported {
+				if err != nil {
+					t.Fatalf("publish to an absent destination: %v", err)
+				}
+				published, err := os.Lstat(destination)
+				if err != nil || !os.SameFile(sourceBefore, published) {
+					t.Fatalf("prepared directory was not moved intact: %v", err)
+				}
+				if got := readFixtureFile(t, filepath.Join(destination, "auth.json")); got != "synthetic-prepared-credential" {
+					t.Fatal("published credential changed")
+				}
+				if _, err := os.Lstat(source); !os.IsNotExist(err) {
+					t.Fatalf("successful publication left the source: %v", err)
+				}
+				return
+			}
+			wantErr := os.ErrExist
+			if !supported {
+				wantErr = errors.ErrUnsupported
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("exclusive publication error = %v, want %v", err, wantErr)
+			}
+			sourceAfter, err := os.Lstat(source)
+			if err != nil || !os.SameFile(sourceBefore, sourceAfter) {
+				t.Fatalf("failed publication changed its source: %v", err)
+			}
+			if got := readFixtureFile(t, filepath.Join(source, "auth.json")); got != "synthetic-prepared-credential" {
+				t.Fatal("failed publication changed the prepared credential")
+			}
+			destinationAfter, err := os.Lstat(destination)
+			if kind == "absent" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("unsupported publication created a destination: %v", err)
+				}
+				return
+			}
+			if err != nil || !os.SameFile(destinationBefore, destinationAfter) {
+				t.Fatalf("failed publication replaced the existing destination: %v", err)
+			}
+			switch kind {
+			case "empty directory":
+				entries, err := os.ReadDir(destination)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("empty destination changed: %v, %v", entries, err)
+				}
+			case "nonempty directory":
+				if got := readFixtureFile(t, filepath.Join(destination, "auth.json")); got != "synthetic-existing-credential" {
+					t.Fatal("existing credential changed")
+				}
+			case "file":
+				if got := readFixtureFile(t, destination); got != "synthetic-existing-file" {
+					t.Fatal("existing file changed")
+				}
+			case "symlink", "dangling symlink":
+				if target, err := os.Readlink(destination); err != nil || target != referent {
+					t.Fatalf("existing symlink changed: %q, %v", target, err)
+				}
+				if kind == "symlink" && readFixtureFile(t, filepath.Join(referent, "auth.json")) != "synthetic-referent-credential" {
+					t.Fatal("symlink referent changed")
+				}
+			}
+		})
+	}
+}
+
+func TestPublishNewBackupPreservesLastMomentDestination(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "prepared")
+	destination := filepath.Join(root, "destination")
+	previous := filepath.Join(root, "previous")
+	if err := os.Mkdir(stage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(stage, "auth.json"), "synthetic-prepared-credential")
+	var concurrent os.FileInfo
+	calls := 0
+	rename := func(from, to string) error {
+		calls++
+		if from != stage || to != destination {
+			t.Fatalf("unexpected publication rename: %s to %s", from, to)
+		}
+		// The publisher has already checked that the destination is absent.
+		// An ordinary os.Rename would replace this newly created empty directory.
+		if err := os.Mkdir(destination, 0700); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		concurrent, err = os.Lstat(destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return renameBackupNoReplace(from, to)
+	}
+	err := publishBackupSnapshot(stage, destination, previous, nil, rename)
+	if !errors.Is(err, os.ErrExist) && !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("last-moment destination was not rejected: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("publication attempted %d renames, want exactly one", calls)
+	}
+	after, err := os.Lstat(destination)
+	if err != nil || !os.SameFile(concurrent, after) {
+		t.Fatalf("publication replaced the concurrently created directory: %v", err)
+	}
+	entries, err := os.ReadDir(destination)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("publication populated the concurrently created directory: %v, %v", entries, err)
+	}
+	if got := readFixtureFile(t, filepath.Join(stage, "auth.json")); got != "synthetic-prepared-credential" {
+		t.Fatal("publication failure lost the prepared credential")
+	}
+	if _, err := os.Lstat(previous); !os.IsNotExist(err) {
+		t.Fatalf("new-profile collision created a previous snapshot: %v", err)
 	}
 }

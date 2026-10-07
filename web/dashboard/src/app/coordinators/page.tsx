@@ -7,6 +7,7 @@ import {
   Loading,
   PageHeader,
   Panel,
+  RefreshButton,
   StatusChip,
   timeAgo,
 } from "@/components/ui";
@@ -23,7 +24,7 @@ const statusHelp: Record<string, string> = {
 };
 
 function Coordinators() {
-  const coordinators = useApi(api.coordinators, 5_000);
+  const coordinators = useApi(api.coordinators);
   const coords = coordinators.data?.coordinators ?? [];
 
   return (
@@ -31,11 +32,12 @@ function Coordinators() {
       <PageHeader
         title="Coordinators"
         subtitle="Remote hosts whose Claude Code sessions are logged back in automatically"
+        action={<RefreshButton loading={coordinators.loading} reload={coordinators.reload} />}
       />
-      <ErrorBanner error={coordinators.error} />
+      <ErrorBanner error={coordinators.error} stale={!!coordinators.data} />
       <Panel title={coordinators.data ? `${coords.length} coordinator(s)` : "Coordinators"}>
         {!coordinators.data ? (
-          <Loading />
+          coordinators.loading ? <Loading /> : <EmptyState>Coordinator status could not be loaded.</EmptyState>
         ) : coords.length === 0 ? (
           <EmptyState>
             No coordinators are configured. Run{" "}
@@ -43,7 +45,7 @@ function Coordinators() {
             <code className="font-mono">caam auth-agent service install</code>.
           </EmptyState>
         ) : (
-          <table className="w-full text-left text-sm">
+          <div className="overflow-x-auto"><table className="w-full text-left text-sm">
             <thead className="text-xs uppercase text-muted">
               <tr>
                 <th className="px-6 py-3 font-medium">Host</th>
@@ -72,7 +74,7 @@ function Coordinators() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         )}
       </Panel>
     </div>

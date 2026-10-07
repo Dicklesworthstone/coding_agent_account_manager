@@ -10,6 +10,82 @@ import (
 	"time"
 )
 
+func TestHasAuthFilesReadOnlyFileSources(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tool      string
+		files     map[string]string
+		directory string
+		want      bool
+	}{
+		{name: "Claude helper without OAuth file", tool: "claude", files: map[string]string{"settings.json": `{"apiKeyHelper":"get-test-key"}`}, want: true},
+		{name: "Claude policy is not auth", tool: "claude", files: map[string]string{"settings.json": `{"model":"opus"}`}},
+		{name: "Claude empty primary overrides helper", tool: "claude", files: map[string]string{claudeCredentialsFile: `{}`, "settings.json": `{"apiKeyHelper":"get-test-key"}`}},
+		{name: "Claude malformed optional settings", tool: "claude", files: map[string]string{claudeCredentialsFile: keychainCreds("live"), "settings.json": `{"env":null}`}},
+		{name: "Cursor config-only keychain metadata", tool: "cursor", files: map[string]string{"cli-config.json": `{"authInfo":{"email":"cursor@example.com"}}`}, want: true},
+		{name: "Cursor config-only policy", tool: "cursor", files: map[string]string{"cli-config.json": `{"model":"default"}`}},
+		{name: "Cursor empty metadata", tool: "cursor", files: map[string]string{"cli-config.json": `{"authInfo":{}}`}},
+		{name: "Cursor empty primary blocks metadata", tool: "cursor", files: map[string]string{"auth.json": `{}`, "cli-config.json": `{"authInfo":{"email":"old@example.com"}}`}},
+		{name: "Cursor malformed primary blocks metadata", tool: "cursor", files: map[string]string{"auth.json": `{`, "cli-config.json": `{"authInfo":{"email":"old@example.com"}}`}},
+		{name: "Cursor malformed access token", tool: "cursor", files: map[string]string{"auth.json": `{"accessToken":3}`}},
+		{name: "Cursor refresh token alone", tool: "cursor", files: map[string]string{"auth.json": `{"refreshToken":"refresh"}`}},
+		{name: "Cursor API key with null access slot", tool: "cursor", files: map[string]string{"auth.json": `{"apiKey":"synthetic-key","accessToken":null}`}, want: true},
+		{name: "Cursor nonregular primary blocks metadata", tool: "cursor", directory: "auth.json", files: map[string]string{"cli-config.json": `{"authInfo":{"email":"old@example.com"}}`}},
+		{name: "Codex credential", tool: "codex", files: map[string]string{"auth.json": `{"access_token":"synthetic-access"}`}, want: true},
+		{name: "Codex empty credential", tool: "codex", files: map[string]string{"auth.json": "  \n"}},
+		{name: "Codex nonregular source", tool: "codex", directory: "auth.json"},
+		{name: "Grok credential", tool: "grok", files: map[string]string{"auth.json": `{"access_token":"synthetic-access"}`}, want: true},
+		{name: "Grok config alone", tool: "grok", files: map[string]string{"config.toml": "model = 'grok'"}},
+		{name: "OpenCode credential", tool: "opencode", files: map[string]string{"auth.json": `{"provider":{"key":"synthetic-key"}}`}, want: true},
+		{name: "Gemini OAuth without settings", tool: "gemini", files: map[string]string{"oauth_creds.json": `{"access_token":"synthetic-access"}`}, want: true},
+		{name: "Gemini empty sources", tool: "gemini", files: map[string]string{"settings.json": "", "oauth_creds.json": ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			fs := AuthFileSet{Tool: tc.tool}
+			add := func(name string, required bool) {
+				fs.Files = append(fs.Files, AuthFileSpec{Tool: tc.tool, Path: filepath.Join(root, name), Required: required})
+			}
+			switch tc.tool {
+			case "claude":
+				add(claudeCredentialsFile, true)
+				add("settings.json", false)
+				fs.AllowOptionalOnly = true
+			case "cursor":
+				add("cli-config.json", false)
+				add("auth.json", false)
+				fs.AllowOptionalOnly = true
+			case "gemini":
+				add("settings.json", true)
+				add("oauth_creds.json", false)
+				fs.AllowOptionalOnly = true
+			default:
+				add("auth.json", true)
+				if tc.tool == "grok" {
+					add("config.toml", false)
+				}
+			}
+			for name, data := range tc.files {
+				writeFixtureFile(t, filepath.Join(root, name), data)
+			}
+			if tc.directory != "" {
+				if err := os.Mkdir(filepath.Join(root, tc.directory), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := HasAuthFilesReadOnly(fs); got != tc.want {
+				t.Fatalf("read-only presence = %v, want %v", got, tc.want)
+			}
+			for name, data := range tc.files {
+				if got := readFixtureFile(t, filepath.Join(root, name)); got != data {
+					t.Fatalf("read-only presence changed %s", name)
+				}
+			}
+		})
+	}
+}
+
 func TestSwitchPreservesRotatedCodexCredential(t *testing.T) {
 	old := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	newer := old.Add(time.Hour)

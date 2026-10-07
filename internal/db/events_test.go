@@ -1,11 +1,85 @@
 package db
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestSummarizeActivityUsesBoundedRecordedEvents(t *testing.T) {
+	d, err := OpenAt(filepath.Join(t.TempDir(), "activity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	since := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	until := since.Add(time.Hour)
+	for _, e := range []Event{
+		{Timestamp: since.Add(-time.Second), Type: EventActivate, Provider: "grok", ProfileName: "work"},
+		{Timestamp: since, Type: EventActivate, Provider: "grok", ProfileName: "work"},
+		{Timestamp: since.Add(time.Minute), Type: EventSwitch, Provider: "grok", ProfileName: "work"},
+		{Timestamp: since.Add(2 * time.Minute), Type: EventError, Provider: "grok", ProfileName: "work", Details: map[string]any{"token": "synthetic-secret-must-not-be-read"}},
+		{Timestamp: since.Add(3 * time.Minute), Type: EventDeactivate, Provider: "grok", ProfileName: "work", Duration: 90 * time.Second},
+		{Timestamp: since.Add(4 * time.Minute), Type: EventRefresh, Provider: "grok", ProfileName: "work", Duration: time.Hour},
+		{Timestamp: until, Type: EventActivate, Provider: "grok", ProfileName: "work"},
+		{Timestamp: until.Add(time.Hour), Type: EventActivate, Provider: "grok", ProfileName: "work"},
+		{Timestamp: since.Add(time.Minute), Type: EventActivate, Provider: "codex", ProfileName: "personal"},
+	} {
+		if err := d.LogEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := d.SummarizeActivity(context.Background(), "", since, until)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("summary = %+v, err = %v", rows, err)
+	}
+	if rows[0].Provider != "codex" || rows[0].ProfileName != "personal" || rows[0].Activations != 1 || rows[0].Errors != 0 || rows[0].ActiveSeconds != 0 {
+		t.Errorf("independent profile summary = %+v", rows[0])
+	}
+	got := rows[1]
+	if got.Provider != "grok" || got.ProfileName != "work" || got.Activations != 2 || got.Errors != 1 || got.ActiveSeconds != 90 || !got.LastActivity.Equal(since.Add(4*time.Minute)) {
+		t.Errorf("recorded activity = %+v", got)
+	}
+	filtered, err := d.SummarizeActivity(context.Background(), "grok", since, until)
+	if err != nil || len(filtered) != 1 || filtered[0] != got {
+		t.Fatalf("filtered summary = %+v, err = %v", filtered, err)
+	}
+	empty, err := d.SummarizeActivity(context.Background(), "claude", since, until)
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("empty summary = %+v, err = %v", empty, err)
+	}
+}
+
+func TestSummarizeActivityRejectsInvalidIntervalsAndCancellation(t *testing.T) {
+	d, err := OpenAt(filepath.Join(t.TempDir(), "activity.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	now := time.Now()
+	for _, bounds := range [][2]time.Time{{{}, now}, {now, {}}, {now, now}, {now, now.Add(-time.Hour)}} {
+		if _, err := d.SummarizeActivity(context.Background(), "", bounds[0], bounds[1]); err == nil {
+			t.Errorf("accepted invalid interval %v", bounds)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := d.SummarizeActivity(ctx, "", now.Add(-time.Hour), now); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled query = %v", err)
+	}
+	if _, err := (*DB)(nil).SummarizeActivity(context.Background(), "", now.Add(-time.Hour), now); err == nil {
+		t.Fatal("nil database accepted")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.SummarizeActivity(context.Background(), "", now.Add(-time.Hour), now); err == nil {
+		t.Fatal("closed database reported empty activity")
+	}
+}
 
 func TestDB_LogEventAndStats(t *testing.T) {
 	tmpDir := t.TempDir()

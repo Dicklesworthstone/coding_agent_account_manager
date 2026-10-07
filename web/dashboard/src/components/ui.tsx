@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertCircle, CheckCircle2, CircleDashed, XCircle } from "lucide-react";
+import { AlertCircle, CheckCircle2, CircleDashed, RefreshCw, XCircle } from "lucide-react";
 import type { ApiError } from "@/lib/api";
 
 export function Panel({
@@ -23,11 +23,12 @@ export function Panel({
   );
 }
 
-export function PageHeader({ title, subtitle }: { title: string; subtitle: string }) {
+export function PageHeader({ title, subtitle, action }: { title: string; subtitle: string; action?: React.ReactNode }) {
   return (
-    <div>
-      <h1 className="text-2xl font-semibold">{title}</h1>
-      <p className="mt-1 text-muted">{subtitle}</p>
+    <div className="flex flex-wrap items-start justify-between gap-4">
+      <div><h1 className="text-2xl font-semibold">{title}</h1>
+        <p className="mt-1 text-muted">{subtitle}</p></div>
+      {action}
     </div>
   );
 }
@@ -78,7 +79,7 @@ export function StatusChip({ status, label }: { status: string | undefined; labe
   );
 }
 
-export function ErrorBanner({ error }: { error: ApiError | undefined }) {
+export function ErrorBanner({ error, stale = false }: { error: ApiError | undefined; stale?: boolean }) {
   if (!error || error.unauthorized) {
     return null;
   }
@@ -88,9 +89,17 @@ export function ErrorBanner({ error }: { error: ApiError | undefined }) {
       className="flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-4 py-3 text-sm text-danger"
     >
       <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-      <span>{error.message}</span>
+      <span>{error.message}{stale && " Showing the last successful result; it may be out of date."}</span>
     </div>
   );
+}
+
+export function RefreshButton({ loading, reload }: { loading: boolean; reload: () => void }) {
+  return <button type="button" disabled={loading} onClick={reload}
+    className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm hover:bg-surface-muted disabled:opacity-50">
+    <RefreshCw aria-hidden="true" className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+    {loading ? "Refreshing…" : "Refresh"}
+  </button>;
 }
 
 export function EmptyState({ children }: { children: React.ReactNode }) {
