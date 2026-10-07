@@ -297,69 +297,71 @@ func StripANSI(s string) string {
 	return ansi.Strip(s)
 }
 
-// DetectState analyzes pane output and returns the detected state.
-// Output is ANSI-normalized before pattern matching to handle colored terminal output.
-func DetectState(output string) (PaneState, map[string]string) {
-	metadata := make(map[string]string)
-
-	// Strip ANSI codes for reliable pattern matching
-	normalizedOutput := StripANSI(output)
-
-	// Check for login success first (highest priority)
-	if Patterns.LoginSuccess.MatchString(normalizedOutput) {
-		return StateResuming, metadata
-	}
-
-	// Check for login failure
-	if Patterns.LoginFailed.MatchString(normalizedOutput) {
-		return StateFailed, metadata
-	}
-
-	// Check for OAuth URL (implies awaiting URL state)
-	// Note: URLs should still be extracted from original output to preserve full URL
-	if match := Patterns.OAuthURL.FindString(normalizedOutput); match != "" {
-		// Extract from original to preserve any URL-encoded characters
-		if origMatch := Patterns.OAuthURL.FindString(output); origMatch != "" {
-			metadata["oauth_url"] = origMatch
-		} else {
-			metadata["oauth_url"] = match
-		}
-		return StateAwaitingURL, metadata
-	}
-
-	// Check for paste prompt (means URL was shown, awaiting code)
-	if Patterns.PastePrompt.MatchString(normalizedOutput) {
-		// Try to extract URL from original output too
-		if match := Patterns.OAuthURL.FindString(output); match != "" {
-			metadata["oauth_url"] = match
-		}
-		return StateAwaitingURL, metadata
-	}
-
-	// Check for login method selection prompt
-	if Patterns.SelectMethod.MatchString(normalizedOutput) {
-		return StateAwaitingMethodSelect, metadata
-	}
-
-	// Check for rate limit last (lowest priority, as it might be in history)
-	if Patterns.RateLimit.MatchString(normalizedOutput) {
-		if match := Patterns.UsageLimitReset.FindStringSubmatch(normalizedOutput); len(match) > 1 {
-			metadata["reset_time"] = match[1]
-		}
-		return StateRateLimited, metadata
-	}
-
-	return StateIdle, metadata
+// stateDetectors map output patterns to pane states. Order breaks ties
+// between matches at the same position.
+var stateDetectors = []struct {
+	pattern *regexp.Regexp
+	state   PaneState
+}{
+	{Patterns.LoginSuccess, StateResuming},
+	{Patterns.LoginFailed, StateFailed},
+	{Patterns.OAuthURL, StateAwaitingURL},
+	{Patterns.PastePrompt, StateAwaitingURL},
+	{Patterns.SelectMethod, StateAwaitingMethodSelect},
+	{Patterns.RateLimit, StateRateLimited},
 }
 
-// ExtractOAuthURL finds and returns the OAuth URL from output.
-// Uses ANSI-stripped output to ensure clean URL extraction without
-// terminal escape codes contaminating the URL.
-func ExtractOAuthURL(output string) string {
-	// Always use normalized output for URL extraction to avoid ANSI codes
-	// being captured as part of the URL (e.g., trailing \x1b[0m)
+// DetectState analyzes pane output and returns the detected state.
+//
+// The pane's scrollback holds earlier sessions and conversations, so the
+// most recent recognized message decides the state: a fresh rate-limit
+// banner is not masked by an old "Logged in as" or by the word "expired"
+// higher up. Output is ANSI-normalized before matching.
+func DetectState(output string) (PaneState, map[string]string) {
+	metadata := make(map[string]string)
 	normalizedOutput := StripANSI(output)
-	return Patterns.OAuthURL.FindString(normalizedOutput)
+
+	state := StateIdle
+	latest := -1
+	for _, d := range stateDetectors {
+		if pos := lastMatchStart(d.pattern, normalizedOutput); pos > latest {
+			latest = pos
+			state = d.state
+		}
+	}
+
+	switch state {
+	case StateAwaitingURL:
+		if url := ExtractOAuthURL(output); url != "" {
+			metadata["oauth_url"] = url
+		}
+	case StateRateLimited:
+		if matches := Patterns.UsageLimitReset.FindAllStringSubmatch(normalizedOutput, -1); len(matches) > 0 {
+			metadata["reset_time"] = matches[len(matches)-1][1]
+		}
+	}
+	return state, metadata
+}
+
+// lastMatchStart returns the start of the last match of re in s, or -1.
+func lastMatchStart(re *regexp.Regexp, s string) int {
+	locs := re.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return -1
+	}
+	return locs[len(locs)-1][0]
+}
+
+// ExtractOAuthURL returns the most recent OAuth URL in the output, so a
+// retried login never reuses the URL of an earlier, abandoned attempt.
+// Matching runs on ANSI-stripped output so escape codes never become part of
+// the URL (e.g., a trailing \x1b[0m).
+func ExtractOAuthURL(output string) string {
+	matches := Patterns.OAuthURL.FindAllString(StripANSI(output), -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1]
 }
 
 // DetectCompactingBanner checks if the output contains a Claude Code compacting banner.

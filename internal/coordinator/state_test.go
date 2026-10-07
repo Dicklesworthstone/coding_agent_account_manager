@@ -501,10 +501,10 @@ Waiting for authentication...`,
 		},
 		{
 			name: "Multiple URLs in output",
-			output: `Primary: https://claude.ai/oauth/authorize?code=primary
-Alternative: https://claude.ai/oauth/authorize?code=alternate`,
-			expected: "https://claude.ai/oauth/authorize?code=primary",
-			desc:     "Multiple URLs - should extract first one (FindString behavior)",
+			output: `Earlier attempt: https://claude.ai/oauth/authorize?code=stale
+Retried /login: https://claude.ai/oauth/authorize?code=current`,
+			expected: "https://claude.ai/oauth/authorize?code=current",
+			desc:     "Multiple URLs - the most recent one belongs to the live login attempt",
 		},
 		{
 			name:     "URL with no query params",
@@ -767,11 +767,11 @@ func TestDetectState_OAuthURLMetadata(t *testing.T) {
 			desc:      "URL should be stored in metadata",
 		},
 		{
-			name:      "URL with ANSI preserved in metadata",
+			name:      "URL with ANSI stripped in metadata",
 			output:    "\x1b[32mhttps://claude.ai/oauth/authorize?ansi=true\x1b[0m",
 			wantState: StateAwaitingURL,
-			wantURL:   "https://claude.ai/oauth/authorize?ansi=true\x1b[0m",
-			desc:      "URL extracted from original output - trailing ANSI captured (regex [^\\s]+ matches escape codes)",
+			wantURL:   "https://claude.ai/oauth/authorize?ansi=true",
+			desc:      "Escape codes around the URL must not become part of the URL handed to the browser",
 		},
 		{
 			name:      "paste prompt with URL",
@@ -1437,5 +1437,63 @@ func TestCoordinator_CompactionReminderDoesNotTriggerOnRateLimit(t *testing.T) {
 	}
 	if sent[0] != "/login\n" {
 		t.Errorf("expected /login injection (rate limit takes precedence), got %q", sent[0])
+	}
+}
+
+// Scrollback holds earlier sessions; the most recent message decides.
+func TestDetectStateUsesMostRecentMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   PaneState
+	}{
+		{
+			name:   "fresh rate limit below an old login",
+			output: "Logged in as old@example.com\n...hours of work...\nYou've hit your limit · resets 2pm",
+			want:   StateRateLimited,
+		},
+		{
+			name:   "rate limit below unrelated 'expired' text",
+			output: "The cache entry expired, retrying\nYou've hit your limit · resets 5pm",
+			want:   StateRateLimited,
+		},
+		{
+			name:   "method prompt after the banner",
+			output: "You've hit your limit · resets 2pm\n> /login\nSelect login method:\n❯ 1. Claude account with subscription",
+			want:   StateAwaitingMethodSelect,
+		},
+		{
+			name:   "login success after the code",
+			output: "You've hit your limit · resets 2pm\nPaste code here if prompted > ABCD\nLogged in as new@example.com",
+			want:   StateResuming,
+		},
+		{
+			name:   "failure after the code",
+			output: "https://claude.ai/oauth/authorize?code=x\nPaste code here if prompted > ABCD\nInvalid code, please try again",
+			want:   StateFailed,
+		},
+		{
+			name:   "new URL after an earlier failure",
+			output: "Login failed: invalid code\n> /login\nhttps://claude.ai/oauth/authorize?code=retry\nPaste code here if prompted >",
+			want:   StateAwaitingURL,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, meta := DetectState(tt.output)
+			if got != tt.want {
+				t.Fatalf("DetectState() = %v, want %v", got, tt.want)
+			}
+			if got == StateAwaitingURL && meta["oauth_url"] != "https://claude.ai/oauth/authorize?code=retry" {
+				t.Fatalf("oauth_url = %q, want the retried URL", meta["oauth_url"])
+			}
+		})
+	}
+}
+
+func TestDetectStateReportsLatestResetTime(t *testing.T) {
+	_, meta := DetectState("You've hit your limit · resets 2pm\n...\nYou've hit your limit · resets 7pm")
+	if meta["reset_time"] != "7pm" {
+		t.Fatalf("reset_time = %q, want 7pm", meta["reset_time"])
 	}
 }
