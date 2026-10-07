@@ -178,6 +178,35 @@ func atoiOr0(s string) int {
 	return n
 }
 
+// UsagePath is where the agent keeps account usage and holds.
+func UsagePath() string {
+	configDir, _ := os.UserConfigDir()
+	return filepath.Join(configDir, "caam", "account_usage.json")
+}
+
+// HeldAccounts returns the accounts the agent holds at their usage limit at
+// now, with when each hold lifts, from the usage file at path.
+func HeldAccounts(path string, now time.Time) (map[string]time.Time, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var usages []*AccountUsage
+	if err := json.Unmarshal(data, &usages); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	held := map[string]time.Time{}
+	for _, u := range usages {
+		if u != nil && u.LimitedUntil.After(now) {
+			held[u.Email] = u.LimitedUntil
+		}
+	}
+	return held, nil
+}
+
 // unheldAccounts returns, in order, the accounts not held at their usage
 // limit at now.
 func unheldAccounts(accounts []string, usage map[string]*AccountUsage, now time.Time) []string {
@@ -471,9 +500,7 @@ func New(config Config) *Agent {
 		config.Logger = slog.Default()
 	}
 
-	// Determine usage storage path
-	configDir, _ := os.UserConfigDir()
-	usagePath := filepath.Join(configDir, "caam", "account_usage.json")
+	usagePath := UsagePath()
 
 	agent := &Agent{
 		config:       config,

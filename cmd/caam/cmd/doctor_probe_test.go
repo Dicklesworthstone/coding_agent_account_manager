@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -305,5 +306,43 @@ func TestCheckDistributedFlagsMissingAccounts(t *testing.T) {
 		if c.Name == "Account rotation" && (c.Status != "pass" || !strings.Contains(c.Message, "2 account(s), strategy round_robin")) {
 			t.Fatalf("rotation check = %+v", c)
 		}
+	}
+}
+
+func TestHeldAccountsCheck(t *testing.T) {
+	now := time.Now()
+	path := filepath.Join(t.TempDir(), "account_usage.json")
+	accounts := []string{"a@example.com", "b@example.com"}
+
+	if _, ok := heldAccountsCheck(accounts, path, now); ok {
+		t.Fatal("no usage file: nothing to report")
+	}
+
+	write := func(usages []*agent.AccountUsage) {
+		t.Helper()
+		data, err := json.Marshal(usages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write([]*agent.AccountUsage{
+		{Email: "A@example.com", LimitedUntil: now.Add(time.Hour)},
+		{Email: "b@example.com", LimitedUntil: now.Add(-time.Minute)}, // lifted
+	})
+	r, ok := heldAccountsCheck(accounts, path, now)
+	if !ok || r.Status != "pass" || !strings.Contains(r.Message, "1 of 2") || !strings.Contains(r.Message, "a@example.com") {
+		t.Fatalf("one held: %+v", r)
+	}
+
+	write([]*agent.AccountUsage{
+		{Email: "a@example.com", LimitedUntil: now.Add(time.Hour)},
+		{Email: "b@example.com", LimitedUntil: now.Add(2 * time.Hour)},
+	})
+	r, ok = heldAccountsCheck(accounts, path, now)
+	if !ok || r.Status != "warn" || !strings.Contains(r.Message, "all 2 accounts") {
+		t.Fatalf("all held: %+v", r)
 	}
 }

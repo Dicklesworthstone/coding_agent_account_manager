@@ -1625,6 +1625,9 @@ func checkDistributed(ctx context.Context, configPath string) []CheckResult {
 	} else {
 		results = append(results, CheckResult{Name: "Account rotation", Status: "pass",
 			Message: fmt.Sprintf("%d account(s), strategy %s", len(fc.Accounts), firstNonEmpty(fc.Strategy, "lru"))})
+		if r, ok := heldAccountsCheck(fc.Accounts, agent.UsagePath(), time.Now()); ok {
+			results = append(results, r)
+		}
 	}
 
 	if chrome := agent.GetChromePath(); chrome != "" {
@@ -1686,6 +1689,37 @@ func checkDistributed(ctx context.Context, configPath string) []CheckResult {
 }
 
 // coordinatorCheck turns one coordinator probe into a check result.
+// heldAccountsCheck reports the configured accounts the agent is passing
+// over because they are at their usage limit. ok is false when none are.
+func heldAccountsCheck(accounts []string, usagePath string, now time.Time) (CheckResult, bool) {
+	held, err := agent.HeldAccounts(usagePath, now)
+	if err != nil {
+		return CheckResult{Name: "Accounts at limit", Status: "warn", Message: err.Error()}, true
+	}
+	var names []string
+	var first time.Time
+	for _, acc := range accounts {
+		for email, until := range held {
+			if strings.EqualFold(email, acc) {
+				names = append(names, fmt.Sprintf("%s until %s", acc, until.Local().Format("Jan 2 15:04")))
+				if first.IsZero() || until.Before(first) {
+					first = until
+				}
+			}
+		}
+	}
+	if len(names) == 0 {
+		return CheckResult{}, false
+	}
+	if len(names) == len(accounts) {
+		return CheckResult{Name: "Accounts at limit", Status: "warn",
+			Message: fmt.Sprintf("all %d accounts are at their usage limit; recoveries wait until %s", len(accounts), first.Local().Format("Jan 2 15:04")),
+			Details: strings.Join(names, "; ")}, true
+	}
+	return CheckResult{Name: "Accounts at limit", Status: "pass",
+		Message: fmt.Sprintf("%d of %d passed over: %s", len(names), len(accounts), strings.Join(names, "; "))}, true
+}
+
 func coordinatorCheck(ep *agent.CoordinatorEndpoint, p agent.CoordinatorProbe, localVersion string) CheckResult {
 	name := "Coordinator " + ep.Name
 	via := ep.Transport()

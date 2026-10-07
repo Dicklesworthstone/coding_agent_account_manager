@@ -1563,7 +1563,7 @@ caam auth-agent signin            # sign in to the Google accounts to rotate thr
 caam auth-agent service install   # run the agent at login (launchd / systemd --user)
 
 # Day to day:
-caam doctor                               # agent config, Chrome, sign-ins, service, every coordinator
+caam doctor                               # agent config, Chrome, sign-ins, accounts at their limit, service, every coordinator
 caam robot status --include-coordinators  # coordinator health and panes (JSON)
 caam auth-coordinator status              # one coordinator, run on its host
 caam update --remotes                     # keep coordinators on this version

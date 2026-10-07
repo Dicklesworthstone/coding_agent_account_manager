@@ -442,9 +442,7 @@ func NewMulti(config MultiConfig) *MultiAgent {
 		config.Logger = slog.Default()
 	}
 
-	// Determine usage storage path
-	configDir, _ := os.UserConfigDir()
-	usagePath := filepath.Join(configDir, "caam", "account_usage.json")
+	usagePath := UsagePath()
 
 	agent := &MultiAgent{
 		config:       config,
