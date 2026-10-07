@@ -88,6 +88,7 @@ func (c *WezTermClient) SendText(ctx context.Context, paneID int, text string, n
 	args := []string{"cli", "send-text", "--pane-id", strconv.Itoa(paneID)}
 	if noPaste {
 		args = append(args, "--no-paste")
+		text = TypedText(text)
 	}
 	args = append(args, text)
 

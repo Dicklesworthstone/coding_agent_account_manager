@@ -159,7 +159,7 @@ func (c *TmuxClient) SendText(ctx context.Context, paneID int, text string, noPa
 	var args []string
 	if noPaste {
 		// Send as literal text (like typing)
-		args = []string{"send-keys", "-t", target, "-l", text}
+		args = []string{"send-keys", "-t", target, "-l", TypedText(text)}
 	} else {
 		// Send through paste buffer (bracketed paste mode if terminal supports it)
 		args = []string{"send-keys", "-t", target, text}

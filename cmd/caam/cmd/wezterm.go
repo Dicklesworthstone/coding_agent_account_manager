@@ -226,15 +226,26 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	payload := "/login\n"
+	// Each entry is typed and submitted separately: the login menu has to
+	// be on screen before the "1" choosing the subscription login arrives.
+	steps := []string{"/login\n"}
 	if subscription {
-		payload += "1\n"
+		steps = append(steps, "1\n")
 	}
 
 	successCount := 0
 	failCount := 0
 	for _, target := range targets {
-		if err := weztermSendTextFunc(target.Pane.ID, payload); err != nil {
+		var err error
+		for i, step := range steps {
+			if i > 0 {
+				time.Sleep(loginMenuSettle)
+			}
+			if err = weztermSendTextFunc(target.Pane.ID, step); err != nil {
+				break
+			}
+		}
+		if err != nil {
 			failCount++
 			fmt.Fprintf(cmd.ErrOrStderr(), "pane %d: %v\n", target.Pane.ID, err)
 			continue
@@ -559,8 +570,13 @@ func weztermGetText(paneID int) (string, error) {
 	return string(out), nil
 }
 
+// loginMenuSettle is the pause between /login and choosing a login method.
+var loginMenuSettle = time.Second
+
+// weztermSendText types text into a pane; a trailing newline presses Enter
+// (see coordinator.TypedText).
 func weztermSendText(paneID int, text string) error {
-	cmd := exec.Command("wezterm", "cli", "send-text", "--pane-id", strconv.Itoa(paneID), "--no-paste", text)
+	cmd := exec.Command("wezterm", "cli", "send-text", "--pane-id", strconv.Itoa(paneID), "--no-paste", coordinator.TypedText(text))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

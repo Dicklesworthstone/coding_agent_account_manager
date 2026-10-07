@@ -4,6 +4,7 @@ package coordinator
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 )
 
@@ -47,6 +48,20 @@ var (
 	_ PaneClient = (*TmuxClient)(nil)
 	_ PaneClient = (*autoPaneClient)(nil)
 )
+
+// TypedText prepares text for typing into a pane. Callers end text with "\n"
+// to mean "press Enter"; the Enter key sends a carriage return, which is
+// what programs in raw mode (Claude Code's input among them) submit on. A
+// line feed is Ctrl+J, which Claude Code takes as "insert a newline", so a
+// trailing "\n" would leave the command unsubmitted in the input box.
+// Newlines inside the text stay line feeds, keeping a multi-line prompt in
+// one message.
+func TypedText(text string) string {
+	if trimmed, ok := strings.CutSuffix(text, "\n"); ok {
+		return strings.TrimSuffix(trimmed, "\r") + "\r"
+	}
+	return text
+}
 
 // autoPaneClient follows whichever multiplexer is answering, in preference
 // order. A coordinator started before the user's multiplexer (by systemd at

@@ -17,6 +17,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1084,5 +1085,108 @@ func TestHungCoordinatorDoesNotStarveOthers(t *testing.T) {
 	}
 	if got := hungPolls.Load(); got != 1 {
 		t.Errorf("hung coordinator polled %d times, want 1 (no pile-up of overlapping polls)", got)
+	}
+}
+
+// fakeClaudeScript plays Claude Code's login flow on a real terminal: it
+// reads typed input line by line (so each submission must arrive as an
+// Enter) and records what it was given in $1.
+const fakeClaudeScript = `out=$1
+echo "You've hit your limit · resets 2pm (America/New_York)"
+read -r cmd; printf '%s' "$cmd" > "$out/cmd"
+echo "Select login method:"
+echo " 1. Claude account with subscription"
+echo " 2. Anthropic Console account"
+read -r choice; printf '%s' "$choice" > "$out/choice"
+echo "Browse to https://claude.ai/oauth/authorize?code=true&client_id=c&state=e2e-state"
+printf 'Paste code here if prompted > '
+read -r code; printf '%s' "$code" > "$out/code"
+echo "Login successful. Press Enter to continue"
+read -r ignored
+printf '> '
+read -r prompt; printf '%s' "$prompt" > "$out/prompt"
+sleep 60
+`
+
+// TestRecoveryEndToEndInRealTmuxPane drives a whole recovery through a real
+// tmux pane: the coordinator (tmux backend) types /login, picks the login
+// method, publishes the OAuth URL, the agent completes it (browser step
+// faked) and delivers the code over HTTP, and the coordinator pastes it,
+// dismisses the post-login screen, and types the resume prompt.
+func TestRecoveryEndToEndInRealTmuxPane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a tmux server")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
+	dir := t.TempDir()
+	script := filepath.Join(dir, "fake-claude.sh")
+	if err := os.WriteFile(script, []byte(fakeClaudeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-x", "200", "-y", "50",
+		"sh "+script+" "+dir).CombinedOutput(); err != nil {
+		t.Fatalf("start tmux: %v: %s", err, b)
+	}
+	t.Cleanup(func() { exec.Command("tmux", "kill-server").Run() })
+
+	cfg := coordinator.DefaultConfig()
+	cfg.Backend = coordinator.BackendTmux
+	cfg.PollInterval = 50 * time.Millisecond
+	cfg.LoginCooldown = 100 * time.Millisecond
+	cfg.MethodSelectCooldown = 500 * time.Millisecond
+	cfg.ResumeCooldown = 100 * time.Millisecond
+	cfg.ResumePrompt = "proceed with the task\n"
+	cfg.Logger = discardLogger()
+	coord := coordinator.New(cfg)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardLogger())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coord.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	mcfg := DefaultMultiConfig()
+	mcfg.PollInterval = 50 * time.Millisecond
+	mcfg.Coordinators = []*CoordinatorEndpoint{{Name: "remote", URL: "http://" + listener.Addr().String()}}
+	mcfg.Logger = discardLogger()
+	ma := NewMulti(mcfg)
+	ma.delivery = fastDelivery
+	ma.oauth = &fakeOAuth{code: "CODE-e2e#e2e-state", account: "a@example.com"}
+	agentCtx, stopAgent := context.WithCancel(ctx)
+	go ma.pollLoop(agentCtx)
+	defer func() {
+		stopAgent()
+		<-ma.doneCh
+		ma.inflight.Wait()
+	}()
+
+	read := func(name string) string {
+		data, _ := os.ReadFile(filepath.Join(dir, name))
+		return string(data)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for read("prompt") == "" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	for name, want := range map[string]string{
+		"cmd":    "/login",
+		"choice": "1",
+		"code":   "CODE-e2e#e2e-state",
+		"prompt": "proceed with the task",
+	} {
+		if got := read(name); got != want {
+			t.Errorf("pane received %s = %q, want %q", name, got, want)
+		}
 	}
 }

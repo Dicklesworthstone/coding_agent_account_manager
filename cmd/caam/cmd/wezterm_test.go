@@ -146,6 +146,9 @@ func TestRunWeztermLoginAllNonInteractiveRequiresYes(t *testing.T) {
 }
 
 func TestRunWeztermLoginAllSendSummary(t *testing.T) {
+	savedSettle := loginMenuSettle
+	loginMenuSettle = 0
+	defer func() { loginMenuSettle = savedSettle }()
 	savedLookup := weztermLookupFunc
 	savedList := weztermListPanesFunc
 	savedGet := weztermGetTextFunc
@@ -188,11 +191,10 @@ func TestRunWeztermLoginAllSendSummary(t *testing.T) {
 		t.Fatalf("runWeztermLoginAll error: %v", err)
 	}
 
-	if len(sentPayloads) != 2 {
-		t.Fatalf("expected 2 payloads, got %d", len(sentPayloads))
-	}
-	if sentPayloads[0] != "/login\n1\n" {
-		t.Fatalf("expected subscription payload, got %q", sentPayloads[0])
+	// /login and the menu choice are separate submissions (one Enter each);
+	// pane 2 fails on its first send.
+	if want := []string{"/login\n", "1\n", "/login\n"}; strings.Join(sentPayloads, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", sentPayloads, want)
 	}
 
 	out := buf.String()

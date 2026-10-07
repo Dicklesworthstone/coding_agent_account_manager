@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -1784,5 +1786,65 @@ func TestTmuxCaptureJoinsWrappedOAuthURL(t *testing.T) {
 	}
 	if got != url {
 		t.Fatalf("extracted %q\nwant      %q", got, url)
+	}
+}
+
+func TestTypedText(t *testing.T) {
+	for in, want := range map[string]string{
+		"/login\n":       "/login\r",
+		"code#state\r\n": "code#state\r",
+		"line1\nline2\n": "line1\nline2\r", // one message, then submit
+		"no newline":     "no newline",
+		"":               "",
+	} {
+		if got := TypedText(in); got != want {
+			t.Errorf("TypedText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestTmuxTypingPressesEnter: a raw-mode program (like Claude Code's input)
+// must receive a carriage return, the byte the Enter key sends, not a line
+// feed (Ctrl+J, which Claude Code takes as "insert a newline").
+func TestTmuxTypingPressesEnter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a tmux server")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
+	out := filepath.Join(t.TempDir(), "bytes")
+	script := fmt.Sprintf("stty raw -echo; head -c 7 > '%s'; sleep 30", out)
+	if b, err := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-x", "80", "-y", "24", script).CombinedOutput(); err != nil {
+		t.Fatalf("start tmux: %v: %s", err, b)
+	}
+	t.Cleanup(func() { exec.Command("tmux", "kill-server").Run() })
+
+	client := NewTmuxClient()
+	ctx := context.Background()
+	var panes []Pane
+	deadline := time.Now().Add(5 * time.Second)
+	for len(panes) == 0 && time.Now().Before(deadline) {
+		panes, _ = client.ListPanes(ctx)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(panes) != 1 {
+		t.Fatal("tmux pane did not start")
+	}
+	time.Sleep(200 * time.Millisecond) // let stty take effect
+	if err := client.SendText(ctx, panes[0].PaneID, "/login\n", true); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for time.Now().Before(deadline) {
+		if got, _ = os.ReadFile(out); len(got) == 7 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if string(got) != "/login\r" {
+		t.Fatalf("raw-mode program received %q, want %q", got, "/login\r")
 	}
 }
