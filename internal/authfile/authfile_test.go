@@ -1880,3 +1880,65 @@ func TestVaultCopyProfile(t *testing.T) {
 		}
 	})
 }
+
+func TestVaultLabelsSurviveBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "auth", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authFile), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authFile, []byte(`{"token":"one"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	fileSet := AuthFileSet{Tool: "testtool", Files: []AuthFileSpec{{Tool: "testtool", Path: authFile, Required: true}}}
+
+	if _, err := v.Labels("testtool", "work"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("labels of a missing profile: err = %v, want ErrNotExist", err)
+	}
+	if err := v.SetLabels("testtool", "work", ProfileLabels{Tags: []string{"x"}}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("labeling a missing profile: err = %v, want ErrNotExist", err)
+	}
+
+	if err := v.Backup(fileSet, "work"); err != nil {
+		t.Fatal(err)
+	}
+	want := ProfileLabels{Description: "Client A", Tags: []string{"client-a", "urgent"}}
+	if err := v.SetLabels("testtool", "work", want); err != nil {
+		t.Fatalf("SetLabels: %v", err)
+	}
+	got, err := v.Labels("testtool", "work")
+	if err != nil || got.Description != want.Description || strings.Join(got.Tags, ",") != "client-a,urgent" {
+		t.Fatalf("Labels = %+v, %v", got, err)
+	}
+
+	// Labeling keeps the snapshot metadata.
+	meta, err := os.ReadFile(filepath.Join(tmpDir, "vault", "testtool", "work", "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(meta), `"backed_up_at"`) || !strings.Contains(string(meta), `"original_paths"`) {
+		t.Fatalf("SetLabels dropped snapshot metadata: %s", meta)
+	}
+
+	// Re-backing up the account keeps its labels.
+	if err := os.WriteFile(authFile, []byte(`{"token":"two"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "work"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = v.Labels("testtool", "work")
+	if err != nil || got.Description != "Client A" || len(got.Tags) != 2 {
+		t.Fatalf("labels after re-backup = %+v, %v", got, err)
+	}
+
+	// Clearing removes the keys entirely.
+	if err := v.SetLabels("testtool", "work", ProfileLabels{}); err != nil {
+		t.Fatal(err)
+	}
+	meta, _ = os.ReadFile(filepath.Join(tmpDir, "vault", "testtool", "work", "meta.json"))
+	if strings.Contains(string(meta), "description") || strings.Contains(string(meta), "tags") {
+		t.Fatalf("cleared labels still present: %s", meta)
+	}
+}

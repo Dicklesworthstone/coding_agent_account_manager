@@ -606,12 +606,15 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
-	// Write metadata
+	// Write metadata. User labels (description, tags) belong to the profile,
+	// not the snapshot, so they survive re-backing up the account.
 	metaPath := filepath.Join(profileDir, "meta.json")
+	labels := readProfileLabels(metaPath)
 	meta := struct {
 		Tool          string   `json:"tool"`
 		Profile       string   `json:"profile"`
 		Description   string   `json:"description,omitempty"` // Free-form notes about profile purpose
+		Tags          []string `json:"tags,omitempty"`
 		BackedUpAt    string   `json:"backed_up_at"`
 		Files         int      `json:"files"`
 		Type          string   `json:"type,omitempty"`       // user|system
@@ -622,6 +625,8 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	}{
 		Tool:          tool,
 		Profile:       profile,
+		Description:   labels.Description,
+		Tags:          labels.Tags,
 		BackedUpAt:    time.Now().Format(time.RFC3339),
 		Files:         backedUp,
 		Type:          "user",
@@ -2698,6 +2703,94 @@ func (v *Vault) claudeProfileIdentityKeys(profileDir string) []string {
 		keys = mergeIdentityKeys(keys, metaKeys)
 	}
 	return keys
+}
+
+// ProfileLabels are user-assigned labels on a vault profile. They live in the
+// profile's meta.json and are carried across backups of the same profile.
+type ProfileLabels struct {
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+}
+
+// readProfileLabels reads the labels from a meta.json (zero when absent or
+// unreadable).
+func readProfileLabels(metaPath string) ProfileLabels {
+	var labels ProfileLabels
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return labels
+	}
+	_ = json.Unmarshal(data, &labels)
+	return labels
+}
+
+// Labels returns the labels of a vault profile.
+func (v *Vault) Labels(tool, profile string) (ProfileLabels, error) {
+	profileDir, err := v.existingProfileDir(tool, profile)
+	if err != nil {
+		return ProfileLabels{}, err
+	}
+	return readProfileLabels(filepath.Join(profileDir, "meta.json")), nil
+}
+
+// SetLabels replaces the labels of a vault profile, keeping every other
+// meta.json field. Callers validate tag syntax.
+func (v *Vault) SetLabels(tool, profile string, labels ProfileLabels) error {
+	profileDir, err := v.existingProfileDir(tool, profile)
+	if err != nil {
+		return err
+	}
+	metaPath := filepath.Join(profileDir, "meta.json")
+
+	meta := map[string]any{}
+	data, err := os.ReadFile(metaPath)
+	switch {
+	case err == nil:
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return fmt.Errorf("parse %s: %w", metaPath, err)
+		}
+	case os.IsNotExist(err):
+		meta["tool"], meta["profile"] = strings.TrimSpace(tool), strings.TrimSpace(profile)
+	default:
+		return fmt.Errorf("read profile metadata: %w", err)
+	}
+
+	if desc := strings.TrimSpace(labels.Description); desc != "" {
+		meta["description"] = desc
+	} else {
+		delete(meta, "description")
+	}
+	if len(labels.Tags) > 0 {
+		meta["tags"] = labels.Tags
+	} else {
+		delete(meta, "tags")
+	}
+
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal profile metadata: %w", err)
+	}
+	// Atomic temp-file + rename replacement (mode 0600).
+	return writeSwitchFile(metaPath, raw, false)
+}
+
+// existingProfileDir resolves a vault profile directory that must exist.
+func (v *Vault) existingProfileDir(tool, profile string) (string, error) {
+	profileDir, err := v.safeProfileDir(tool, profile)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(profileDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("vault profile %s/%s: %w", tool, profile, os.ErrNotExist)
+		}
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("vault profile %s/%s is not a directory", tool, profile)
+	}
+	return profileDir, nil
 }
 
 // profileMetaIdentityKeys reads the identity_keys Backup stored in a

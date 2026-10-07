@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 	"github.com/stretchr/testify/assert"
@@ -134,3 +135,59 @@ func TestTagCommands_Extended(t *testing.T) {
 	h.EndStep("Clear")
 }
 
+
+func TestTagAndDescribeVaultOnlyProfile(t *testing.T) {
+	root := t.TempDir()
+	origVault, origStore := vault, profileStore
+	t.Cleanup(func() {
+		vault, profileStore = origVault, origStore
+		lsCmd.Flags().Set("tag", "")
+		lsCmd.Flags().Set("json", "false")
+	})
+	vault = authfile.NewVault(filepath.Join(root, "vault"))
+	profileStore = profile.NewStore(filepath.Join(root, "profiles"))
+
+	for _, name := range []string{"work", "home"} {
+		dir := filepath.Join(root, "vault", "codex", name)
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"tokens":{"access_token":"a","refresh_token":"r-`+name+`"}}`), 0o600))
+	}
+
+	// The vault profile has no isolated counterpart; tagging still works.
+	_, err := captureStdout(t, func() error {
+		return runTagAdd(tagAddCmd, []string{"codex", "work", "client-a"})
+	})
+	require.NoError(t, err)
+	_, err = captureStdout(t, func() error {
+		return profileDescribeCmd.RunE(profileDescribeCmd, []string{"codex", "work", "Client A seat"})
+	})
+	require.NoError(t, err)
+
+	labels, err := vault.Labels("codex", "work")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"client-a"}, labels.Tags)
+	assert.Equal(t, "Client A seat", labels.Description)
+
+	require.NoError(t, lsCmd.Flags().Set("tag", "client-a"))
+	require.NoError(t, lsCmd.Flags().Set("json", "true"))
+	out, err := captureStdout(t, func() error { return runLs(lsCmd, []string{"codex"}) })
+	require.NoError(t, err)
+	var listed struct {
+		Profiles []struct {
+			Name        string   `json:"name"`
+			Tags        []string `json:"tags"`
+			Description string   `json:"description"`
+		} `json:"profiles"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &listed), out)
+	require.Len(t, listed.Profiles, 1, "ls --tag must match the tagged vault profile only")
+	assert.Equal(t, "work", listed.Profiles[0].Name)
+	assert.Equal(t, []string{"client-a"}, listed.Profiles[0].Tags)
+	assert.Equal(t, "Client A seat", listed.Profiles[0].Description)
+
+	// Unknown names are still rejected.
+	_, err = captureStdout(t, func() error {
+		return runTagAdd(tagAddCmd, []string{"codex", "nope", "x"})
+	})
+	require.Error(t, err)
+}

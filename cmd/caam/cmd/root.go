@@ -1223,6 +1223,30 @@ type lsProfile struct {
 	System   bool               `json:"system"`
 	Health   lsHealth           `json:"health"`
 	Identity *identity.Identity `json:"identity,omitempty"`
+	// Description and Tags are the user's labels for the profile.
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+}
+
+// lsLabels returns a profile's description and tags (empty when unlabeled).
+func lsLabels(tool, name string) (string, []string) {
+	labels, err := loadProfileLabels(tool, name)
+	if err != nil {
+		return "", nil
+	}
+	return labels.Description, labels.Tags
+}
+
+// lsLabelLine renders the labels shown under a profile row ("" when none).
+func lsLabelLine(description string, tags []string) string {
+	var parts []string
+	if description != "" {
+		parts = append(parts, truncateDescription(description, 60))
+	}
+	if len(tags) > 0 {
+		parts = append(parts, "["+strings.Join(tags, ", ")+"]")
+	}
+	return strings.Join(parts, "  ")
 }
 
 type lsIsolatedProfile struct {
@@ -1283,10 +1307,16 @@ func runLs(cmd *cobra.Command, args []string) error {
 	tagFilter, _ := cmd.Flags().GetString("tag")
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
-	// Helper to check if a profile has the specified tag
+	// Helper to check if a profile has the specified tag. Vault profiles keep
+	// tags in the vault; isolated profiles in the profile store.
 	hasTag := func(tool, profileName string) bool {
 		if tagFilter == "" {
 			return true // No filter, include all
+		}
+		for _, t := range vaultProfileTags(tool, profileName) {
+			if profile.NormalizeTag(t) == profile.NormalizeTag(tagFilter) {
+				return true
+			}
 		}
 		if profileStore == nil {
 			return false // No profile store, can't check tags
@@ -1353,6 +1383,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 				applyLiveExpiry(tool, ph)
 			}
 			status := health.CalculateStatus(ph)
+			description, tags := lsLabels(tool, p)
 
 			if jsonOutput {
 				lp := lsProfile{
@@ -1368,7 +1399,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
 						VerificationInfo: health.VerificationFor(ph),
 					},
-					Identity: id,
+					Identity:    id,
+					Description: description,
+					Tags:        tags,
 				}
 				if !ph.TokenExpiresAt.IsZero() {
 					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
@@ -1388,6 +1421,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
 				fmt.Printf("%s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
+				if line := lsLabelLine(description, tags); line != "" {
+					fmt.Printf("    %s\n", line)
+				}
 			}
 		}
 
@@ -1456,6 +1492,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 				applyLiveExpiry(tool, ph)
 			}
 			status := health.CalculateStatus(ph)
+			description, tags := lsLabels(tool, p)
 
 			if jsonOutput {
 				lp := lsProfile{
@@ -1471,7 +1508,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
 						VerificationInfo: health.VerificationFor(ph),
 					},
-					Identity: id,
+					Identity:    id,
+					Description: description,
+					Tags:        tags,
 				}
 				if !ph.TokenExpiresAt.IsZero() {
 					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
@@ -1491,6 +1530,9 @@ func runLs(cmd *cobra.Command, args []string) error {
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
 				fmt.Printf("  %s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
+				if line := lsLabelLine(description, tags); line != "" {
+					fmt.Printf("      %s\n", line)
+				}
 			}
 		}
 	}
@@ -2134,10 +2176,11 @@ func init() {
 var profileDescribeCmd = &cobra.Command{
 	Use:   "describe <tool> <name> [description]",
 	Short: "Set or show profile description",
-	Long: `Set or show the description for an isolated profile.
+	Long: `Set or show the description for a vault or isolated profile.
 
 If description is provided, sets it. Otherwise, shows the current description.
-Use --clear to remove the description.
+Use --clear to remove the description. 'caam ls' shows descriptions under
+each profile.
 
 Examples:
   caam profile describe claude work                    # Show description
@@ -2148,7 +2191,7 @@ Examples:
 		tool := strings.ToLower(args[0])
 		name := args[1]
 
-		prof, err := profileStore.Load(tool, name)
+		labels, err := loadProfileLabels(tool, name)
 		if err != nil {
 			return err
 		}
@@ -2156,28 +2199,28 @@ Examples:
 		clearFlag, _ := cmd.Flags().GetBool("clear")
 
 		if clearFlag {
-			prof.Description = ""
-			if err := prof.Save(); err != nil {
-				return fmt.Errorf("save profile: %w", err)
+			labels.Description = ""
+			if err := labels.Save(); err != nil {
+				return err
 			}
 			fmt.Printf("Cleared description for %s/%s\n", tool, name)
 			return nil
 		}
 
 		if len(args) == 3 {
-			prof.Description = args[2]
-			if err := prof.Save(); err != nil {
-				return fmt.Errorf("save profile: %w", err)
+			labels.Description = strings.TrimSpace(args[2])
+			if err := labels.Save(); err != nil {
+				return err
 			}
-			fmt.Printf("Set description for %s/%s: %s\n", tool, name, prof.Description)
+			fmt.Printf("Set description for %s/%s: %s\n", tool, name, labels.Description)
 			return nil
 		}
 
 		// Show current description
-		if prof.Description == "" {
+		if labels.Description == "" {
 			fmt.Printf("%s/%s has no description\n", tool, name)
 		} else {
-			fmt.Printf("%s/%s: %s\n", tool, name, prof.Description)
+			fmt.Printf("%s/%s: %s\n", tool, name, labels.Description)
 		}
 		return nil
 	},
