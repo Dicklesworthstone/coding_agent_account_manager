@@ -12,12 +12,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -27,6 +30,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 // CheckResult represents the result of a single diagnostic check.
@@ -53,6 +57,7 @@ type DoctorReport struct {
 	Locks           []CheckResult `json:"locks"`
 	AuthFiles       []CheckResult `json:"auth_files"`
 	TokenValidation []CheckResult `json:"token_validation,omitempty"`
+	Distributed     []CheckResult `json:"distributed,omitempty"`
 }
 
 // DependencySpec defines an optional external dependency with install hints.
@@ -169,6 +174,9 @@ func runDoctorChecks(fix bool, validate bool, autoInstall bool, skipConfirm bool
 	// Check auth files
 	report.AuthFiles = checkAuthFiles()
 
+	// Check distributed auth recovery (only when this machine runs the agent)
+	report.Distributed = checkDistributed(context.Background(), agent.DefaultConfigPath())
+
 	// Check token validation (if requested)
 	if validate {
 		report.TokenValidation = checkTokenValidation()
@@ -182,6 +190,7 @@ func runDoctorChecks(fix bool, validate bool, autoInstall bool, skipConfirm bool
 	allChecks = append(allChecks, report.Locks...)
 	allChecks = append(allChecks, report.AuthFiles...)
 	allChecks = append(allChecks, report.TokenValidation...)
+	allChecks = append(allChecks, report.Distributed...)
 
 	for _, check := range allChecks {
 		switch check.Status {
@@ -1519,6 +1528,15 @@ func printDoctorReport(report *DoctorReport, validate bool) {
 	}
 	fmt.Println()
 
+	// Distributed auth recovery (only when this machine runs the agent)
+	if len(report.Distributed) > 0 {
+		fmt.Println("Checking distributed auth recovery...")
+		for _, check := range report.Distributed {
+			printCheck(check)
+		}
+		fmt.Println()
+	}
+
 	// Token Validation (only if --validate was used)
 	if validate && len(report.TokenValidation) > 0 {
 		fmt.Println("Validating tokens...")
@@ -1565,4 +1583,112 @@ func printCheck(check CheckResult) {
 	if check.Details != "" && check.Status != "pass" {
 		fmt.Printf("      %s\n", check.Details)
 	}
+}
+
+// distributedProbeTimeout bounds each coordinator check (an SSH dial can
+// take its whole timeout on an unreachable host).
+const distributedProbeTimeout = 20 * time.Second
+
+// checkDistributed checks the distributed auth recovery setup from this
+// machine (the auth agent side): config, Chrome, the agent profile's
+// sign-ins, the login service, and every coordinator. It returns nothing
+// when there is no agent config, so machines that do not use distributed
+// recovery see no section.
+func checkDistributed(ctx context.Context, configPath string) []CheckResult {
+	fc, err := agent.LoadFileConfig(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return []CheckResult{{Name: "Agent config", Status: "fail", Message: err.Error(), Details: configPath}}
+	}
+	useMulti, single, multi, err := loadAgentConfig(configPath)
+	if err != nil {
+		return []CheckResult{{Name: "Agent config", Status: "fail", Message: err.Error(), Details: configPath}}
+	}
+	endpoints := multi.Coordinators
+	if !useMulti {
+		endpoints = []*agent.CoordinatorEndpoint{{Name: "coordinator", URL: single.CoordinatorURL, Token: single.CoordinatorToken}}
+	}
+	results := []CheckResult{{
+		Name:    "Agent config",
+		Status:  "pass",
+		Message: fmt.Sprintf("%d coordinator(s) in %s", len(endpoints), shortenPath(configPath)),
+	}}
+
+	if chrome := agent.GetChromePath(); chrome != "" {
+		results = append(results, CheckResult{Name: "Chrome", Status: "pass", Message: chrome})
+	} else {
+		results = append(results, CheckResult{Name: "Chrome", Status: "fail",
+			Message: "Chrome/Chromium not found; the agent cannot complete logins",
+			Details: "install Google Chrome or Chromium"})
+	}
+
+	profileDir := agent.ResolveChromeUserDataDir(fc.ChromeUserDataDir())
+	google, claude, err := agent.ProfileSessions(profileDir)
+	switch {
+	case err != nil:
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "warn",
+			Message: "could not read the agent's Chrome profile: " + err.Error(), Details: profileDir})
+	case !google:
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "warn",
+			Message: "no Google account is signed in to the agent's Chrome profile",
+			Details: "run: caam auth-agent signin"})
+	default:
+		msg := "Google signed in"
+		if claude {
+			msg += "; Claude signed in"
+		}
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "pass", Message: msg})
+	}
+
+	if svc, err := deploy.NewAgentService(configPath); err == nil {
+		if st, err := svc.Status(ctx); err == nil {
+			switch {
+			case st.Installed && st.Running:
+				results = append(results, CheckResult{Name: "Agent service", Status: "pass", Message: "installed and running"})
+			case st.Installed:
+				results = append(results, CheckResult{Name: "Agent service", Status: "warn",
+					Message: "installed but not running", Details: "logs: " + st.LogPath})
+			default:
+				results = append(results, CheckResult{Name: "Agent service", Status: "warn",
+					Message: "not installed; nothing completes logins unless 'caam auth-agent' runs",
+					Details: "run: caam auth-agent service install"})
+			}
+		}
+	}
+
+	checks := make([]CheckResult, len(endpoints))
+	var wg sync.WaitGroup
+	for i, ep := range endpoints {
+		wg.Add(1)
+		go func(i int, ep *agent.CoordinatorEndpoint) {
+			defer wg.Done()
+			defer ep.Close()
+			pctx, cancel := context.WithTimeout(ctx, distributedProbeTimeout)
+			defer cancel()
+			checks[i] = coordinatorCheck(ep, ep.Probe(pctx), version.Short())
+		}(i, ep)
+	}
+	wg.Wait()
+	return append(results, checks...)
+}
+
+// coordinatorCheck turns one coordinator probe into a check result.
+func coordinatorCheck(ep *agent.CoordinatorEndpoint, p agent.CoordinatorProbe, localVersion string) CheckResult {
+	name := "Coordinator " + ep.Name
+	via := ep.Transport()
+	if ep.SSH != nil {
+		via = "ssh " + ep.SSH.Host
+	}
+	if !p.Healthy {
+		return CheckResult{Name: name, Status: "fail", Message: "unreachable via " + via, Details: p.Error}
+	}
+	msg := fmt.Sprintf("reachable via %s; %s; %d pane(s), %d pending", via, p.Backend, p.PaneCount, p.PendingAuths)
+	if p.Version != "" && p.Version != localVersion {
+		return CheckResult{Name: name, Status: "warn",
+			Message: fmt.Sprintf("%s; runs caam %s, this machine %s", msg, p.Version, localVersion),
+			Details: "run: caam update --remotes"}
+	}
+	return CheckResult{Name: name, Status: "pass", Message: msg}
 }

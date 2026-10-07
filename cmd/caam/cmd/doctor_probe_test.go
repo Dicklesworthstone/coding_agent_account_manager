@@ -2,15 +2,22 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
@@ -177,3 +184,95 @@ func TestClassifyCodexProbeError(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckDistributedWithoutAgentConfigIsSilent(t *testing.T) {
+	if got := checkDistributed(context.Background(), filepath.Join(t.TempDir(), "none.json")); got != nil {
+		t.Fatalf("checks = %+v, want no section without an agent config", got)
+	}
+}
+
+func TestCheckDistributedReportsSetup(t *testing.T) {
+	// A live coordinator (real API, scripted panes) and a dead one.
+	coord := coordinator.New(coordinator.Config{PaneClient: &stubPanes{}, Logger: discardSlog()})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, discardSlog())
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+
+	// The agent profile is signed in to Google.
+	profileDir := t.TempDir()
+	cookies := filepath.Join(profileDir, "Default", "Network", "Cookies")
+	if err := os.MkdirAll(filepath.Dir(cookies), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", cookies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE cookies (host_key TEXT, name TEXT); INSERT INTO cookies VALUES ('.google.com', 'SID')`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "agent.json")
+	err = agent.WriteFileConfig(cfgPath, agent.FileConfig{
+		ChromeProfile: profileDir,
+		Coordinators: []*agent.CoordinatorEndpoint{
+			{Name: "live", URL: "http://" + listener.Addr().String()},
+			{Name: "dead", URL: "http://127.0.0.1:1"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checks := map[string]CheckResult{}
+	for _, c := range checkDistributed(context.Background(), cfgPath) {
+		checks[c.Name] = c
+	}
+	for name, want := range map[string]string{
+		"Agent config":     "pass",
+		"Agent sign-ins":   "pass",
+		"Coordinator live": "pass",
+		"Coordinator dead": "fail",
+	} {
+		if got := checks[name]; got.Status != want {
+			t.Errorf("%s = %+v, want %s", name, got, want)
+		}
+	}
+	if !strings.Contains(checks["Coordinator live"].Message, "reachable via direct; stub") {
+		t.Errorf("live coordinator message = %q", checks["Coordinator live"].Message)
+	}
+	if _, ok := checks["Agent service"]; !ok {
+		t.Error("no agent service check")
+	}
+}
+
+func TestCoordinatorCheckFlagsVersionSkew(t *testing.T) {
+	ep := &agent.CoordinatorEndpoint{Name: "c", URL: "http://127.0.0.1:7890", SSH: &agent.SSHTunnel{Host: "build1"}}
+	got := coordinatorCheck(ep, agent.CoordinatorProbe{Healthy: true, Backend: "tmux", Version: "v1.0.0"}, "v1.2.0")
+	if got.Status != "warn" || !strings.Contains(got.Message, "v1.0.0") || !strings.Contains(got.Details, "caam update --remotes") {
+		t.Fatalf("skewed coordinator = %+v", got)
+	}
+	if got := coordinatorCheck(ep, agent.CoordinatorProbe{Healthy: true, Version: "v1.2.0"}, "v1.2.0"); got.Status != "pass" || !strings.Contains(got.Message, "ssh build1") {
+		t.Fatalf("matching coordinator = %+v", got)
+	}
+}
+
+// stubPanes is a one-pane multiplexer for coordinator API tests.
+type stubPanes struct{}
+
+func (stubPanes) ListPanes(ctx context.Context) ([]coordinator.Pane, error) {
+	return []coordinator.Pane{{PaneID: 1}}, nil
+}
+func (stubPanes) GetText(ctx context.Context, paneID, startLine int) (string, error) { return "", nil }
+func (stubPanes) SendText(ctx context.Context, paneID int, text string, noPaste bool) error {
+	return nil
+}
+func (stubPanes) IsAvailable(ctx context.Context) bool { return true }
+func (stubPanes) Backend() string                      { return "stub" }
+
+func discardSlog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
