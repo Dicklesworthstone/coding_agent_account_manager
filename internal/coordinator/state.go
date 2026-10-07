@@ -413,10 +413,11 @@ var Patterns = struct {
 	// "3pm (America/New_York)", "Oct 9, 3pm", "in 2h 13m"
 	LimitReset: regexp.MustCompile(`(?i)\bresets?\s+(?:at\s+)?([^\n·∙•]{1,60})`),
 
-	// "Conversation compacted · ctrl+o for history" or similar variants
+	// "Conversation compacted (ctrl+o for history)" (Claude Code 2.1), or
+	// "Conversation compacted · ctrl+o for history" and similar variants
 	// Matches with optional box-drawing characters, middot/bullet separators,
 	// and various whitespace. Also handles "Conversation was compacted" variants.
-	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|]*ctrl\+?o`),
+	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|(]*ctrl\+?o`),
 }
 
 // StripANSI removes ANSI escape codes from terminal output for pattern matching.

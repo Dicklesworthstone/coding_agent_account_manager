@@ -819,6 +819,13 @@ func TestDetectCompactingBanner(t *testing.T) {
 			desc:         "Standard Claude Code compacting banner",
 		},
 		{
+			name:         "banner with parenthesized hint (Claude Code 2.1)",
+			output:       "Conversation compacted (ctrl+o for history)",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Claude Code 2.1 renders the hint in parentheses",
+		},
+		{
 			name:         "banner with bullet point",
 			output:       "Conversation compacted • ctrl+o for history",
 			wantDetected: true,
