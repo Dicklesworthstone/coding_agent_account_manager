@@ -421,6 +421,9 @@ func TestAutoRecoverDismissesPostLoginScreenBeforeResumePrompt(t *testing.T) {
 		weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, recoverContinueSettle = savedList, savedGet, savedSend, savedSettle
 	}()
 	recoverContinueSettle = 0
+	savedGap := weztermKeyGap
+	weztermKeyGap = 0
+	defer func() { weztermKeyGap = savedGap }()
 
 	weztermListPanesFunc = func() ([]weztermPane, error) {
 		return []weztermPane{{ID: 1, Title: "claude"}, {ID: 2, Title: "claude"}}, nil
@@ -449,10 +452,12 @@ func TestAutoRecoverDismissesPostLoginScreenBeforeResumePrompt(t *testing.T) {
 		t.Fatalf("runAutoRecover: %v\n%s", err, buf.String())
 	}
 
-	if got := sent[1]; len(got) != 2 || got[0] != "\n" || got[1] != "proceed\n" {
-		t.Errorf("pane on the post-login screen got %q, want Enter then the prompt", got)
+	// The prompt goes into an emptied prompt line.
+	prompt := coordinator.PromptKeys("proceed\n")
+	if got, want := sent[1], append([]string{"\n"}, prompt...); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("pane on the post-login screen got %q, want Enter then the prompt %q", got, want)
 	}
-	if got := sent[2]; len(got) != 1 || got[0] != "proceed\n" {
-		t.Errorf("pane at its prompt got %q, want just the prompt", got)
+	if got := sent[2]; strings.Join(got, "|") != strings.Join(prompt, "|") {
+		t.Errorf("pane at its prompt got %q, want just the prompt %q", got, prompt)
 	}
 }

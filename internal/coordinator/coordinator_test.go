@@ -1642,8 +1642,8 @@ func TestResumeDismissesPostLoginScreenBeforePrompting(t *testing.T) {
 	tracker.SetCooldown("continue", 0)
 	client.output = "Login successful. Press Enter to continue…\n\n> "
 	coord.pollPanes(ctx)
-	if got := client.sentText(); len(got) != 2 || got[1] != "proceed\n" {
-		t.Fatalf("sent %q, want Enter then the resume prompt", got)
+	if got, want := client.sentText(), []string{"\n", KeyEndOfLine, KeyKillLine, "proceed\n"}; !slices.Equal(got, want) {
+		t.Fatalf("sent %q, want Enter then the resume prompt in an emptied line %q", got, want)
 	}
 	if tracker.GetState() != StateIdle {
 		t.Fatalf("state = %v, want idle after resuming", tracker.GetState())

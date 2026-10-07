@@ -96,6 +96,13 @@ func LoginKeys(output string) []string {
 	return append(keys, KeyEndOfLine, KeyKillLine, "/login\n")
 }
 
+// PromptKeys returns the keys, sent one at a time KeyGap apart, that submit
+// prompt in an emptied prompt line: text left there (Claude Code's
+// "continue" prefill, say) would otherwise be sent in front of it.
+func PromptKeys(prompt string) []string {
+	return []string{KeyEndOfLine, KeyKillLine, prompt}
+}
+
 // RateLimitMenuOpen reports whether Claude Code's usage-limit menu is on
 // screen in output.
 func RateLimitMenuOpen(output string) bool {

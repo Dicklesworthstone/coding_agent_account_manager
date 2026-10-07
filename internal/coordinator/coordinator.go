@@ -1211,7 +1211,7 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 		"action", "inject_resume")
 
 	time.Sleep(500 * time.Millisecond)
-	if err := c.paneClient.SendText(ctx, tracker.PaneID, c.config.ResumePrompt, true); err != nil {
+	if err := sendKeys(ctx, c.paneClient, tracker.PaneID, PromptKeys(c.config.ResumePrompt)); err != nil {
 		c.logger.Error("injection failed",
 			"pane_id", tracker.PaneID,
 			"state", StateResuming.String(),

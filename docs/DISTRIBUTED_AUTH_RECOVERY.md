@@ -366,7 +366,8 @@ usage. So `/login` is typed as separate keys (`coordinator.LoginKeys`):
 3. `/login` and Enter.
 
 `caam wezterm recover`, `caam wezterm login-all claude`, and the `caam run`
-handoff type the same keys.
+handoff type the same keys. The resume prompt after a login also goes into a
+prompt line emptied with Ctrl+E Ctrl+U.
 
 #### HTTP API
 

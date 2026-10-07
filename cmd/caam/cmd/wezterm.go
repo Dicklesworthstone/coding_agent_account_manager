@@ -716,7 +716,7 @@ func sendResumePrompt(s *RecoverPaneState, prompt string) error {
 		}
 		time.Sleep(recoverContinueSettle)
 	}
-	return weztermSendTextFunc(s.Pane.ID, prompt)
+	return sendWeztermKeys(s.Pane.ID, coordinator.PromptKeys(prompt))
 }
 
 // IsOnCooldown returns true if the pane is still on cooldown from last action.

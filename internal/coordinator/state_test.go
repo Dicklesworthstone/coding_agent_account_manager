@@ -400,13 +400,9 @@ func TestCoordinator_ResumeCooldownPreventsDoubleInjection(t *testing.T) {
 	// First call should inject resume prompt
 	coord.handleResumingState(ctx, tracker, client.output)
 	sentBefore := client.sentText()
-	if len(sentBefore) != 1 {
-		t.Fatalf("expected 1 sent message after first call, got %d: %v", len(sentBefore), sentBefore)
-	}
-
-	// Verify the resume prompt was sent
-	if sentBefore[0] != cfg.ResumePrompt {
-		t.Fatalf("expected resume prompt %q, got %q", cfg.ResumePrompt, sentBefore[0])
+	// The resume prompt goes into an emptied prompt line.
+	if want := PromptKeys(cfg.ResumePrompt); !slices.Equal(sentBefore, want) {
+		t.Fatalf("sent %q after first call, want %q", sentBefore, want)
 	}
 
 	// Create a new tracker (simulating next poll cycle) in resuming state
@@ -417,9 +413,9 @@ func TestCoordinator_ResumeCooldownPreventsDoubleInjection(t *testing.T) {
 	// Second call with cooldown active should NOT inject
 	coord.handleResumingState(ctx, tracker2, client.output)
 	sentAfter := client.sentText()
-	// Should still be just 1 message (no additional injection)
-	if len(sentAfter) != 1 {
-		t.Fatalf("expected 1 sent message after second call (cooldown active), got %d: %v", len(sentAfter), sentAfter)
+	// No additional injection
+	if len(sentAfter) != len(sentBefore) {
+		t.Fatalf("sent %q after second call (cooldown active), want nothing more than %q", sentAfter, sentBefore)
 	}
 }
 
