@@ -542,6 +542,12 @@ caam auth-agent --config ~/.config/caam/distributed-agent.json
 # Sign in to the Google accounts (and Claude) the agent will use; once per machine
 caam auth-agent signin [--config PATH] [--chrome-profile DIR]
 
+# The accounts to rotate through, in order, with last use and limit holds;
+# add/remove edit the config's "accounts" and restart an installed service
+caam auth-agent accounts [--config PATH]
+caam auth-agent accounts add <email>...
+caam auth-agent accounts remove <email>...
+
 # Run at login and restart on crash (launchd on macOS, systemd --user on Linux)
 caam auth-agent service install [--config PATH]
 caam auth-agent service status [--json]

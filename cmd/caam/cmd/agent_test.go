@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,5 +164,84 @@ func TestSignInProfileDirReadsDefaultConfig(t *testing.T) {
 
 	if dir, err := signInProfileDir(newSignInCmd(t)); err != nil || dir != "~/agent-chrome" {
 		t.Fatalf("dir=%q err=%v, want the setup config's chrome_profile", dir, err)
+	}
+}
+
+func TestAgentAccountsAddListRemove(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := agent.WriteFileConfig(path, agent.FileConfig{
+		Strategy:     "lru",
+		Accounts:     []string{"a@example.com"},
+		Coordinators: []*agent.CoordinatorEndpoint{{Name: "csd", URL: "http://127.0.0.1:7890", Token: "tok"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saved := agentAccountsConfig
+	agentAccountsConfig = path
+	t.Cleanup(func() { agentAccountsConfig = saved })
+
+	run := func(c *cobra.Command, args ...string) (string, error) {
+		t.Helper()
+		var out bytes.Buffer
+		c.SetOut(&out)
+		c.SetErr(&out)
+		c.SetContext(context.Background())
+		t.Cleanup(func() { c.SetOut(nil); c.SetErr(nil) })
+		err := c.RunE(c, args)
+		return out.String(), err
+	}
+	accounts := func() []string {
+		t.Helper()
+		fc, err := agent.LoadFileConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fc.Accounts
+	}
+
+	// Duplicates (in any case) are not added twice; the rest keep their order.
+	if _, err := run(agentAccountsAddCmd, "b@example.com", "A@example.com", "c@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(accounts(), ","); got != "a@example.com,b@example.com,c@example.com" {
+		t.Fatalf("accounts = %s", got)
+	}
+	if _, err := run(agentAccountsAddCmd, "not-an-email"); err == nil {
+		t.Fatal("an invalid address was accepted")
+	}
+	// The rest of the config survives the edit.
+	if fc, _ := agent.LoadFileConfig(path); len(fc.Coordinators) != 1 || fc.Coordinators[0].Token != "tok" || fc.Strategy != "lru" {
+		t.Fatalf("config lost other settings: %+v", fc)
+	}
+
+	// The list shows holds from the agent's usage file.
+	usage := `[{"email":"b@example.com","last_used":"2026-10-07T10:00:00Z","use_count":1,"last_result":"success","limited_until":"` +
+		time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `"}]`
+	if err := os.MkdirAll(filepath.Dir(agent.UsagePath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agent.UsagePath(), []byte(usage), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(agentAccountsCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"1. a@example.com", "2. b@example.com", "at its limit until", "3. c@example.com"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list output lacks %q:\n%s", want, out)
+		}
+	}
+
+	if _, err := run(agentAccountsRemoveCmd, "B@EXAMPLE.COM"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(accounts(), ","); got != "a@example.com,c@example.com" {
+		t.Fatalf("accounts after remove = %s", got)
+	}
+	if out, _ := run(agentAccountsRemoveCmd, "nobody@example.com"); !strings.Contains(out, "Nothing to change") {
+		t.Fatalf("removing an unknown account: %q", out)
 	}
 }

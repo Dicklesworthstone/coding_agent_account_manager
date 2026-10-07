@@ -1621,7 +1621,7 @@ func checkDistributed(ctx context.Context, configPath string) []CheckResult {
 	if len(fc.Accounts) == 0 {
 		results = append(results, CheckResult{Name: "Account rotation", Status: "warn",
 			Message: "no accounts configured; recoveries reuse whichever account is offered first",
-			Details: "list the Google accounts to rotate through under \"accounts\" in " + shortenPath(configPath)})
+			Details: "add the Google accounts to rotate through: caam auth-agent accounts add <email>..."})
 	} else {
 		results = append(results, CheckResult{Name: "Account rotation", Status: "pass",
 			Message: fmt.Sprintf("%d account(s), strategy %s", len(fc.Accounts), firstNonEmpty(fc.Strategy, "lru"))})

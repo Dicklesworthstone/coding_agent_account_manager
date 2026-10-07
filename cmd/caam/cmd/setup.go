@@ -217,8 +217,8 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	} else if successCount > 0 {
 		fmt.Println("1. Sign in to the Google accounts the agent should use (once per machine):")
 		fmt.Println("     caam auth-agent signin")
-		fmt.Println("   and list them under \"accounts\" in:")
-		fmt.Printf("     %s\n", result.LocalConfigPath)
+		fmt.Println("   and add them to the rotation:")
+		fmt.Printf("     caam auth-agent accounts add --config %s <email>...\n", result.LocalConfigPath)
 		fmt.Println("2. Run the local agent as a login service:")
 		fmt.Println("     caam auth-agent service install")
 		fmt.Println("   or in the foreground:")

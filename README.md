@@ -1585,6 +1585,7 @@ coordinator pastes it and resumes the session.
 caam setup distributed            # deploy coordinators to your WezTerm SSH domains
 caam setup distributed --host ubuntu@build1 --host gpu   # or name hosts (tmux, ~/.ssh/config aliases)
 caam auth-agent signin            # sign in to the Google accounts to rotate through
+caam auth-agent accounts add a@gmail.com b@gmail.com     # and put them in the rotation
 caam auth-agent service install   # run the agent at login (launchd / systemd --user)
 
 # Day to day:

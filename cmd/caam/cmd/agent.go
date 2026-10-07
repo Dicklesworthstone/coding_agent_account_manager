@@ -485,8 +485,9 @@ the config's chrome_profile, or by default <caam data dir>/auth-agent-chrome
 		if cfgPath == "" {
 			cfgPath = agent.DefaultConfigPath()
 		}
-		fmt.Fprintf(out, "List the accounts to rotate through under \"accounts\" in %s;\n", cfgPath)
-		fmt.Fprintln(out, "without them every recovery reuses whichever account is offered first. Check with: caam doctor")
+		fmt.Fprintf(out, "Add the accounts to rotate through (they go into %s):\n", cfgPath)
+		fmt.Fprintln(out, "  caam auth-agent accounts add <email>...")
+		fmt.Fprintln(out, "Without them every recovery reuses whichever account is offered first. Check with: caam doctor")
 		return nil
 	},
 }
@@ -649,6 +650,178 @@ func init() {
 		"agent config whose chrome_profile to use (default: the 'caam setup distributed' config)")
 	agentSignInCmd.Flags().StringVar(&agentSignInProfile, "chrome-profile", "",
 		"Chrome user data directory (overrides the config)")
+}
+
+var agentAccountsConfig string
+
+// agentAccountsCmd lists and edits the Google accounts the agent rotates
+// through (the config's "accounts").
+var agentAccountsCmd = &cobra.Command{
+	Use:   "accounts",
+	Short: "List the accounts the auth agent rotates through",
+	Long: `List the Google accounts the auth agent signs panes in with, in order, with
+when each was last used and any hold: an account that hit its usage limit is
+passed over until the limit resets.
+
+Add or remove accounts with 'caam auth-agent accounts add|remove <email>...'.
+Sign in to them first in the agent's Chrome profile: caam auth-agent signin.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path, fc, err := loadAgentAccountsConfig()
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		if len(fc.Accounts) == 0 {
+			fmt.Fprintf(out, "No accounts in %s; every recovery reuses whichever account is offered first.\n", path)
+			fmt.Fprintln(out, "Add some with: caam auth-agent accounts add <email>...")
+			return nil
+		}
+		held, err := agent.HeldAccounts(agent.UsagePath(), time.Now())
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %v\n", err)
+		}
+		lastUsed := accountLastUsed(agent.UsagePath())
+		fmt.Fprintf(out, "Accounts (%s, strategy %s):\n", path, firstNonEmpty(fc.Strategy, "lru"))
+		for i, acc := range fc.Accounts {
+			line := fmt.Sprintf("  %d. %s", i+1, acc)
+			if t, ok := lastUsed[strings.ToLower(acc)]; ok && !t.IsZero() {
+				line += "  last used " + t.Local().Format("Jan 2 15:04")
+			}
+			for email, until := range held {
+				if strings.EqualFold(email, acc) {
+					line += "  at its limit until " + until.Local().Format("Jan 2 15:04")
+				}
+			}
+			fmt.Fprintln(out, line)
+		}
+		return nil
+	},
+}
+
+var agentAccountsAddCmd = &cobra.Command{
+	Use:   "add <email>...",
+	Short: "Add accounts for the auth agent to rotate through",
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return editAgentAccounts(cmd, func(accounts []string) ([]string, []string, error) {
+			var changed []string
+			for _, email := range args {
+				email = strings.TrimSpace(email)
+				if !strings.Contains(email, "@") || strings.ContainsAny(email, " \t,") {
+					return nil, nil, fmt.Errorf("%q is not an email address", email)
+				}
+				if !containsFold(accounts, email) {
+					accounts = append(accounts, email)
+					changed = append(changed, email)
+				}
+			}
+			return accounts, changed, nil
+		}, "Added")
+	},
+}
+
+var agentAccountsRemoveCmd = &cobra.Command{
+	Use:   "remove <email>...",
+	Short: "Stop the auth agent from using accounts",
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return editAgentAccounts(cmd, func(accounts []string) ([]string, []string, error) {
+			var kept, changed []string
+			for _, acc := range accounts {
+				if containsFold(args, acc) {
+					changed = append(changed, acc)
+				} else {
+					kept = append(kept, acc)
+				}
+			}
+			if kept == nil {
+				kept = []string{}
+			}
+			return kept, changed, nil
+		}, "Removed")
+	},
+}
+
+func loadAgentAccountsConfig() (string, agent.FileConfig, error) {
+	path := agentAccountsConfig
+	if path == "" {
+		path = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, fc, fmt.Errorf("agent config %s not found: run 'caam setup distributed' or pass --config", path)
+	}
+	if err != nil {
+		return path, fc, fmt.Errorf("agent config %s: %w", path, err)
+	}
+	return path, fc, nil
+}
+
+// editAgentAccounts applies edit to the config's accounts, saves the config,
+// and restarts an installed agent service so it uses them.
+func editAgentAccounts(cmd *cobra.Command, edit func([]string) (accounts, changed []string, err error), verb string) error {
+	path, fc, err := loadAgentAccountsConfig()
+	if err != nil {
+		return err
+	}
+	accounts, changed, err := edit(append([]string(nil), fc.Accounts...))
+	if err != nil {
+		return err
+	}
+	out := cmd.OutOrStdout()
+	if len(changed) == 0 {
+		fmt.Fprintln(out, "Nothing to change.")
+		return nil
+	}
+	fc.Accounts = accounts
+	if err := agent.WriteFileConfig(path, fc); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s %s in %s.\n", verb, strings.Join(changed, ", "), path)
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if restartInstalledAgentService(ctx, path) {
+		fmt.Fprintln(out, "Restarted the auth-agent service.")
+	}
+	return nil
+}
+
+// accountLastUsed reads when each account was last used, by lowercased email.
+func accountLastUsed(usagePath string) map[string]time.Time {
+	data, err := os.ReadFile(usagePath)
+	if err != nil {
+		return nil
+	}
+	var usages []*agent.AccountUsage
+	if json.Unmarshal(data, &usages) != nil {
+		return nil
+	}
+	out := make(map[string]time.Time, len(usages))
+	for _, u := range usages {
+		if u != nil {
+			out[strings.ToLower(u.Email)] = u.LastUsed
+		}
+	}
+	return out
+}
+
+func containsFold(list []string, s string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func init() {
+	agentCmd.AddCommand(agentAccountsCmd)
+	agentAccountsCmd.AddCommand(agentAccountsAddCmd, agentAccountsRemoveCmd)
+	agentAccountsCmd.PersistentFlags().StringVar(&agentAccountsConfig, "config", "",
+		"agent config file (default: the 'caam setup distributed' config)")
 }
 
 func init() {
