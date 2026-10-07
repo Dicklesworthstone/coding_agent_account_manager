@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	caamsync "github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
@@ -43,6 +44,7 @@ type CoordinatorEndpoint struct {
 	IsHealthy bool      `json:"-"`
 	LastError string    `json:"-"`
 	mu        sync.RWMutex
+	polling   atomic.Bool // a poll of this coordinator is in flight
 
 	transportMu sync.Mutex
 	client      *http.Client
@@ -593,24 +595,36 @@ func (a *MultiAgent) pollLoop(ctx context.Context) {
 		case <-a.stopCh:
 			return
 		case <-ticker.C:
-			a.pollAllCoordinators(ctx)
+			a.startPolls(ctx)
 		}
 	}
 }
 
-// pollAllCoordinators fans out to check all coordinators concurrently.
-func (a *MultiAgent) pollAllCoordinators(ctx context.Context) {
+// startPolls polls, each in its own goroutine, every coordinator whose
+// previous poll has finished, and returns a function that waits for these
+// polls. The poll loop does not wait: a slow or unreachable host (an SSH
+// dial can take its full timeout) must not delay polling of the others.
+func (a *MultiAgent) startPolls(ctx context.Context) (wait func()) {
 	var wg sync.WaitGroup
-
 	for _, coord := range a.GetCoordinators() {
+		if !coord.polling.CompareAndSwap(false, true) {
+			continue // still waiting on the previous poll
+		}
 		wg.Add(1)
+		a.inflight.Add(1)
 		go func(c *CoordinatorEndpoint) {
+			defer a.inflight.Done()
 			defer wg.Done()
+			defer c.polling.Store(false)
 			a.checkCoordinator(ctx, c)
 		}(coord)
 	}
+	return wg.Wait
+}
 
-	wg.Wait()
+// pollAllCoordinators polls every coordinator once and waits for the polls.
+func (a *MultiAgent) pollAllCoordinators(ctx context.Context) {
+	a.startPolls(ctx)()
 }
 
 // checkCoordinator polls a single coordinator for pending requests.

@@ -1047,3 +1047,42 @@ func TestInfoLogsNeverContainCodesOrOAuthQueries(t *testing.T) {
 		t.Errorf("logs should correlate by request_id:\n%s", out)
 	}
 }
+
+func TestHungCoordinatorDoesNotStarveOthers(t *testing.T) {
+	release := make(chan struct{})
+	var hungPolls, fastPolls atomic.Int32
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hungPolls.Add(1)
+		select { // like an SSH dial waiting out its timeout
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer hung.Close()
+	defer close(release)
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastPolls.Add(1)
+		json.NewEncoder(w).Encode([]pendingRequest{})
+	}))
+	defer fast.Close()
+
+	cfg := DefaultMultiConfig()
+	cfg.PollInterval = 20 * time.Millisecond
+	cfg.Coordinators = []*CoordinatorEndpoint{{Name: "hung", URL: hung.URL}, {Name: "fast", URL: fast.URL}}
+	cfg.Logger = discardLogger()
+	ma := NewMulti(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go ma.pollLoop(ctx)
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+	<-ma.doneCh
+	ma.inflight.Wait()
+
+	if got := fastPolls.Load(); got < 8 {
+		t.Errorf("fast coordinator polled %d times in 400ms at a 20ms interval; the hung one starved it", got)
+	}
+	if got := hungPolls.Load(); got != 1 {
+		t.Errorf("hung coordinator polled %d times, want 1 (no pile-up of overlapping polls)", got)
+	}
+}
