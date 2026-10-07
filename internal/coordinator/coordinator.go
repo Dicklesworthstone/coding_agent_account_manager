@@ -371,25 +371,16 @@ func selectPaneClient(backend Backend, logger *slog.Logger) PaneClient {
 	case BackendAuto:
 		fallthrough
 	default:
-		// Try WezTerm first (preferred)
-		wezterm := NewWezTermClient()
-		if wezterm.IsAvailable(ctx) {
-			logger.Info("using WezTerm backend (preferred)")
-			return wezterm
+		// WezTerm is preferred; tmux is the fallback. The choice follows
+		// whichever is running, so a multiplexer started after the
+		// coordinator is picked up.
+		auto := newAutoPaneClient(ctx, logger, NewWezTermClient(), NewTmuxClient())
+		if auto.IsAvailable(ctx) {
+			logger.Info("using terminal multiplexer backend", "backend", auto.Backend())
+		} else {
+			logger.Warn("no terminal multiplexer running yet; will use WezTerm or tmux once one starts")
 		}
-
-		// Fall back to tmux
-		tmux := NewTmuxClient()
-		if tmux.IsAvailable(ctx) {
-			logger.Info("WezTerm not available, using tmux backend",
-				"note", "WezTerm is recommended for better integration")
-			return tmux
-		}
-
-		// Neither available - return WezTerm anyway, errors will surface later
-		logger.Warn("no terminal multiplexer detected",
-			"hint", "start WezTerm or tmux before running the coordinator")
-		return wezterm
+		return auto
 	}
 }
 

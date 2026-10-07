@@ -183,6 +183,9 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Printf("  ✗ %s: %v\n", dr.Machine, dr.Error)
 		}
+		for _, w := range dr.Warnings {
+			fmt.Printf("      ⚠ %s\n", w)
+		}
 	}
 
 	if result.LocalConfigPath != "" {

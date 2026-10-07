@@ -191,9 +191,14 @@ other address (for example a Tailscale IP) is refused unless a token is set.
 `caam setup distributed` deploys each coordinator with a freshly generated
 per-host token in `~/.config/caam/coordinator.json` (mode 0600, `bind:
 127.0.0.1`) and a systemd user unit whose `ExecStart` uses `%h` for the config
-path. After starting the service it calls the authenticated `/status` endpoint
-through the same SSH connection, so a deployment is reported as successful only
-when the agent's exact path works.
+path. The unit's `PATH` is the user's login-shell `PATH` plus the system
+directories (systemd otherwise gives user services only the latter, missing a
+`wezterm` or `tmux` under the home directory or `/opt`). After starting the
+service it calls the authenticated `/status` endpoint through the same SSH
+connection, so a deployment is reported as successful only when the agent's
+exact path works. It also checks that a multiplexer is on the service's
+`PATH` and that lingering is on (without it, systemd stops the coordinator
+when you log out), and prints a warning with the fix for either.
 
 The local agent config (`~/.config/caam/distributed-agent.json`, mode 0600)
 gets one entry per verified host. Each entry carries the token and an `ssh`
@@ -624,7 +629,7 @@ installs passes it) and by `caam auth-coordinator status`.
 | `resume_prompt` | see above | Text injected after a successful login. |
 | `resume_cooldown` | `10s` | Wait after login success before injecting the resume prompt. |
 | `output_lines` | `100` | Scrollback lines read per poll. |
-| `backend` | `auto` | `auto` (WezTerm, then tmux), `wezterm`, or `tmux`. |
+| `backend` | `auto` | `auto` (WezTerm preferred, else tmux; follows whichever multiplexer is running, so one started after the coordinator is picked up), `wezterm`, or `tmux`. |
 | `auth_token` | none | Bearer token required on every endpoint except `/health`. |
 
 Command-line flags (`--bind`, `--port`, `--backend`, `--poll-interval`,

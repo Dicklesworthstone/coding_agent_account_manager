@@ -4,6 +4,8 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -105,6 +107,40 @@ func (d *Deployer) RunCommand(ctx context.Context, cmd string) (string, error) {
 		}
 		return stdout.String(), nil
 	}
+}
+
+// sha256Command prints a file's SHA-256 with whichever tool the host has.
+func sha256Command(path string) string {
+	q := shellEscape(path)
+	return "sh -c " + shellEscape("sha256sum "+q+" 2>/dev/null || shasum -a 256 "+q)
+}
+
+// parseSHA256Output returns the digest from sha256sum or shasum output.
+func parseSHA256Output(out string) (string, error) {
+	fields := strings.Fields(out)
+	if len(fields) == 0 || len(fields[0]) != sha256.Size*2 {
+		return "", fmt.Errorf("unexpected checksum output %q", strings.TrimSpace(out))
+	}
+	if _, err := hex.DecodeString(fields[0]); err != nil {
+		return "", fmt.Errorf("unexpected checksum output %q", strings.TrimSpace(out))
+	}
+	return strings.ToLower(fields[0]), nil
+}
+
+// verifyRemoteSHA256 checks that the remote file at path has digest want.
+func (d *Deployer) verifyRemoteSHA256(ctx context.Context, path, want string) error {
+	out, err := d.RunCommand(ctx, sha256Command(path))
+	if err != nil {
+		return fmt.Errorf("checksum uploaded binary: %w", err)
+	}
+	got, err := parseSHA256Output(out)
+	if err != nil {
+		return fmt.Errorf("checksum uploaded binary: %w", err)
+	}
+	if got != want {
+		return fmt.Errorf("uploaded binary is corrupt: sha256 %s, want %s", got, want)
+	}
+	return nil
 }
 
 // RemoteHome returns the remote user's home directory.
@@ -242,6 +278,13 @@ func (d *Deployer) UploadBinary(ctx context.Context) (string, error) {
 	if err := d.sshClient.WriteFile(tempPath, data, 0755); err != nil {
 		return "", fmt.Errorf("failed to upload binary: %w", err)
 	}
+	// A cut-short upload would install a truncated binary that crash-loops
+	// the service; check it before it replaces anything.
+	sum := sha256.Sum256(data)
+	if err := d.verifyRemoteSHA256(ctx, tempPath, hex.EncodeToString(sum[:])); err != nil {
+		d.RunCommand(ctx, "rm -f "+shellEscape(tempPath))
+		return "", err
+	}
 
 	// Move to final location with sudo if it works without a password prompt.
 	// Shell-escape paths to prevent command injection.
@@ -374,6 +417,9 @@ ExecStart={{.ExecStart}}
 Restart=on-failure
 RestartSec=5
 Environment=HOME=%h
+{{- if .Path}}
+Environment={{.Path}}
+{{- end}}
 
 [Install]
 WantedBy=default.target
@@ -383,6 +429,10 @@ WantedBy=default.target
 type SystemdUnitConfig struct {
 	Type      string // "coordinator" or "agent"
 	ExecStart string // Full command to run
+	// Path, when set, is the service's PATH. systemd user services otherwise
+	// get only the system directories, which misses a wezterm or tmux
+	// installed under the home directory or /opt.
+	Path string
 }
 
 // GenerateSystemdUnit generates a systemd unit file content.
@@ -392,12 +442,126 @@ func GenerateSystemdUnit(config SystemdUnitConfig) (string, error) {
 		return "", err
 	}
 
+	data := config
+	if data.Path != "" {
+		data.Path = systemdEnvQuote("PATH=" + data.Path)
+	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, config); err != nil {
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", err
 	}
 
 	return buf.String(), nil
+}
+
+// systemdEnvQuote quotes a VAR=value assignment for an Environment= line.
+func systemdEnvQuote(assignment string) string {
+	assignment = strings.ReplaceAll(assignment, "%", "%%")
+	assignment = strings.ReplaceAll(assignment, `\`, `\\`)
+	assignment = strings.ReplaceAll(assignment, `"`, `\"`)
+	return `"` + assignment + `"`
+}
+
+const (
+	pathMarkerStart = "__CAAM_PATH__"
+	pathMarkerEnd   = "__CAAM_END__"
+)
+
+// loginPathCommand prints the login shell's environment between markers, so
+// profile scripts that write to stdout do not corrupt it. env prints PATH
+// colon-joined in every shell, fish included. Remote commands run through
+// the user's shell, so POSIX syntax is wrapped in sh -c.
+var loginPathCommand = "sh -c " + shellEscape(`"${SHELL:-/bin/sh}" -lc 'echo `+pathMarkerStart+`; env; echo `+pathMarkerEnd+`' 2>/dev/null </dev/null`)
+
+// parseMarkedPath extracts PATH from loginPathCommand output.
+func parseMarkedPath(output string) string {
+	start := strings.LastIndex(output, pathMarkerStart)
+	if start < 0 {
+		return ""
+	}
+	rest := output[start+len(pathMarkerStart):]
+	end := strings.Index(rest, pathMarkerEnd)
+	if end < 0 {
+		return ""
+	}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), "PATH="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// servicePath builds the coordinator's PATH: the user's login PATH, the
+// directory holding the caam binary, and the system directories, deduplicated
+// in that order. Relative entries are dropped; a service has no meaningful
+// working directory.
+func servicePath(loginPath, binaryPath string) string {
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" || !strings.HasPrefix(dir, "/") || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	for _, dir := range strings.Split(loginPath, ":") {
+		add(dir)
+	}
+	if i := strings.LastIndex(binaryPath, "/"); i > 0 {
+		add(binaryPath[:i])
+	}
+	for _, dir := range []string{"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
+		add(dir)
+	}
+	return strings.Join(dirs, ":")
+}
+
+// serviceEnvironmentCommand reports which multiplexers the service can run
+// with path and whether the user's services survive logout.
+func serviceEnvironmentCommand(path string) string {
+	return "sh -c " + shellEscape("PATH="+shellEscape(path)+`; export PATH; `+
+		`for b in wezterm tmux; do command -v "$b" >/dev/null 2>&1 && echo "found=$b"; done; `+
+		`echo "linger=$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)"; `+
+		`echo "user=$(id -un)"`)
+}
+
+// serviceEnvironmentWarnings turns serviceEnvironmentCommand output into
+// operator warnings for a coordinator using backend.
+func serviceEnvironmentWarnings(output, backend string) []string {
+	found := map[string]bool{}
+	var linger, user string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "found="):
+			found[strings.TrimPrefix(line, "found=")] = true
+		case strings.HasPrefix(line, "linger="):
+			linger = strings.TrimPrefix(line, "linger=")
+		case strings.HasPrefix(line, "user="):
+			user = strings.TrimPrefix(line, "user=")
+		}
+	}
+
+	var warnings []string
+	switch backend {
+	case "wezterm", "tmux":
+		if !found[backend] {
+			warnings = append(warnings, fmt.Sprintf("%s is not on the coordinator's PATH; it cannot see any panes until %s is installed there", backend, backend))
+		}
+	default:
+		if !found["wezterm"] && !found["tmux"] {
+			warnings = append(warnings, "neither wezterm nor tmux is on the coordinator's PATH; it cannot see any panes until one is installed")
+		}
+	}
+	if linger == "no" {
+		if user == "" {
+			user = "$USER"
+		}
+		warnings = append(warnings, fmt.Sprintf("lingering is off, so the coordinator stops when you log out; enable it with: sudo loginctl enable-linger %s", user))
+	}
+	return warnings
 }
 
 // CoordinatorExecStart builds the coordinator unit's ExecStart line. systemd
@@ -607,6 +771,9 @@ type DeployResult struct {
 	Error         error
 	LocalVersion  string
 	RemoteVersion string
+	// Warnings are conditions that let the deploy succeed but will stop the
+	// coordinator from working later (no multiplexer, no lingering).
+	Warnings []string
 }
 
 // ensureBinary makes a runnable caam available on the remote and returns its
@@ -673,9 +840,20 @@ func (d *Deployer) DeployCoordinator(ctx context.Context, config coordinator.Fil
 	}
 	result.ConfigWritten = true
 
+	// Run the service with the user's login PATH so it finds the
+	// multiplexer the user runs.
+	pathCtx, cancelPath := context.WithTimeout(ctx, 15*time.Second)
+	loginOut, err := d.RunCommand(pathCtx, loginPathCommand)
+	cancelPath()
+	if err != nil {
+		d.logger.Debug("could not read login PATH", "machine", d.machine.Name, "error", err)
+	}
+	path := servicePath(parseMarkedPath(loginOut), installPath)
+
 	unitConfig := SystemdUnitConfig{
 		Type:      "Auth Recovery Coordinator",
 		ExecStart: CoordinatorExecStart(installPath),
+		Path:      path,
 	}
 	if err := d.WriteSystemdUnit(ctx, CoordinatorServiceName, unitConfig); err != nil {
 		return fail(fmt.Errorf("systemd unit write failed: %w", err))
@@ -683,6 +861,12 @@ func (d *Deployer) DeployCoordinator(ctx context.Context, config coordinator.Fil
 
 	if err := d.EnableAndStartService(ctx, CoordinatorServiceName); err != nil {
 		return fail(fmt.Errorf("service start failed: %w", err))
+	}
+
+	if envOut, err := d.RunCommand(ctx, serviceEnvironmentCommand(path)); err == nil {
+		result.Warnings = serviceEnvironmentWarnings(envOut, config.Backend)
+	} else {
+		d.logger.Debug("could not check service environment", "machine", d.machine.Name, "error", err)
 	}
 
 	verifyCtx, cancel := context.WithTimeout(ctx, 20*time.Second)

@@ -3,6 +3,8 @@ package coordinator
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 )
 
 // PaneClient is the interface for terminal multiplexer backends.
@@ -43,4 +45,82 @@ type PaneClient interface {
 var (
 	_ PaneClient = (*WezTermClient)(nil)
 	_ PaneClient = (*TmuxClient)(nil)
+	_ PaneClient = (*autoPaneClient)(nil)
 )
+
+// autoPaneClient follows whichever multiplexer is answering, in preference
+// order. A coordinator started before the user's multiplexer (by systemd at
+// boot, say) would otherwise stay bound to whatever a one-time probe found.
+// The backend changes only when the current one stops answering, so panes
+// are never interleaved from two backends.
+type autoPaneClient struct {
+	clients []PaneClient
+	logger  *slog.Logger
+
+	mu      sync.Mutex
+	current PaneClient
+}
+
+func newAutoPaneClient(ctx context.Context, logger *slog.Logger, clients ...PaneClient) *autoPaneClient {
+	a := &autoPaneClient{clients: clients, logger: logger, current: clients[0]}
+	for _, c := range clients {
+		if c.IsAvailable(ctx) {
+			a.current = c
+			break
+		}
+	}
+	return a
+}
+
+func (a *autoPaneClient) active() PaneClient {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.current
+}
+
+// ListPanes lists the current backend's panes, switching to the first other
+// backend that answers when the current one fails.
+func (a *autoPaneClient) ListPanes(ctx context.Context) ([]Pane, error) {
+	current := a.active()
+	panes, err := current.ListPanes(ctx)
+	if err == nil {
+		return panes, nil
+	}
+	for _, c := range a.clients {
+		if c == current {
+			continue
+		}
+		if other, otherErr := c.ListPanes(ctx); otherErr == nil {
+			a.mu.Lock()
+			a.current = c
+			a.mu.Unlock()
+			a.logger.Info("terminal multiplexer backend changed",
+				"from", current.Backend(),
+				"to", c.Backend(),
+				"reason", err.Error())
+			return other, nil
+		}
+	}
+	return nil, err
+}
+
+func (a *autoPaneClient) GetText(ctx context.Context, paneID int, startLine int) (string, error) {
+	return a.active().GetText(ctx, paneID, startLine)
+}
+
+func (a *autoPaneClient) SendText(ctx context.Context, paneID int, text string, noPaste bool) error {
+	return a.active().SendText(ctx, paneID, text, noPaste)
+}
+
+func (a *autoPaneClient) IsAvailable(ctx context.Context) bool {
+	for _, c := range a.clients {
+		if c.IsAvailable(ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *autoPaneClient) Backend() string {
+	return a.active().Backend()
+}

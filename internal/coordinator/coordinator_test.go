@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1474,5 +1476,83 @@ func TestFailedLoginIsRetriedWithinBudget(t *testing.T) {
 	coord.processPaneState(context.Background(), client.panes[0])
 	if tracker.GetState() != StateRateLimited || tracker.GetRetryCount() != 0 {
 		t.Fatalf("new episode: state=%v retries=%d", tracker.GetState(), tracker.GetRetryCount())
+	}
+}
+
+// switchablePane is a multiplexer backend that can be started and stopped.
+type switchablePane struct {
+	name string
+	up   atomic.Bool
+	sent atomic.Int32
+}
+
+func (p *switchablePane) ListPanes(ctx context.Context) ([]Pane, error) {
+	if !p.up.Load() {
+		return nil, fmt.Errorf("%s: no server running", p.name)
+	}
+	return []Pane{{PaneID: 7, Title: p.name}}, nil
+}
+
+func (p *switchablePane) GetText(ctx context.Context, paneID int, startLine int) (string, error) {
+	return p.name + " output", nil
+}
+
+func (p *switchablePane) SendText(ctx context.Context, paneID int, text string, noPaste bool) error {
+	p.sent.Add(1)
+	return nil
+}
+
+func (p *switchablePane) IsAvailable(ctx context.Context) bool { return p.up.Load() }
+func (p *switchablePane) Backend() string                      { return p.name }
+
+func TestAutoBackendFollowsTheRunningMultiplexer(t *testing.T) {
+	ctx := context.Background()
+	wezterm := &switchablePane{name: "wezterm"}
+	tmux := &switchablePane{name: "tmux"}
+
+	// Started before any multiplexer (systemd at boot): WezTerm by preference.
+	auto := newAutoPaneClient(ctx, slog.Default(), wezterm, tmux)
+	if auto.Backend() != "wezterm" || auto.IsAvailable(ctx) {
+		t.Fatalf("no multiplexer: backend=%s available=%v", auto.Backend(), auto.IsAvailable(ctx))
+	}
+	if _, err := auto.ListPanes(ctx); err == nil {
+		t.Fatal("ListPanes succeeded with no multiplexer running")
+	}
+
+	// The user starts tmux: the next poll finds its panes.
+	tmux.up.Store(true)
+	panes, err := auto.ListPanes(ctx)
+	if err != nil || len(panes) != 1 || panes[0].Title != "tmux" {
+		t.Fatalf("after tmux started: panes=%v err=%v", panes, err)
+	}
+	if auto.Backend() != "tmux" {
+		t.Fatalf("backend = %s, want tmux", auto.Backend())
+	}
+	if err := auto.SendText(ctx, 7, "/login\n", true); err != nil || tmux.sent.Load() != 1 || wezterm.sent.Load() != 0 {
+		t.Fatalf("injection went to the wrong backend: tmux=%d wezterm=%d err=%v", tmux.sent.Load(), wezterm.sent.Load(), err)
+	}
+
+	// WezTerm appearing while tmux still answers does not flip backends.
+	wezterm.up.Store(true)
+	if _, err := auto.ListPanes(ctx); err != nil || auto.Backend() != "tmux" {
+		t.Fatalf("backend flipped while tmux answers: %s err=%v", auto.Backend(), err)
+	}
+
+	// tmux exits: WezTerm takes over.
+	tmux.up.Store(false)
+	panes, err = auto.ListPanes(ctx)
+	if err != nil || panes[0].Title != "wezterm" || auto.Backend() != "wezterm" {
+		t.Fatalf("after tmux exited: panes=%v backend=%s err=%v", panes, auto.Backend(), err)
+	}
+}
+
+func TestAutoBackendPrefersWezTermWhenBothRun(t *testing.T) {
+	ctx := context.Background()
+	wezterm := &switchablePane{name: "wezterm"}
+	tmux := &switchablePane{name: "tmux"}
+	wezterm.up.Store(true)
+	tmux.up.Store(true)
+	if got := newAutoPaneClient(ctx, slog.Default(), wezterm, tmux).Backend(); got != "wezterm" {
+		t.Fatalf("backend = %s, want wezterm", got)
 	}
 }
