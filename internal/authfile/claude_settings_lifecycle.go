@@ -112,6 +112,19 @@ type claudeSettingsRestore struct {
 	hasAuth bool
 }
 
+// resolveLiveParent follows symlinks in the directory part of one of the
+// host's live Claude paths. The user's own ~/.claude may be a symlink (GNU
+// stow, a dotfiles checkout), which v0.1.22 restored through (#120). The
+// private-path checks stay strict for vault profiles and still see the final
+// file itself, so a symlinked credential file is still refused.
+func resolveLiveParent(path string) string {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return path
+	}
+	return filepath.Join(dir, filepath.Base(path))
+}
+
 // prepareClaudeSettingsRestore runs before credentials or keychain mirrors are
 // changed. Both present and absent raw credentials participate in the same
 // recoverable batch as mixed settings and Desktop caches. Source generations,
@@ -146,6 +159,7 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 	for _, spec := range fileSet.Files {
 		filename := filepath.Base(spec.Path)
 		snapshotPath := filepath.Join(profileDir, filename)
+		livePath := resolveLiveParent(spec.Path)
 		var plan claudeSettingsRestore
 		switch {
 		case isClaudeSettingsDocument(fileSet.Tool, spec.Path):
@@ -153,7 +167,7 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			if filename == ".claude.json" {
 				prepare = claudesettings.PrepareLegacyRestore
 			}
-			update, err := prepare(snapshotPath, spec.Path, policy)
+			update, err := prepare(snapshotPath, livePath, policy)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude settings restore: %w", err)
 			}
@@ -164,7 +178,7 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			plan = claudeSettingsRestore{update: update, hasAuth: snapshot.hasAuth}
 		case filename == claudeCredentialsFile || filename == "auth.json":
 			mirror := claudeRetirementMirror(fileSet, spec.Path)
-			retirement, err := prepareClaudeCredentialRetirement(snapshotPath, spec.Path, mirror)
+			retirement, err := prepareClaudeCredentialRetirement(snapshotPath, livePath, mirror)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude credential retirement: %w", err)
 			}
@@ -175,10 +189,10 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			var keepLive func() bool
 			if filename == claudeCredentialsFile {
 				keepLive = func() bool {
-					return identityVault.claudeLiveIsNewer(liveKeys, profileDir, spec.Path, snapshotPath)
+					return identityVault.claudeLiveIsNewer(liveKeys, profileDir, livePath, snapshotPath)
 				}
 			}
-			replacement, err := prepareClaudeCredentialRestore(snapshotPath, spec.Path, identitySources, mirror, keepLive)
+			replacement, err := prepareClaudeCredentialRestore(snapshotPath, livePath, identitySources, mirror, keepLive)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude credential replacement: %w", err)
 			}
@@ -191,7 +205,7 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			}
 			plan = claudeSettingsRestore{update: replacement, hasAuth: true}
 		case isClaudeDesktopConfig(fileSet.Tool, spec.Path):
-			update, err := claudesettings.PrepareFieldsRestore(snapshotPath, spec.Path, claudeDesktopTokenKeys)
+			update, err := claudesettings.PrepareFieldsRestore(snapshotPath, livePath, claudeDesktopTokenKeys)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude Desktop cache restore: %w", err)
 			}

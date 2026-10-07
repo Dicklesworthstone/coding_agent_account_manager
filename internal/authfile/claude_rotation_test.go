@@ -538,6 +538,46 @@ func TestClaudeRotationSwitchFlow(t *testing.T) {
 	}
 }
 
+// A ~/.claude that is a symlink (GNU stow's default tree folding, dotfiles
+// repos) must not block activation: v0.1.22 restored through it (#120).
+func TestClaudeSwitchThroughSymlinkedClaudeDir(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	home := filepath.Dir(f.liveSettings)
+	realDir := filepath.Join(filepath.Dir(home), "dotfiles", "claude")
+	if err := os.MkdirAll(realDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.Remove(claudeDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, claudeDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	f.writeProfile("alice", aliceGen1, aliceSettings(1))
+	f.writeProfile("bob", bobGen1, bobSettings(1))
+	f.writeLive(aliceGen2, aliceSettings(9))
+
+	if err := f.vault.ResnapshotOutgoing(f.fileSet, f.active(), "bob"); err != nil {
+		t.Fatalf("ResnapshotOutgoing: %v", err)
+	}
+	if err := f.vault.Restore(f.fileSet, "bob"); err != nil {
+		t.Fatalf("Restore bob through symlinked ~/.claude: %v", err)
+	}
+	if got := readFixtureFile(t, filepath.Join(realDir, ".credentials.json")); got != bobGen1 {
+		t.Fatalf("credentials in the symlink target = %s, want bob's", got)
+	}
+	if info, err := os.Lstat(claudeDir); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("~/.claude is no longer the user's symlink: info=%v err=%v", info, err)
+	}
+	if err := f.vault.Restore(f.fileSet, "alice"); err != nil {
+		t.Fatalf("Restore alice through symlinked ~/.claude: %v", err)
+	}
+	if got := readFixtureFile(t, f.liveCreds); got != aliceGen2 {
+		t.Fatalf("alice restored with stale tokens through the symlink:\n got %s\nwant %s", got, aliceGen2)
+	}
+}
+
 // --- Helpers ---------------------------------------------------------------
 
 func TestClaudeIdentityKeys(t *testing.T) {
