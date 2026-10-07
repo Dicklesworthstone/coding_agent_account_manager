@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -389,152 +391,285 @@ func (p *Provider) ValidateProfile(ctx context.Context, prof *profile.Profile) e
 	return nil
 }
 
-// DetectExistingAuth detects existing Codex authentication files in standard locations.
-// Locations checked:
-// - $CODEX_HOME/auth.json (if CODEX_HOME is set)
-// - ~/.codex/auth.json (default location)
+// DetectExistingAuth inspects the credential store Codex actually uses. An
+// explicit CODEX_HOME is authoritative, including when its credential is absent
+// or invalid; a different account in ~/.codex must never rescue that failure.
 func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	detection := &provider.AuthDetection{
 		Provider:  p.ID(),
 		Locations: []provider.AuthLocation{},
 	}
-
-	homeDir, err := os.UserHomeDir()
+	home := os.Getenv("CODEX_HOME")
+	description := "Codex CLI credentials (CODEX_HOME)"
+	if home == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("get home dir: %w", err)
+		}
+		home = filepath.Join(homeDir, ".codex")
+		description = "Codex CLI credentials (default location)"
+	}
+	path, err := filepath.Abs(filepath.Join(home, "auth.json"))
 	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
+		return nil, fmt.Errorf("resolve Codex credential path: %w", err)
 	}
-
-	// Define locations to check
-	locations := []struct {
-		path        string
-		description string
-	}{
-		{
-			path:        filepath.Join(homeDir, ".codex", "auth.json"),
-			description: "Codex CLI OAuth token (default location)",
-		},
-	}
-
-	// Also check CODEX_HOME if it's set and different from default
-	if codexHomeEnv := os.Getenv("CODEX_HOME"); codexHomeEnv != "" {
-		envPath := filepath.Join(codexHomeEnv, "auth.json")
-		defaultPath := filepath.Join(homeDir, ".codex", "auth.json")
-		if envPath != defaultPath {
-			locations = append([]struct {
-				path        string
-				description string
-			}{
-				{
-					path:        envPath,
-					description: "Codex CLI OAuth token (CODEX_HOME)",
-				},
-			}, locations...)
+	loc := provider.AuthLocation{Path: path, Description: description}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			loc.ValidationError = fmt.Sprintf("inspect credential: %v", err)
 		}
-	}
-
-	var mostRecent *provider.AuthLocation
-
-	for _, loc := range locations {
-		authLoc := provider.AuthLocation{
-			Path:        loc.path,
-			Description: loc.description,
+	} else {
+		loc.Exists = true
+		loc.LastModified, loc.FileSize = info.ModTime(), info.Size()
+		data, err := readCodexCredentialSource(path)
+		if err == nil {
+			_, err = parseCodexCredential(data)
 		}
-
-		info, err := os.Stat(loc.path)
 		if err != nil {
-			if os.IsNotExist(err) {
-				authLoc.Exists = false
-			} else {
-				authLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
-			}
-			detection.Locations = append(detection.Locations, authLoc)
-			continue
-		}
-
-		authLoc.Exists = true
-		authLoc.LastModified = info.ModTime()
-		authLoc.FileSize = info.Size()
-
-		// Basic validation: try to parse as JSON and check for expected fields
-		data, err := os.ReadFile(loc.path)
-		if err != nil {
-			authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
+			loc.ValidationError = err.Error()
 		} else {
-			var parsed map[string]interface{}
-			if err := json.Unmarshal(data, &parsed); err != nil {
-				authLoc.ValidationError = fmt.Sprintf("invalid JSON: %v", err)
-			} else {
-				// Check for expected Codex auth fields
-				if _, ok := parsed["access_token"]; ok {
-					authLoc.IsValid = true
-				} else if _, ok := parsed["accessToken"]; ok {
-					authLoc.IsValid = true
-				} else if _, ok := parsed["api_key"]; ok {
-					authLoc.IsValid = true
-				} else if _, ok := parsed["token"]; ok {
-					authLoc.IsValid = true
-				} else {
-					authLoc.ValidationError = "missing expected auth fields (access_token, api_key, or token)"
-				}
-			}
-		}
-
-		detection.Locations = append(detection.Locations, authLoc)
-
-		// Track most recent valid auth
-		if authLoc.Exists && authLoc.IsValid {
+			loc.IsValid = true
 			detection.Found = true
-			if mostRecent == nil || authLoc.LastModified.After(mostRecent.LastModified) {
-				locCopy := authLoc // Copy to avoid pointer issues
-				mostRecent = &locCopy
-			}
+			detection.Primary = &loc
 		}
 	}
-
-	detection.Primary = mostRecent
-
-	// Set warning if multiple valid auth files found
-	validCount := 0
-	for _, loc := range detection.Locations {
-		if loc.Exists && loc.IsValid {
-			validCount++
-		}
-	}
-	if validCount > 1 {
-		detection.Warning = "multiple auth files found; using most recent"
-	}
-
+	detection.Locations = append(detection.Locations, loc)
 	return detection, nil
 }
 
-// ImportAuth imports detected auth files into a profile directory.
+// ImportAuth validates one captured source and publishes its original bytes at
+// the canonical Codex path. A later source rotation cannot change the bytes
+// between validation and copying, and invalid imports leave the target intact.
 func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
-	// Validate source file exists
-	info, err := os.Stat(sourcePath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if prof == nil || strings.TrimSpace(prof.BasePath) == "" {
+		return nil, fmt.Errorf("profile has no base path")
+	}
+	data, err := readCodexCredentialSource(sourcePath)
 	if err != nil {
-		return nil, fmt.Errorf("source auth file not found: %w", err)
+		return nil, err
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("source path is a directory, not a file")
+	credential, err := parseCodexCredential(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Codex credential: %w", err)
 	}
-
-	var copiedFiles []string
-
-	// For Codex, auth files go into codex_home
-	codexHomePath := prof.CodexHomePath()
-	if err := os.MkdirAll(codexHomePath, 0700); err != nil {
-		return nil, fmt.Errorf("create codex_home dir: %w", err)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	// Copy auth.json to codex_home
-	basename := filepath.Base(sourcePath)
-	targetPath := filepath.Join(codexHomePath, basename)
-	if err := copyFile(sourcePath, targetPath); err != nil {
-		return nil, fmt.Errorf("copy %s: %w", basename, err)
+	targetPath := filepath.Join(prof.CodexHomePath(), "auth.json")
+	if sourceInfo, err := os.Stat(sourcePath); err == nil {
+		if targetInfo, err := os.Stat(targetPath); err == nil && os.SameFile(sourceInfo, targetInfo) {
+			return nil, fmt.Errorf("source and destination refer to the same credential file")
+		}
 	}
-	copiedFiles = append(copiedFiles, targetPath)
+	if err := atomicWriteFile(targetPath, data, 0600); err != nil {
+		return nil, fmt.Errorf("write imported auth.json: %w", err)
+	}
+	prof.AuthMode = string(credential.mode)
+	return []string{targetPath}, nil
+}
 
-	return copiedFiles, nil
+const maxCodexCredentialBytes int64 = 16 << 20
+
+// readCodexCredentialSource is shared by detection, import and passive checks.
+// It never modifies a native file and rejects nonregular sources before opening.
+func readCodexCredentialSource(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("inspect Codex credential: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxCodexCredentialBytes {
+		return nil, fmt.Errorf("Codex credential must be a regular file no larger than %d bytes", maxCodexCredentialBytes)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open Codex credential: %w", err)
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect open Codex credential: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxCodexCredentialBytes {
+		return nil, fmt.Errorf("Codex credential must be a regular file no larger than %d bytes", maxCodexCredentialBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxCodexCredentialBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Codex credential: %w", err)
+	}
+	if int64(len(data)) > maxCodexCredentialBytes {
+		return nil, fmt.Errorf("Codex credential exceeds %d bytes", maxCodexCredentialBytes)
+	}
+	return data, nil
+}
+
+type codexCredential struct {
+	mode       provider.AuthMode
+	expiresAt  time.Time
+	hasRefresh bool
+}
+
+// parseCodexCredential recognizes native ChatGPT and API-key records as well
+// as flat OAuth records. Optional native API-key/tokens slots can be null, but
+// a present malformed credential field cannot be treated as a usable login.
+func parseCodexCredential(data []byte) (codexCredential, error) {
+	var result codexCredential
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil || root == nil {
+		return result, fmt.Errorf("expected a JSON object")
+	}
+	apiKey, err := codexCredentialAliases(root, true, "OPENAI_API_KEY", "api_key", "apiKey")
+	if err != nil {
+		return result, err
+	}
+	authMode, err := codexCredentialAliases(root, true, "auth_mode")
+	if err != nil {
+		return result, err
+	}
+	if raw, exists := root["last_refresh"]; exists && strings.TrimSpace(string(raw)) != "null" {
+		var stamp string
+		if json.Unmarshal(raw, &stamp) != nil {
+			return result, fmt.Errorf("last_refresh must be a timestamp")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
+			return result, fmt.Errorf("last_refresh must be a timestamp")
+		}
+	}
+	entry := root
+	if raw, exists := root["tokens"]; exists && strings.TrimSpace(string(raw)) != "null" {
+		var tokens map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &tokens); err != nil || tokens == nil {
+			return result, fmt.Errorf("tokens must be an object")
+		}
+		entry = tokens
+	}
+	access, err := codexCredentialAliases(entry, false, "access_token", "accessToken", "token")
+	if err != nil {
+		return result, err
+	}
+	refresh, err := codexCredentialAliases(entry, false, "refresh_token", "refreshToken")
+	if err != nil {
+		return result, err
+	}
+	for _, key := range []string{"refresh_token", "refreshToken"} {
+		if _, exists := entry[key]; exists && refresh == "" {
+			return result, fmt.Errorf("refresh credential is empty")
+		}
+	}
+	if refresh != "" && access == "" {
+		return result, fmt.Errorf("access credential is missing")
+	}
+	if _, nested := root["tokens"]; nested {
+		flatAccess, err := codexCredentialAliases(root, false, "access_token", "accessToken", "token")
+		if err != nil {
+			return result, err
+		}
+		flatRefresh, err := codexCredentialAliases(root, false, "refresh_token", "refreshToken")
+		if err != nil {
+			return result, err
+		}
+		if (flatAccess != "" && flatAccess != access) || (flatRefresh != "" && flatRefresh != refresh) {
+			return result, fmt.Errorf("flat and nested credentials conflict")
+		}
+	}
+	for _, obj := range []map[string]json.RawMessage{root, entry} {
+		if _, err := codexCredentialAliases(obj, true, "id_token", "idToken"); err != nil {
+			return result, err
+		}
+		if _, err := codexCredentialAliases(obj, true, "account_id", "accountId"); err != nil {
+			return result, err
+		}
+	}
+	switch strings.ToLower(authMode) {
+	case "apikey", "api-key":
+		if apiKey == "" {
+			return result, fmt.Errorf("API-key auth mode has no API key")
+		}
+		result.mode = provider.AuthModeAPIKey
+	case "chatgpt", "oauth", "chatgptauthtokens":
+		if access == "" {
+			return result, fmt.Errorf("ChatGPT auth mode has no access token")
+		}
+		result.mode = provider.AuthModeOAuth
+	case "":
+		if access != "" && apiKey != "" {
+			return result, fmt.Errorf("multiple authentication methods require an auth_mode")
+		}
+		if access != "" {
+			result.mode = provider.AuthModeOAuth
+		} else if apiKey != "" {
+			result.mode = provider.AuthModeAPIKey
+		} else {
+			return result, fmt.Errorf("credential has no access token or API key")
+		}
+	default:
+		return result, fmt.Errorf("unsupported Codex auth_mode")
+	}
+	if result.mode == provider.AuthModeAPIKey {
+		return result, nil
+	}
+	result.hasRefresh = refresh != ""
+	for _, obj := range []map[string]json.RawMessage{root, entry} {
+		for _, key := range []string{"expires_at", "expiresAt", "expires"} {
+			if raw, exists := obj[key]; exists {
+				var value any
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return result, fmt.Errorf("credential expiry is malformed")
+				}
+				var expiry time.Time
+				switch v := value.(type) {
+				case string:
+					expiry, _ = parseCodexExpiryTime(v)
+				case float64:
+					expiry = parseCodexUnixTime(v)
+				}
+				if expiry.IsZero() || expiry.Year() < 1970 || expiry.Year() > 9999 {
+					return result, fmt.Errorf("credential expiry is malformed")
+				}
+				if !result.expiresAt.IsZero() && !result.expiresAt.Equal(expiry) {
+					return result, fmt.Errorf("credential expiry fields conflict")
+				}
+				result.expiresAt = expiry
+			}
+		}
+	}
+	if result.expiresAt.IsZero() {
+		if id, err := identity.ExtractFromJWT(access); err == nil {
+			result.expiresAt = id.ExpiresAt
+		}
+	}
+	return result, nil
+}
+
+func codexCredentialAliases(obj map[string]json.RawMessage, allowNull bool, keys ...string) (string, error) {
+	var selected string
+	for _, key := range keys {
+		raw, exists := obj[key]
+		if !exists {
+			continue
+		}
+		if strings.TrimSpace(string(raw)) == "null" {
+			if allowNull {
+				continue
+			}
+			return "", fmt.Errorf("%s must be a string", key)
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", fmt.Errorf("%s must be a string", key)
+		}
+		value = strings.TrimSpace(value)
+		if selected != "" && value != "" && selected != value {
+			return "", fmt.Errorf("credential aliases conflict")
+		}
+		if value != "" {
+			selected = value
+		}
+	}
+	return selected, nil
 }
 
 // atomicWriteFile writes data to a file atomically using temp file + fsync + rename.
@@ -577,50 +712,6 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// copyFile copies a file from src to dst with fsync for durability.
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	// Get source file info for permissions
-	srcInfo, err := srcFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Write to temp file first for atomicity
-	tmpPath := dst + ".tmp"
-	dstFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode()&0600)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(dstFile, srcFile)
-	if err != nil {
-		dstFile.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-
-	// Sync to disk
-	if err := dstFile.Sync(); err != nil {
-		dstFile.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-
-	if err := dstFile.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	// Atomic rename
-	return os.Rename(tmpPath, dst)
-}
-
 // ValidateToken validates that the authentication token works.
 // For passive validation: checks file existence, format, and expiry timestamps.
 // For active validation: attempts minimal API call to OpenAI.
@@ -640,65 +731,26 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 // validateTokenPassive performs passive validation without network calls.
 func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profile, result *provider.ValidationResult) (*provider.ValidationResult, error) {
 	result.Method = "passive"
-
-	// Check auth.json exists
-	authPath := filepath.Join(prof.CodexHomePath(), "auth.json")
-	if _, err := os.Stat(authPath); os.IsNotExist(err) {
-		result.Valid = false
-		result.Error = "auth.json not found"
-		return result, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	// Read and parse auth.json
-	data, err := os.ReadFile(authPath)
+	data, err := readCodexCredentialSource(filepath.Join(prof.CodexHomePath(), "auth.json"))
 	if err != nil {
-		result.Valid = false
-		result.Error = fmt.Sprintf("cannot read auth.json: %v", err)
+		result.Error = err.Error()
 		return result, nil
 	}
-
-	var authData map[string]interface{}
-	if err := json.Unmarshal(data, &authData); err != nil {
-		result.Valid = false
-		result.Error = fmt.Sprintf("invalid JSON in auth.json: %v", err)
+	credential, err := parseCodexCredential(data)
+	if err != nil {
+		result.Error = err.Error()
 		return result, nil
 	}
-
-	// Check for access_token field
-	if _, hasToken := authData["access_token"]; !hasToken {
-		if _, hasToken := authData["accessToken"]; !hasToken {
-			result.Valid = false
-			result.Error = "no access token found in auth.json"
-			return result, nil
-		}
+	result.ExpiresAt = credential.expiresAt
+	// A complete refresh grant remains usable after access-token expiry. The
+	// native CLI can renew it; passive validation must not require a new login.
+	if !credential.expiresAt.IsZero() && !credential.expiresAt.After(result.CheckedAt) && !credential.hasRefresh {
+		result.Error = "token has expired"
+		return result, nil
 	}
-
-	// Check for expiry timestamp
-	for _, key := range []string{"expires_at", "expiresAt", "expires"} {
-		if expiresAt, ok := authData[key]; ok {
-			var expTime time.Time
-			switch v := expiresAt.(type) {
-			case string:
-				if t, err := parseCodexExpiryTime(v); err == nil {
-					expTime = t
-				}
-			case float64:
-				expTime = parseCodexUnixTime(v)
-			}
-
-			if !expTime.IsZero() {
-				result.ExpiresAt = expTime
-				if expTime.Before(time.Now()) {
-					result.Valid = false
-					result.Error = "token has expired"
-					return result, nil
-				}
-			}
-			break
-		}
-	}
-
-	// Passive validation passed
 	result.Valid = true
 	return result, nil
 }
@@ -740,6 +792,9 @@ func parseCodexExpiryTime(s string) (time.Time, error) {
 }
 
 func parseCodexUnixTime(f float64) time.Time {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 || f >= float64(math.MaxInt64) || math.Trunc(f) != f {
+		return time.Time{}
+	}
 	if f > 1e12 {
 		return time.UnixMilli(int64(f))
 	}

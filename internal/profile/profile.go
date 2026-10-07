@@ -9,6 +9,7 @@
 package profile
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -332,6 +333,33 @@ func (p *Profile) IsLocked() bool {
 // Lock creates a lock file to indicate the profile is in use.
 // Uses O_EXCL for atomic creation to prevent race conditions.
 func (p *Profile) Lock() error {
+	return p.lockWithMutation(false)
+}
+
+func (p *Profile) lockWithMutation(cleanStale bool) error {
+	// A previously loaded profile can be launched while a forced import is
+	// publishing its replacement. Share the store's mutation lock so that a
+	// runner cannot recreate the destination between the two directory moves.
+	base := filepath.Clean(p.BasePath)
+	if p.Provider != "" && filepath.Base(base) == p.Name && filepath.Base(filepath.Dir(base)) == p.Provider {
+		store := NewStore(filepath.Dir(filepath.Dir(base)))
+		unlock, err := store.lockMutation(p.Provider, p.Name)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	if cleanStale {
+		if _, err := p.CleanStaleLock(); err != nil {
+			return fmt.Errorf("check stale lock: %w", err)
+		}
+	}
+	return p.lockFile()
+}
+
+// lockFile is used when the caller already owns the store mutation lock, or
+// when locking a private staging directory outside the registered layout.
+func (p *Profile) lockFile() error {
 	lockPath := p.LockPath()
 
 	// Ensure the parent directory exists (for transient profiles that may not
@@ -513,29 +541,29 @@ func (p *Profile) CleanStaleLock() (bool, error) {
 // LockWithCleanup attempts to acquire a lock, cleaning stale locks first.
 // This is the recommended method for acquiring locks.
 func (p *Profile) LockWithCleanup() error {
-	// Try to clean any stale locks first
-	_, err := p.CleanStaleLock()
-	if err != nil {
-		return fmt.Errorf("check stale lock: %w", err)
-	}
-
-	// Now try to acquire the lock
-	return p.Lock()
+	return p.lockWithMutation(true)
 }
 
 // Save persists the profile metadata to disk.
 func (p *Profile) Save() error {
+	return p.saveAt(p.BasePath)
+}
+
+// saveAt lets a prepared profile record its final runtime path while its
+// metadata is still being written inside the unpublished staging directory.
+func (p *Profile) saveAt(basePath string) error {
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal profile: %w", err)
 	}
 
-	if err := os.MkdirAll(p.BasePath, 0700); err != nil {
+	if err := os.MkdirAll(basePath, 0700); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
 	}
 
 	// Atomic write: write to temp file then rename
-	tmpPath := p.MetaPath() + ".tmp"
+	metaPath := filepath.Join(basePath, "profile.json")
+	tmpPath := metaPath + ".tmp"
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("create temp profile file: %w", err)
@@ -558,7 +586,7 @@ func (p *Profile) Save() error {
 		return fmt.Errorf("close temp profile file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, p.MetaPath()); err != nil {
+	if err := os.Rename(tmpPath, metaPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp profile file: %w", err)
 	}
@@ -644,6 +672,11 @@ func (s *Store) Create(provider, name, authMode string) (*Profile, error) {
 		return nil, err
 	}
 	authMode = strings.TrimSpace(authMode)
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	profilePath := s.ProfilePath(provider, name)
 
@@ -674,6 +707,193 @@ func (s *Store) Create(provider, name, authMode string) (*Profile, error) {
 	}
 
 	return profile, nil
+}
+
+// ImportResult describes a published isolated profile. BackupPath is populated
+// when an existing profile was replaced; that complete directory is retained
+// outside the routable profile layout so a forced import never erases it.
+type ImportResult struct {
+	Profile    *Profile
+	BackupPath string
+}
+
+// lockMutation serializes creation, import, deletion and cloning of one name
+// across Store instances and processes. The lock lives outside that profile,
+// so publishing a prepared directory cannot replace the lock itself.
+func (s *Store) lockMutation(provider, name string) (func(), error) {
+	lock := &Profile{
+		Name:     provider + "/" + name,
+		BasePath: filepath.Join(s.basePath, ".imports", "locks", provider, name),
+	}
+	if err := lock.LockWithCleanup(); err != nil {
+		return nil, fmt.Errorf("profile %s/%s is being modified: %w", provider, name, err)
+	}
+	owned, err := os.Lstat(lock.LockPath())
+	if err != nil {
+		return nil, fmt.Errorf("inspect mutation lock: %w", err)
+	}
+	return func() { unlockImportedProfile(lock, owned) }, nil
+}
+
+func unlockImportedProfile(p *Profile, owned os.FileInfo) {
+	// A concurrent directory replacement must never make cleanup remove a
+	// different process's lock. Rename preserves the identity of our lock.
+	if current, err := os.Lstat(p.LockPath()); err == nil && os.SameFile(owned, current) {
+		_ = p.Unlock()
+	}
+}
+
+// Import prepares and validates a new isolated profile before publishing it.
+// The callback must write only into the supplied profile and reject unusable
+// credentials. Existing profiles remain in place throughout preparation, and
+// an in-use profile cannot be replaced. A successful forced replacement keeps
+// the complete previous directory; a failed publish restores it.
+func (s *Store) Import(ctx context.Context, provider, name, authMode string, force bool, prepare func(*Profile) error) (*ImportResult, error) {
+	if s == nil || strings.TrimSpace(s.basePath) == "" {
+		return nil, fmt.Errorf("profile store base path is empty")
+	}
+	if prepare == nil {
+		return nil, fmt.Errorf("profile import requires preparation and validation")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var err error
+	provider, err = validateStoreSegment("provider", provider)
+	if err != nil {
+		return nil, err
+	}
+	name, err = validateStoreSegment("name", name)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	target, err := filepath.Abs(s.ProfilePath(provider, name))
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return nil, fmt.Errorf("create provider directory: %w", err)
+	}
+	parentInfo, err := os.Lstat(parent)
+	if err != nil || !parentInfo.IsDir() {
+		return nil, fmt.Errorf("provider directory must be a private directory")
+	}
+	previousInfo, err := os.Lstat(target)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect existing profile: %w", err)
+	}
+	var previousLock *Profile
+	if err == nil {
+		if !force {
+			return nil, fmt.Errorf("profile %s/%s already exists (use --force to overwrite)", provider, name)
+		}
+		if !previousInfo.IsDir() {
+			return nil, fmt.Errorf("existing profile must be a private directory")
+		}
+		previousLock = &Profile{Name: name, Provider: provider, BasePath: target}
+		if err := previousLock.lockFile(); err != nil {
+			return nil, fmt.Errorf("cannot replace profile in use: %w", err)
+		}
+		owned, err := os.Lstat(previousLock.LockPath())
+		if err != nil {
+			return nil, fmt.Errorf("inspect existing profile lock: %w", err)
+		}
+		defer func() { unlockImportedProfile(previousLock, owned) }()
+	}
+
+	// Neither List nor ListAll can see a profile.json at this nesting level.
+	// Keeping staging on the store filesystem also permits directory renames.
+	transactions, err := filepath.Abs(filepath.Join(s.basePath, ".imports"))
+	if err != nil {
+		return nil, err
+	}
+	work, err := os.MkdirTemp(transactions, provider+"-"+name+"-")
+	if err != nil {
+		return nil, fmt.Errorf("create import staging directory: %w", err)
+	}
+	retainPrevious := false
+	defer func() {
+		if !retainPrevious {
+			_ = os.RemoveAll(work)
+		}
+	}()
+	staging := filepath.Join(work, "prepared")
+	prepared := &Profile{
+		Name: name, Provider: provider, AuthMode: strings.TrimSpace(authMode),
+		BasePath: staging, CreatedAt: time.Now(), Metadata: make(map[string]string),
+	}
+	if err := prepared.EnsureLayout(); err != nil {
+		return nil, fmt.Errorf("prepare profile layout: %w", err)
+	}
+	if err := prepare(prepared); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if prepared.BasePath != staging || prepared.Name != name || prepared.Provider != provider {
+		return nil, fmt.Errorf("profile identity or staging path changed during import")
+	}
+	prepared.LoadIdentity()
+	// Block a runner until publication and lock cleanup are both complete.
+	preparedLock := &Profile{Name: name, Provider: provider, BasePath: staging}
+	if err := preparedLock.lockFile(); err != nil {
+		return nil, fmt.Errorf("lock prepared profile: %w", err)
+	}
+	owned, err := os.Lstat(preparedLock.LockPath())
+	if err != nil {
+		return nil, fmt.Errorf("inspect prepared profile lock: %w", err)
+	}
+	defer func() { unlockImportedProfile(preparedLock, owned) }()
+	prepared.BasePath = target
+	if err := prepared.saveAt(staging); err != nil {
+		return nil, fmt.Errorf("save prepared profile: %w", err)
+	}
+
+	currentParent, err := os.Lstat(parent)
+	if err != nil || !os.SameFile(parentInfo, currentParent) {
+		return nil, fmt.Errorf("provider directory changed during import; retry")
+	}
+	current, err := os.Lstat(target)
+	if previousInfo == nil {
+		if err == nil || !os.IsNotExist(err) {
+			return nil, fmt.Errorf("profile destination changed during import; retry")
+		}
+	} else if err != nil || !os.SameFile(previousInfo, current) {
+		return nil, fmt.Errorf("existing profile changed during import; retry")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	result := &ImportResult{Profile: prepared}
+	if previousLock != nil {
+		result.BackupPath = filepath.Join(work, "previous")
+		if err := os.Rename(target, result.BackupPath); err != nil {
+			return nil, fmt.Errorf("preserve previous profile: %w", err)
+		}
+		retainPrevious = true
+		previousLock.BasePath = result.BackupPath
+	}
+	if err := os.Rename(staging, target); err != nil {
+		if previousLock != nil {
+			if restoreErr := os.Rename(result.BackupPath, target); restoreErr != nil {
+				return nil, fmt.Errorf("publish profile: %v; restore previous profile: %v; previous profile retained at %s", err, restoreErr, result.BackupPath)
+			}
+			previousLock.BasePath = target
+			retainPrevious = false
+		}
+		return nil, fmt.Errorf("publish imported profile: %w", err)
+	}
+	preparedLock.BasePath = target
+	return result, nil
 }
 
 // Load retrieves a profile from disk.
@@ -734,6 +954,11 @@ func (s *Store) Delete(provider, name string) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	profilePath := s.ProfilePath(provider, name)
 
@@ -850,6 +1075,11 @@ func (s *Store) Clone(provider, sourceName, targetName string, opts CloneOptions
 	if sourceName == targetName {
 		return nil, fmt.Errorf("source and target profile names cannot be the same")
 	}
+	unlock, err := s.lockMutation(provider, targetName)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	// Load source profile
 	source, err := s.Load(provider, sourceName)

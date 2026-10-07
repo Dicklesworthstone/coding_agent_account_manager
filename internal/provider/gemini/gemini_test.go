@@ -1,12 +1,20 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -330,7 +338,7 @@ func TestEnv(t *testing.T) {
 		}
 	})
 
-	t.Run("returns only HOME for OAuth mode", func(t *testing.T) {
+	t.Run("isolates native homes and auth selection for OAuth mode", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		prof := &profile.Profile{
 			Name:     "test",
@@ -342,8 +350,11 @@ func TestEnv(t *testing.T) {
 		p := New()
 		env, _ := p.Env(context.Background(), prof)
 
-		if len(env) != 1 {
-			t.Errorf("Env() returned %d vars for OAuth, want 1", len(env))
+		if env["GEMINI_HOME"] != filepath.Join(prof.HomePath(), ".gemini") || env["GEMINI_CLI_HOME"] != prof.HomePath() {
+			t.Errorf("Env() did not isolate native homes: %#v", env)
+		}
+		if env["GOOGLE_GENAI_USE_GCA"] != "true" || env["GOOGLE_GENAI_USE_VERTEXAI"] != "false" {
+			t.Errorf("Env() did not preserve OAuth selection: %#v", env)
 		}
 	})
 
@@ -370,7 +381,7 @@ func TestEnv(t *testing.T) {
 		}
 	})
 
-	t.Run("returns two vars for VertexADC mode", func(t *testing.T) {
+	t.Run("pins the ADC source and Vertex auth mode", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		prof := &profile.Profile{
 			Name:     "test",
@@ -382,8 +393,9 @@ func TestEnv(t *testing.T) {
 		p := New()
 		env, _ := p.Env(context.Background(), prof)
 
-		if len(env) != 2 {
-			t.Errorf("Env() returned %d vars for VertexADC, want 2", len(env))
+		want := filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json")
+		if env["GOOGLE_APPLICATION_CREDENTIALS"] != want || env["GOOGLE_GENAI_USE_VERTEXAI"] != "true" {
+			t.Errorf("Env() does not select imported ADC: %#v", env)
 		}
 	})
 }
@@ -944,7 +956,6 @@ func TestFullVertexADCLifecycle(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // DetectExistingAuth Tests
 // =============================================================================
@@ -955,6 +966,10 @@ func TestDetectExistingAuth(t *testing.T) {
 		xdg := filepath.Join(home, ".config")
 		t.Setenv("HOME", home)
 		t.Setenv("XDG_CONFIG_HOME", xdg)
+		t.Setenv("GEMINI_HOME", "")
+		t.Setenv("GEMINI_CLI_HOME", "")
+		t.Setenv("CLOUDSDK_CONFIG", "")
+		t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 		return home, xdg
 	}
 
@@ -965,7 +980,7 @@ func TestDetectExistingAuth(t *testing.T) {
 		geminiDir := filepath.Join(home, ".gemini")
 		os.MkdirAll(geminiDir, 0700)
 		path := filepath.Join(geminiDir, "settings.json")
-		writeJSON(t, path, map[string]interface{}{"oauth": map[string]interface{}{}})
+		writeJSON(t, path, map[string]interface{}{"oauth": map[string]interface{}{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}})
 
 		detection, err := p.DetectExistingAuth()
 		if err != nil {
@@ -1031,7 +1046,7 @@ func TestDetectExistingAuth(t *testing.T) {
 		gcloudDir := filepath.Join(xdg, "gcloud")
 		os.MkdirAll(gcloudDir, 0700)
 		path := filepath.Join(gcloudDir, "application_default_credentials.json")
-		writeJSON(t, path, map[string]interface{}{"client_id": "test", "type": "authorized_user"})
+		writeJSON(t, path, map[string]interface{}{"client_id": "synthetic-client", "client_secret": "synthetic-secret", "refresh_token": "synthetic-refresh", "type": "authorized_user"})
 
 		detection, err := p.DetectExistingAuth()
 		if err != nil {
@@ -1053,7 +1068,7 @@ func TestDetectExistingAuth(t *testing.T) {
 		p := New()
 
 		path := filepath.Join(customHome, "settings.json")
-		writeJSON(t, path, map[string]interface{}{"oauth": map[string]interface{}{}})
+		writeJSON(t, path, map[string]interface{}{"oauth": map[string]interface{}{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}})
 
 		detection, err := p.DetectExistingAuth()
 		if err != nil {
@@ -1115,7 +1130,7 @@ func TestImportAuth(t *testing.T) {
 		srcGemini := filepath.Join(srcDir, ".gemini")
 		os.MkdirAll(srcGemini, 0700)
 		srcPath := filepath.Join(srcGemini, "settings.json")
-		writeJSON(t, srcPath, map[string]interface{}{"oauth": true})
+		writeJSON(t, srcPath, map[string]interface{}{"oauth": map[string]interface{}{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}})
 
 		copied, err := p.ImportAuth(context.Background(), srcPath, prof)
 		if err != nil {
@@ -1123,8 +1138,8 @@ func TestImportAuth(t *testing.T) {
 		}
 
 		expected := filepath.Join(prof.HomePath(), ".gemini", "settings.json")
-		if copied[0] != expected {
-			t.Errorf("Copied to %s, want %s", copied[0], expected)
+		if !slices.Contains(copied, expected) {
+			t.Errorf("Copied files %v do not include %s", copied, expected)
 		}
 	})
 
@@ -1133,7 +1148,7 @@ func TestImportAuth(t *testing.T) {
 		prof := &profile.Profile{
 			Name:     "test",
 			Provider: "gemini",
-			AuthMode: "vertex_adc", // Important for PrepareProfile to create gcloud dir
+			AuthMode: string(provider.AuthModeOAuth), // Import must infer the actual mode.
 			BasePath: tmpDir,
 		}
 		p := New()
@@ -1144,7 +1159,7 @@ func TestImportAuth(t *testing.T) {
 		srcGcloud := filepath.Join(srcDir, "gcloud")
 		os.MkdirAll(srcGcloud, 0700)
 		srcPath := filepath.Join(srcGcloud, "application_default_credentials.json")
-		writeJSON(t, srcPath, map[string]interface{}{"type": "authorized_user"})
+		writeJSON(t, srcPath, map[string]interface{}{"type": "authorized_user", "client_id": "synthetic-client", "client_secret": "synthetic-secret", "refresh_token": "synthetic-refresh"})
 
 		copied, err := p.ImportAuth(context.Background(), srcPath, prof)
 		if err != nil {
@@ -1171,7 +1186,7 @@ func TestImportAuth(t *testing.T) {
 		srcGemini := filepath.Join(srcDir, ".gemini")
 		os.MkdirAll(srcGemini, 0700)
 		srcPath := filepath.Join(srcGemini, ".env")
-		os.WriteFile(srcPath, []byte("KEY=val"), 0600)
+		os.WriteFile(srcPath, []byte("GEMINI_API_KEY=synthetic-key"), 0600)
 
 		copied, err := p.ImportAuth(context.Background(), srcPath, prof)
 		if err != nil {
@@ -1183,6 +1198,750 @@ func TestImportAuth(t *testing.T) {
 			t.Errorf("Copied to %s, want %s", copied[0], expected)
 		}
 	})
+}
+
+func TestGeminiImportCompleteSelectedBundle(t *testing.T) {
+	const oauth = "{\n  \"access_token\": \"synthetic-access\", \"refresh_token\": \"synthetic-refresh\", \"expiry_date\": 1893456000000\n}\n"
+	const adc = `{"type":"authorized_user","client_id":"synthetic-client","client_secret":"synthetic-secret","refresh_token":"synthetic-refresh","quota_project_id":"private-project"}`
+	const oauthSettings = "{\n \"security\": {\"auth\": {\"selectedType\": \"oauth-personal\"}}, \"mcpServers\": {\"private\": {\"command\": \"private-helper\"}}\n}\n"
+	const keySettings = `{"selectedAuthType":"gemini-api-key","theme":"private-theme"}`
+	const keyEnv = "# Private account configuration\nexport GEMINI_API_KEY='synthetic-key' # account key\nGOOGLE_CLOUD_PROJECT=private-project\n"
+	const embedded = `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}`
+	for _, tc := range []struct {
+		name     string
+		source   string
+		files    map[string]string
+		mode     provider.AuthMode
+		expected map[string]string
+	}{
+		{
+			name: "OAuth cache includes private settings and excludes other auth sources", source: "oauth_creds.json",
+			files: map[string]string{"oauth_creds.json": oauth, "settings.json": oauthSettings, ".env": keyEnv, "oauth_credentials.json": `{"access_token":"unrelated-old-account"}`},
+			mode:  provider.AuthModeOAuth, expected: map[string]string{"home/.gemini/oauth_creds.json": oauth, "home/.gemini/settings.json": oauthSettings},
+		},
+		{
+			name: "settings entry imports its selected OAuth cache", source: "settings.json",
+			files: map[string]string{"oauth_creds.json": oauth, "settings.json": oauthSettings, ".env": keyEnv},
+			mode:  provider.AuthModeOAuth, expected: map[string]string{"home/.gemini/oauth_creds.json": oauth, "home/.gemini/settings.json": oauthSettings},
+		},
+		{
+			name: "API key includes settings and excludes unrelated OAuth", source: ".env",
+			files: map[string]string{".env": keyEnv, "settings.json": keySettings, "oauth_creds.json": oauth},
+			mode:  provider.AuthModeAPIKey, expected: map[string]string{"home/.gemini/.env": keyEnv, "home/.gemini/settings.json": keySettings},
+		},
+		{
+			name: "arbitrary OAuth filename is canonicalized by content", source: "exported-login.backup",
+			files: map[string]string{"exported-login.backup": oauth}, mode: provider.AuthModeOAuth,
+			expected: map[string]string{"home/.gemini/oauth_creds.json": oauth},
+		},
+		{
+			name: "legacy OAuth filename becomes current cache", source: "oauth_credentials.json",
+			files: map[string]string{"oauth_credentials.json": oauth}, mode: provider.AuthModeOAuth,
+			expected: map[string]string{"home/.gemini/oauth_creds.json": oauth},
+		},
+		{
+			name: "arbitrary API key filename is canonicalized by content", source: "key.backup",
+			files: map[string]string{"key.backup": keyEnv}, mode: provider.AuthModeAPIKey,
+			expected: map[string]string{"home/.gemini/.env": keyEnv},
+		},
+		{
+			name: "ADC is imported to the runtime selected gcloud path", source: "google-login.backup",
+			files: map[string]string{"google-login.backup": adc}, mode: provider.AuthModeVertexADC,
+			expected: map[string]string{"gcloud/application_default_credentials.json": adc},
+		},
+		{
+			name: "ADC named settings is classified by credential content", source: "settings.json",
+			files: map[string]string{"settings.json": adc}, mode: provider.AuthModeVertexADC,
+			expected: map[string]string{"gcloud/application_default_credentials.json": adc},
+		},
+		{
+			name: "embedded legacy OAuth preserves settings and supplies modern cache", source: "settings.json",
+			files: map[string]string{"settings.json": `{"theme":"private","oauth":` + embedded + `}`}, mode: provider.AuthModeOAuth,
+			expected: map[string]string{"home/.gemini/settings.json": `{"theme":"private","oauth":` + embedded + `}`, "home/.gemini/oauth_creds.json": embedded},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sourceDir := t.TempDir()
+			for name, data := range tc.files {
+				writeGeminiFixture(t, filepath.Join(sourceDir, name), data)
+			}
+			prof := &profile.Profile{Name: "imported", Provider: "gemini", AuthMode: "oauth", BasePath: t.TempDir()}
+			copied, err := New().ImportAuth(context.Background(), filepath.Join(sourceDir, tc.source), prof)
+			if err != nil {
+				t.Fatalf("ImportAuth: %v", err)
+			}
+			if prof.AuthMode != string(tc.mode) || len(copied) != len(tc.expected) {
+				t.Fatalf("import mode/files = %s/%v, want %s/%d files", prof.AuthMode, copied, tc.mode, len(tc.expected))
+			}
+			validation, err := New().ValidateToken(context.Background(), prof, true)
+			if err != nil || validation == nil || !validation.Valid {
+				t.Fatalf("imported bundle did not pass passive validation: %+v, %v", validation, err)
+			}
+			for rel, want := range tc.expected {
+				path := filepath.Join(prof.BasePath, rel)
+				got, err := os.ReadFile(path)
+				if err != nil || string(got) != want || !slices.Contains(copied, path) {
+					t.Errorf("import did not preserve expected %s: %v", rel, err)
+				}
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Errorf("imported file %s permissions: %v", rel, err)
+				}
+			}
+			for name, want := range tc.files {
+				got, err := os.ReadFile(filepath.Join(sourceDir, name))
+				if err != nil || string(got) != want {
+					t.Errorf("native source %s was changed: %v", name, err)
+				}
+			}
+			for _, rel := range []string{"home/.gemini/.env", "home/.gemini/oauth_creds.json", "home/.gemini/oauth_credentials.json", "home/.gemini/settings.json", "gcloud/application_default_credentials.json"} {
+				if _, want := tc.expected[rel]; want {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(prof.BasePath, rel)); !os.IsNotExist(err) {
+					t.Errorf("unexpected imported auth source %s: %v", rel, err)
+				}
+			}
+			t.Setenv("GEMINI_API_KEY", "unrelated-ambient-key")
+			t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "/unrelated/ambient-adc.json")
+			env, err := New().Env(context.Background(), prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.mode == provider.AuthModeAPIKey && env["GEMINI_API_KEY"] != "synthetic-key" {
+				t.Error("saved API key was not pinned against ambient credentials")
+			}
+			if tc.mode == provider.AuthModeVertexADC && env["GOOGLE_APPLICATION_CREDENTIALS"] != filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json") {
+				t.Error("runtime does not point at imported ADC")
+			}
+		})
+	}
+}
+
+func TestGeminiRejectsMalformedNativeAuth(t *testing.T) {
+	for _, tc := range []struct{ name, filename, data string }{
+		{"policy settings", "settings.json", `{"theme":"dark"}`},
+		{"selector without login", "settings.json", `{"selectedAuthType":"oauth-personal"}`},
+		{"empty OAuth settings", "settings.json", `{"oauth":{}}`},
+		{"null OAuth settings", "settings.json", `{"oauth":null}`},
+		{"boolean OAuth settings", "settings.json", `{"oauth":true}`},
+		{"null settings", "settings.json", `null`},
+		{"array settings", "settings.json", `[]`},
+		{"empty file", "oauth_creds.json", ""},
+		{"malformed JSON", "oauth_creds.json", "{"},
+		{"null cache", "oauth_creds.json", "null"},
+		{"array cache", "oauth_creds.json", "[]"},
+		{"null access", "oauth_creds.json", `{"access_token":null}`},
+		{"number access", "oauth_creds.json", `{"access_token":42}`},
+		{"empty access", "oauth_creds.json", `{"access_token":" "}`},
+		{"refresh only", "oauth_creds.json", `{"refresh_token":"synthetic-refresh"}`},
+		{"null refresh", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":null}`},
+		{"empty refresh", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":""}`},
+		{"array refresh", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":[]}`},
+		{"conflicting access aliases", "oauth_creds.json", `{"access_token":"synthetic-access","accessToken":"different-account"}`},
+		{"invalid identity", "oauth_creds.json", `{"access_token":"synthetic-access","email":[]}`},
+		{"null expiry", "oauth_creds.json", `{"access_token":"synthetic-access","expiry_date":null}`},
+		{"invalid expiry", "oauth_creds.json", `{"access_token":"synthetic-access","expiry_date":"tomorrow"}`},
+		{"negative expiry", "oauth_creds.json", `{"access_token":"synthetic-access","expiry_date":-1}`},
+		{"fractional expiry", "oauth_creds.json", `{"access_token":"synthetic-access","expiry_date":1.25}`},
+		{"out of range expiry", "oauth_creds.json", `{"access_token":"synthetic-access","expiry_date":1e30}`},
+		{"renewable expiry overflows int64", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expiry_date":9223372036854775807}`},
+		{"renewable expiry exceeds year 9999", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expiry_date":253402300800000}`},
+		{"seconds expiry exceeds year 9999", "oauth_creds.json", `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_at":253402300800}`},
+		{"comment mentioning key", ".env", "# GEMINI_API_KEY=synthetic-key\nFOO=bar\n"},
+		{"unrelated env", ".env", "NOT_GEMINI_API_KEY=synthetic-key\n"},
+		{"empty API key", ".env", "GEMINI_API_KEY=\n"},
+		{"quoted empty API key", ".env", "GEMINI_API_KEY=' '\n"},
+		{"API key containing whitespace", ".env", "GEMINI_API_KEY='not a usable key'\n"},
+		{"unterminated API key", ".env", "GEMINI_API_KEY='synthetic-key\n"},
+		{"trailing shell text", ".env", "GEMINI_API_KEY='synthetic-key' unexpected\n"},
+		{"different auth selection", ".env", "GEMINI_API_KEY=synthetic-key\nGOOGLE_GENAI_USE_VERTEXAI=true\n"},
+		{"mixed API keys", ".env", "GEMINI_API_KEY=synthetic-key\nGOOGLE_API_KEY=other-key\n"},
+		{"type-only ADC", "application_default_credentials.json", `{"type":"authorized_user"}`},
+		{"null ADC type", "application_default_credentials.json", `{"type":null,"client_id":"client","client_secret":"secret","refresh_token":"refresh"}`},
+		{"null ADC refresh", "application_default_credentials.json", `{"type":"authorized_user","client_id":"client","client_secret":"secret","refresh_token":null}`},
+		{"missing ADC client secret", "application_default_credentials.json", `{"type":"authorized_user","client_id":"client","refresh_token":"refresh"}`},
+		{"invalid service account key", "application_default_credentials.json", `{"type":"service_account","client_email":"synthetic@example.com","private_key":"not-a-key","token_uri":"https://oauth2.googleapis.com/token"}`},
+		{"unsupported external account", "application_default_credentials.json", `{"type":"external_account","credential_source":{"file":"/other/account"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolateGeminiDetection(t)
+			path := filepath.Join(dir, tc.filename)
+			writeGeminiFixture(t, path, tc.data)
+			if tc.filename == "application_default_credentials.json" {
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
+			}
+			detection, err := New().DetectExistingAuth()
+			if err != nil || detection.Found || detection.Primary != nil {
+				t.Fatalf("malformed source detected as a login: %+v, %v", detection, err)
+			}
+			prof := &profile.Profile{Name: "protected", Provider: "gemini", AuthMode: "existing-mode", BasePath: t.TempDir()}
+			oldPath := filepath.Join(prof.HomePath(), ".gemini", "oauth_creds.json")
+			writeGeminiFixture(t, oldPath, `{"access_token":"working-existing-account"}`)
+			copied, err := New().ImportAuth(context.Background(), path, prof)
+			if err == nil || len(copied) != 0 || prof.AuthMode != "existing-mode" {
+				t.Fatalf("malformed import changed profile: files=%v mode=%s error=%v", copied, prof.AuthMode, err)
+			}
+			got, err := os.ReadFile(oldPath)
+			if err != nil || string(got) != `{"access_token":"working-existing-account"}` {
+				t.Fatal("malformed import overwrote valid credentials")
+			}
+		})
+	}
+}
+
+func TestGeminiDetectionUsesSelectedGrant(t *testing.T) {
+	const oauth = `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}`
+	const key = "GEMINI_API_KEY=synthetic-key\n"
+	for _, tc := range []struct {
+		name    string
+		files   map[string]string
+		primary string
+		mode    provider.AuthMode
+	}{
+		{"newer policy does not replace OAuth", map[string]string{"oauth_creds.json": oauth, "settings.json": `{"theme":"newer-private-theme"}`}, "oauth_creds.json", provider.AuthModeOAuth},
+		{"legacy filename is usable", map[string]string{"oauth_credentials.json": oauth}, "oauth_credentials.json", provider.AuthModeOAuth},
+		{"current cache outranks old account", map[string]string{"oauth_creds.json": oauth, "oauth_credentials.json": `{"access_token":"different-account"}`}, "oauth_creds.json", provider.AuthModeOAuth},
+		{"invalid current cache blocks old login", map[string]string{"oauth_creds.json": `null`, "oauth_credentials.json": oauth}, "", ""},
+		{"invalid current blocks settings fallback", map[string]string{"oauth_creds.json": `{}`, "settings.json": `{"oauth":` + oauth + `}`}, "", ""},
+		{"OAuth selection excludes API key", map[string]string{"settings.json": `{"selectedAuthType":"oauth-personal"}`, "oauth_creds.json": oauth, ".env": key}, "oauth_creds.json", provider.AuthModeOAuth},
+		{"current API key selection excludes malformed OAuth", map[string]string{"settings.json": `{"security":{"auth":{"selectedType":"gemini-api-key"}}}`, "oauth_creds.json": `null`, ".env": key}, ".env", provider.AuthModeAPIKey},
+		{"API selector imports key bundle through settings", map[string]string{"settings.json": `{"selectedAuthType":"gemini-api-key"}`, "oauth_creds.json": oauth, ".env": key}, ".env", provider.AuthModeAPIKey},
+		{"selection missing credential does not fallback", map[string]string{"settings.json": `{"selectedAuthType":"oauth-personal"}`, ".env": key}, "", ""},
+		{"API selection missing key does not fallback", map[string]string{"settings.json": `{"selectedAuthType":"gemini-api-key"}`, "oauth_creds.json": oauth}, "", ""},
+		{"dotenv API key selects native method", map[string]string{"oauth_creds.json": oauth, ".env": key}, ".env", provider.AuthModeAPIKey},
+		{"unknown selection", map[string]string{"settings.json": `{"selectedAuthType":"unknown-mode"}`, "oauth_creds.json": oauth}, "", ""},
+		{"null selection", map[string]string{"settings.json": `{"selectedAuthType":null}`, "oauth_creds.json": oauth}, "", ""},
+		{"conflicting selectors", map[string]string{"settings.json": `{"selectedAuthType":"oauth-personal","security":{"auth":{"selectedType":"gemini-api-key"}}}`, "oauth_creds.json": oauth, ".env": key}, "", ""},
+		{"conflicting embedded account", map[string]string{"settings.json": `{"oauth":{"access_token":"different-account"}}`, "oauth_creds.json": oauth}, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolateGeminiDetection(t)
+			for name, data := range tc.files {
+				writeGeminiFixture(t, filepath.Join(dir, name), data)
+				stamp := time.Unix(1600000000, 0)
+				if name == "settings.json" || name == "oauth_credentials.json" {
+					stamp = time.Unix(1900000000, 0)
+				}
+				if err := os.Chtimes(filepath.Join(dir, name), stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
+			}
+			detection, err := New().DetectExistingAuth()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.primary == "" {
+				if detection.Found || detection.Primary != nil {
+					t.Fatalf("incorrect auth fallback: %+v", detection)
+				}
+				return
+			}
+			want := filepath.Join(dir, tc.primary)
+			if !detection.Found || detection.Primary == nil || detection.Primary.Path != want || !detection.Primary.IsValid {
+				t.Fatalf("detected %+v, want selected source %s", detection, want)
+			}
+			prof := &profile.Profile{Name: "detected", Provider: "gemini", BasePath: t.TempDir()}
+			if _, err := New().ImportAuth(context.Background(), detection.Primary.Path, prof); err != nil {
+				t.Fatalf("detected source cannot be imported: %v", err)
+			}
+			if prof.AuthMode != string(tc.mode) {
+				t.Errorf("import mode %s, want %s", prof.AuthMode, tc.mode)
+			}
+		})
+	}
+}
+
+func TestGeminiDetectionRespectsNativeEnvironmentSelection(t *testing.T) {
+	const key = "GEMINI_API_KEY=synthetic-key\n"
+	const project = "GOOGLE_CLOUD_PROJECT=selected-project\nGOOGLE_CLOUD_LOCATION=us-central1\n"
+	for _, tc := range []struct {
+		name     string
+		env      map[string]string
+		dotenv   string
+		settings string
+		mode     provider.AuthMode
+	}{
+		{name: "ambient Vertex selects ADC over old OAuth", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "true"}, mode: provider.AuthModeVertexADC},
+		{name: "ambient Vertex retains ADC project bundle", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "true"}, dotenv: project, mode: provider.AuthModeVertexADC},
+		{name: "GCA precedes Vertex and API key", env: map[string]string{"GOOGLE_GENAI_USE_GCA": "true", "GOOGLE_GENAI_USE_VERTEXAI": "true", "GEMINI_API_KEY": "other-key"}, dotenv: key, mode: provider.AuthModeOAuth},
+		{name: "Vertex precedes ambient API key", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "true", "GEMINI_API_KEY": "other-key"}, mode: provider.AuthModeVertexADC},
+		{name: "dotenv GCA precedes ambient Vertex", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "true"}, dotenv: "GOOGLE_GENAI_USE_GCA=true\n", mode: provider.AuthModeOAuth},
+		{name: "shell false overrides dotenv selector", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "false"}, dotenv: "GOOGLE_GENAI_USE_VERTEXAI=true\n", mode: provider.AuthModeOAuth},
+		{name: "shell empty overrides dotenv selector", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": ""}, dotenv: "GOOGLE_GENAI_USE_VERTEXAI=true\n", mode: provider.AuthModeOAuth},
+		{name: "configured OAuth precedes environment", env: map[string]string{"GOOGLE_GENAI_USE_VERTEXAI": "true"}, settings: `{"security":{"auth":{"selectedType":"oauth-personal"}}}`, mode: provider.AuthModeOAuth},
+		{name: "configured Vertex precedes environment", env: map[string]string{"GOOGLE_GENAI_USE_GCA": "true"}, settings: `{"security":{"auth":{"selectedType":"vertex-ai"}}}`, mode: provider.AuthModeVertexADC},
+		{name: "shell-only key cannot import old OAuth", env: map[string]string{"GEMINI_API_KEY": "other-key"}},
+		{name: "shell key cannot import a different saved key", env: map[string]string{"GEMINI_API_KEY": "other-key"}, dotenv: key},
+		{name: "matching saved key is importable", env: map[string]string{"GEMINI_API_KEY": "synthetic-key"}, dotenv: key, mode: provider.AuthModeAPIKey},
+		{name: "configured API still requires selected key", env: map[string]string{"GEMINI_API_KEY": "other-key"}, dotenv: key, settings: `{"selectedAuthType":"gemini-api-key"}`},
+		{name: "shell empty suppresses configured saved key", env: map[string]string{"GEMINI_API_KEY": ""}, dotenv: key, settings: `{"selectedAuthType":"gemini-api-key"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolateGeminiDetection(t)
+			writeGeminiFixture(t, filepath.Join(dir, "oauth_creds.json"), `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}`)
+			adcPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "gcloud", "application_default_credentials.json")
+			writeGeminiFixture(t, adcPath, `{"type":"authorized_user","client_id":"synthetic-client","client_secret":"synthetic-secret","refresh_token":"synthetic-adc"}`)
+			if tc.dotenv != "" {
+				writeGeminiFixture(t, filepath.Join(dir, ".env"), tc.dotenv)
+			}
+			if tc.settings != "" {
+				writeGeminiFixture(t, filepath.Join(dir, "settings.json"), tc.settings)
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			detection, err := New().DetectExistingAuth()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.mode == "" {
+				if detection.Found || detection.Primary != nil {
+					t.Fatalf("detected a different account from the native selection: %+v", detection)
+				}
+				return
+			}
+			if !detection.Found || detection.Primary == nil || !detection.Primary.IsValid {
+				t.Fatalf("selected native grant not found: %+v", detection)
+			}
+			prof := &profile.Profile{Name: "native-selection", Provider: "gemini", BasePath: t.TempDir()}
+			if _, err := New().ImportAuth(context.Background(), detection.Primary.Path, prof); err != nil {
+				t.Fatalf("detected selection cannot be imported: %v", err)
+			}
+			if prof.AuthMode != string(tc.mode) {
+				t.Fatalf("imported mode %s, want native selection %s", prof.AuthMode, tc.mode)
+			}
+			result, err := New().ValidateToken(context.Background(), prof, true)
+			if err != nil || result == nil || !result.Valid {
+				t.Fatalf("selected imported profile is invalid: %+v, %v", result, err)
+			}
+		})
+	}
+}
+
+func TestGeminiExplicitCredentialSourceIgnoresAmbientAuthMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode provider.AuthMode
+	}{
+		{"oauth_creds.json", provider.AuthModeOAuth},
+		{".env", provider.AuthModeAPIKey},
+		{"application_default_credentials.json", provider.AuthModeVertexADC},
+		{"ADC dotenv bundle", provider.AuthModeVertexADC},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolateGeminiDetection(t)
+			t.Setenv("GOOGLE_GENAI_USE_GCA", "true")
+			t.Setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+			t.Setenv("GEMINI_API_KEY", "unrelated-ambient-key")
+			path := filepath.Join(dir, tc.name)
+			data := `{"access_token":"selected-access","refresh_token":"selected-refresh"}`
+			switch tc.mode {
+			case provider.AuthModeAPIKey:
+				data = "GEMINI_API_KEY=selected-key\n"
+			case provider.AuthModeVertexADC:
+				data = `{"type":"authorized_user","client_id":"selected-client","client_secret":"selected-secret","refresh_token":"selected-refresh"}`
+				if tc.name == "ADC dotenv bundle" {
+					adcPath := filepath.Join(t.TempDir(), "application_default_credentials.json")
+					writeGeminiFixture(t, adcPath, data)
+					path = filepath.Join(dir, ".env")
+					data = "GOOGLE_APPLICATION_CREDENTIALS=" + adcPath + "\nGOOGLE_CLOUD_PROJECT=selected-project\nGOOGLE_CLOUD_LOCATION=us-central1\n"
+					writeGeminiFixture(t, filepath.Join(dir, "oauth_creds.json"), `{"access_token":"unrelated-old-login"}`)
+				}
+			}
+			writeGeminiFixture(t, path, data)
+			prof := &profile.Profile{Name: "explicit-selection", Provider: "gemini", BasePath: t.TempDir()}
+			if _, err := New().ImportAuth(context.Background(), path, prof); err != nil || prof.AuthMode != string(tc.mode) {
+				t.Fatalf("explicit credential was overridden by ambient auth: mode=%s, %v", prof.AuthMode, err)
+			}
+		})
+	}
+}
+
+func TestGeminiDetectionRespectsConfiguredHome(t *testing.T) {
+	for _, mode := range []string{"GEMINI_HOME", "GEMINI_CLI_HOME", "GEMINI_HOME wins", "explicit empty home"} {
+		t.Run(mode, func(t *testing.T) {
+			defaultDir := isolateGeminiDetection(t)
+			writeGeminiFixture(t, filepath.Join(defaultDir, "oauth_creds.json"), `{"access_token":"newer-unrelated-default-account"}`)
+			custom := t.TempDir()
+			selected := custom
+			if mode == "GEMINI_CLI_HOME" {
+				t.Setenv("GEMINI_CLI_HOME", custom)
+				selected = filepath.Join(custom, ".gemini")
+			} else {
+				t.Setenv("GEMINI_HOME", custom)
+				if mode == "GEMINI_HOME wins" {
+					t.Setenv("GEMINI_CLI_HOME", t.TempDir())
+				}
+			}
+			if mode != "explicit empty home" {
+				path := filepath.Join(selected, "oauth_creds.json")
+				writeGeminiFixture(t, path, `{"access_token":"configured-account"}`)
+				old := time.Unix(1500000000, 0)
+				if err := os.Chtimes(path, old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			detection, err := New().DetectExistingAuth()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "explicit empty home" {
+				if detection.Found {
+					t.Fatal("explicit empty home fell back to default account")
+				}
+			} else if !detection.Found || detection.Primary == nil || detection.Primary.Path != filepath.Join(selected, "oauth_creds.json") {
+				t.Fatalf("did not select configured home: %+v", detection)
+			}
+		})
+	}
+}
+
+func TestGeminiADCSelectionRetainsSettingsAndProject(t *testing.T) {
+	dir := isolateGeminiDetection(t)
+	settings := `{"security":{"auth":{"selectedType":"vertex-ai"}},"theme":"private-theme"}`
+	envData := "GOOGLE_CLOUD_PROJECT=private-project\nGOOGLE_CLOUD_LOCATION=us-central1\n"
+	writeGeminiFixture(t, filepath.Join(dir, "settings.json"), settings)
+	writeGeminiFixture(t, filepath.Join(dir, ".env"), envData)
+	writeGeminiFixture(t, filepath.Join(dir, "oauth_creds.json"), `{"access_token":"unrelated-google-login"}`)
+	sdk := t.TempDir()
+	t.Setenv("CLOUDSDK_CONFIG", sdk)
+	oldADC := `{"type":"authorized_user","client_id":"old-client","client_secret":"old-secret","refresh_token":"old-account"}`
+	writeGeminiFixture(t, filepath.Join(sdk, "application_default_credentials.json"), oldADC)
+	selected := filepath.Join(t.TempDir(), "chosen-account.backup")
+	adc := `{"type":"authorized_user","client_id":"selected-client","client_secret":"selected-secret","refresh_token":"selected-account"}`
+	writeGeminiFixture(t, selected, adc)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", selected)
+	detection, err := New().DetectExistingAuth()
+	if err != nil || !detection.Found || detection.Primary == nil {
+		t.Fatalf("Vertex detection = %+v, %v", detection, err)
+	}
+	prof := &profile.Profile{Name: "vertex", Provider: "gemini", AuthMode: "oauth", BasePath: t.TempDir()}
+	if _, err := New().ImportAuth(context.Background(), detection.Primary.Path, prof); err != nil {
+		t.Fatal(err)
+	}
+	for rel, want := range map[string]string{"gcloud/application_default_credentials.json": adc, "home/.gemini/settings.json": settings, "home/.gemini/.env": envData} {
+		got, err := os.ReadFile(filepath.Join(prof.BasePath, rel))
+		if err != nil || string(got) != want {
+			t.Errorf("Vertex bundle lost %s: %v", rel, err)
+		}
+	}
+	if prof.AuthMode != string(provider.AuthModeVertexADC) {
+		t.Fatalf("ADC mode = %s", prof.AuthMode)
+	}
+	env, err := New().Env(context.Background(), prof)
+	if err != nil || env["GOOGLE_CLOUD_PROJECT"] != "private-project" || env["GOOGLE_CLOUD_LOCATION"] != "us-central1" {
+		t.Fatalf("Vertex runtime lost the selected project context: %+v, %v", env, err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "missing-adc.json"))
+	detection, err = New().DetectExistingAuth()
+	if err != nil || detection.Found {
+		t.Fatalf("missing selected ADC fell back to another account: %+v, %v", detection, err)
+	}
+}
+
+func TestGeminiADCDetectionWithoutSettingsPreservesSelectedEnvBundle(t *testing.T) {
+	for _, selection := range []string{"project context", "dotenv credential path", "ambient credential path", "dotenv gcloud directory"} {
+		t.Run(selection, func(t *testing.T) {
+			dir := isolateGeminiDetection(t)
+			selectedDir := t.TempDir()
+			selectedPath := filepath.Join(selectedDir, "application_default_credentials.json")
+			selected := `{"type":"authorized_user","client_id":"selected-client","client_secret":"selected-secret","refresh_token":"selected-account"}`
+			other := `{"type":"authorized_user","client_id":"other-client","client_secret":"other-secret","refresh_token":"other-account"}`
+			writeGeminiFixture(t, selectedPath, selected)
+			defaultPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "gcloud", "application_default_credentials.json")
+			writeGeminiFixture(t, defaultPath, other)
+			envData := "GOOGLE_CLOUD_PROJECT=selected-project\nGOOGLE_CLOUD_LOCATION=us-central1\n"
+			switch selection {
+			case "project context":
+				t.Setenv("CLOUDSDK_CONFIG", selectedDir)
+			case "dotenv credential path":
+				envData += "GOOGLE_GENAI_USE_VERTEXAI=true\nGOOGLE_APPLICATION_CREDENTIALS=" + selectedPath + "\n"
+				writeGeminiFixture(t, filepath.Join(dir, "oauth_creds.json"), `{"access_token":"unrelated-oauth-account"}`)
+			case "ambient credential path":
+				t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", selectedPath)
+				envData += "GOOGLE_APPLICATION_CREDENTIALS=" + defaultPath + "\n"
+			case "dotenv gcloud directory":
+				envData += "CLOUDSDK_CONFIG=" + selectedDir + "\n"
+			}
+			envPath := filepath.Join(dir, ".env")
+			writeGeminiFixture(t, envPath, envData)
+			detection, err := New().DetectExistingAuth()
+			if err != nil || !detection.Found || detection.Primary == nil || detection.Primary.Path != envPath {
+				t.Fatalf("detected entry does not retain ADC context: %+v, %v", detection, err)
+			}
+			prof := &profile.Profile{Name: "selected-adc", Provider: "gemini", BasePath: t.TempDir()}
+			copied, err := New().ImportAuth(context.Background(), detection.Primary.Path, prof)
+			if err != nil || len(copied) != 2 || prof.AuthMode != string(provider.AuthModeVertexADC) {
+				t.Fatalf("ADC bundle import = %v, mode=%s, %v", copied, prof.AuthMode, err)
+			}
+			for rel, want := range map[string]string{"gcloud/application_default_credentials.json": selected, "home/.gemini/.env": envData} {
+				got, err := os.ReadFile(filepath.Join(prof.BasePath, rel))
+				if err != nil || string(got) != want {
+					t.Fatalf("selected ADC import lost %s: %v", rel, err)
+				}
+			}
+			env, err := New().Env(context.Background(), prof)
+			if err != nil || env["GOOGLE_CLOUD_PROJECT"] != "selected-project" || env["GOOGLE_APPLICATION_CREDENTIALS"] != filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json") {
+				t.Fatalf("runtime does not use selected ADC and project: %+v, %v", env, err)
+			}
+		})
+	}
+}
+
+func TestGeminiStandaloneADCImportDoesNotAdoptUnrelatedHome(t *testing.T) {
+	dir := isolateGeminiDetection(t)
+	writeGeminiFixture(t, filepath.Join(dir, "settings.json"), `{"selectedAuthType":"gemini-api-key"}`)
+	writeGeminiFixture(t, filepath.Join(dir, ".env"), "GEMINI_API_KEY=unrelated-native-key\nGOOGLE_CLOUD_PROJECT=unrelated-project\n")
+	path := filepath.Join(t.TempDir(), "explicit-adc.json")
+	writeGeminiFixture(t, path, `{"type":"authorized_user","client_id":"synthetic-client","client_secret":"synthetic-secret","refresh_token":"selected-refresh"}`)
+	prof := &profile.Profile{Name: "standalone", Provider: "gemini", BasePath: t.TempDir()}
+	copied, err := New().ImportAuth(context.Background(), path, prof)
+	if err != nil || len(copied) != 1 || prof.AuthMode != string(provider.AuthModeVertexADC) {
+		t.Fatalf("standalone ADC import = %v, mode=%s, %v", copied, prof.AuthMode, err)
+	}
+	for _, name := range []string{".env", "settings.json"} {
+		if _, err := os.Stat(filepath.Join(prof.HomePath(), ".gemini", name)); !os.IsNotExist(err) {
+			t.Fatalf("standalone ADC adopted unrelated %s", name)
+		}
+	}
+}
+
+func TestGeminiImportRejectsMalformedCompanionBeforeWriting(t *testing.T) {
+	for _, settings := range []string{
+		`null`, `{`, `[]`, `{"security":null}`, `{"security":{"auth":[]}}`,
+		`{"security":{"auth":{"selectedType":42}}}`, `{"oauth":null}`,
+		`{"oauth":{"refresh_token":"synthetic-refresh"}}`,
+		`{"selectedAuthType":"gemini-api-key"}`,
+		`{"oauth":{"access_token":"different-account"}}`,
+	} {
+		t.Run(settings, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "oauth_creds.json")
+			writeGeminiFixture(t, path, `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}`)
+			writeGeminiFixture(t, filepath.Join(dir, "settings.json"), settings)
+			prof := &profile.Profile{Name: "protected", Provider: "gemini", AuthMode: "original-mode", BasePath: t.TempDir()}
+			target := filepath.Join(prof.HomePath(), ".gemini", "oauth_creds.json")
+			original := []byte(`{"access_token":"original-valid-account"}`)
+			writeGeminiFixture(t, target, string(original))
+			if copied, err := New().ImportAuth(context.Background(), path, prof); err == nil || len(copied) != 0 {
+				t.Fatalf("invalid companion accepted: %v, %v", copied, err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || !bytes.Equal(got, original) || prof.AuthMode != "original-mode" {
+				t.Fatal("failed companion validation changed the existing account")
+			}
+		})
+	}
+}
+
+func TestGeminiImportServiceAccount(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]string{
+		"type": "service_account", "client_email": "synthetic@private-project.iam.gserviceaccount.com",
+		"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
+		"token_uri":   "https://oauth2.googleapis.com/token", "project_id": "private-project",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "service-account.backup")
+	writeGeminiFixture(t, path, string(data))
+	prof := &profile.Profile{Name: "service", Provider: "gemini", BasePath: t.TempDir()}
+	if _, err := New().ImportAuth(context.Background(), path, prof); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json"))
+	if err != nil || !bytes.Equal(got, data) || prof.AuthMode != "vertex-adc" {
+		t.Fatal("service-account import did not retain its exact usable credential")
+	}
+}
+
+func TestGeminiImportRevalidatesAndHonorsCancellation(t *testing.T) {
+	dir := isolateGeminiDetection(t)
+	path := filepath.Join(dir, "oauth_creds.json")
+	writeGeminiFixture(t, path, `{"access_token":"synthetic-access"}`)
+	detection, err := New().DetectExistingAuth()
+	if err != nil || !detection.Found {
+		t.Fatalf("detect: %+v, %v", detection, err)
+	}
+	writeGeminiFixture(t, path, `{"access_token":null}`)
+	prof := &profile.Profile{Name: "changed", Provider: "gemini", BasePath: t.TempDir()}
+	if _, err := New().ImportAuth(context.Background(), detection.Primary.Path, prof); err == nil {
+		t.Fatal("import trusted validation from before the native source changed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	writeGeminiFixture(t, path, `{"access_token":"synthetic-access"}`)
+	if _, err := New().ImportAuth(ctx, path, prof); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled import error = %v", err)
+	}
+	if _, err := os.Stat(prof.HomePath()); !os.IsNotExist(err) {
+		t.Fatal("failed or canceled import created destination files")
+	}
+}
+
+func TestGeminiPassiveValidationRequiresUsableSelectedCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    provider.AuthMode
+		files   map[string]string
+		valid   bool
+		expired bool
+	}{
+		{
+			name: "native CLI can renew expired OAuth", mode: provider.AuthModeOAuth,
+			files: map[string]string{"home/.gemini/oauth_creds.json": `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expiry_date":1600000000000}`},
+			valid: true, expired: true,
+		},
+		{
+			name: "expired access-only OAuth is unusable", mode: provider.AuthModeOAuth,
+			files:   map[string]string{"home/.gemini/oauth_creds.json": `{"access_token":"synthetic-access","expiry_date":1600000000000}`},
+			expired: true,
+		},
+		{
+			name: "null access is not authenticated", mode: provider.AuthModeOAuth,
+			files: map[string]string{"home/.gemini/oauth_creds.json": `{"access_token":null}`, "home/.gemini/settings.json": `{"theme":"private"}`},
+		},
+		{
+			name: "null refresh cannot renew expired access", mode: provider.AuthModeOAuth,
+			files: map[string]string{"home/.gemini/oauth_creds.json": `{"access_token":"synthetic-access","refresh_token":null,"expiry_date":1600000000000}`},
+		},
+		{
+			name: "settings policy alone is not OAuth", mode: provider.AuthModeOAuth,
+			files: map[string]string{"home/.gemini/settings.json": `{"theme":"private"}`},
+		},
+		{
+			name: "API key comment is not authentication", mode: provider.AuthModeAPIKey,
+			files: map[string]string{"home/.gemini/.env": "# GEMINI_API_KEY=synthetic-key\n"},
+		},
+		{
+			name: "complete ADC is valid without an OAuth cache", mode: provider.AuthModeVertexADC,
+			files: map[string]string{"gcloud/application_default_credentials.json": `{"type":"authorized_user","client_id":"synthetic-client","client_secret":"synthetic-secret","refresh_token":"synthetic-refresh"}`},
+			valid: true,
+		},
+		{
+			name: "type-only ADC is not valid", mode: provider.AuthModeVertexADC,
+			files: map[string]string{"gcloud/application_default_credentials.json": `{"type":"authorized_user"}`},
+		},
+		{
+			name: "OAuth profile cannot use selected API key", mode: provider.AuthModeOAuth,
+			files: map[string]string{"home/.gemini/settings.json": `{"selectedAuthType":"gemini-api-key"}`, "home/.gemini/.env": "GEMINI_API_KEY=synthetic-key\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateGeminiDetection(t)
+			t.Setenv("GEMINI_API_KEY", "")
+			prof := &profile.Profile{Name: "passive", Provider: "gemini", AuthMode: string(tc.mode), BasePath: t.TempDir()}
+			for name, data := range tc.files {
+				writeGeminiFixture(t, filepath.Join(prof.BasePath, name), data)
+			}
+			result, err := New().ValidateToken(context.Background(), prof, true)
+			if err != nil || result == nil || result.Valid != tc.valid {
+				t.Fatalf("passive result %+v, %v; want valid=%v", result, err, tc.valid)
+			}
+			if tc.expired && (result.ExpiresAt.IsZero() || !result.ExpiresAt.Before(time.Now())) {
+				t.Fatalf("passive validation lost the expired timestamp: %+v", result)
+			}
+		})
+	}
+}
+
+func TestGeminiOAuthExpiryBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		key     string
+		value   string
+		expires string
+	}{
+		{"native milliseconds upper bound", "expiry_date", "253402300799999", "9999-12-31T23:59:59.999Z"},
+		{"seconds upper bound", "expires_at", "253402300799", "9999-12-31T23:59:59Z"},
+		{"RFC3339 upper bound", "expiresAt", `"9999-12-31T23:59:59Z"`, "9999-12-31T23:59:59Z"},
+		{"native milliseconds year 10000", "expiry_date", "253402300800000", ""},
+		{"seconds year 10000", "expires_at", "253402300800", ""},
+		{"int64 rounded overflow", "expiry_date", "9223372036854775807", ""},
+		{"int64 overflow", "expiry_date", "9223372036854775808", ""},
+		{"RFC3339 UTC year 10000", "expiresAt", `"9999-12-31T23:59:59-01:00"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateGeminiDetection(t)
+			prof := &profile.Profile{Name: "expiry", Provider: "gemini", AuthMode: "oauth", BasePath: t.TempDir()}
+			data := `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","` + tc.key + `":` + tc.value + `}`
+			writeGeminiFixture(t, filepath.Join(prof.HomePath(), ".gemini", "oauth_creds.json"), data)
+			result, err := New().ValidateToken(context.Background(), prof, true)
+			if err != nil || result == nil || result.Valid != (tc.expires != "") {
+				t.Fatalf("expiry validation = %+v, %v", result, err)
+			}
+			if tc.expires != "" && result.ExpiresAt.UTC().Format(time.RFC3339Nano) != tc.expires {
+				t.Fatalf("expiry = %s, want %s", result.ExpiresAt, tc.expires)
+			}
+		})
+	}
+}
+
+func TestGeminiImportRejectsNonregularAndOversizedSources(t *testing.T) {
+	for _, kind := range []string{"directory", "oversized"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "oauth_creds.json")
+			if kind == "directory" {
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				file, err := os.Create(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = file.Truncate((16 << 20) + 1)
+				closeErr := file.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("prepare oversized fixture: %v, %v", err, closeErr)
+				}
+			}
+			prof := &profile.Profile{Name: "bounded", Provider: "gemini", BasePath: t.TempDir()}
+			if _, err := New().ImportAuth(context.Background(), path, prof); err == nil {
+				t.Fatal("invalid source was imported")
+			}
+			if _, err := os.Stat(prof.HomePath()); !os.IsNotExist(err) {
+				t.Fatal("invalid source created an account directory")
+			}
+		})
+	}
+}
+
+func isolateGeminiDetection(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GEMINI_HOME", "")
+	t.Setenv("GEMINI_CLI_HOME", "")
+	t.Setenv("CLOUDSDK_CONFIG", "")
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI"} {
+		t.Setenv(key, "") // Register restoration before making the value absent.
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(home, ".gemini")
+}
+
+func writeGeminiFixture(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeJSON(t *testing.T, path string, data interface{}) {

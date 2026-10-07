@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1019,7 +1020,9 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 		}
 		if credentials.expiresAt != nil {
 			result.ExpiresAt = *credentials.expiresAt
-			if result.ExpiresAt.Before(timeNow()) {
+			// Claude renews a complete grant itself. Preserve the access
+			// expiry for reporting without requiring another browser login.
+			if !result.ExpiresAt.After(result.CheckedAt) && !credentials.hasRefresh {
 				result.Valid = false
 				result.Error = "token has expired"
 				return result, nil
@@ -1233,6 +1236,30 @@ func parseClaudeCredentials(data []byte) (*claudeCredentials, error) {
 	if err := json.Unmarshal(data, &creds); err != nil {
 		return nil, err
 	}
+	if creds.ClaudeAiOauth != nil {
+		// A missing refresh token is an access-only grant, but a present
+		// null, empty or malformed token must not make a grant renewable.
+		var raw struct {
+			OAuth map[string]json.RawMessage `json:"claudeAiOauth"`
+		}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return nil, err
+		}
+		for _, key := range []string{"accessToken", "refreshToken"} {
+			if value, exists := raw.OAuth[key]; exists {
+				var token string
+				if json.Unmarshal(value, &token) != nil || strings.TrimSpace(token) == "" {
+					return nil, fmt.Errorf("%s must be a nonempty string", key)
+				}
+			}
+		}
+		if _, exists := raw.OAuth["expiresAt"]; exists {
+			expiry := creds.ClaudeAiOauth.ExpiresAt
+			if expiry <= 0 || expiry >= float64(math.MaxInt64) || math.Trunc(expiry) != expiry {
+				return nil, fmt.Errorf("expiresAt must be a positive millisecond timestamp")
+			}
+		}
+	}
 	return &creds, nil
 }
 
@@ -1244,7 +1271,8 @@ func (c *claudeCredentials) hasToken() bool {
 }
 
 type credentialsInfo struct {
-	expiresAt *time.Time
+	expiresAt  *time.Time
+	hasRefresh bool
 }
 
 func loadClaudeCredentials(path string) (*credentialsInfo, error) {
@@ -1261,7 +1289,7 @@ func loadClaudeCredentials(path string) (*credentialsInfo, error) {
 		return nil, fmt.Errorf("no access credential in .credentials.json")
 	}
 
-	info := &credentialsInfo{}
+	info := &credentialsInfo{hasRefresh: strings.TrimSpace(creds.ClaudeAiOauth.RefreshToken) != ""}
 	if creds.ClaudeAiOauth != nil && creds.ClaudeAiOauth.ExpiresAt > 0 {
 		exp := time.UnixMilli(int64(creds.ClaudeAiOauth.ExpiresAt))
 		info.expiresAt = &exp
@@ -1271,9 +1299,10 @@ func loadClaudeCredentials(path string) (*credentialsInfo, error) {
 
 // claudeCredCandidate is one probed .credentials.json candidate.
 type claudeCredCandidate struct {
-	path      string
-	parseErr  error
-	expiresAt *time.Time
+	path       string
+	parseErr   error
+	expiresAt  *time.Time
+	hasRefresh bool
 }
 
 func readClaudeCredentialCandidate(path string) *claudeCredCandidate {
@@ -1285,6 +1314,7 @@ func readClaudeCredentialCandidate(path string) *claudeCredCandidate {
 		candidate.parseErr = err
 	} else {
 		candidate.expiresAt = info.expiresAt
+		candidate.hasRefresh = info.hasRefresh
 	}
 	return candidate
 }

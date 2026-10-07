@@ -4,6 +4,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	osexec "os/exec"
@@ -48,6 +49,13 @@ func init() {
 }
 
 func runInitWizard(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	quick, _ := cmd.Flags().GetBool("quick")
 	noShell, _ := cmd.Flags().GetBool("no-shell")
@@ -71,49 +79,32 @@ func runInitWizard(cmd *cobra.Command, args []string) error {
 	// Phase 2: Detect tools
 	detectTools(false)
 
-	// Phase 3: NEW - Provider-based auth detection
+	// Phase 3: Provider-based auth detection
 	providerDetections := detectProviderAuth()
 	printProviderDetectionResults(providerDetections)
 
-	// Phase 4: NEW - Import detected auth as profiles
-	importedCount := 0
-	hasDetectedAuth := false
-	for _, d := range providerDetections {
-		if d.Error == nil && d.Detection != nil && d.Detection.Found {
-			hasDetectedAuth = true
-			break
-		}
-	}
-	if hasDetectedAuth {
-		importedCount = importDetectedAuth(providerDetections, quick)
+	// Phase 4: Every provider uses the same validated import transaction.
+	// A rejected native credential must never be resurrected by legacy backup.
+	importedCount, importErr := importDetectedAuth(ctx, providerDetections, quick)
+	if err := ctx.Err(); err != nil {
+		return errors.Join(importErr, err)
 	}
 
-	// Phase 5: Fallback - Also run legacy discovery for any sessions not covered
-	scanResult := discovery.Scan()
-	legacySavedCount := 0
-	if len(scanResult.Found) > 0 && importedCount == 0 {
-		// Only show legacy discovery if new import didn't find anything
-		printDiscoveryResults(scanResult)
-		legacySavedCount = saveDiscoveredSessions(scanResult.Found, quick)
-	}
-
-	totalSaved := importedCount + legacySavedCount
-
-	// Phase 6: Browser configuration (optional)
+	// Phase 5: Browser configuration (optional)
 	browserConfigured := false
 	if !quick {
 		browserConfigured = setupBrowserConfiguration()
 	}
 
-	// Phase 7: Shell integration (optional)
+	// Phase 6: Shell integration (optional)
 	if !noShell && (quick || promptYesNo("Set up shell integration for seamless usage?", true)) {
 		setupShellIntegration()
 	}
 
-	// Phase 8: Print summary
-	printSetupSummaryV2(providerDetections, totalSaved, browserConfigured)
+	// Phase 7: Print summary; successful imports remain available if another fails.
+	printSetupSummaryV2(providerDetections, importedCount, browserConfigured)
 
-	return nil
+	return importErr
 }
 
 func printWelcomeBanner() {
@@ -153,58 +144,6 @@ func printDiscoveryResults(result *discovery.ScanResult) {
 		fmt.Printf("    [--] %-8s not found or not logged in\n", tool)
 	}
 	fmt.Println()
-}
-
-func saveDiscoveredSessions(found []discovery.DiscoveredAuth, autoSave bool) int {
-	fmt.Println("------------------------------------------------------------")
-	fmt.Println("  STEP 1: Save Current Sessions")
-	fmt.Println("------------------------------------------------------------")
-	fmt.Println()
-	fmt.Println("  Saving your sessions as profiles lets you switch back to them later.")
-	fmt.Println()
-
-	vault := authfile.NewVault(authfile.DefaultVaultPath())
-	savedCount := 0
-
-	for _, auth := range found {
-		// Suggest profile name based on identity
-		suggested := suggestProfileName(auth)
-
-		var profileName string
-		if autoSave {
-			profileName = suggested
-			fmt.Printf("  Saving %s as '%s'...\n", auth.Tool, profileName)
-		} else {
-			fmt.Printf("  Save your %s session as a profile?\n", auth.Tool)
-			if auth.Identity != "" {
-				fmt.Printf("  Currently logged in as: %s\n", auth.Identity)
-			}
-			profileName = promptWithDefault(fmt.Sprintf("  Profile name [%s]:", suggested), suggested)
-			if profileName == "" {
-				fmt.Println("  Skipped.")
-				continue
-			}
-		}
-
-		// Get the auth file set for this tool
-		fileSet := getAuthFileSetForTool(string(auth.Tool))
-		if fileSet == nil {
-			fmt.Printf("  Error: unknown tool %s\n", auth.Tool)
-			continue
-		}
-
-		// Backup to vault
-		if err := vault.Backup(*fileSet, profileName); err != nil {
-			fmt.Printf("  Error saving profile: %v\n", err)
-			continue
-		}
-
-		fmt.Printf("  [OK] Saved %s/%s\n", auth.Tool, profileName)
-		savedCount++
-	}
-
-	fmt.Println()
-	return savedCount
 }
 
 func suggestProfileName(auth discovery.DiscoveredAuth) string {
@@ -538,7 +477,7 @@ func printSetupSummaryV2(detections []ProviderAuthDetection, savedCount int, bro
 	// Show providers without auth
 	missingAuth := []string{}
 	for _, d := range detections {
-		if d.Error != nil || !d.Detection.Found {
+		if d.Error != nil || d.Detection == nil || !d.Detection.Found {
 			missingAuth = append(missingAuth, d.DisplayName)
 		}
 	}
@@ -706,8 +645,12 @@ func printProviderDetectionResults(detections []ProviderAuthDetection) {
 			continue
 		}
 
-		if !d.Detection.Found {
+		if d.Detection == nil || !d.Detection.Found {
 			fmt.Printf("  [--] %s: no existing auth detected\n", d.DisplayName)
+			continue
+		}
+		if d.Detection.Primary == nil || !d.Detection.Primary.Exists || !d.Detection.Primary.IsValid || d.Detection.Primary.Path == "" {
+			fmt.Printf("  [!] %s: detected source is not a complete usable credential\n", d.DisplayName)
 			continue
 		}
 
@@ -743,7 +686,13 @@ func printProviderDetectionResults(detections []ProviderAuthDetection) {
 }
 
 // importDetectedAuth imports detected auth credentials into profiles.
-func importDetectedAuth(detections []ProviderAuthDetection, autoSave bool) int {
+func importDetectedAuth(ctx context.Context, detections []ProviderAuthDetection, autoSave bool) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if registry == nil || profileStore == nil {
+		return 0, fmt.Errorf("provider registry or profile store is unavailable")
+	}
 	fmt.Println("------------------------------------------------------------")
 	fmt.Println("  IMPORT: Create Profiles from Detected Auth")
 	fmt.Println("------------------------------------------------------------")
@@ -752,24 +701,39 @@ func importDetectedAuth(detections []ProviderAuthDetection, autoSave bool) int {
 	fmt.Println("  can switch between without re-authenticating.")
 	fmt.Println()
 
-	ctx := context.Background()
 	importedCount := 0
+	var failures []error
 
 	for _, d := range detections {
-		if d.Error != nil || !d.Detection.Found || d.Detection.Primary == nil {
+		if err := ctx.Err(); err != nil {
+			return importedCount, errors.Join(append(failures, err)...)
+		}
+		if d.Error != nil {
+			failures = append(failures, fmt.Errorf("detect %s auth: %w", d.ProviderID, d.Error))
+			continue
+		}
+		if d.Detection == nil {
+			failures = append(failures, fmt.Errorf("%s returned no auth detection result", d.ProviderID))
+			continue
+		}
+		if !d.Detection.Found {
+			continue
+		}
+		loc := d.Detection.Primary
+		if d.Detection.Provider != d.ProviderID || loc == nil || !loc.Exists || !loc.IsValid || strings.TrimSpace(loc.Path) == "" {
+			failures = append(failures, fmt.Errorf("%s reported an incomplete or invalid auth source", d.ProviderID))
 			continue
 		}
 
 		prov, ok := registry.Get(d.ProviderID)
 		if !ok {
+			failures = append(failures, fmt.Errorf("unknown detected provider %s", d.ProviderID))
 			continue
 		}
 
-		loc := d.Detection.Primary
-
 		// Check if profile already exists
 		defaultName := "default"
-		if profileStore.Exists(d.ProviderID, defaultName) {
+		if autoSave && profileStore.Exists(d.ProviderID, defaultName) {
 			fmt.Printf("  [--] %s: profile 'default' already exists, skipping\n", d.DisplayName)
 			continue
 		}
@@ -790,32 +754,14 @@ func importDetectedAuth(detections []ProviderAuthDetection, autoSave bool) int {
 			}
 		}
 
-		// Create profile
-		prof, err := profileStore.Create(d.ProviderID, profileName, "oauth")
+		if profileStore.Exists(d.ProviderID, profileName) {
+			fmt.Printf("  [--] %s: profile '%s' already exists, skipping\n", d.DisplayName, profileName)
+			continue
+		}
+		_, err := importAuthProfile(ctx, prov, profileName, loc.Path, "Imported during caam init", false)
 		if err != nil {
-			fmt.Printf("  [!] Error creating profile: %v\n", err)
-			continue
-		}
-
-		// Save profile
-		if err := prof.Save(); err != nil {
-			profileStore.Delete(d.ProviderID, profileName)
-			fmt.Printf("  [!] Error saving profile: %v\n", err)
-			continue
-		}
-
-		// Prepare profile directory
-		if err := prov.PrepareProfile(ctx, prof); err != nil {
-			profileStore.Delete(d.ProviderID, profileName)
-			fmt.Printf("  [!] Error preparing profile: %v\n", err)
-			continue
-		}
-
-		// Import auth
-		_, err = prov.ImportAuth(ctx, loc.Path, prof)
-		if err != nil {
-			profileStore.Delete(d.ProviderID, profileName)
 			fmt.Printf("  [!] Error importing auth: %v\n", err)
+			failures = append(failures, fmt.Errorf("import %s auth: %w", d.ProviderID, err))
 			continue
 		}
 
@@ -824,7 +770,7 @@ func importDetectedAuth(detections []ProviderAuthDetection, autoSave bool) int {
 	}
 
 	fmt.Println()
-	return importedCount
+	return importedCount, errors.Join(failures...)
 }
 
 // shortenHomePath replaces home directory with ~.

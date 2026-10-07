@@ -21,6 +21,23 @@ import (
 // Watchers use the same limit while fingerprinting file changes.
 const MaxDiscoveryFileBytes int64 = 16 << 20
 
+// ValidateCredentialData checks the credential material in one native auth
+// artifact without reading or modifying its source. Callers that import a
+// complete bundle must also validate the provider's selected runtime layout.
+func ValidateCredentialData(tool, filename string, data []byte) error {
+	if int64(len(data)) > MaxDiscoveryFileBytes {
+		return fmt.Errorf("%w: credential file exceeds size limit", ErrInvalidCredentials)
+	}
+	material, err := discoveryMaterial(tool, filepath.Base(filename), data)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalidCredentials, err)
+	}
+	if len(material) == 0 {
+		return ErrNoCredentials
+	}
+	return nil
+}
+
 // DiscoveryResult describes a native login captured without changing live
 // files. Identity is extracted from the credential bytes that were saved;
 // profile names and unrelated settings are never proof of account ownership.

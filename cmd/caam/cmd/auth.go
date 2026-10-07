@@ -5,13 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
 
@@ -121,6 +125,7 @@ type AuthImportResult struct {
 	ProfilePath string   `json:"profile_path"`
 	SourceFile  string   `json:"source_file"`
 	CopiedFiles []string `json:"copied_files"`
+	BackupPath  string   `json:"backup_path,omitempty"`
 	Success     bool     `json:"success"`
 	Error       string   `json:"error,omitempty"`
 }
@@ -133,16 +138,17 @@ var authImportCmd = &cobra.Command{
 This detects existing auth credentials and imports them into a new profile,
 allowing you to manage multiple accounts without re-authenticating.
 
-The tool argument is required and specifies which CLI tool:
-  - claude  - Claude Code (Anthropic)
-  - codex   - Codex CLI (OpenAI)
-  - gemini  - Gemini CLI (Google)
+Credentials are validated before the profile becomes available. With --force,
+the previous profile is retained at the backup path printed in the result.
+An in-use profile cannot be replaced.
+
+Supported tools: claude, codex, gemini, grok, opencode, cursor, agy.
 
 Examples:
   caam auth import claude                    # Import Claude auth to 'default' profile
   caam auth import codex -n work             # Import Codex auth to 'work' profile
   caam auth import gemini --source ~/.gemini/settings.json  # Import specific file
-  caam auth import claude --force            # Overwrite existing profile
+  caam auth import claude --force            # Replace and retain previous profile
   caam auth import claude --json             # Output as JSON
 
 Use 'caam auth detect' first to see what auth files are available.`,
@@ -158,7 +164,7 @@ func init() {
 	authCmd.AddCommand(authImportCmd)
 	authImportCmd.Flags().StringP("name", "n", "default", "profile name")
 	authImportCmd.Flags().StringP("description", "d", "", "profile description")
-	authImportCmd.Flags().Bool("force", false, "overwrite existing profile")
+	authImportCmd.Flags().Bool("force", false, "replace an existing profile after validation, retaining its previous data")
 	authImportCmd.Flags().String("source", "", "path to auth file (overrides detection)")
 	authImportCmd.Flags().Bool("json", false, "output in JSON format")
 }
@@ -408,110 +414,168 @@ func runAuthImport(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("detect auth: %w", err)
 		}
-		if !detection.Found || detection.Primary == nil {
+		if detection == nil || !detection.Found || detection.Primary == nil || !detection.Primary.IsValid {
 			return fmt.Errorf("no existing auth detected for %s; run 'caam auth detect %s' to see details or use --source", tool, tool)
 		}
 		sourcePath = detection.Primary.Path
 	}
 
-	result := AuthImportResult{
-		Provider:    tool,
-		ProfileName: name,
-		SourceFile:  sourcePath,
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	// Delete existing profile if force is set
-	if profileStore.Exists(tool, name) && force {
-		if err := profileStore.Delete(tool, name); err != nil {
-			result.Error = fmt.Sprintf("delete existing profile: %v", err)
-			if jsonOutput {
-				return outputImportResult(result)
-			}
-			return fmt.Errorf("delete existing profile: %w", err)
-		}
-	}
-
-	// Create profile
-	// Use "oauth" as default auth mode since we're importing existing auth
-	prof, err := profileStore.Create(tool, name, "oauth")
-	if err != nil {
-		result.Error = fmt.Sprintf("create profile: %v", err)
-		if jsonOutput {
-			return outputImportResult(result)
-		}
-		return fmt.Errorf("create profile: %w", err)
-	}
-
-	// Set description if provided
-	if description != "" {
-		prof.Description = description
-	}
-
-	// Save profile
-	if err := prof.Save(); err != nil {
-		profileStore.Delete(tool, name)
-		result.Error = fmt.Sprintf("save profile: %v", err)
-		if jsonOutput {
-			return outputImportResult(result)
-		}
-		return fmt.Errorf("save profile: %w", err)
-	}
-
-	// Prepare profile directory structure
-	ctx := context.Background()
-	if err := prov.PrepareProfile(ctx, prof); err != nil {
-		profileStore.Delete(tool, name)
-		result.Error = fmt.Sprintf("prepare profile: %v", err)
-		if jsonOutput {
-			return outputImportResult(result)
-		}
-		return fmt.Errorf("prepare profile: %w", err)
-	}
-
-	// Import auth files
-	copiedFiles, err := prov.ImportAuth(ctx, sourcePath, prof)
-	if err != nil {
-		profileStore.Delete(tool, name)
-		result.Error = fmt.Sprintf("import auth: %v", err)
-		if jsonOutput {
-			return outputImportResult(result)
-		}
-		return fmt.Errorf("import auth: %w", err)
-	}
-
-	result.Success = true
-	result.ProfilePath = prof.BasePath
-	result.CopiedFiles = copiedFiles
-
+	result, err := importAuthProfile(ctx, prov, name, sourcePath, description, force)
 	if jsonOutput {
-		return outputImportResult(result)
+		return outputImportResult(cmd, result)
+	}
+	if err != nil {
+		return err
 	}
 
 	// Print success message
 	displayName := getProviderDisplayName(tool)
-	fmt.Printf("Successfully imported %s auth to profile '%s'\n", displayName, name)
-	fmt.Printf("\n")
-	fmt.Printf("  Profile: %s/%s\n", tool, name)
-	fmt.Printf("  Path: %s\n", prof.BasePath)
-	fmt.Printf("  Source: %s\n", shortenPath(sourcePath))
-	fmt.Printf("  Files copied:\n")
-	for _, f := range copiedFiles {
-		fmt.Printf("    - %s\n", shortenPath(f))
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "Successfully imported %s auth to profile '%s'\n\n", displayName, name)
+	fmt.Fprintf(out, "  Profile: %s/%s\n", tool, name)
+	fmt.Fprintf(out, "  Path: %s\n", result.ProfilePath)
+	fmt.Fprintf(out, "  Source: %s\n", shortenPath(sourcePath))
+	if result.BackupPath != "" {
+		fmt.Fprintf(out, "  Previous profile retained at: %s\n", result.BackupPath)
 	}
-	fmt.Printf("\n")
-	fmt.Printf("Next steps:\n")
-	fmt.Printf("  Run your CLI with: caam exec %s %s -- <your command>\n", tool, name)
-	fmt.Printf("  Or activate profile: eval \"$(caam env %s %s)\"\n", tool, name)
+	fmt.Fprintln(out, "  Files copied:")
+	for _, f := range result.CopiedFiles {
+		fmt.Fprintf(out, "    - %s\n", shortenPath(f))
+	}
+	fmt.Fprint(out, "\nNext steps:\n")
+	fmt.Fprintf(out, "  Run your CLI with: caam exec %s %s -- <your command>\n", tool, name)
+	fmt.Fprintf(out, "  Or activate profile: eval \"$(caam env %s %s)\"\n", tool, name)
 
 	return nil
 }
 
-func outputImportResult(result AuthImportResult) error {
+// importAuthProfile is the shared intake path for explicit imports and setup.
+// Credentials are checked inside an unpublished profile, so errors cannot
+// remove a working account or leave a partially imported account routable.
+func importAuthProfile(ctx context.Context, prov provider.Provider, name, sourcePath, description string, force bool) (result AuthImportResult, err error) {
+	result = AuthImportResult{Provider: prov.ID(), ProfileName: name, SourceFile: sourcePath}
+	defer func() {
+		if err != nil {
+			result.Error = err.Error()
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return result, fmt.Errorf("inspect source credential: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+		return result, fmt.Errorf("source credential must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+	}
+	var relativeFiles []string
+	imported, err := profileStore.Import(ctx, prov.ID(), name, string(provider.AuthModeOAuth), force, func(prof *profile.Profile) error {
+		prof.Description = description
+		if err := prov.PrepareProfile(ctx, prof); err != nil {
+			return fmt.Errorf("prepare profile: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		files, err := prov.ImportAuth(ctx, sourcePath, prof)
+		if err != nil {
+			return fmt.Errorf("import auth: %w", err)
+		}
+		relativeFiles, err = validateImportedFiles(prov.ID(), prof.BasePath, files)
+		if err != nil {
+			return err
+		}
+		if err := prov.ValidateProfile(ctx, prof); err != nil {
+			return fmt.Errorf("validate imported profile: %w", err)
+		}
+		validation, err := prov.ValidateToken(ctx, prof, true)
+		if err != nil {
+			return fmt.Errorf("validate imported credentials: %w", err)
+		}
+		if validation == nil || !validation.Valid {
+			reason := "provider did not confirm usable credentials"
+			if validation != nil && validation.Error != "" {
+				reason = validation.Error
+			}
+			return fmt.Errorf("validate imported credentials: %s", reason)
+		}
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+	result.Success = true
+	result.ProfilePath = imported.Profile.BasePath
+	result.BackupPath = imported.BackupPath
+	for _, path := range relativeFiles {
+		result.CopiedFiles = append(result.CopiedFiles, filepath.Join(result.ProfilePath, path))
+	}
+	return result, nil
+}
+
+func validateImportedFiles(tool, basePath string, files []string) ([]string, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf("import produced no credential files")
+	}
+	root, err := filepath.EvalSymlinks(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve imported profile: %w", err)
+	}
+	var relativeFiles []string
+	for _, path := range files {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(basePath, path)
+		}
+		relative, err := filepath.Rel(basePath, path)
+		if err != nil || !filepath.IsLocal(relative) {
+			return nil, fmt.Errorf("imported file is outside the profile")
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve imported file: %w", err)
+		}
+		inside, err := filepath.Rel(root, resolved)
+		if err != nil || !filepath.IsLocal(inside) {
+			return nil, fmt.Errorf("imported file points outside the profile")
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+			return nil, fmt.Errorf("imported file must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+		}
+		// These adapters retain permissive passive validators for historical
+		// formats. Apply the native discovery credential checks before intake.
+		if tool == "grok" || tool == "opencode" || tool == "agy" {
+			f, err := os.Open(path)
+			if err != nil {
+				return nil, fmt.Errorf("read imported credential: %w", err)
+			}
+			data, readErr := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
+			closeErr := f.Close()
+			if readErr != nil || closeErr != nil {
+				return nil, fmt.Errorf("cannot read imported credential")
+			}
+			if err := authfile.ValidateCredentialData(tool, filepath.Base(path), data); err != nil {
+				return nil, fmt.Errorf("validate imported credential: %w", err)
+			}
+		}
+		relativeFiles = append(relativeFiles, relative)
+	}
+	return relativeFiles, nil
+}
+
+func outputImportResult(cmd *cobra.Command, result AuthImportResult) error {
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(data))
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(data)); err != nil {
+		return err
+	}
 	if !result.Success {
 		return fmt.Errorf("%s", result.Error)
 	}

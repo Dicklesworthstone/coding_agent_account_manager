@@ -1,7 +1,9 @@
 package codex
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -578,7 +580,6 @@ func TestFullProfileLifecycle(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // DetectExistingAuth Tests
 // =============================================================================
@@ -587,6 +588,7 @@ func TestDetectExistingAuth(t *testing.T) {
 	setupEnv := func(t *testing.T) string {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
+		t.Setenv("CODEX_HOME", "")
 		return home
 	}
 
@@ -670,32 +672,71 @@ func TestDetectExistingAuth(t *testing.T) {
 		}
 	})
 
-	t.Run("prioritizes recent file", func(t *testing.T) {
+	t.Run("configured home wins over a newer default login", func(t *testing.T) {
 		home := setupEnv(t)
 		customHome := t.TempDir()
 		t.Setenv("CODEX_HOME", customHome)
 		p := New()
 
-		// Old file in default location
+		// A different account in the default home must never override CODEX_HOME.
 		defaultDir := filepath.Join(home, ".codex")
 		os.MkdirAll(defaultDir, 0700)
 		defaultPath := filepath.Join(defaultDir, "auth.json")
-		writeJSON(t, defaultPath, map[string]interface{}{"token": "old"})
-		os.Chtimes(defaultPath, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
+		writeJSON(t, defaultPath, map[string]interface{}{"token": "other-account"})
+		os.Chtimes(defaultPath, time.Now(), time.Now())
 
-		// New file in custom location
+		// The configured account is authoritative even when its file is older.
 		customPath := filepath.Join(customHome, "auth.json")
-		writeJSON(t, customPath, map[string]interface{}{"token": "new"})
-		os.Chtimes(customPath, time.Now(), time.Now())
+		writeJSON(t, customPath, map[string]interface{}{"token": "configured-account"})
+		os.Chtimes(customPath, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour))
 
-		detection, _ := p.DetectExistingAuth()
-		if detection.Primary.Path != customPath {
-			t.Errorf("Should pick custom path (newer). Got %s", detection.Primary.Path)
+		detection, err := p.DetectExistingAuth()
+		if err != nil {
+			t.Fatal(err)
 		}
-		if detection.Warning == "" {
-			t.Error("Should warn about multiple files")
+		if detection.Primary == nil || detection.Primary.Path != customPath {
+			t.Fatalf("primary=%+v, want configured home %s", detection.Primary, customPath)
+		}
+		if len(detection.Locations) != 1 || detection.Locations[0].Path != customPath {
+			t.Fatalf("unconfigured account was scanned: %+v", detection.Locations)
 		}
 	})
+}
+
+func TestCodexDetectionDoesNotFallbackFromInvalidConfiguredHome(t *testing.T) {
+	for _, body := range []string{"missing", `{`, `{"tokens":null}`, `{"access_token":false}`, "directory"} {
+		t.Run(body, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			configured := t.TempDir()
+			t.Setenv("CODEX_HOME", configured)
+			defaultDir := filepath.Join(home, ".codex")
+			if err := os.MkdirAll(defaultDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeJSON(t, filepath.Join(defaultDir, "auth.json"), map[string]any{"access_token": "other-account"})
+			configuredPath := filepath.Join(configured, "auth.json")
+			if body == "directory" {
+				if err := os.Mkdir(configuredPath, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else if body != "missing" {
+				if err := os.WriteFile(configuredPath, []byte(body), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			detection, err := New().DetectExistingAuth()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if detection.Found || detection.Primary != nil {
+				t.Fatalf("unconfigured account rescued invalid CODEX_HOME: %+v", detection)
+			}
+			if len(detection.Locations) != 1 || detection.Locations[0].Path != configuredPath {
+				t.Fatalf("unexpected locations: %+v", detection.Locations)
+			}
+		})
+	}
 }
 
 // =============================================================================
@@ -743,6 +784,229 @@ func TestImportAuth(t *testing.T) {
 			t.Error("Should fail")
 		}
 	})
+}
+
+func TestCodexCredentialIntake(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		mode provider.AuthMode
+	}{
+		{"modern nested OAuth", `{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","id_token":"synthetic-id","account_id":"workspace"},"last_refresh":"2026-10-06T12:00:00Z"}`, provider.AuthModeOAuth},
+		{"native API key", `{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key","tokens":null,"last_refresh":null}`, provider.AuthModeAPIKey},
+		{"flat access token", `{"access_token":"synthetic-access"}`, provider.AuthModeOAuth},
+		{"flat camel case token", `{"accessToken":"synthetic-access"}`, provider.AuthModeOAuth},
+		{"flat token alias", `{"token":"synthetic-access"}`, provider.AuthModeOAuth},
+		{"flat API key", `{"api_key":"synthetic-key"}`, provider.AuthModeAPIKey},
+		{"camel case API key", `{"apiKey":"synthetic-key"}`, provider.AuthModeAPIKey},
+		{"matching access aliases", `{"access_token":"synthetic-access","accessToken":"synthetic-access"}`, provider.AuthModeOAuth},
+		{"empty optional API key with OAuth", `{"OPENAI_API_KEY":"","tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`, provider.AuthModeOAuth},
+		{"invalid JSON", `{`, ""},
+		{"null document", `null`, ""},
+		{"array document", `[]`, ""},
+		{"empty object", `{}`, ""},
+		{"settings only", `{"model":"gpt-5"}`, ""},
+		{"null access", `{"access_token":null}`, ""},
+		{"numeric access", `{"access_token":12}`, ""},
+		{"empty access", `{"access_token":"  "}`, ""},
+		{"refresh only", `{"refresh_token":"synthetic-refresh"}`, ""},
+		{"identity only", `{"id_token":"synthetic-id"}`, ""},
+		{"null API key only", `{"OPENAI_API_KEY":null}`, ""},
+		{"numeric API key", `{"OPENAI_API_KEY":12}`, ""},
+		{"null tokens only", `{"tokens":null}`, ""},
+		{"array tokens", `{"tokens":[]}`, ""},
+		{"string tokens", `{"tokens":"synthetic-access"}`, ""},
+		{"empty tokens", `{"tokens":{}}`, ""},
+		{"nested null access", `{"tokens":{"access_token":null,"refresh_token":"synthetic-refresh"}}`, ""},
+		{"nested refresh only", `{"tokens":{"refresh_token":"synthetic-refresh"}}`, ""},
+		{"null refresh", `{"access_token":"synthetic-access","refresh_token":null}`, ""},
+		{"empty refresh", `{"access_token":"synthetic-access","refresh_token":""}`, ""},
+		{"wrong refresh type", `{"access_token":"synthetic-access","refresh_token":{}}`, ""},
+		{"conflicting access aliases", `{"access_token":"first","accessToken":"second"}`, ""},
+		{"conflicting credential layouts", `{"access_token":"first","tokens":{"access_token":"second"}}`, ""},
+		{"malformed flat token with valid nested login", `{"access_token":false,"tokens":{"access_token":"synthetic-access"}}`, ""},
+		{"malformed identity", `{"tokens":{"access_token":"synthetic-access","account_id":[]}}`, ""},
+		{"wrong nested fields with valid flat token", `{"access_token":"synthetic-access","tokens":{"access_token":false}}`, ""},
+		{"wrong API key type with OAuth", `{"OPENAI_API_KEY":false,"tokens":{"access_token":"synthetic-access"}}`, ""},
+		{"bad expiry", `{"access_token":"synthetic-access","expires_at":"tomorrow"}`, ""},
+		{"null expiry", `{"access_token":"synthetic-access","expires_at":null}`, ""},
+		{"out of range expiry", `{"access_token":"synthetic-access","expires_at":1e30}`, ""},
+		{"bad last refresh", `{"tokens":{"access_token":"synthetic-access"},"last_refresh":false}`, ""},
+		{"bad auth mode", `{"auth_mode":true,"access_token":"synthetic-access"}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("CODEX_HOME", "")
+			source := filepath.Join(home, ".codex", "auth.json")
+			if err := os.MkdirAll(filepath.Dir(source), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := New()
+			detection, err := p.DetectExistingAuth()
+			if err != nil {
+				t.Fatal(err)
+			}
+			valid := tc.mode != ""
+			if detection.Found != valid || (detection.Primary != nil) != valid {
+				t.Errorf("detection found=%v primary=%v, want valid=%v", detection.Found, detection.Primary != nil, valid)
+			}
+			if len(detection.Locations) != 1 || detection.Locations[0].IsValid != valid {
+				t.Fatalf("unexpected detection locations: %+v", detection.Locations)
+			}
+			prof := &profile.Profile{Name: "imported", Provider: "codex", AuthMode: "unchanged", BasePath: filepath.Join(t.TempDir(), "target")}
+			copied, err := p.ImportAuth(context.Background(), source, prof)
+			if !valid {
+				if err == nil {
+					t.Fatal("malformed credential imported successfully")
+				}
+				if _, err := os.Lstat(prof.BasePath); !os.IsNotExist(err) {
+					t.Fatalf("invalid import created a profile directory: %v", err)
+				}
+				if prof.AuthMode != "unchanged" {
+					t.Fatalf("invalid import changed auth mode: %s", prof.AuthMode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ImportAuth: %v", err)
+			}
+			target := filepath.Join(prof.CodexHomePath(), "auth.json")
+			if len(copied) != 1 || copied[0] != target {
+				t.Fatalf("copied=%v, want %s", copied, target)
+			}
+			data, err := os.ReadFile(target)
+			if err != nil || !bytes.Equal(data, []byte(tc.body)) {
+				t.Fatalf("import did not preserve credential bytes: %v", err)
+			}
+			if prof.AuthMode != string(tc.mode) {
+				t.Errorf("auth mode=%s, want %s", prof.AuthMode, tc.mode)
+			}
+			validation, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || !validation.Valid {
+				t.Errorf("imported credential fails passive validation: %+v, %v", validation, err)
+			}
+			after, err := os.Stat(source)
+			if err != nil || before.Mode() != after.Mode() || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatalf("native source metadata changed: %v", err)
+			}
+			data, err = os.ReadFile(source)
+			if err != nil || !bytes.Equal(data, []byte(tc.body)) {
+				t.Fatalf("native source changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCodexImportUsesCanonicalPathAndPreservesTargetOnFailure(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "exported-credentials.json")
+	const native = `{"tokens":{"access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`
+	if err := os.WriteFile(source, []byte(native), 0644); err != nil {
+		t.Fatal(err)
+	}
+	prof := &profile.Profile{Name: "work", Provider: "codex", BasePath: t.TempDir()}
+	target := filepath.Join(prof.CodexHomePath(), "auth.json")
+	if _, err := New().ImportAuth(context.Background(), source, prof); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != native {
+		t.Fatalf("canonical credential missing: %v", err)
+	}
+	if info, err := os.Stat(target); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("imported credential permissions are not private: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(prof.CodexHomePath(), filepath.Base(source))); !os.IsNotExist(err) {
+		t.Fatalf("source basename was published as a credential path: %v", err)
+	}
+	if err := os.WriteFile(source, []byte(`{"tokens":null}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New().ImportAuth(context.Background(), source, prof); err == nil {
+		t.Fatal("invalid replacement succeeded")
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != native {
+		t.Fatalf("failed replacement changed working credentials: %v", err)
+	}
+}
+
+func TestCodexPassiveValidationUsesAccessExpiry(t *testing.T) {
+	jwt := func(exp time.Time) string {
+		claims, err := json.Marshal(map[string]any{"exp": exp.Unix()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".synthetic"
+	}
+	now := time.Now()
+	prof := &profile.Profile{Name: "work", Provider: "codex", BasePath: t.TempDir()}
+	if err := os.MkdirAll(prof.CodexHomePath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSON(t, filepath.Join(prof.CodexHomePath(), "auth.json"), map[string]any{"tokens": map[string]any{
+		"access_token": jwt(now.Add(time.Hour)), "id_token": jwt(now.Add(-time.Hour)), "refresh_token": "synthetic-refresh",
+	}})
+	result, err := New().ValidateToken(context.Background(), prof, true)
+	if err != nil || !result.Valid || result.ExpiresAt.Unix() != now.Add(time.Hour).Unix() {
+		t.Fatalf("access token did not control passive expiry: %+v, %v", result, err)
+	}
+	for _, refreshable := range []bool{false, true} {
+		tokens := map[string]any{"access_token": jwt(now.Add(-time.Hour))}
+		if refreshable {
+			tokens["refresh_token"] = "synthetic-refresh"
+		}
+		writeJSON(t, filepath.Join(prof.CodexHomePath(), "auth.json"), map[string]any{"tokens": tokens})
+		result, err = New().ValidateToken(context.Background(), prof, true)
+		if err != nil || result.Valid != refreshable {
+			t.Fatalf("expired access token with renewable=%v: %+v, %v", refreshable, result, err)
+		}
+	}
+}
+
+func TestCodexImportRejectsUnusableSourcesBeforeWriting(t *testing.T) {
+	for _, kind := range []string{"directory", "oversized", "canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			source := filepath.Join(t.TempDir(), "source")
+			if kind == "directory" {
+				if err := os.Mkdir(source, 0700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				f, err := os.Create(source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if kind == "oversized" {
+					err = f.Truncate(16<<20 + 1)
+				} else {
+					_, err = f.WriteString(`{"OPENAI_API_KEY":"synthetic-key"}`)
+				}
+				closeErr := f.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("create source: %v, %v", err, closeErr)
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if kind == "canceled" {
+				cancel()
+			}
+			prof := &profile.Profile{Name: "work", Provider: "codex", BasePath: filepath.Join(t.TempDir(), "target")}
+			if _, err := New().ImportAuth(ctx, source, prof); err == nil {
+				t.Fatal("unusable source imported successfully")
+			}
+			if _, err := os.Lstat(prof.BasePath); !os.IsNotExist(err) {
+				t.Fatalf("invalid import modified target: %v", err)
+			}
+		})
+	}
 }
 
 func writeJSON(t *testing.T, path string, data interface{}) {

@@ -20,13 +20,20 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -72,6 +79,9 @@ func (p *Provider) SupportedAuthModes() []provider.AuthMode {
 func geminiHome() string {
 	if home := os.Getenv("GEMINI_HOME"); home != "" {
 		return home
+	}
+	if home := os.Getenv("GEMINI_CLI_HOME"); home != "" {
+		return filepath.Join(home, ".gemini")
 	}
 	homeDir, _ := os.UserHomeDir()
 	return filepath.Join(homeDir, ".gemini")
@@ -144,12 +154,57 @@ func (p *Provider) PrepareProfile(ctx context.Context, prof *profile.Profile) er
 // Env returns the environment variables for running Gemini in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
 	env := map[string]string{
-		"HOME": prof.HomePath(),
+		"HOME":            prof.HomePath(),
+		"GEMINI_HOME":     filepath.Join(prof.HomePath(), ".gemini"),
+		"GEMINI_CLI_HOME": prof.HomePath(),
 	}
 
 	// For Vertex AI mode, also set CLOUDSDK_CONFIG for gcloud isolation
 	if provider.AuthMode(prof.AuthMode) == provider.AuthModeVertexADC {
 		env["CLOUDSDK_CONFIG"] = filepath.Join(prof.BasePath, "gcloud")
+		env["GOOGLE_APPLICATION_CREDENTIALS"] = filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json")
+		env["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+		env["GOOGLE_GENAI_USE_GCA"] = "false"
+		env["GEMINI_API_KEY"] = ""
+		env["GOOGLE_API_KEY"] = ""
+		data, err := readGeminiImportFile(filepath.Join(prof.HomePath(), ".gemini", ".env"))
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if err == nil {
+			values, err := parseGeminiEnv(data)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateGeminiEnvMode(values, provider.AuthModeVertexADC); err != nil {
+				return nil, err
+			}
+			for _, key := range []string{"GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID", "GOOGLE_CLOUD_LOCATION"} {
+				if values[key] != "" {
+					env[key] = values[key]
+				}
+			}
+		}
+	} else if provider.AuthMode(prof.AuthMode) == provider.AuthModeAPIKey {
+		data, err := readGeminiImportFile(filepath.Join(prof.HomePath(), ".gemini", ".env"))
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if err == nil {
+			values, err := parseGeminiEnv(data)
+			if err != nil || values["GEMINI_API_KEY"] == "" {
+				return nil, fmt.Errorf("profile .env has no usable GEMINI_API_KEY")
+			}
+			env["GEMINI_API_KEY"] = values["GEMINI_API_KEY"]
+		}
+		env["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
+		env["GOOGLE_GENAI_USE_GCA"] = "false"
+		env["GOOGLE_API_KEY"] = ""
+	} else if provider.AuthMode(prof.AuthMode) == provider.AuthModeOAuth {
+		env["GOOGLE_GENAI_USE_GCA"] = "true"
+		env["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
+		env["GEMINI_API_KEY"] = ""
+		env["GOOGLE_API_KEY"] = ""
 	}
 
 	return env, nil
@@ -407,130 +462,43 @@ func xdgConfigHome() string {
 	return filepath.Join(homeDir, ".config")
 }
 
-// DetectExistingAuth detects existing Gemini authentication files in standard locations.
-// Locations checked:
-// - ~/.gemini/settings.json (main settings with OAuth state)
-// - ~/.gemini/oauth_creds.json (OAuth credentials cache)
-// - ~/.gemini/.env (API key)
-// - ~/.config/gcloud/application_default_credentials.json (Vertex AI ADC)
+// DetectExistingAuth inspects the selected native login without mixing homes or
+// choosing an unrelated account because its settings were modified more recently.
 func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	detection := &provider.AuthDetection{
 		Provider:  p.ID(),
 		Locations: []provider.AuthLocation{},
 	}
 
-	homeDir, err := os.UserHomeDir()
+	dir, err := filepath.Abs(geminiHome())
 	if err != nil {
-		return nil, fmt.Errorf("get home dir: %w", err)
+		return nil, fmt.Errorf("resolve Gemini home: %w", err)
 	}
 
-	// Define locations to check
-	type authLocationSpec struct {
-		path        string
-		description string
-		validator   func(data []byte) (bool, string) // Custom validator
+	paths := []string{
+		filepath.Join(dir, "settings.json"),
+		filepath.Join(dir, "oauth_creds.json"),
+		filepath.Join(dir, "oauth_credentials.json"),
+		filepath.Join(dir, ".env"),
+		geminiADCPath(nil),
 	}
-
-	buildLocations := func(baseDir, label string) []authLocationSpec {
-		suffix := ""
-		if label != "" {
-			suffix = " (" + label + ")"
-		}
-		return []authLocationSpec{
-			{
-				path:        filepath.Join(baseDir, "settings.json"),
-				description: "Gemini CLI settings with Google OAuth state" + suffix,
-				validator: func(data []byte) (bool, string) {
-					var parsed map[string]interface{}
-					if err := json.Unmarshal(data, &parsed); err != nil {
-						return false, fmt.Sprintf("invalid JSON: %v", err)
-					}
-					// Check for OAuth-related fields
-					if _, ok := parsed["oauth"]; ok {
-						return true, ""
-					}
-					if _, ok := parsed["credentials"]; ok {
-						return true, ""
-					}
-					// Accept any valid JSON settings file
-					return true, ""
-				},
-			},
-			{
-				path:        filepath.Join(baseDir, "oauth_creds.json"),
-				description: "Gemini CLI OAuth credentials cache" + suffix,
-				validator: func(data []byte) (bool, string) {
-					var parsed map[string]interface{}
-					if err := json.Unmarshal(data, &parsed); err != nil {
-						return false, fmt.Sprintf("invalid JSON: %v", err)
-					}
-					// Check for token fields
-					if _, ok := parsed["access_token"]; ok {
-						return true, ""
-					}
-					if _, ok := parsed["refresh_token"]; ok {
-						return true, ""
-					}
-					return false, "missing expected OAuth fields"
-				},
-			},
-			{
-				path:        filepath.Join(baseDir, ".env"),
-				description: "Gemini API key (.env file)" + suffix,
-				validator: func(data []byte) (bool, string) {
-					content := string(data)
-					if len(content) > 0 {
-						// Check if it contains GEMINI_API_KEY
-						if strings.Contains(content, "GEMINI_API_KEY") {
-							return true, ""
-						}
-						return false, "missing GEMINI_API_KEY"
-					}
-					return false, "empty file"
-				},
-			},
+	bundle, bundleErr := loadGeminiDirectory(dir, "")
+	if bundleErr == nil {
+		for _, file := range bundle.files {
+			if !slices.Contains(paths, file.source) {
+				paths = append(paths, file.source)
+			}
 		}
 	}
-
-	defaultGeminiHome := filepath.Join(homeDir, ".gemini")
-	locations := buildLocations(defaultGeminiHome, "")
-	if geminiHomeEnv := os.Getenv("GEMINI_HOME"); geminiHomeEnv != "" && geminiHomeEnv != defaultGeminiHome {
-		locations = append(buildLocations(geminiHomeEnv, "GEMINI_HOME"), locations...)
-	}
-
-	// Always check ADC location for Vertex AI
-	locations = append(locations, authLocationSpec{
-		path:        filepath.Join(xdgConfigHome(), "gcloud", "application_default_credentials.json"),
-		description: "Google Cloud Application Default Credentials (Vertex AI)",
-		validator: func(data []byte) (bool, string) {
-			var parsed map[string]interface{}
-			if err := json.Unmarshal(data, &parsed); err != nil {
-				return false, fmt.Sprintf("invalid JSON: %v", err)
-			}
-			// Check for ADC fields
-			if _, ok := parsed["client_id"]; ok {
-				return true, ""
-			}
-			if _, ok := parsed["type"]; ok {
-				return true, ""
-			}
-			return false, "missing expected ADC fields"
-		},
-	})
-
-	var mostRecent *provider.AuthLocation
-
-	for _, loc := range locations {
+	for _, path := range paths {
 		authLoc := provider.AuthLocation{
-			Path:        loc.path,
-			Description: loc.description,
+			Path:        path,
+			Description: "Gemini native " + filepath.Base(path),
 		}
 
-		info, err := os.Stat(loc.path)
+		info, err := os.Stat(path)
 		if err != nil {
-			if os.IsNotExist(err) {
-				authLoc.Exists = false
-			} else {
+			if !os.IsNotExist(err) {
 				authLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
 			}
 			detection.Locations = append(detection.Locations, authLoc)
@@ -541,145 +509,607 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		authLoc.LastModified = info.ModTime()
 		authLoc.FileSize = info.Size()
 
-		// Read and validate
-		data, err := os.ReadFile(loc.path)
-		if err != nil {
-			authLoc.ValidationError = fmt.Sprintf("read error: %v", err)
-		} else {
-			valid, validationErr := loc.validator(data)
-			authLoc.IsValid = valid
-			authLoc.ValidationError = validationErr
-		}
-
-		detection.Locations = append(detection.Locations, authLoc)
-
-		// Track most recent valid auth
-		if authLoc.Exists && authLoc.IsValid {
-			detection.Found = true
-			if mostRecent == nil || authLoc.LastModified.After(mostRecent.LastModified) {
-				locCopy := authLoc // Copy to avoid pointer issues
-				mostRecent = &locCopy
+		if bundleErr == nil {
+			for _, file := range bundle.files {
+				if file.source == path {
+					authLoc.IsValid = true
+				}
 			}
+			if path == bundle.primary {
+				detection.Found = true
+				primary := authLoc
+				detection.Primary = &primary
+			}
+		} else {
+			authLoc.ValidationError = bundleErr.Error()
 		}
+		detection.Locations = append(detection.Locations, authLoc)
 	}
-
-	detection.Primary = mostRecent
-
-	// Set warning if multiple valid auth files found
-	validCount := 0
-	for _, loc := range detection.Locations {
-		if loc.Exists && loc.IsValid {
-			validCount++
-		}
-	}
-	if validCount > 1 {
-		detection.Warning = "multiple auth sources found; using most recent"
+	if bundleErr != nil {
+		detection.Warning = bundleErr.Error()
 	}
 
 	return detection, nil
 }
 
-// ImportAuth imports detected auth files into a profile directory.
-// For Gemini, this copies OAuth credentials, settings, or .env file.
+// ImportAuth validates and reads the entire selected grant before writing any
+// destination. The caller publishes the prepared profile transactionally.
 func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
-	// Validate source file exists
-	info, err := os.Stat(sourcePath)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if prof == nil || prof.Provider != p.ID() || strings.TrimSpace(prof.BasePath) == "" {
+		return nil, fmt.Errorf("invalid Gemini import profile")
+	}
+	bundle, err := loadGeminiImport(sourcePath)
 	if err != nil {
-		return nil, fmt.Errorf("source auth file not found: %w", err)
+		return nil, fmt.Errorf("validate Gemini auth source: %w", err)
 	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("source path is a directory, not a file")
+	copied := make([]string, 0, len(bundle.files))
+	for _, file := range bundle.files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		target := filepath.Join(prof.HomePath(), ".gemini", file.name)
+		if file.name == "application_default_credentials.json" {
+			target = filepath.Join(prof.BasePath, "gcloud", file.name)
+		}
+		if err := atomicWriteFile(target, file.data, 0600); err != nil {
+			return nil, fmt.Errorf("write imported %s: %w", file.name, err)
+		}
+		copied = append(copied, target)
 	}
-
-	var copiedFiles []string
-
-	basename := filepath.Base(sourcePath)
-	parentDir := filepath.Base(filepath.Dir(sourcePath))
-
-	// Determine target location based on source file type
-	switch {
-	case parentDir == ".gemini":
-		// Files from ~/.gemini/ go to profile home's .gemini/
-		targetDir := filepath.Join(prof.HomePath(), ".gemini")
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create .gemini dir: %w", err)
-		}
-		targetPath := filepath.Join(targetDir, basename)
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy %s: %w", basename, err)
-		}
-		copiedFiles = append(copiedFiles, targetPath)
-
-	case parentDir == "gcloud":
-		// ADC files go to profile's gcloud config
-		targetDir := filepath.Join(prof.BasePath, "gcloud")
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create gcloud dir: %w", err)
-		}
-		targetPath := filepath.Join(targetDir, basename)
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy %s: %w", basename, err)
-		}
-		copiedFiles = append(copiedFiles, targetPath)
-
-	default:
-		// Default: copy to .gemini directory
-		targetDir := filepath.Join(prof.HomePath(), ".gemini")
-		if err := os.MkdirAll(targetDir, 0700); err != nil {
-			return nil, fmt.Errorf("create .gemini dir: %w", err)
-		}
-		targetPath := filepath.Join(targetDir, basename)
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy %s: %w", basename, err)
-		}
-		copiedFiles = append(copiedFiles, targetPath)
-	}
-
-	return copiedFiles, nil
+	prof.AuthMode = string(bundle.mode)
+	return copied, nil
 }
 
-// copyFile copies a file from src to dst with fsync for durability.
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
+type geminiImportFile struct {
+	source string
+	name   string
+	data   []byte
+}
+
+type geminiImportBundle struct {
+	mode    provider.AuthMode
+	primary string
+	files   []geminiImportFile
+}
+
+// Credential reads are bounded, including a source that grows after Stat.
+func readGeminiImportFile(path string) ([]byte, error) {
+	const maxBytes = 16 << 20
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxBytes {
+		return nil, fmt.Errorf("%s must be a regular file no larger than 16 MiB", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxBytes {
+		return nil, fmt.Errorf("%s must be a regular file no larger than 16 MiB", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err == nil && len(data) > maxBytes {
+		err = fmt.Errorf("%s exceeds 16 MiB", path)
+	}
+	return data, err
+}
+
+func geminiADCPath(values map[string]string) string {
+	path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	if path == "" {
+		path = values["GOOGLE_APPLICATION_CREDENTIALS"]
+	}
+	if path == "" {
+		dir := os.Getenv("CLOUDSDK_CONFIG")
+		if dir == "" {
+			dir = values["CLOUDSDK_CONFIG"]
+		}
+		if dir == "" {
+			dir = filepath.Join(xdgConfigHome(), "gcloud")
+		}
+		path = filepath.Join(dir, "application_default_credentials.json")
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
+func loadGeminiDirectory(dir string, explicitMode provider.AuthMode) (*geminiImportBundle, error) {
+	settingsPath := filepath.Join(dir, "settings.json")
+	settings, err := readGeminiImportFile(settingsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	mode, embedded, err := parseGeminiSettings(settings)
+	if err != nil {
+		return nil, fmt.Errorf("invalid settings.json: %w", err)
+	}
+	if explicitMode != "" {
+		if mode != "" && mode != explicitMode {
+			return nil, fmt.Errorf("settings.json selects a different auth method")
+		}
+		mode = explicitMode
+	}
+	envPath := filepath.Join(dir, ".env")
+	var envData []byte
+	var envValues map[string]string
+	if mode != provider.AuthModeOAuth {
+		envData, err = readGeminiImportFile(envPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if err == nil {
+			envValues, err = parseGeminiEnv(envData)
+			if err != nil {
+				return nil, fmt.Errorf("invalid .env: %w", err)
+			}
+		}
+		if mode == "" {
+			// Native settings select the method first. Otherwise the CLI
+			// checks GCA, Vertex, then an API key in its loaded environment.
+			if geminiAuthEnv(envValues, "GOOGLE_GENAI_USE_GCA") == "true" {
+				mode = provider.AuthModeOAuth
+			} else if geminiAuthEnv(envValues, "GOOGLE_GENAI_USE_VERTEXAI") == "true" {
+				mode = provider.AuthModeVertexADC
+			} else if geminiAuthEnv(envValues, "GEMINI_API_KEY") != "" {
+				mode = provider.AuthModeAPIKey
+			}
+		}
+	}
+	var candidates []*geminiImportBundle
+	if mode == "" || mode == provider.AuthModeOAuth {
+		for _, name := range []string{"oauth_creds.json", "oauth_credentials.json"} {
+			path := filepath.Join(dir, name)
+			data, err := readGeminiImportFile(path)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if _, err := parseGeminiOAuth(data); err != nil {
+				return nil, fmt.Errorf("invalid %s: %w", name, err)
+			}
+			if embedded != nil && !sameGeminiGrant(embedded, data) {
+				return nil, fmt.Errorf("settings.json and %s contain different OAuth grants", name)
+			}
+			candidates = append(candidates, &geminiImportBundle{mode: provider.AuthModeOAuth, primary: path,
+				files: []geminiImportFile{{path, "oauth_creds.json", data}}})
+			break // A present cache is authoritative, including when malformed.
+		}
+		if len(candidates) == 0 && embedded != nil {
+			candidates = append(candidates, &geminiImportBundle{mode: provider.AuthModeOAuth, primary: settingsPath,
+				files: []geminiImportFile{{settingsPath, "oauth_creds.json", embedded}}})
+		}
+	}
+	if mode == provider.AuthModeAPIKey {
+		// File import must not silently select a different account from a
+		// shell-provided key. Only an exact saved match can be imported.
+		if geminiAuthEnv(envValues, "GEMINI_API_KEY") != envValues["GEMINI_API_KEY"] {
+			return nil, fmt.Errorf("selected Gemini API key does not match the saved .env credential")
+		}
+		if envValues["GEMINI_API_KEY"] != "" {
+			if err := validateGeminiEnvMode(envValues, provider.AuthModeAPIKey); err != nil {
+				return nil, err
+			}
+			candidates = append(candidates, &geminiImportBundle{mode: provider.AuthModeAPIKey, primary: envPath,
+				files: []geminiImportFile{{envPath, ".env", envData}}})
+		}
+	}
+	if mode == provider.AuthModeVertexADC || (mode == "" && len(candidates) == 0) {
+		path := geminiADCPath(envValues)
+		data, err := readGeminiImportFile(path)
+		if err == nil {
+			if err := validateGeminiADC(data); err != nil {
+				return nil, fmt.Errorf("invalid ADC: %w", err)
+			}
+			primary := path
+			if settings != nil {
+				// Importing the selected settings path retains Vertex settings
+				// and the configured ADC source as one bundle.
+				primary = settingsPath
+			}
+			candidates = append(candidates, &geminiImportBundle{mode: provider.AuthModeVertexADC, primary: primary,
+				files: []geminiImportFile{{path, "application_default_credentials.json", data}}})
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no complete credentials for the selected Gemini auth method")
+	}
+	bundle := candidates[0]
+	if embedded != nil && bundle.mode != provider.AuthModeOAuth {
+		return nil, fmt.Errorf("settings.json contains OAuth credentials for a different auth method")
+	}
+	if settings != nil {
+		bundle.files = append(bundle.files, geminiImportFile{settingsPath, "settings.json", settings})
+	}
+	if bundle.mode == provider.AuthModeVertexADC && envData != nil {
+		if err := validateGeminiEnvMode(envValues, bundle.mode); err != nil {
+			return nil, err
+		}
+		if settings != nil || geminiEnvSelectsADC(envValues) {
+			bundle.files = append(bundle.files, geminiImportFile{envPath, ".env", envData})
+			if settings == nil {
+				// The entry point must retain both the selected ADC and its
+				// project context on a later detect-to-import call.
+				bundle.primary = envPath
+			}
+		}
+	}
+	return bundle, nil
+}
+
+func loadGeminiImport(sourcePath string) (*geminiImportBundle, error) {
+	path, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readGeminiImportFile(path)
+	if err != nil {
+		return nil, err
+	}
+	bundle := &geminiImportBundle{primary: path}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) == nil && obj != nil {
+		if _, exists := obj["type"]; exists {
+			if err := validateGeminiADC(data); err != nil {
+				return nil, err
+			}
+			bundle.mode = provider.AuthModeVertexADC
+			bundle.files = []geminiImportFile{{path, "application_default_credentials.json", data}}
+			return bundle, nil
+		}
+		if filepath.Base(path) == "settings.json" {
+			return loadGeminiDirectory(filepath.Dir(path), "")
+		}
+		if _, err := parseGeminiOAuth(data); err != nil {
+			return nil, err
+		}
+		bundle.mode = provider.AuthModeOAuth
+		bundle.files = []geminiImportFile{{path, "oauth_creds.json", data}}
+	} else {
+		values, err := parseGeminiEnv(data)
+		if err != nil {
+			return nil, fmt.Errorf("source has no unambiguous OAuth, API key, or ADC credential")
+		}
+		if values["GEMINI_API_KEY"] == "" {
+			if filepath.Base(path) == ".env" && geminiEnvSelectsADC(values) {
+				// This explicit .env selects its ADC bundle even when the
+				// importing shell is currently configured for another method.
+				selected, err := loadGeminiDirectory(filepath.Dir(path), provider.AuthModeVertexADC)
+				if err != nil {
+					return nil, err
+				}
+				if selected.mode == provider.AuthModeVertexADC {
+					return selected, nil
+				}
+			}
+			return nil, fmt.Errorf("source has no selected API key or ADC credential")
+		}
+		if err := validateGeminiEnvMode(values, provider.AuthModeAPIKey); err != nil {
+			return nil, err
+		}
+		bundle.mode = provider.AuthModeAPIKey
+		bundle.files = []geminiImportFile{{path, ".env", data}}
+	}
+	settingsPath := filepath.Join(filepath.Dir(path), "settings.json")
+	settings, err := readGeminiImportFile(settingsPath)
+	if os.IsNotExist(err) {
+		return bundle, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	mode, embedded, err := parseGeminiSettings(settings)
+	if err != nil {
+		return nil, fmt.Errorf("invalid companion settings.json: %w", err)
+	}
+	if mode != "" && mode != bundle.mode {
+		return nil, fmt.Errorf("companion settings.json selects a different auth method")
+	}
+	if embedded != nil && (bundle.mode != provider.AuthModeOAuth || !sameGeminiGrant(embedded, data)) {
+		return nil, fmt.Errorf("companion settings.json contains a different OAuth grant")
+	}
+	bundle.files = append(bundle.files, geminiImportFile{settingsPath, "settings.json", settings})
+	return bundle, nil
+}
+
+func geminiJSONObject(data []byte) (map[string]json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) != nil || obj == nil {
+		return nil, fmt.Errorf("expected a JSON object")
+	}
+	return obj, nil
+}
+
+// An omitted optional slot is different from a present but unusable credential.
+func geminiCredentialString(obj map[string]json.RawMessage, keys ...string) (string, error) {
+	var selected string
+	for _, key := range keys {
+		raw, exists := obj[key]
+		if !exists {
+			continue
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil || strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("%s must be a nonempty string", key)
+		}
+		if selected != "" && value != selected {
+			return "", fmt.Errorf("credential aliases contain conflicting values")
+		}
+		selected = value
+	}
+	return selected, nil
+}
+
+func parseGeminiOAuth(data []byte) (map[string]json.RawMessage, error) {
+	obj, err := geminiJSONObject(data)
+	if err != nil {
+		return nil, err
+	}
+	access, err := geminiCredentialString(obj, "access_token", "accessToken")
+	if err != nil || access == "" {
+		return nil, fmt.Errorf("OAuth access token is missing or malformed")
+	}
+	if _, err := geminiCredentialString(obj, "refresh_token", "refreshToken"); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"id_token", "idToken", "email", "user_email", "client_email", "client_id", "client_secret"} {
+		if _, err := geminiCredentialString(obj, key); err != nil {
+			return nil, err
+		}
+	}
+	for _, key := range []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"} {
+		raw, exists := obj[key]
+		if !exists {
+			continue
+		}
+		if _, err := parseGeminiCredentialExpiry(key, raw); err != nil {
+			return nil, err
+		}
+	}
+	return obj, nil
+}
+
+func parseGeminiCredentialExpiry(key string, raw json.RawMessage) (time.Time, error) {
+	// This is the final millisecond of year 9999. Bounding before converting
+	// to int64 also rejects values rounded up to 2^63 by JSON float decoding.
+	const maxUnixMillis = 253402300799999
+	var expires time.Time
+	var number float64
+	if json.Unmarshal(raw, &number) == nil && number > 0 && number <= maxUnixMillis && math.Trunc(number) == number {
+		expires = parseGeminiUnixTime(number)
+		if key == "expiry_date" {
+			expires = time.UnixMilli(int64(number))
+		}
+	} else {
+		var stamp string
+		if json.Unmarshal(raw, &stamp) == nil {
+			expires, _ = parseGeminiExpiryTime(stamp)
+		}
+	}
+	if !expires.After(time.Unix(0, 0)) || expires.UTC().Year() > 9999 {
+		return time.Time{}, fmt.Errorf("%s is not a valid credential expiry", key)
+	}
+	return expires, nil
+}
+
+func sameGeminiGrant(a, b []byte) bool {
+	left, leftErr := parseGeminiOAuth(a)
+	right, rightErr := parseGeminiOAuth(b)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	for _, keys := range [][]string{{"access_token", "accessToken"}, {"refresh_token", "refreshToken"}} {
+		l, _ := geminiCredentialString(left, keys...)
+		r, _ := geminiCredentialString(right, keys...)
+		if l != r {
+			return false
+		}
+	}
+	for _, keys := range [][]string{{"id_token", "idToken"}, {"email", "user_email", "client_email"}} {
+		l, lerr := geminiCredentialString(left, keys...)
+		r, rerr := geminiCredentialString(right, keys...)
+		if lerr != nil || rerr != nil || (l != "" && r != "" && l != r) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseGeminiSettings(data []byte) (provider.AuthMode, []byte, error) {
+	if data == nil {
+		return "", nil, nil
+	}
+	obj, err := geminiJSONObject(data)
+	if err != nil {
+		return "", nil, err
+	}
+	selected, err := geminiCredentialString(obj, "selectedAuthType")
+	if err != nil {
+		return "", nil, err
+	}
+	if raw, exists := obj["security"]; exists {
+		security, err := geminiJSONObject(raw)
+		if err != nil {
+			return "", nil, fmt.Errorf("security must be an object")
+		}
+		if raw, exists := security["auth"]; exists {
+			auth, err := geminiJSONObject(raw)
+			if err != nil {
+				return "", nil, fmt.Errorf("security.auth must be an object")
+			}
+			current, err := geminiCredentialString(auth, "selectedType")
+			if err != nil {
+				return "", nil, err
+			}
+			if selected != "" && current != "" && selected != current {
+				return "", nil, fmt.Errorf("conflicting selected auth types")
+			}
+			if current != "" {
+				selected = current
+			}
+		}
+	}
+	var mode provider.AuthMode
+	switch selected {
+	case "":
+	case "oauth-personal":
+		mode = provider.AuthModeOAuth
+	case "gemini-api-key":
+		mode = provider.AuthModeAPIKey
+	case "vertex-ai":
+		mode = provider.AuthModeVertexADC
+	default:
+		return "", nil, fmt.Errorf("unsupported Gemini selected auth type")
+	}
+	var embedded []byte
+	for _, key := range []string{"oauth", "credentials", "googleOAuth"} {
+		if raw, exists := obj[key]; exists {
+			if _, err := parseGeminiOAuth(raw); err != nil {
+				return "", nil, fmt.Errorf("%s contains incomplete OAuth credentials", key)
+			}
+			if embedded != nil && !sameGeminiGrant(embedded, raw) {
+				return "", nil, fmt.Errorf("settings contain conflicting OAuth grants")
+			}
+			embedded = raw
+		}
+	}
+	for _, key := range []string{"access_token", "accessToken", "refresh_token", "refreshToken"} {
+		if _, exists := obj[key]; exists {
+			if _, err := parseGeminiOAuth(data); err != nil {
+				return "", nil, err
+			}
+			if embedded != nil && !sameGeminiGrant(embedded, data) {
+				return "", nil, fmt.Errorf("settings contain conflicting OAuth grants")
+			}
+			embedded = data
+			break
+		}
+	}
+	return mode, embedded, nil
+}
+
+func parseGeminiEnv(data []byte) (map[string]string, error) {
+	values := make(map[string]string)
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" || strings.ContainsAny(key, " \t\r\x00") {
+			return nil, fmt.Errorf("expected a dotenv assignment")
+		}
+		if len(value) > 0 && (value[0] == '\'' || value[0] == '"') {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated dotenv value")
+			}
+			end++
+			tail := strings.TrimSpace(value[end+1:])
+			if tail != "" && !strings.HasPrefix(tail, "#") {
+				return nil, fmt.Errorf("unexpected text after dotenv value")
+			}
+			value = value[1:end]
+		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return nil, fmt.Errorf("invalid dotenv value")
+		}
+		if key == "GEMINI_API_KEY" && (strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t")) {
+			return nil, fmt.Errorf("GEMINI_API_KEY is empty or contains whitespace")
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+func validateGeminiEnvMode(values map[string]string, mode provider.AuthMode) error {
+	if values["GOOGLE_API_KEY"] != "" || values["GOOGLE_GENAI_USE_GCA"] == "true" ||
+		(mode == provider.AuthModeAPIKey && values["GOOGLE_GENAI_USE_VERTEXAI"] == "true") ||
+		(mode == provider.AuthModeVertexADC && values["GEMINI_API_KEY"] != "") {
+		return fmt.Errorf(".env contains credentials or selection for a different auth method")
+	}
+	return nil
+}
+
+func geminiAuthEnv(values map[string]string, key string) string {
+	// Gemini's dotenv loader never overwrites a shell-defined variable,
+	// including an explicitly empty value or a false mode selector.
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return values[key]
+}
+
+func geminiEnvSelectsADC(values map[string]string) bool {
+	return values["GOOGLE_GENAI_USE_VERTEXAI"] == "true" ||
+		values["GOOGLE_APPLICATION_CREDENTIALS"] != "" || values["CLOUDSDK_CONFIG"] != "" ||
+		((values["GOOGLE_CLOUD_PROJECT"] != "" || values["GOOGLE_CLOUD_PROJECT_ID"] != "") && values["GOOGLE_CLOUD_LOCATION"] != "")
+}
+
+func validateGeminiADC(data []byte) error {
+	obj, err := geminiJSONObject(data)
 	if err != nil {
 		return err
 	}
-	defer srcFile.Close()
-
-	// Get source file info for permissions
-	srcInfo, err := srcFile.Stat()
+	kind, err := geminiCredentialString(obj, "type")
 	if err != nil {
 		return err
 	}
-
-	// Write to temp file first for atomicity
-	tmpPath := dst + ".tmp"
-	dstFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode()&0600)
-	if err != nil {
-		return err
+	var required []string
+	switch kind {
+	case "authorized_user":
+		required = []string{"client_id", "client_secret", "refresh_token"}
+	case "service_account":
+		required = []string{"client_email", "private_key", "token_uri"}
+	default:
+		return fmt.Errorf("unsupported or missing ADC type")
 	}
-
-	_, err = io.Copy(dstFile, srcFile)
-	if err != nil {
-		dstFile.Close()
-		os.Remove(tmpPath)
-		return err
+	for _, key := range required {
+		value, err := geminiCredentialString(obj, key)
+		if err != nil || value == "" {
+			return fmt.Errorf("ADC requires a nonempty %s", key)
+		}
 	}
-
-	// Sync to disk
-	if err := dstFile.Sync(); err != nil {
-		dstFile.Close()
-		os.Remove(tmpPath)
-		return err
+	if kind == "service_account" {
+		key, _ := geminiCredentialString(obj, "private_key")
+		block, rest := pem.Decode([]byte(key))
+		if block == nil || len(bytes.TrimSpace(rest)) != 0 {
+			return fmt.Errorf("service account private_key is not a PEM private key")
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			parsed, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+		}
+		if _, ok := parsed.(*rsa.PrivateKey); err != nil || !ok {
+			return fmt.Errorf("service account private_key is not an RSA private key")
+		}
+		uri, _ := geminiCredentialString(obj, "token_uri")
+		endpoint, err := url.Parse(uri)
+		if err != nil || endpoint.Scheme != "https" || endpoint.Hostname() == "" || endpoint.User != nil {
+			return fmt.Errorf("service account token_uri must be an HTTPS endpoint")
+		}
 	}
-
-	if err := dstFile.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	// Atomic rename
-	return os.Rename(tmpPath, dst)
+	return nil
 }
 
 // atomicWriteFile writes data to a file atomically using temp file + fsync + rename.
@@ -726,6 +1156,9 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // For passive validation: checks file existence, format, and expiry timestamps.
 // For active validation: attempts minimal API call to Google.
 func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, passive bool) (*provider.ValidationResult, error) {
+	if prof == nil {
+		return nil, fmt.Errorf("profile is nil")
+	}
 	result := &provider.ValidationResult{
 		Provider:  p.ID(),
 		Profile:   prof.Name,
@@ -741,133 +1174,70 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 // validateTokenPassive performs passive validation without network calls.
 func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profile, result *provider.ValidationResult) (*provider.ValidationResult, error) {
 	result.Method = "passive"
-
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	authMode := provider.AuthMode(prof.AuthMode)
-
-	// Check auth files exist
-	geminiDir := filepath.Join(prof.HomePath(), ".gemini")
-	settingsPath := filepath.Join(geminiDir, "settings.json")
-	oauthPath := filepath.Join(geminiDir, "oauth_creds.json")
-	envPath := filepath.Join(geminiDir, ".env")
-
-	settingsExists := fileExistsGemini(settingsPath)
-	oauthExists := fileExistsGemini(oauthPath)
-	envExists := fileExistsGemini(envPath)
-
-	// API key mode: accept .env or environment variable
-	if authMode == provider.AuthModeAPIKey {
-		if envExists {
-			data, err := os.ReadFile(envPath)
-			if err != nil {
-				result.Valid = false
-				result.Error = fmt.Sprintf("cannot read .env: %v", err)
-				return result, nil
-			}
-			if !strings.Contains(string(data), "GEMINI_API_KEY") {
-				result.Valid = false
-				result.Error = "GEMINI_API_KEY not found in .env"
-				return result, nil
-			}
+	dir := filepath.Join(prof.HomePath(), ".gemini")
+	var source string
+	switch authMode {
+	case provider.AuthModeAPIKey:
+		source = filepath.Join(dir, ".env")
+		if _, err := os.Stat(source); os.IsNotExist(err) && strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) != "" {
 			result.Valid = true
 			return result, nil
 		}
-		if os.Getenv("GEMINI_API_KEY") != "" {
-			result.Valid = true
-			return result, nil
-		}
-		result.Valid = false
-		result.Error = "no API key configured"
-		return result, nil
-	}
-
-	if !settingsExists && !oauthExists {
-		result.Valid = false
-		result.Error = "no auth files found"
-		return result, nil
-	}
-
-	// Check oauth_creds.json if it exists (has expiry info)
-	if oauthExists {
-		data, err := os.ReadFile(oauthPath)
-		if err != nil {
-			result.Valid = false
-			result.Error = fmt.Sprintf("cannot read oauth_creds.json: %v", err)
-			return result, nil
-		}
-
-		var oauthData map[string]interface{}
-		if err := json.Unmarshal(data, &oauthData); err != nil {
-			result.Valid = false
-			result.Error = fmt.Sprintf("invalid JSON in oauth_creds.json: %v", err)
-			return result, nil
-		}
-
-		// Check for access_token field
-		if _, hasToken := oauthData["access_token"]; !hasToken {
-			// No access token - check settings.json for OAuth state
-			if !settingsExists {
-				result.Valid = false
-				result.Error = "no access token found"
-				return result, nil
-			}
-		}
-
-		// Check for expiry timestamp
-		for _, key := range []string{"expires_at", "expiry", "token_expiry", "expires"} {
-			if expiresAt, ok := oauthData[key]; ok {
-				var expTime time.Time
-				switch v := expiresAt.(type) {
-				case string:
-					if t, err := parseGeminiExpiryTime(v); err == nil {
-						expTime = t
-					}
-				case float64:
-					expTime = parseGeminiUnixTime(v)
-				}
-
-				if !expTime.IsZero() {
-					result.ExpiresAt = expTime
-					if expTime.Before(time.Now()) {
-						result.Valid = false
-						result.Error = "token has expired"
-						return result, nil
-					}
-				}
+	case provider.AuthModeVertexADC:
+		source = filepath.Join(prof.BasePath, "gcloud", "application_default_credentials.json")
+	case provider.AuthModeOAuth, "":
+		authMode = provider.AuthModeOAuth
+		for _, name := range []string{"oauth_creds.json", "oauth_credentials.json", "settings.json"} {
+			path := filepath.Join(dir, name)
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				source = path
 				break
 			}
 		}
+	default:
+		result.Error = "unsupported Gemini profile auth mode"
+		return result, nil
 	}
-
-	// Check settings.json if it exists
-	if settingsExists {
-		data, err := os.ReadFile(settingsPath)
-		if err != nil {
-			result.Valid = false
-			result.Error = fmt.Sprintf("cannot read settings.json: %v", err)
-			return result, nil
-		}
-
-		var settingsData map[string]interface{}
-		if err := json.Unmarshal(data, &settingsData); err != nil {
-			result.Valid = false
-			result.Error = fmt.Sprintf("invalid JSON in settings.json: %v", err)
-			return result, nil
-		}
-
-		// Check for OAuth or API key mode
-		if _, hasOAuth := settingsData["oauth"]; !hasOAuth {
-			if _, hasAPIKey := settingsData["api_key"]; !hasAPIKey {
-				// Check for .env file with API key
-				if !envExists && !oauthExists && os.Getenv("GEMINI_API_KEY") == "" {
-					result.Valid = false
-					result.Error = "no authentication configured"
-					return result, nil
-				}
+	if source == "" {
+		result.Error = "no auth files found"
+		return result, nil
+	}
+	bundle, err := loadGeminiImport(source)
+	if err != nil {
+		result.Error = err.Error()
+		return result, nil
+	}
+	if bundle.mode != authMode {
+		result.Error = "credential does not match the profile auth mode"
+		return result, nil
+	}
+	if authMode == provider.AuthModeOAuth {
+		var grant map[string]json.RawMessage
+		for _, file := range bundle.files {
+			if file.name == "oauth_creds.json" {
+				grant, _ = parseGeminiOAuth(file.data) // Already validated by the loader.
 			}
 		}
+		for _, key := range []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"} {
+			raw, exists := grant[key]
+			if !exists {
+				continue
+			}
+			result.ExpiresAt, _ = parseGeminiCredentialExpiry(key, raw)
+			break
+		}
+		refresh, _ := geminiCredentialString(grant, "refresh_token", "refreshToken")
+		// The native CLI can renew a complete cached grant. Preserve expiry
+		// for health reporting without forcing that account to log in again.
+		if !result.ExpiresAt.IsZero() && !result.ExpiresAt.After(time.Now()) && refresh == "" {
+			result.Error = "access token has expired and has no refresh token"
+			return result, nil
+		}
 	}
-
-	// Passive validation passed
 	result.Valid = true
 	return result, nil
 }
@@ -889,11 +1259,6 @@ func (p *Provider) validateTokenActive(ctx context.Context, prof *profile.Profil
 	// to verify the token. For now, we rely on passive validation.
 	result.Valid = true
 	return result, nil
-}
-
-func fileExistsGemini(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }
 
 func parseGeminiExpiryTime(s string) (time.Time, error) {

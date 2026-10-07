@@ -2,9 +2,13 @@
 package profile
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1693,4 +1697,421 @@ func TestProfileEnsureLayout(t *testing.T) {
 			t.Error("EnsureLayout() = nil, want an error when a file blocks the layout")
 		}
 	})
+}
+
+func TestStoreImportPublishesCompleteFinalPaths(t *testing.T) {
+	store := NewStore(t.TempDir())
+	var staged string
+	result, err := store.Import(context.Background(), "codex", "work", "oauth", false, func(p *Profile) error {
+		staged = p.BasePath
+		p.AuthMode = "api-key"
+		p.Description = "Imported work account"
+		p.Metadata["purpose"] = "development"
+		if err := os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"OPENAI_API_KEY":"synthetic-import"}`), 0600); err != nil {
+			return err
+		}
+		// Even a provider that writes metadata during preparation must remain
+		// invisible until the complete prepared directory is published.
+		if err := p.Save(); err != nil {
+			return err
+		}
+		all, err := store.ListAll()
+		if err != nil {
+			return err
+		}
+		if len(all) != 0 || store.Exists("codex", "work") {
+			t.Errorf("staged import is already routable: %v", all)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := filepath.Abs(store.ProfilePath("codex", "work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.BasePath != target || result.BackupPath != "" {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	loaded, err := store.Load("codex", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BasePath != target || loaded.AuthMode != "api-key" || loaded.Description != "Imported work account" || loaded.Metadata["purpose"] != "development" {
+		t.Fatalf("final metadata was not published: %+v", loaded)
+	}
+	if loaded.IsLocked() {
+		t.Fatal("published profile remained locked after import")
+	}
+	for _, path := range []string{loaded.BasePath, loaded.HomePath(), loaded.XDGConfigPath(), loaded.CodexHomePath()} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+			t.Fatalf("profile directory is not private: %s, %v", path, err)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(loaded.CodexHomePath(), "auth.json")); err != nil || string(data) != `{"OPENAI_API_KEY":"synthetic-import"}` {
+		t.Fatalf("published credential is unavailable at final path: %v", err)
+	}
+	if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+		t.Fatalf("prepared profile remained behind: %v", err)
+	}
+	all, err := store.ListAll()
+	if err != nil || len(all) != 1 || len(all["codex"]) != 1 || all["codex"][0].Name != "work" {
+		t.Fatalf("published profile listing: %v, %v", all, err)
+	}
+}
+
+func TestStoreImportFailurePreservesProfiles(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "new"
+		if existing {
+			name = "existing"
+		}
+		for _, failure := range []string{"prepare", "canceled before import", "canceled during preparation", "changed identity"} {
+			t.Run(name+"/"+failure, func(t *testing.T) {
+				store := NewStore(t.TempDir())
+				target := store.ProfilePath("codex", "work")
+				var previous map[string]importProfileEntry
+				if existing {
+					seedImportProfile(t, store, "work")
+					previous = snapshotImportProfile(t, target)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if failure == "canceled before import" {
+					cancel()
+				}
+				called := false
+				preparationFailure := errors.New("synthetic import failure")
+				_, err := store.Import(ctx, "codex", "work", "oauth", existing, func(p *Profile) error {
+					called = true
+					if err := os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte("incomplete"), 0600); err != nil {
+						return err
+					}
+					if err := p.Save(); err != nil {
+						return err
+					}
+					visible, err := store.List("codex")
+					if err != nil {
+						return err
+					}
+					want := 0
+					if existing {
+						want = 1
+					}
+					if len(visible) != want {
+						t.Errorf("preparation changed routable profile count: %d, want %d", len(visible), want)
+					}
+					switch failure {
+					case "prepare":
+						return preparationFailure
+					case "canceled during preparation":
+						cancel()
+					case "changed identity":
+						p.Name = "other"
+					}
+					return nil
+				})
+				if err == nil {
+					t.Fatal("failed preparation published a profile")
+				}
+				if failure == "prepare" && !errors.Is(err, preparationFailure) {
+					t.Fatalf("preparation error was lost: %v", err)
+				}
+				if failure == "canceled before import" && called {
+					t.Fatal("canceled import called the provider")
+				}
+				if existing {
+					if after := snapshotImportProfile(t, target); !reflect.DeepEqual(previous, after) {
+						t.Fatal("failed forced import changed the existing profile")
+					}
+				} else {
+					if _, err := os.Lstat(target); !os.IsNotExist(err) {
+						t.Fatalf("failed import left a destination: %v", err)
+					}
+					all, err := store.ListAll()
+					if err != nil || len(all) != 0 {
+						t.Fatalf("failed import remained listed: %v, %v", all, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestStoreImportForceRetainsCompletePreviousProfile(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	before := snapshotImportProfile(t, previous.BasePath)
+	result, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(p *Profile) error {
+		p.Description = "Replacement account"
+		return os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"access_token":"synthetic-replacement"}`), 0600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BackupPath == "" || result.BackupPath == result.Profile.BasePath {
+		t.Fatalf("previous profile has no recovery directory: %+v", result)
+	}
+	if after := snapshotImportProfile(t, result.BackupPath); !reflect.DeepEqual(before, after) {
+		t.Fatal("replacement did not retain complete previous metadata, history, settings and credentials")
+	}
+	loaded, err := store.Load("codex", "work")
+	if err != nil || loaded.Description != "Replacement account" || loaded.IsLocked() {
+		t.Fatalf("replacement not ready: %+v, %v", loaded, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(loaded.CodexHomePath(), "auth.json")); err != nil || string(data) != `{"access_token":"synthetic-replacement"}` {
+		t.Fatalf("replacement credential not published: %v", err)
+	}
+	all, err := store.ListAll()
+	if err != nil || len(all) != 1 || len(all["codex"]) != 1 {
+		t.Fatalf("recovery copy became a routable account: %v, %v", all, err)
+	}
+}
+
+func TestStoreImportPreservesLockedProfile(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	if err := previous.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Unlock()
+	before := snapshotImportProfile(t, previous.BasePath)
+	called := false
+	_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("locked profile reached preparation: called=%v, err=%v", called, err)
+	}
+	if after := snapshotImportProfile(t, previous.BasePath); !reflect.DeepEqual(before, after) {
+		t.Fatal("failed import modified an in-use profile or its lock")
+	}
+}
+
+func TestStoreImportSerializesCompetingMutationsAndRunners(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "new"
+		if existing {
+			name = "existing"
+		}
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			store := NewStore(base)
+			seedImportProfile(t, store, "source")
+			if existing {
+				seedImportProfile(t, store, "work")
+			}
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			done := make(chan error, 1)
+			go func() {
+				_, err := store.Import(context.Background(), "codex", "work", "oauth", existing, func(p *Profile) error {
+					close(started)
+					<-release
+					return os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"access_token":"synthetic-import"}`), 0600)
+				})
+				done <- err
+			}()
+			select {
+			case <-started:
+			case err := <-done:
+				t.Fatalf("import never reached preparation: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("import preparation timed out")
+			}
+			other := NewStore(base)
+			runner := &Profile{Name: "work", Provider: "codex", BasePath: store.ProfilePath("codex", "work")}
+			attempts := []struct {
+				name string
+				run  func() error
+			}{
+				{"create", func() error { _, err := other.Create("codex", "work", "oauth"); return err }},
+				{"delete", func() error { return other.Delete("codex", "work") }},
+				{"clone", func() error { _, err := other.Clone("codex", "source", "work", CloneOptions{Force: true}); return err }},
+				{"import", func() error {
+					_, err := other.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error { return nil })
+					return err
+				}},
+				{"runner lock", runner.Lock},
+				{"runner stale-lock cleanup", runner.LockWithCleanup},
+			}
+			for _, attempt := range attempts {
+				if err := attempt.run(); err == nil {
+					t.Errorf("competing %s succeeded during import", attempt.name)
+				}
+			}
+			if !existing {
+				if _, err := os.Lstat(runner.BasePath); !os.IsNotExist(err) {
+					t.Errorf("runner or competing mutation recreated unpublished destination: %v", err)
+				}
+			}
+			if _, err := other.Create("codex", "unrelated", "oauth"); err != nil {
+				t.Errorf("import blocked an unrelated profile: %v", err)
+			}
+			unblock()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("original import failed after contention: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("import failed to finish")
+			}
+			if err := runner.Lock(); err != nil {
+				t.Fatalf("finished import left runner blocked: %v", err)
+			}
+			if err := runner.Unlock(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestStoreImportRejectsChangedDestinationWithoutRemovingOtherLock(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	before := snapshotImportProfile(t, previous.BasePath)
+	moved := filepath.Join(t.TempDir(), "moved-original")
+	const competingLock = "synthetic lock belonging to another writer"
+	_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error {
+		if err := os.Rename(previous.BasePath, moved); err != nil {
+			return err
+		}
+		replacement := &Profile{Name: "work", Provider: "codex", BasePath: previous.BasePath}
+		if err := replacement.EnsureLayout(); err != nil {
+			return err
+		}
+		if err := replacement.Save(); err != nil {
+			return err
+		}
+		// Simulate an external writer replacing the directory. It does not use
+		// CAAM's mutation gate, so identity checks must preserve its lock.
+		return os.WriteFile(replacement.LockPath(), []byte(competingLock), 0600)
+	})
+	if err == nil {
+		t.Fatal("changed destination was overwritten")
+	}
+	if data, err := os.ReadFile(previous.LockPath()); err != nil || string(data) != competingLock {
+		t.Fatalf("cleanup removed or changed the other writer's lock: %v", err)
+	}
+	after := snapshotImportProfile(t, moved)
+	delete(after, ".lock") // The outside writer moved the original lock with its directory.
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("changed-destination handling lost original profile data")
+	}
+}
+
+func TestStoreImportRejectsUnsafeDestinationPaths(t *testing.T) {
+	for _, kind := range []string{"target file", "target symlink", "provider symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			store := NewStore(t.TempDir())
+			outside := t.TempDir()
+			sentinel := filepath.Join(outside, "keep")
+			if err := os.WriteFile(sentinel, []byte("unrelated native data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			parent := filepath.Dir(store.ProfilePath("codex", "work"))
+			if kind == "provider symlink" {
+				if err := os.Symlink(outside, parent); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.MkdirAll(parent, 0700); err != nil {
+					t.Fatal(err)
+				}
+				target := store.ProfilePath("codex", "work")
+				if kind == "target file" {
+					if err := os.WriteFile(target, []byte("existing unrelated file"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(outside, target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := snapshotImportProfile(t, outside)
+			blocked := store.ProfilePath("codex", "work")
+			if kind == "provider symlink" {
+				blocked = parent
+			}
+			blockedBefore := snapshotImportProfile(t, blocked)
+			called := false
+			_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error { called = true; return nil })
+			if err == nil || called {
+				t.Fatalf("unsafe destination reached preparation: called=%v, err=%v", called, err)
+			}
+			if after := snapshotImportProfile(t, outside); !reflect.DeepEqual(before, after) {
+				t.Fatal("unsafe import modified unrelated native files")
+			}
+			if after := snapshotImportProfile(t, blocked); !reflect.DeepEqual(blockedBefore, after) {
+				t.Fatal("unsafe import replaced the blocking file or symlink")
+			}
+		})
+	}
+}
+
+type importProfileEntry struct {
+	Mode    os.FileMode
+	Data    string
+	Link    string
+	ModTime int64
+}
+
+func snapshotImportProfile(t *testing.T, root string) map[string]importProfileEntry {
+	t.Helper()
+	result := make(map[string]importProfileEntry)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entry := importProfileEntry{Mode: info.Mode()}
+		if info.Mode()&os.ModeSymlink != 0 {
+			entry.Link, err = os.Readlink(path)
+		} else if info.Mode().IsRegular() {
+			var data []byte
+			data, err = os.ReadFile(path)
+			entry.Data, entry.ModTime = string(data), info.ModTime().UnixNano()
+		}
+		result[rel] = entry
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func seedImportProfile(t *testing.T, store *Store, name string) *Profile {
+	t.Helper()
+	p, err := store.Create("codex", name, "api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Description = "Existing account with important state"
+	p.Tags = []string{"work"}
+	p.Metadata["custom"] = "retained setting"
+	p.BrowserCommand = "configured-browser"
+	if err := p.Save(); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(p.CodexHomePath(), "auth.json"):  `{"OPENAI_API_KEY":"synthetic-old-key"}`,
+		filepath.Join(p.HomePath(), "session.json"):    `{"history":["important work"]}`,
+		filepath.Join(p.XDGConfigPath(), "settings"):   "private account settings",
+		filepath.Join(p.BasePath, "unknown-state.bin"): "unknown metadata must survive",
+	}
+	for path, data := range files {
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
 }

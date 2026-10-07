@@ -1493,6 +1493,78 @@ func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
 	})
 }
 
+func TestValidateTokenPassive_ClaudeRenewalUsesSelectedGrant(t *testing.T) {
+	past := time.Now().Add(-2 * time.Hour).UnixMilli()
+	future := time.Now().Add(4 * time.Hour).UnixMilli()
+	for _, tc := range []struct {
+		name       string
+		oauth      any
+		valid      bool
+		expiresAt  int64
+		legacyOnly bool
+	}{
+		{"expired complete grant", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": past}, true, past, false},
+		{"legacy expired complete grant", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": past}, true, past, true},
+		{"unexpired access without refresh", map[string]any{"accessToken": "synthetic-access", "expiresAt": future}, true, future, false},
+		{"complete grant without expiry", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh"}, true, 0, false},
+		{"expired without refresh", map[string]any{"accessToken": "synthetic-access", "expiresAt": past}, false, past, false},
+		{"null refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": nil, "expiresAt": past}, false, 0, false},
+		{"empty refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "", "expiresAt": past}, false, 0, false},
+		{"whitespace refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": " \t", "expiresAt": past}, false, 0, false},
+		{"wrong type refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": true, "expiresAt": past}, false, 0, false},
+		{"unexpired access does not rescue null refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": nil, "expiresAt": future}, false, 0, false},
+		{"refresh without access", map[string]any{"refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"null access with refresh", map[string]any{"accessToken": nil, "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"empty access with refresh", map[string]any{"accessToken": "", "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"whitespace access with refresh", map[string]any{"accessToken": " \t", "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"wrong type access with refresh", map[string]any{"accessToken": 42, "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"null OAuth", nil, false, 0, false},
+		{"nonobject OAuth", []any{}, false, 0, false},
+		{"null expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": nil}, false, 0, false},
+		{"zero expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": 0}, false, 0, false},
+		{"negative expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": -1}, false, 0, false},
+		{"wrong type expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": "not-a-timestamp"}, false, 0, false},
+		{"fractional expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": float64(past) + 0.5}, false, 0, false},
+		{"overflowing expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": 1e30}, false, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			legacy := filepath.Join(claudeLegacyDirForProfile(prof), ".credentials.json")
+			selected := claudeXDGCredentialsPathForProfile(prof)
+			if tc.legacyOnly {
+				selected = legacy
+			} else {
+				// A healthy ignored account must never supply the selected
+				// account's missing or malformed refresh capability.
+				writeClaudeLifecycleJSON(t, legacy, `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh"}}`)
+			}
+			data, err := json.Marshal(map[string]any{"claudeAiOauth": tc.oauth})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeClaudeLifecycleJSON(t, selected, string(data))
+			p := New()
+			result, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || result == nil || result.Valid != tc.valid {
+				t.Fatalf("selected grant validation = %+v, %v; want valid=%v", result, err, tc.valid)
+			}
+			if tc.expiresAt == 0 {
+				if !result.ExpiresAt.IsZero() {
+					t.Fatalf("unexpected expiry from another grant: %v", result.ExpiresAt)
+				}
+			} else if result.ExpiresAt.UnixMilli() != tc.expiresAt {
+				t.Fatalf("expiry = %v, want selected grant timestamp %d", result.ExpiresAt, tc.expiresAt)
+			}
+			if (result.Error == "") != tc.valid || result.Method != "passive" {
+				t.Fatalf("validation did not report its result accurately: %+v", result)
+			}
+			if unchanged, err := os.ReadFile(selected); err != nil || !bytes.Equal(unchanged, data) {
+				t.Fatalf("passive validation modified the native credential: %v", err)
+			}
+		})
+	}
+}
+
 func claudeLifecycleFixture(t *testing.T) (string, *profile.Profile) {
 	t.Helper()
 	realHome := t.TempDir()
