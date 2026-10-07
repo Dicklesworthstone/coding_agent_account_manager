@@ -1556,3 +1556,37 @@ func TestAutoBackendPrefersWezTermWhenBothRun(t *testing.T) {
 		t.Fatalf("backend = %s, want wezterm", got)
 	}
 }
+
+func TestResumeDismissesPostLoginScreenBeforePrompting(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1, Title: "claude"}}}
+	cfg := DefaultConfig()
+	cfg.ResumePrompt = "proceed\n"
+	coord := New(cfg)
+	coord.paneClient = client
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateResuming)
+	coord.trackers[1] = tracker
+	ctx := context.Background()
+
+	// Text typed on this screen would be swallowed; it needs an Enter first.
+	client.output = "\x1b[32mLogin successful.\x1b[0m Press Enter to continue…"
+	coord.pollPanes(ctx)
+	coord.pollPanes(ctx) // settling: nothing more is typed
+	if got := client.sentText(); len(got) != 1 || got[0] != "\n" {
+		t.Fatalf("sent %q, want a single Enter to dismiss the screen", got)
+	}
+	if tracker.GetState() != StateResuming {
+		t.Fatalf("state = %v, want still resuming", tracker.GetState())
+	}
+
+	// Back at the prompt (the dismissed screen may linger in scrollback).
+	tracker.SetCooldown("continue", 0)
+	client.output = "Login successful. Press Enter to continue…\n\n> "
+	coord.pollPanes(ctx)
+	if got := client.sentText(); len(got) != 2 || got[1] != "proceed\n" {
+		t.Fatalf("sent %q, want Enter then the resume prompt", got)
+	}
+	if tracker.GetState() != StateIdle {
+		t.Fatalf("state = %v, want idle after resuming", tracker.GetState())
+	}
+}

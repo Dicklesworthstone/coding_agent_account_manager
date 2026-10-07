@@ -349,3 +349,45 @@ func TestDetectRecoverStateUsesMostRecentMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoRecoverDismissesPostLoginScreenBeforeResumePrompt(t *testing.T) {
+	savedList, savedGet, savedSend, savedSettle := weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, recoverContinueSettle
+	defer func() {
+		weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, recoverContinueSettle = savedList, savedGet, savedSend, savedSettle
+	}()
+	recoverContinueSettle = 0
+
+	weztermListPanesFunc = func() ([]weztermPane, error) {
+		return []weztermPane{{ID: 1, Title: "claude"}, {ID: 2, Title: "claude"}}, nil
+	}
+	weztermGetTextFunc = func(paneID int) (string, error) {
+		if paneID == 1 {
+			return "Login successful. Press Enter to continue…", nil
+		}
+		return "Logged in as b@example.com", nil
+	}
+	sent := map[int][]string{}
+	weztermSendTextFunc = func(paneID int, text string) error {
+		sent[paneID] = append(sent[paneID], text)
+		return nil
+	}
+
+	states, err := scanRecoverStates(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	if err := runAutoRecover(cmd, states, true, "proceed\n", nil); err != nil {
+		t.Fatalf("runAutoRecover: %v\n%s", err, buf.String())
+	}
+
+	if got := sent[1]; len(got) != 2 || got[0] != "\n" || got[1] != "proceed\n" {
+		t.Errorf("pane on the post-login screen got %q, want Enter then the prompt", got)
+	}
+	if got := sent[2]; len(got) != 1 || got[0] != "proceed\n" {
+		t.Errorf("pane at its prompt got %q, want just the prompt", got)
+	}
+}

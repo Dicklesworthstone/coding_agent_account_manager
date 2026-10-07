@@ -652,6 +652,25 @@ type RecoverPaneState struct {
 	Error       string
 	LastAction  time.Time
 	Cooldown    time.Duration
+	// PressEnter is set when a resuming pane shows Claude Code's "Press
+	// Enter to continue" after login; text typed there is dropped.
+	PressEnter bool
+}
+
+// recoverContinueSettle is the pause after dismissing the post-login screen
+// before the resume prompt is typed.
+var recoverContinueSettle = 1500 * time.Millisecond
+
+// sendResumePrompt types the resume prompt into a resuming pane, first
+// dismissing the post-login screen when one is showing.
+func sendResumePrompt(s *RecoverPaneState, prompt string) error {
+	if s.PressEnter {
+		if err := weztermSendTextFunc(s.Pane.ID, "\n"); err != nil {
+			return err
+		}
+		time.Sleep(recoverContinueSettle)
+	}
+	return weztermSendTextFunc(s.Pane.ID, prompt)
 }
 
 // IsOnCooldown returns true if the pane is still on cooldown from last action.
@@ -767,6 +786,9 @@ func scanRecoverStates(logger *slog.Logger) ([]*RecoverPaneState, error) {
 			State:       state,
 			MatchReason: reason,
 			OAuthURL:    url,
+		}
+		if state == RecoverResuming {
+			ps.PressEnter = coordinator.Patterns.PressEnter.MatchString(normalizeWeztermText(text))
 		}
 
 		if match.Matched && ps.MatchReason == "" {
@@ -934,7 +956,7 @@ func runAutoRecover(cmd *cobra.Command, states []*RecoverPaneState, yes bool, re
 			}
 		case RecoverResuming:
 			time.Sleep(500 * time.Millisecond)
-			err = weztermSendTextFunc(s.Pane.ID, resumePrompt)
+			err = sendResumePrompt(s, resumePrompt)
 			if err == nil && logger != nil {
 				logger.Debug("injected resume prompt", "pane_id", s.Pane.ID)
 			}
@@ -1037,7 +1059,11 @@ func injectToState(cmd *cobra.Command, states []*RecoverPaneState, targetState R
 		if s.State != targetState {
 			continue
 		}
-		if err := weztermSendTextFunc(s.Pane.ID, text); err != nil {
+		send := func() error { return weztermSendTextFunc(s.Pane.ID, text) }
+		if targetState == RecoverResuming {
+			send = func() error { return sendResumePrompt(s, text) }
+		}
+		if err := send(); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  pane %d: FAILED - %v\n", s.Pane.ID, err)
 		} else {
 			fmt.Fprintf(cmd.OutOrStdout(), "  pane %d: OK\n", s.Pane.ID)

@@ -69,6 +69,7 @@ type PaneTracker struct {
 	UsedAccount  string // Account used for auth
 	ErrorMessage string
 	RetryCount   int
+	ContinueSent bool                 // Enter sent to dismiss the post-login screen this cycle
 	LastOutput   string               // Cached output for duplicate detection
 	Cooldowns    map[string]time.Time // action -> cooldown expiry
 	mu           sync.RWMutex
@@ -119,7 +120,18 @@ func (t *PaneTracker) Reset() {
 	t.ReceivedCode = ""
 	t.UsedAccount = ""
 	t.ErrorMessage = ""
+	t.ContinueSent = false
 	t.Cooldowns = make(map[string]time.Time)
+}
+
+// MarkContinueSent records that the post-login screen was dismissed and
+// reports whether it already had been this cycle.
+func (t *PaneTracker) MarkContinueSent() (alreadySent bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	alreadySent = t.ContinueSent
+	t.ContinueSent = true
+	return alreadySent
 }
 
 // Thread-safe accessors for tracker fields
@@ -275,7 +287,11 @@ var Patterns = struct {
 	OptionOne        *regexp.Regexp
 	UsageLimitReset  *regexp.Regexp
 	CompactingBanner *regexp.Regexp
+	PressEnter       *regexp.Regexp
 }{
+	// "Login successful. Press Enter to continue…"
+	PressEnter: regexp.MustCompile(`(?i)press\s+enter\s+to\s+continue`),
+
 	// "You've hit your limit · resets 2pm (America/New_York)"; tolerant of
 	// case and of a curly or missing apostrophe.
 	RateLimit: regexp.MustCompile(`(?i)you['’]?ve hit your limit.*resets`),

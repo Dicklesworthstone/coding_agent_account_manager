@@ -328,23 +328,19 @@ any host failed or was rolled back.
 
 #### Pattern Detection
 
-```go
-var patterns = struct {
-    RateLimit    *regexp.Regexp
-    SelectMethod *regexp.Regexp
-    OAuthURL     *regexp.Regexp
-    PastePrompt  *regexp.Regexp
-    LoginSuccess *regexp.Regexp
-    LoginFailed  *regexp.Regexp
-}{
-    RateLimit:    regexp.MustCompile(`You've hit your limit.*resets`),
-    SelectMethod: regexp.MustCompile(`Select login method:`),
-    OAuthURL:     regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
-    PastePrompt:  regexp.MustCompile(`Paste code here if prompted`),
-    LoginSuccess: regexp.MustCompile(`Logged in as ([^\s]+@[^\s]+)`),
-    LoginFailed:  regexp.MustCompile(`Login failed|Authentication error`),
-}
-```
+Patterns live in `coordinator.Patterns` (`internal/coordinator/state.go`).
+Output is stripped of ANSI codes first, and when several messages are in the
+scrollback the most recent one decides the state.
+
+| Pattern | Matches (case-insensitive) | Leads to |
+|---------|----------------------------|----------|
+| `RateLimit` | `You've hit your limit … resets` (curly or missing apostrophe) | inject `/login` |
+| `SelectMethod` | `Select login method:` | select option 1 |
+| `OAuthURL` | `https://claude.ai/oauth/authorize?…` (the newest one) | publish auth request |
+| `PastePrompt` | `Paste code here if prompted` | wait for the code |
+| `LoginSuccess` | `Logged in as`, `Login successful`, `Successfully authenticated/logged in`, `Welcome back` | resume |
+| `PressEnter` | `Press Enter to continue` | while resuming, send one Enter first: text typed on that screen is dropped |
+| `LoginFailed` | `Login failed`, `Authentication error`, `Invalid code`, `expired`, `Error signing` | retry `/login` within the budget, then fail |
 
 #### HTTP API
 

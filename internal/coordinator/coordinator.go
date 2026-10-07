@@ -990,7 +990,36 @@ func (c *Coordinator) handleAwaitingConfirmState(ctx context.Context, tracker *P
 	}
 }
 
+// continueSettle is how long the session gets to return to its prompt after
+// the post-login screen is dismissed.
+const continueSettle = 2 * time.Second
+
 func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTracker, output string) {
+	// Claude Code confirms a login with "Login successful. Press Enter to
+	// continue"; text typed on that screen is dropped (its newline only
+	// dismisses it), so dismiss it first, once per cycle.
+	if Patterns.PressEnter.MatchString(StripANSI(output)) && !tracker.MarkContinueSent() {
+		if err := c.paneClient.SendText(ctx, tracker.PaneID, "\n", true); err != nil {
+			c.logger.Error("injection failed",
+				"pane_id", tracker.PaneID,
+				"state", StateResuming.String(),
+				"inject_type", "continue",
+				"error", err,
+				"action", "inject_failed")
+			return
+		}
+		tracker.SetCooldown("continue", continueSettle)
+		c.logger.Info("dismissed post-login screen",
+			"pane_id", tracker.PaneID,
+			"state", StateResuming.String(),
+			"request_id", tracker.GetRequestID(),
+			"action", "inject_continue")
+		return
+	}
+	if tracker.IsOnCooldown("continue") {
+		return
+	}
+
 	// Check resume cooldown to prevent duplicate injections
 	if tracker.IsOnCooldown("resume") {
 		c.logger.Debug("action blocked by cooldown",
