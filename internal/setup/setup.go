@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +43,15 @@ type DiscoveredMachine struct {
 	Role          Role   // coordinator or agent
 	IsReachable   bool   // Whether we can connect
 	IsLocal       bool   // Whether this is the local machine
+}
+
+// endpointName is the machine's name in the agent config: its WezTerm domain,
+// which Tailscale matching does not rename, or the --host name.
+func (m *DiscoveredMachine) endpointName() string {
+	if m.WezTermDomain != "" {
+		return m.WezTermDomain
+	}
+	return m.Name
 }
 
 // MachineOverride provides manual address/config overrides for a machine.
@@ -80,6 +91,11 @@ type Options struct {
 
 	// Remotes limits setup to these domain names. Empty means all.
 	Remotes []string
+
+	// Hosts are additional coordinator hosts, as [user@]host[:port] or a
+	// ~/.ssh/config alias. With hosts, a WezTerm config is optional (tmux
+	// users need none).
+	Hosts []string
 
 	// ManualOverrides maps WezTerm domain names to manual address/config overrides.
 	// Use this when discovery produces wrong results or for machines not on tailnet.
@@ -136,6 +152,7 @@ type ScriptOptions struct {
 	LocalPort     int
 	RemotePort    int
 	Remotes       []string
+	Hosts         []string
 }
 
 // NewOrchestrator creates a new setup orchestrator.
@@ -153,29 +170,34 @@ func NewOrchestrator(opts Options) *Orchestrator {
 func (o *Orchestrator) Discover(ctx context.Context) error {
 	o.logger.Info("discovering machines...")
 
-	// Find WezTerm config
+	// Find WezTerm config. It is optional when hosts are given explicitly.
+	hostsOnly := len(o.opts.Hosts) > 0
 	configPath := o.opts.WezTermConfig
 	if configPath == "" {
 		configPath = wezterm.FindConfigPath()
-		if configPath == "" {
-			return fmt.Errorf("WezTerm config not found; specify path with --wezterm-config or create ~/.wezterm.lua")
+	}
+	o.weztermConfig = &wezterm.Config{}
+	switch {
+	case configPath == "" && !hostsOnly:
+		return fmt.Errorf("WezTerm config not found; name coordinator hosts with --host (tmux users need no WezTerm), or point to wezterm.lua with --wezterm-config")
+	case configPath != "":
+		o.logger.Info("parsing WezTerm config", "path", configPath)
+		cfg, err := wezterm.ParseConfig(configPath)
+		switch {
+		case err == nil:
+			o.weztermConfig = cfg
+		case hostsOnly:
+			o.addWarning("", "WEZTERM_CONFIG_ERROR", fmt.Sprintf("ignoring WezTerm config %s: %v", configPath, err))
+		default:
+			return fmt.Errorf("failed to parse WezTerm config: %w", err)
 		}
 	}
 
-	o.logger.Info("parsing WezTerm config", "path", configPath)
-
-	// Parse WezTerm config
-	cfg, err := wezterm.ParseConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to parse WezTerm config: %w", err)
-	}
-	o.weztermConfig = cfg
-
-	if len(cfg.SSHDomains) == 0 {
-		return fmt.Errorf("no SSH domains found in WezTerm config; add ssh_domains entries to your WezTerm config file")
+	if len(o.weztermConfig.SSHDomains) == 0 && !hostsOnly {
+		return fmt.Errorf("no SSH domains found in WezTerm config; add ssh_domains entries or name coordinator hosts with --host")
 	}
 
-	o.logger.Info("found SSH domains", "count", len(cfg.SSHDomains))
+	o.logger.Info("found SSH domains", "count", len(o.weztermConfig.SSHDomains), "hosts", len(o.opts.Hosts))
 
 	// Check Tailscale availability
 	if o.opts.UseTailscale {
@@ -356,8 +378,87 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 			"user", machine.Username)
 	}
 
+	hostMachines, err := hostsToMachines(o.opts.Hosts, sshConfigHosts())
+	if err != nil {
+		return err
+	}
+	for _, m := range hostMachines {
+		duplicate := false
+		for _, existing := range machines {
+			if strings.EqualFold(existing.endpointName(), m.Name) || strings.EqualFold(existing.Name, m.Name) {
+				duplicate = true
+			}
+		}
+		if duplicate {
+			o.addWarning(m.Name, "DUPLICATE_HOST", "named by --host and by a WezTerm domain; using the WezTerm domain")
+			continue
+		}
+		machines = append(machines, m)
+		o.logger.Info("remote from --host", "name", m.Name, "address", m.PublicIP, "user", m.Username, "port", m.Port)
+	}
+
 	o.remoteMachines = machines
 	return nil
+}
+
+// sshConfigHosts returns the hosts in ~/.ssh/config by alias, so --host can
+// name them the way ssh does.
+func sshConfigHosts() map[string]*sync.Machine {
+	hosts := map[string]*sync.Machine{}
+	machines, err := sync.DiscoverFromSSHConfig()
+	if err != nil {
+		return hosts
+	}
+	for _, m := range machines {
+		hosts[strings.ToLower(m.Name)] = m
+	}
+	return hosts
+}
+
+// hostsToMachines turns --host specs ([user@]host[:port], or an alias from
+// ~/.ssh/config, whose HostName, User, Port and IdentityFile apply unless
+// the spec sets user or port) into coordinator machines.
+func hostsToMachines(specs []string, sshConfig map[string]*sync.Machine) ([]*DiscoveredMachine, error) {
+	var machines []*DiscoveredMachine
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		user, hostPort, hasUser := strings.Cut(spec, "@")
+		if !hasUser {
+			user, hostPort = "", spec
+		}
+		host, port := hostPort, 0
+		if h, p, err := net.SplitHostPort(hostPort); err == nil {
+			n, err := strconv.Atoi(p)
+			if err != nil || n <= 0 || n > 65535 {
+				return nil, fmt.Errorf("--host %q: invalid port %q", spec, p)
+			}
+			host, port = h, n
+		}
+		host = strings.Trim(host, "[]")
+		if host == "" || strings.ContainsAny(host, " /") {
+			return nil, fmt.Errorf("--host %q: expected [user@]host[:port]", spec)
+		}
+
+		m := &DiscoveredMachine{Name: host, PublicIP: host, Username: user, Port: port, Role: RoleCoordinator}
+		if alias, ok := sshConfig[strings.ToLower(host)]; ok {
+			m.PublicIP = alias.Address
+			if m.Username == "" {
+				m.Username = alias.SSHUser
+			}
+			if m.Port == 0 {
+				m.Port = alias.Port
+			}
+			m.IdentityFile = alias.SSHKeyPath
+		}
+		if m.Port == 0 {
+			m.Port = 22
+		}
+		machines = append(machines, m)
+	}
+	return machines, nil
 }
 
 // addWarning adds a discovery warning.
@@ -436,6 +537,10 @@ func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
 	if len(opts.Remotes) > 0 {
 		b.WriteString(" --remotes ")
 		b.WriteString(shellQuote(strings.Join(opts.Remotes, ",")))
+	}
+	for _, host := range opts.Hosts {
+		b.WriteString(" --host ")
+		b.WriteString(shellQuote(host))
 	}
 	b.WriteString("\n\n")
 
@@ -610,7 +715,7 @@ func (o *Orchestrator) coordinatorToken(m *DiscoveredMachine) (string, error) {
 	if !o.opts.RotateTokens {
 		if existing, err := agent.LoadFileConfig(o.agentConfigPath()); err == nil {
 			for _, c := range existing.Coordinators {
-				if c != nil && strings.EqualFold(c.Name, m.WezTermDomain) && len(c.Token) >= 32 {
+				if c != nil && strings.EqualFold(c.Name, m.endpointName()) && len(c.Token) >= 32 {
 					return c.Token, nil
 				}
 			}
@@ -633,7 +738,7 @@ func generateToken() (string, error) {
 // to the loopback-only API, authenticated with the host's token.
 func (o *Orchestrator) coordinatorEndpoint(m *DiscoveredMachine, token string) *agent.CoordinatorEndpoint {
 	return &agent.CoordinatorEndpoint{
-		Name:        m.WezTermDomain,
+		Name:        m.endpointName(),
 		URL:         "http://" + coordinator.ListenAddress(coordinator.DefaultBindAddress, o.opts.RemotePort),
 		DisplayName: m.Name,
 		Token:       token,
@@ -791,7 +896,11 @@ func (o *Orchestrator) PrintDiscoveryResults() {
 
 	fmt.Printf("\nRemote Machines (%d):\n", len(o.remoteMachines))
 	for _, m := range o.remoteMachines {
-		fmt.Printf("\n  %s (%s):\n", m.Name, m.WezTermDomain)
+		source := "--host"
+		if m.WezTermDomain != "" {
+			source = "WezTerm domain " + m.WezTermDomain
+		}
+		fmt.Printf("\n  %s (%s):\n", m.Name, source)
 		fmt.Printf("    Public IP: %s\n", m.PublicIP)
 		if m.TailscaleIP != "" {
 			fmt.Printf("    Tailscale IP: %s (preferred)\n", m.TailscaleIP)

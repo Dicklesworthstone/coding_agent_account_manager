@@ -1537,6 +1537,7 @@ coordinator pastes it and resumes the session.
 ```bash
 # One time, on the machine with the browser:
 caam setup distributed            # deploy coordinators to your WezTerm SSH domains
+caam setup distributed --host ubuntu@build1 --host gpu   # or name hosts (tmux, ~/.ssh/config aliases)
 caam auth-agent signin            # sign in to the Google accounts to rotate through
 caam auth-agent service install   # run the agent at login (launchd / systemd --user)
 

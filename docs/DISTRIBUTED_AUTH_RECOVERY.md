@@ -188,7 +188,13 @@ other address (for example a Tailscale IP) is refused unless a token is set.
 
 #### Transport (what `caam setup distributed` provisions)
 
-`caam setup distributed` deploys each coordinator with a freshly generated
+`caam setup distributed` targets the `ssh_domains` in your WezTerm config and
+any hosts named with `--host [user@]host[:port]` (repeatable). A `--host` that
+matches a `~/.ssh/config` alias takes its `HostName`, `User`, `Port`, and
+`IdentityFile`. With `--host`, no WezTerm config is needed, so tmux-only
+setups work the same way.
+
+It deploys each coordinator with a freshly generated
 per-host token in `~/.config/caam/coordinator.json` (mode 0600, `bind:
 127.0.0.1`) and a systemd user unit whose `ExecStart` uses `%h` for the config
 path. The unit's `PATH` is the user's login-shell `PATH` plus the system

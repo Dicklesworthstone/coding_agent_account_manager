@@ -35,7 +35,8 @@ var setupDistributedCmd = &cobra.Command{
 	Long: `Automatically configures the distributed auth recovery system across machines.
 
 This command:
-1. Parses your WezTerm config to discover SSH domains
+1. Discovers SSH domains in your WezTerm config, plus any --host machines
+   (tmux users can name hosts with --host and skip WezTerm entirely)
 2. Uses Tailscale (if available) for optimal connectivity
 3. Deploys coordinators to remote machines
 4. Generates local agent configuration
@@ -47,6 +48,7 @@ Examples:
   caam setup distributed                     # Auto-detect everything
   caam setup distributed --dry-run           # Preview what would be done
   caam setup distributed --remotes css,csd   # Only setup specific domains
+  caam setup distributed --host ubuntu@build1 --host gpu:2222   # Hosts outside WezTerm
   caam setup distributed --no-tailscale      # Use public IPs only`,
 	RunE: runSetupDistributed,
 }
@@ -60,7 +62,8 @@ func init() {
 	setupDistributedCmd.Flags().Bool("print-script", false, "print a pasteable setup script and exit")
 	setupDistributedCmd.Flags().Int("local-port", 7891, "port for local auth-agent")
 	setupDistributedCmd.Flags().Int("remote-port", 7890, "port for remote coordinators")
-	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these domain names")
+	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these WezTerm domain names")
+	setupDistributedCmd.Flags().StringArray("host", nil, "coordinator host as [user@]host[:port] or a ~/.ssh/config alias (repeatable; no WezTerm config needed)")
 	setupDistributedCmd.Flags().Bool("no-tailscale", false, "disable Tailscale (use public IPs)")
 	setupDistributedCmd.Flags().Bool("rotate-tokens", false, "issue new coordinator API tokens instead of keeping existing ones")
 }
@@ -78,6 +81,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")
 	remotes, _ := cmd.Flags().GetStringSlice("remotes")
+	hosts, _ := cmd.Flags().GetStringArray("host")
 	rotateTokens, _ := cmd.Flags().GetBool("rotate-tokens")
 
 	if noTailscale {
@@ -90,6 +94,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		LocalPort:     localPort,
 		RemotePort:    remotePort,
 		Remotes:       remotes,
+		Hosts:         hosts,
 		DryRun:        dryRun,
 		RotateTokens:  rotateTokens,
 	}
@@ -115,7 +120,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 
 	remoteMachines := orch.GetRemoteMachines()
 	if len(remoteMachines) == 0 {
-		return fmt.Errorf("no remote machines to setup; add SSH domains to WezTerm config or specify hosts with --remote")
+		return fmt.Errorf("no remote machines to setup; add SSH domains to your WezTerm config or name hosts with --host")
 	}
 
 	if printScript {
@@ -125,6 +130,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 			LocalPort:     localPort,
 			RemotePort:    remotePort,
 			Remotes:       remotes,
+			Hosts:         hosts,
 		})
 		if err != nil {
 			return err

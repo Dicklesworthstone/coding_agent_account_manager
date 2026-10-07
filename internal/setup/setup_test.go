@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 )
 
 func TestDefaultOptions(t *testing.T) {
@@ -588,5 +590,172 @@ func TestCoordinatorTokenReusesExistingUnlessRotating(t *testing.T) {
 	}
 	if token, _ := orch.coordinatorToken(machine); token == "weak" {
 		t.Fatal("a weak token must be replaced")
+	}
+}
+
+func TestHostsToMachines(t *testing.T) {
+	sshConfig := map[string]*sync.Machine{
+		"build": {Name: "build", Address: "10.1.2.3", SSHUser: "deploy", Port: 2200, SSHKeyPath: "/keys/build"},
+	}
+	tests := []struct {
+		spec                string
+		name, address, user string
+		port                int
+		identity            string
+	}{
+		{spec: "box1", name: "box1", address: "box1", port: 22},
+		{spec: "ubuntu@10.0.0.5:2222", name: "10.0.0.5", address: "10.0.0.5", user: "ubuntu", port: 2222},
+		{spec: "[::1]:2022", name: "::1", address: "::1", port: 2022},
+		{spec: "fe80::1", name: "fe80::1", address: "fe80::1", port: 22},
+		// An ssh_config alias supplies HostName, User, Port and IdentityFile...
+		{spec: "BUILD", name: "BUILD", address: "10.1.2.3", user: "deploy", port: 2200, identity: "/keys/build"},
+		// ...unless the spec names them itself.
+		{spec: "root@build:22", name: "build", address: "10.1.2.3", user: "root", port: 22, identity: "/keys/build"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.spec, func(t *testing.T) {
+			machines, err := hostsToMachines([]string{tt.spec}, sshConfig)
+			if err != nil {
+				t.Fatalf("hostsToMachines(%q): %v", tt.spec, err)
+			}
+			if len(machines) != 1 {
+				t.Fatalf("got %d machines", len(machines))
+			}
+			m := machines[0]
+			if m.Name != tt.name || m.PublicIP != tt.address || m.Username != tt.user || m.Port != tt.port || m.IdentityFile != tt.identity {
+				t.Errorf("got name=%q address=%q user=%q port=%d identity=%q", m.Name, m.PublicIP, m.Username, m.Port, m.IdentityFile)
+			}
+			if m.Role != RoleCoordinator || m.WezTermDomain != "" {
+				t.Errorf("role=%q domain=%q; --host machines are coordinators outside WezTerm", m.Role, m.WezTermDomain)
+			}
+		})
+	}
+
+	for _, bad := range []string{"box:0", "box:70000", "box:ssh", "user@", "a b", "host/path"} {
+		if _, err := hostsToMachines([]string{bad}, nil); err == nil {
+			t.Errorf("hostsToMachines(%q) accepted an invalid spec", bad)
+		}
+	}
+	if machines, err := hostsToMachines([]string{"", "  "}, nil); err != nil || len(machines) != 0 {
+		t.Errorf("blank specs = %v, %v; want none", machines, err)
+	}
+}
+
+func TestDiscoverWithHostsNeedsNoWezTerm(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sshConfig := "Host gpu\n  HostName 192.0.2.7\n  User ml\n  Port 2201\n"
+	if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte(sshConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without hosts, a missing WezTerm config is an error that points at --host.
+	orch := NewOrchestrator(Options{})
+	err := orch.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--host") {
+		t.Fatalf("Discover without WezTerm or hosts = %v; want an error naming --host", err)
+	}
+
+	orch = NewOrchestrator(Options{Hosts: []string{"ubuntu@build1:2222", "gpu"}})
+	if err := orch.Discover(context.Background()); err != nil {
+		t.Fatalf("Discover with --host and no WezTerm config: %v", err)
+	}
+	remotes := orch.GetRemoteMachines()
+	if len(remotes) != 2 {
+		t.Fatalf("got %d remotes, want 2", len(remotes))
+	}
+	if r := remotes[0]; r.Name != "build1" || r.Username != "ubuntu" || r.Port != 2222 {
+		t.Errorf("first remote = %+v", r)
+	}
+	if r := remotes[1]; r.Name != "gpu" || r.PublicIP != "192.0.2.7" || r.Username != "ml" || r.Port != 2201 {
+		t.Errorf("ssh_config alias = %+v", r)
+	}
+
+	// An unreadable WezTerm config is only a warning when hosts are given.
+	orch = NewOrchestrator(Options{Hosts: []string{"build1"}, WezTermConfig: filepath.Join(home, "missing.lua")})
+	if err := orch.Discover(context.Background()); err != nil {
+		t.Fatalf("Discover with a broken WezTerm config and --host: %v", err)
+	}
+	found := false
+	for _, w := range orch.GetDiscoveryWarnings() {
+		found = found || w.Code == "WEZTERM_CONFIG_ERROR"
+	}
+	if !found {
+		t.Error("expected a WEZTERM_CONFIG_ERROR warning")
+	}
+}
+
+func TestDiscoverPrefersWezTermDomainOverDuplicateHost(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "wezterm.lua")
+	lua := `local config = {}
+config.ssh_domains = {
+  { name = 'csd', remote_address = '203.0.113.9', username = 'ubuntu' },
+}
+return config
+`
+	if err := os.WriteFile(config, []byte(lua), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orch := NewOrchestrator(Options{WezTermConfig: config, Hosts: []string{"CSD", "extra"}})
+	if err := orch.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range orch.GetRemoteMachines() {
+		names = append(names, m.Name)
+	}
+	if strings.Join(names, ",") != "csd,extra" {
+		t.Fatalf("remotes = %v; want the WezTerm domain plus the new host", names)
+	}
+	found := false
+	for _, w := range orch.GetDiscoveryWarnings() {
+		found = found || (w.Code == "DUPLICATE_HOST" && w.Machine == "CSD")
+	}
+	if !found {
+		t.Errorf("expected a DUPLICATE_HOST warning, got %+v", orch.GetDiscoveryWarnings())
+	}
+}
+
+func TestHostMachineKeysAgentConfigByHostName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.json")
+	orch := setupWithRemotes(t, path)
+	hosts, err := hostsToMachines([]string{"ubuntu@build1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := hosts[0]
+
+	existing := strings.Repeat("b", 64)
+	if err := agent.WriteFileConfig(path, agent.FileConfig{Coordinators: []*agent.CoordinatorEndpoint{
+		{Name: "build1", URL: "http://127.0.0.1:7890", Token: existing},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if token, err := orch.coordinatorToken(host); err != nil || token != existing {
+		t.Fatalf("token = %q, %v; a --host machine keeps its token across setup runs", token, err)
+	}
+	if ep := orch.coordinatorEndpoint(host, existing); ep.Name != "build1" {
+		t.Fatalf("endpoint name = %q, want build1", ep.Name)
+	}
+	if ep := orch.coordinatorEndpoint(orch.remoteMachines[0], "tok"); ep.Name != "csd" {
+		t.Fatalf("endpoint name = %q; a WezTerm machine keeps its domain name even when Tailscale renames it", ep.Name)
+	}
+}
+
+func TestBuildSetupScriptRepeatsHosts(t *testing.T) {
+	orch := NewOrchestrator(DefaultOptions())
+	orch.localMachine = &DiscoveredMachine{Name: "local", IsLocal: true}
+	orch.remoteMachines = []*DiscoveredMachine{{Name: "box", PublicIP: "box", Port: 22}}
+	script, err := orch.BuildSetupScript(ScriptOptions{UseTailscale: true, Hosts: []string{"ubuntu@box:2222", "gpu"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "caam setup distributed --yes --host ubuntu@box:2222 --host gpu\n") {
+		t.Errorf("script does not repeat --host:\n%s", script)
 	}
 }
