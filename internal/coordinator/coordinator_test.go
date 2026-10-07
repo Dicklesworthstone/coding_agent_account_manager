@@ -397,6 +397,42 @@ func TestAPIStatusEndpoint(t *testing.T) {
 	if resp.Panes[0].State != "AUTH_PENDING" {
 		t.Errorf("expected AUTH_PENDING state, got %q", resp.Panes[0].State)
 	}
+	if resp.Panes[0].HoldUntil != nil || resp.Panes[0].LimitedAccount != "" {
+		t.Errorf("pane without a limit reports one: %+v", resp.Panes[0])
+	}
+}
+
+// TestAPIStatusShowsLimitAndHold: a pane at its limit says which account hit
+// it, and a pane waiting for a free account says until when.
+func TestAPIStatusShowsLimitAndHold(t *testing.T) {
+	coord := New(DefaultConfig())
+	coord.paneClient = &fakePaneClient{}
+	tracker := NewPaneTracker(1)
+	tracker.SetLimit("a@example.com", "3pm (America/New_York)")
+	until := time.Now().Add(time.Hour).Truncate(time.Second)
+	tracker.SetHoldUntil(until)
+	coord.trackers[1] = tracker
+	expired := NewPaneTracker(2)
+	expired.SetHoldUntil(time.Now().Add(-time.Minute))
+	coord.trackers[2] = expired
+
+	w := httptest.NewRecorder()
+	NewAPIServer(coord, "", 0, nil).handleStatus(w, httptest.NewRequest("GET", "/status", nil))
+	var resp StatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	byPane := map[int]PaneStatusResponse{}
+	for _, p := range resp.Panes {
+		byPane[p.PaneID] = p
+	}
+	p := byPane[1]
+	if p.LimitedAccount != "a@example.com" || p.LimitReset != "3pm (America/New_York)" || p.HoldUntil == nil || !p.HoldUntil.Equal(until) {
+		t.Fatalf("pane 1 = %+v", p)
+	}
+	if byPane[2].HoldUntil != nil {
+		t.Fatalf("an expired hold is reported: %+v", byPane[2])
+	}
 }
 
 func TestAPITokenAuth(t *testing.T) {

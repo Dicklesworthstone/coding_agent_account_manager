@@ -189,6 +189,12 @@ type PaneStatusResponse struct {
 	Account      string    `json:"account,omitempty"`
 	Error        string    `json:"error,omitempty"`
 	Retries      int       `json:"retries,omitempty"` // login retries used this rate-limit episode
+	// LimitedAccount hit its usage limit in this pane (LimitReset is the
+	// banner's reset); HoldUntil, when set, is when a login may start
+	// again after the agent found no account free.
+	LimitedAccount string     `json:"limited_account,omitempty"`
+	LimitReset     string     `json:"limit_reset,omitempty"`
+	HoldUntil      *time.Time `json:"hold_until,omitempty"`
 }
 
 func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -198,15 +204,22 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	panes := make([]PaneStatusResponse, 0, len(trackers))
 	for _, t := range trackers {
 		t.mu.RLock()
-		panes = append(panes, PaneStatusResponse{
-			PaneID:       t.PaneID,
-			State:        t.State.String(),
-			StateEntered: t.StateEntered,
-			RequestID:    t.RequestID,
-			Account:      t.UsedAccount,
-			Error:        t.ErrorMessage,
-			Retries:      t.RetryCount,
-		})
+		status := PaneStatusResponse{
+			PaneID:         t.PaneID,
+			State:          t.State.String(),
+			StateEntered:   t.StateEntered,
+			RequestID:      t.RequestID,
+			Account:        t.UsedAccount,
+			Error:          t.ErrorMessage,
+			Retries:        t.RetryCount,
+			LimitedAccount: t.LimitedAccount,
+			LimitReset:     t.LimitReset,
+		}
+		if t.HoldUntil.After(time.Now()) {
+			hold := t.HoldUntil
+			status.HoldUntil = &hold
+		}
+		panes = append(panes, status)
 		t.mu.RUnlock()
 	}
 

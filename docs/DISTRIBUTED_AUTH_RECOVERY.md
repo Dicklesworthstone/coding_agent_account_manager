@@ -395,7 +395,9 @@ GET /status
   Response: {
     "panes": [
       { "id": 123, "state": "IDLE", "last_check": "..." },
-      { "id": 456, "state": "AUTH_PENDING", "request_id": "uuid" }
+      { "id": 456, "state": "AUTH_PENDING", "request_id": "uuid",
+        "limited_account": "alice@gmail.com", "limit_reset": "3pm (America/New_York)" },
+      { "id": 789, "state": "IDLE", "hold_until": "2026-10-07T19:00:00Z" }   (no account free until then)
     ],
     "pending_auths": 2,
     "completed_today": 15

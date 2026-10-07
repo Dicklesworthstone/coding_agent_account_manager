@@ -366,6 +366,12 @@ func runCoordinatorStatus(cmd *cobra.Command, args []string) error {
 		if p.Error != "" {
 			line += " error=" + p.Error
 		}
+		if p.LimitedAccount != "" {
+			line += " limited=" + p.LimitedAccount
+		}
+		if p.HoldUntil != nil {
+			line += " waiting-for-a-free-account-until=" + p.HoldUntil.Local().Format("Jan 2 15:04")
+		}
 		fmt.Fprintln(out, line)
 	}
 	return nil
