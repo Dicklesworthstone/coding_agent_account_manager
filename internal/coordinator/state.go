@@ -59,19 +59,19 @@ func (s PaneState) String() string {
 
 // PaneTracker tracks the state of a single pane.
 type PaneTracker struct {
-	PaneID        int
-	State         PaneState
-	LastCheck     time.Time
-	StateEntered  time.Time
-	OAuthURL      string
-	RequestID     string // ID for auth request
-	ReceivedCode  string // Code received from local agent
-	UsedAccount   string // Account used for auth
-	ErrorMessage  string
-	RetryCount    int
-	LastOutput    string // Cached output for duplicate detection
-	Cooldowns     map[string]time.Time // action -> cooldown expiry
-	mu            sync.RWMutex
+	PaneID       int
+	State        PaneState
+	LastCheck    time.Time
+	StateEntered time.Time
+	OAuthURL     string
+	RequestID    string // ID for auth request
+	ReceivedCode string // Code received from local agent
+	UsedAccount  string // Account used for auth
+	ErrorMessage string
+	RetryCount   int
+	LastOutput   string               // Cached output for duplicate detection
+	Cooldowns    map[string]time.Time // action -> cooldown expiry
+	mu           sync.RWMutex
 }
 
 // NewPaneTracker creates a tracker for a pane.
@@ -261,17 +261,18 @@ var Patterns = struct {
 	UsageLimitReset  *regexp.Regexp
 	CompactingBanner *regexp.Regexp
 }{
-	// "You've hit your limit · resets 2pm (America/New_York)"
-	RateLimit: regexp.MustCompile(`You've hit your limit.*resets`),
+	// "You've hit your limit · resets 2pm (America/New_York)"; tolerant of
+	// case and of a curly or missing apostrophe.
+	RateLimit: regexp.MustCompile(`(?i)you['’]?ve hit your limit.*resets`),
 
 	// "Select login method:"
-	SelectMethod: regexp.MustCompile(`Select login method:`),
+	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
 
 	// OAuth URL: https://claude.ai/oauth/authorize?code=true&...
 	OAuthURL: regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
 
 	// "Paste code here if prompted >"
-	PastePrompt: regexp.MustCompile(`Paste code here if prompted`),
+	PastePrompt: regexp.MustCompile(`(?i)paste code here if prompted`),
 
 	// "Logged in as user@example.com" or similar success patterns
 	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|successfully authenticated|welcome back)`),

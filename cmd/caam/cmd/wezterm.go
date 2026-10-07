@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -661,59 +662,29 @@ func (r *RecoverPaneState) IsOnCooldown() bool {
 	return time.Since(r.LastAction) < r.Cooldown
 }
 
-// Recovery state detection patterns (using coordinator patterns).
-var recoverPatterns = struct {
-	RateLimit    *regexp.Regexp
-	SelectMethod *regexp.Regexp
-	OAuthURL     *regexp.Regexp
-	PastePrompt  *regexp.Regexp
-	LoginSuccess *regexp.Regexp
-	LoginFailed  *regexp.Regexp
-}{
-	RateLimit:    regexp.MustCompile(`(?i)you'?ve hit your limit.*resets`),
-	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
-	OAuthURL:     regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
-	PastePrompt:  regexp.MustCompile(`(?i)paste code here if prompted`),
-	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|successfully authenticated|welcome back)`),
-	LoginFailed:  regexp.MustCompile(`(?i)(login failed|authentication error|invalid code|expired|error signing)`),
-}
-
-// detectRecoverState analyzes pane output and returns the recovery state.
+// detectRecoverState analyzes pane output and returns the recovery state,
+// the reason, and the OAuth URL when one is shown. It shares the distributed
+// coordinator's detection, where the most recent message in the scrollback
+// decides.
 func detectRecoverState(text string) (RecoverState, string, string) {
-	normalized := normalizeWeztermText(text)
-
-	// Check for login success first (highest priority)
-	if recoverPatterns.LoginSuccess.MatchString(normalized) {
+	state, meta := coordinator.DetectState(normalizeWeztermText(text))
+	switch state {
+	case coordinator.StateResuming:
 		return RecoverResuming, "login_success", ""
-	}
-
-	// Check for login failure
-	if recoverPatterns.LoginFailed.MatchString(normalized) {
+	case coordinator.StateFailed:
 		return RecoverFailed, "login_failed", ""
-	}
-
-	// Check for OAuth URL
-	if url := recoverPatterns.OAuthURL.FindString(normalized); url != "" {
-		return RecoverAwaitingURL, "oauth_url", url
-	}
-
-	// Check for paste prompt (URL was shown)
-	if recoverPatterns.PastePrompt.MatchString(normalized) {
-		url := recoverPatterns.OAuthURL.FindString(normalized)
-		return RecoverAwaitingURL, "paste_prompt", url
-	}
-
-	// Check for method selection prompt
-	if recoverPatterns.SelectMethod.MatchString(normalized) {
+	case coordinator.StateAwaitingURL:
+		if url := meta["oauth_url"]; url != "" {
+			return RecoverAwaitingURL, "oauth_url", url
+		}
+		return RecoverAwaitingURL, "paste_prompt", ""
+	case coordinator.StateAwaitingMethodSelect:
 		return RecoverAwaitingSelect, "select_method", ""
-	}
-
-	// Check for rate limit
-	if recoverPatterns.RateLimit.MatchString(normalized) {
+	case coordinator.StateRateLimited:
 		return RecoverRateLimited, "rate_limit", ""
+	default:
+		return RecoverIdle, "", ""
 	}
-
-	return RecoverIdle, "", ""
 }
 
 func runWeztermRecover(cmd *cobra.Command, args []string) error {

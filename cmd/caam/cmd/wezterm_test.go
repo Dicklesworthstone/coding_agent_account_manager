@@ -326,3 +326,26 @@ func TestWeztermOAuthReportRedactsLogs(t *testing.T) {
 		t.Fatalf("expected logs to redact urls, got: %s", logs)
 	}
 }
+
+func TestDetectRecoverStateUsesMostRecentMessage(t *testing.T) {
+	tests := []struct {
+		text       string
+		wantState  RecoverState
+		wantReason string
+		wantURL    string
+	}{
+		{"Logged in as a@example.com\n...\nYou’ve hit your limit · resets 3pm", RecoverRateLimited, "rate_limit", ""},
+		{"\x1b[31mYou've hit your limit\x1b[0m · resets 2pm\n> /login\n│ Select login method: │", RecoverAwaitingSelect, "select_method", ""},
+		{"https://claude.ai/oauth/authorize?code=old\nLogin failed\nhttps://claude.ai/oauth/authorize?code=new\nPaste code here if prompted >", RecoverAwaitingURL, "oauth_url", "https://claude.ai/oauth/authorize?code=new"},
+		{"Paste code here if prompted >", RecoverAwaitingURL, "paste_prompt", ""},
+		{"Paste code here if prompted > CODE\nInvalid code", RecoverFailed, "login_failed", ""},
+		{"Paste code here if prompted > CODE\nLogged in as b@example.com", RecoverResuming, "login_success", ""},
+		{"just a shell", RecoverIdle, "", ""},
+	}
+	for _, tt := range tests {
+		state, reason, url := detectRecoverState(tt.text)
+		if state != tt.wantState || reason != tt.wantReason || url != tt.wantURL {
+			t.Errorf("detectRecoverState(%q) = %v, %q, %q; want %v, %q, %q", tt.text, state, reason, url, tt.wantState, tt.wantReason, tt.wantURL)
+		}
+	}
+}
