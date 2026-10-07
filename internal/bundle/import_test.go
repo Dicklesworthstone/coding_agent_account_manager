@@ -1,12 +1,306 @@
 package bundle
 
 import (
+	"archive/zip"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+// Write raw manifests so recovery tests exercise the importer, including cases
+// a normal exporter would reject. Every payload has its exact SHA-256 checksum.
+func writeRecoveryBundle(t *testing.T, manifest *ManifestV1, files map[string]string) string {
+	t.Helper()
+	manifest.Source.Hostname = "synthetic-recovery-test"
+	for name, data := range files {
+		if name == EncryptionMarkerFile {
+			continue
+		}
+		if _, exists := manifest.Checksums.Files[name]; !exists {
+			checksum, err := ComputeDataChecksum([]byte(data), AlgorithmSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.AddChecksum(name, checksum)
+		}
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "recovery.zip")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	for name, contents := range files {
+		entry, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte(contents)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry, err := w.Create(ManifestFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeRecoveryFile(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireRecoveryFile(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != want {
+		t.Errorf("preserved file %s: got %q, error %v; want %q", path, got, err, want)
+	}
+}
+
+func TestVaultImporterRejectsManifestTraversalBeforeAnyChanges(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		for _, names := range [][2]string{{"codex", "../../victim"}, {"../..", "victim"}, {"codex", `..\..\victim`}, {`C:\vault`, "victim"}, {"codex", "NUL"}, {"codex", "victim."}} {
+			t.Run(names[0]+"/"+names[1]+"/dry="+fmt.Sprint(dryRun), func(t *testing.T) {
+				root := t.TempDir()
+				vaultPath := filepath.Join(root, "vault")
+				victim := filepath.Join(root, "victim", "auth.json")
+				existing := filepath.Join(vaultPath, "codex", "existing", "auth.json")
+				configPath := filepath.Join(root, "config.json")
+				writeRecoveryFile(t, victim, "outside-original")
+				writeRecoveryFile(t, existing, "account-original")
+				writeRecoveryFile(t, configPath, "config-original")
+				manifest := NewManifest()
+				manifest.AddProfile(names[0], names[1])
+				manifest.AddProfile("codex", "existing")
+				manifest.SetConfig(true, "config.json")
+				bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+					"victim/auth.json": "outside-replacement", "vault/codex/existing/auth.json": "account-replacement", "config.json": "config-replacement",
+				})
+				result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vaultPath, ConfigPath: configPath, Mode: ImportModeReplace, Force: true, DryRun: dryRun})
+				if err == nil {
+					t.Fatal("unsafe manifest accepted")
+				}
+				if result != nil && len(result.ProfileActions) != 0 {
+					t.Fatalf("unsafe manifest was previewed: %+v", result.ProfileActions)
+				}
+				requireRecoveryFile(t, victim, "outside-original")
+				requireRecoveryFile(t, existing, "account-original")
+				requireRecoveryFile(t, configPath, "config-original")
+			})
+		}
+	}
+}
+
+func TestVaultImporterForceCannotBypassCorruption(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprint(dryRun), func(t *testing.T) {
+			root := t.TempDir()
+			vaultPath := filepath.Join(root, "vault")
+			existing := filepath.Join(vaultPath, "codex", "work", "auth.json")
+			configPath := filepath.Join(root, "config.json")
+			writeRecoveryFile(t, existing, "account-original")
+			writeRecoveryFile(t, configPath, "config-original")
+			manifest := NewManifest()
+			manifest.AddProfile("codex", "work")
+			manifest.SetConfig(true, "config.json")
+			checksum, err := ComputeDataChecksum([]byte("untampered"), AlgorithmSHA256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.AddChecksum("vault/codex/work/auth.json", checksum)
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{"vault/codex/work/auth.json": "tampered", "config.json": "replacement"})
+			result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vaultPath, ConfigPath: configPath, Mode: ImportModeReplace, Force: true, DryRun: dryRun})
+			if err == nil || !strings.Contains(err.Error(), "checksum verification failed") {
+				t.Fatalf("want integrity refusal, got %v", err)
+			}
+			if result == nil || result.VerificationResult == nil || result.VerificationResult.Valid || len(result.ProfileActions) != 0 {
+				t.Fatalf("corruption was not rejected before preview: %+v", result)
+			}
+			requireRecoveryFile(t, existing, "account-original")
+			requireRecoveryFile(t, configPath, "config-original")
+		})
+	}
+}
+
+func TestVaultImporterRejectsMetadataAsOptionalPayload(t *testing.T) {
+	for _, source := range []string{EncryptionMarkerFile, ManifestFileName, EncryptionMarkerFile + "/", ".CAAM_ENCRYPTED", "MaNiFeSt.JsOn", ".CaAm_EnCrYpTeD/"} {
+		t.Run(source, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.json")
+			writeRecoveryFile(t, configPath, "original-config")
+			manifest := NewManifest()
+			manifest.SetConfig(true, source)
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{EncryptionMarkerFile: "unchecked-config"})
+			if _, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{ConfigPath: configPath}); err == nil || !strings.Contains(err.Error(), "reserved bundle metadata") {
+				t.Fatalf("want reserved metadata refusal, got %v", err)
+			}
+			requireRecoveryFile(t, configPath, "original-config")
+		})
+	}
+}
+
+func TestVaultImporterRejectsDestinationSymlinks(t *testing.T) {
+	for _, target := range []string{"vault", "provider", "profile", "credential", "config", "config-parent", "sync-child"} {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(target+"/dry="+fmt.Sprint(dryRun), func(t *testing.T) {
+				root, outside := t.TempDir(), t.TempDir()
+				vaultPath := filepath.Join(root, "vault")
+				configPath := filepath.Join(root, "config", "config.json")
+				syncPath := filepath.Join(root, "sync")
+				link, to := "", outside
+				switch target {
+				case "vault":
+					link = vaultPath
+				case "provider":
+					link = filepath.Join(vaultPath, "codex")
+				case "profile":
+					link = filepath.Join(vaultPath, "codex", "work")
+				case "credential":
+					link, to = filepath.Join(vaultPath, "codex", "work", "auth.json"), filepath.Join(outside, "auth.json")
+				case "config":
+					link, to = configPath, filepath.Join(outside, "config.json")
+				case "config-parent":
+					link = filepath.Dir(configPath)
+				case "sync-child":
+					link = filepath.Join(syncPath, "nested")
+				}
+				if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+					t.Fatal(err)
+				}
+				for _, file := range []string{"auth.json", "config.json", "codex/work/auth.json", "work/auth.json", "pools.json"} {
+					writeRecoveryFile(t, filepath.Join(outside, file), "outside-original")
+				}
+				if err := os.Symlink(to, link); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+				manifest := NewManifest()
+				manifest.AddProfile("codex", "work")
+				manifest.SetConfig(true, "config.json")
+				manifest.SetSyncConfig(true, "sync/")
+				bundlePath := writeRecoveryBundle(t, manifest, map[string]string{"vault/codex/work/auth.json": "replacement", "config.json": "replacement", "sync/nested/pools.json": "replacement"})
+				result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vaultPath, ConfigPath: configPath, SyncPath: syncPath, Mode: ImportModeReplace, Force: true, DryRun: dryRun})
+				if err == nil {
+					t.Fatal("destination symlink accepted")
+				}
+				if result != nil && len(result.ProfileActions) != 0 {
+					t.Fatalf("unsafe destination was previewed: %+v", result.ProfileActions)
+				}
+				for _, file := range []string{"auth.json", "config.json", "codex/work/auth.json", "work/auth.json", "pools.json"} {
+					requireRecoveryFile(t, filepath.Join(outside, file), "outside-original")
+				}
+				if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("rejected import replaced link: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestVaultImporterReplacePreservesBackupNamedProfile(t *testing.T) {
+	root := t.TempDir()
+	vaultPath := filepath.Join(root, "vault")
+	profilePath := filepath.Join(vaultPath, "codex", "work", "auth.json")
+	backupNamedPath := filepath.Join(vaultPath, "codex", "work.bak", "auth.json")
+	writeRecoveryFile(t, profilePath, "old-generation")
+	writeRecoveryFile(t, backupNamedPath, "separate-account")
+	manifest := NewManifest()
+	manifest.AddProfile("codex", "work")
+	bundlePath := writeRecoveryBundle(t, manifest, map[string]string{"vault/codex/work/auth.json": "new-generation"})
+	result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vaultPath, Mode: ImportModeReplace})
+	if err != nil || result.UpdatedProfiles != 1 || len(result.Errors) != 0 {
+		t.Fatalf("replace failed: %+v, %v", result, err)
+	}
+	requireRecoveryFile(t, profilePath, "new-generation")
+	requireRecoveryFile(t, backupNamedPath, "separate-account")
+}
+
+func TestVaultImporterAllowsTrustedHomeAlias(t *testing.T) {
+	realHome, aliasRoot := t.TempDir(), t.TempDir()
+	homeAlias := filepath.Join(aliasRoot, "home")
+	if err := os.Symlink(realHome, homeAlias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	manifest := NewManifest()
+	manifest.AddProfile("codex", "work")
+	manifest.SetConfig(true, "config.json")
+	bundlePath := writeRecoveryBundle(t, manifest, map[string]string{"vault/codex/work/auth.json": "synthetic-credential", "config.json": "synthetic-config"})
+	opts := &ImportOptions{VaultPath: filepath.Join(homeAlias, "data", "vault"), ConfigPath: filepath.Join(homeAlias, "config", "caam", "config.json"), Mode: ImportModeReplace}
+	originalVault := opts.VaultPath
+	result, err := (&VaultImporter{BundlePath: bundlePath}).Import(opts)
+	if err != nil || result.NewProfiles != 1 || len(result.Errors) != 0 {
+		t.Fatalf("trusted HOME alias rejected: %+v, %v", result, err)
+	}
+	if opts.VaultPath != originalVault {
+		t.Fatal("import mutated caller options")
+	}
+	requireRecoveryFile(t, filepath.Join(realHome, "data", "vault", "codex", "work", "auth.json"), "synthetic-credential")
+	requireRecoveryFile(t, filepath.Join(realHome, "config", "caam", "config.json"), "synthetic-config")
+}
+
+func TestVaultImporterRejectsSpecialAndDuplicateArchiveEntries(t *testing.T) {
+	for _, mode := range []string{"symlink", "duplicate", "windows-traversal"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			bundlePath := filepath.Join(root, "invalid.zip")
+			f, err := os.Create(bundlePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := zip.NewWriter(f)
+			header := &zip.FileHeader{Name: "vault/codex/work/auth.json", Method: zip.Store}
+			if mode == "symlink" {
+				header.SetMode(os.ModeSymlink | 0600)
+			} else if mode == "windows-traversal" {
+				header.Name = `..\outside\auth.json`
+			}
+			entry, err := w.CreateHeader(header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := entry.Write([]byte("synthetic")); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "duplicate" {
+				if _, err := w.Create(header.Name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_, err = (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: filepath.Join(root, "vault"), Force: true})
+			if err == nil || !strings.Contains(err.Error(), "extract bundle") {
+				t.Fatalf("invalid archive was not refused during extraction: %v", err)
+			}
+		})
+	}
+}
 
 func TestDefaultImportOptions(t *testing.T) {
 	opts := DefaultImportOptions()

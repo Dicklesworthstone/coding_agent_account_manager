@@ -174,6 +174,7 @@ func VerifyChecksums(bundleDir string, manifest *ManifestV1) (*VerificationResul
 
 		expectedChecksum, exists := expectedFiles[relPath]
 		if !exists {
+			result.Valid = false
 			result.Extra = append(result.Extra, relPath)
 			return nil
 		}
@@ -223,7 +224,8 @@ func VerifyChecksums(bundleDir string, manifest *ManifestV1) (*VerificationResul
 
 // VerificationResult contains the results of checksum verification.
 type VerificationResult struct {
-	// Valid is true if all checksums match and no files are missing.
+	// Valid is true if every payload file has a matching checksum and no
+	// declared files are missing.
 	Valid bool
 
 	// Verified is the list of files that passed verification.

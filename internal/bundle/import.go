@@ -117,10 +117,10 @@ type ImportResult struct {
 
 // ProfileAction describes what happened to a single profile during import.
 type ProfileAction struct {
-	Provider string
-	Profile  string
-	Action   string // "add", "update", "skip", "error"
-	Reason   string
+	Provider     string
+	Profile      string
+	Action       string // "add", "update", "skip", "error"
+	Reason       string
 	LocalExpiry  *time.Time
 	BundleExpiry *time.Time
 }
@@ -144,6 +144,9 @@ func (i *VaultImporter) Import(opts *ImportOptions) (*ImportResult, error) {
 	if opts == nil {
 		opts = DefaultImportOptions()
 	}
+	// Resolve trusted configured ancestors without changing the caller's options.
+	options := *opts
+	opts = &options
 
 	result := &ImportResult{
 		ProfileActions:  make([]ProfileAction, 0),
@@ -204,8 +207,14 @@ func (i *VaultImporter) Import(opts *ImportOptions) (*ImportResult, error) {
 	}
 	result.VerificationResult = verifyResult
 
-	if !verifyResult.Valid && !opts.Force {
+	if !verifyResult.Valid {
 		return result, fmt.Errorf("checksum verification failed: %s", verifyResult.Summary())
+	}
+	if err := resolveImportDestinations(opts, manifest); err != nil {
+		return result, fmt.Errorf("unsafe destination: %w", err)
+	}
+	if err := preflightImport(tempDir, manifest, opts); err != nil {
+		return result, fmt.Errorf("unsafe import: %w", err)
 	}
 
 	// If dry run, determine what would happen without doing it
@@ -240,6 +249,69 @@ func (i *VaultImporter) extractBundle(destDir string) error {
 	}
 
 	return nil
+}
+
+func resolveImportDestinations(opts *ImportOptions, manifest *ManifestV1) error {
+	for _, target := range []struct {
+		path      *string
+		directory bool
+		included  bool
+	}{
+		{&opts.VaultPath, true, len(manifest.Contents.Vault.Profiles) != 0},
+		{&opts.ConfigPath, false, manifest.Contents.Config.Included && !opts.SkipConfig},
+		{&opts.ProjectsPath, false, manifest.Contents.Projects.Included && !opts.SkipProjects},
+		{&opts.HealthPath, false, manifest.Contents.Health.Included && !opts.SkipHealth},
+		{&opts.DatabasePath, false, manifest.Contents.Database.Included && !opts.SkipDatabase},
+		{&opts.SyncPath, true, manifest.Contents.SyncConfig.Included && !opts.SkipSync},
+	} {
+		if !target.included || *target.path == "" {
+			continue
+		}
+		path, err := filepath.Abs(*target.path)
+		if err != nil {
+			return err
+		}
+		root := path
+		if !target.directory {
+			root = filepath.Dir(path)
+		}
+		// Root aliases are refused, while aliases above the configured storage
+		// root (such as HOME or macOS /var) are trusted caller configuration.
+		if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+			return fmt.Errorf("destination root is not a real directory: %s", root)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		parent, err := resolveExistingAncestors(filepath.Dir(root))
+		if err != nil {
+			return err
+		}
+		resolved := filepath.Join(parent, filepath.Base(root))
+		if root == filepath.Dir(root) {
+			resolved = root
+		}
+		if !target.directory {
+			resolved = filepath.Join(resolved, filepath.Base(path))
+		}
+		*target.path = resolved
+	}
+	return nil
+}
+
+func resolveExistingAncestors(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil || !os.IsNotExist(err) {
+		return resolved, err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return "", err
+	}
+	resolved, err = resolveExistingAncestors(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolved, filepath.Base(path)), nil
 }
 
 // extractEncryptedBundle decrypts and extracts an encrypted bundle.
@@ -285,6 +357,12 @@ func (i *VaultImporter) extractEncryptedBundle(destDir, password string) error {
 
 // extractZipFile extracts a single file from a zip archive.
 func extractZipFile(f *zip.File, destDir string) error {
+	if err := validateRelativePath(f.Name); err != nil {
+		return err
+	}
+	if mode := f.Mode(); !mode.IsRegular() && !mode.IsDir() {
+		return fmt.Errorf("unsupported archive entry type: %s", f.Name)
+	}
 	// Sanitize path to prevent directory traversal (Zip Slip attack)
 	// First, clean the zip entry name to normalize any path components
 	cleanName := filepath.Clean(DenormalizePath(f.Name))
@@ -334,7 +412,7 @@ func extractZipFile(f *zip.File, destDir string) error {
 	defer rc.Close()
 
 	// Create destination
-	dest, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	dest, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -350,6 +428,135 @@ func extractZipFile(f *zip.File, destDir string) error {
 		return fmt.Errorf("file %s exceeded size limit during extraction", f.Name)
 	}
 	return nil
+}
+
+// Validate every selected path before previewing freshness or changing any
+// local file, so a bad entry cannot partially restore an otherwise valid bundle.
+func preflightImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions) error {
+	for provider, profiles := range manifest.Contents.Vault.Profiles {
+		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
+			continue
+		}
+		for _, profile := range profiles {
+			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
+				continue
+			}
+			if opts.VaultPath == "" {
+				return fmt.Errorf("vault destination is empty")
+			}
+			if err := validateRestorePath(opts.VaultPath, true, true); err != nil {
+				return err
+			}
+			src, err := ValidateManifestPath(bundleDir, "vault/"+provider+"/"+profile)
+			if err != nil {
+				return err
+			}
+			dst, err := ValidateManifestPath(opts.VaultPath, provider+"/"+profile)
+			if err != nil {
+				return err
+			}
+			if err := validateRestoreTree(src, dst, true); err != nil {
+				return fmt.Errorf("profile %s/%s: %w", provider, profile, err)
+			}
+		}
+	}
+	for _, item := range []struct {
+		name    string
+		content OptionalContent
+		dst     string
+		skip    bool
+	}{
+		{"config", manifest.Contents.Config, opts.ConfigPath, opts.SkipConfig},
+		{"projects", manifest.Contents.Projects, opts.ProjectsPath, opts.SkipProjects},
+		{"health", manifest.Contents.Health, opts.HealthPath, opts.SkipHealth},
+		{"database", manifest.Contents.Database, opts.DatabasePath, opts.SkipDatabase},
+		{"sync", manifest.Contents.SyncConfig, opts.SyncPath, opts.SkipSync},
+	} {
+		if !item.content.Included || item.skip || item.dst == "" {
+			continue
+		}
+		src, err := ValidateManifestPath(bundleDir, item.content.Path)
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(src)
+		if err != nil {
+			return err
+		}
+		// Older bundles stored health as a directory, whereas current callers
+		// normally restore its health.json to one file.
+		if item.name == "health" && info.IsDir() && strings.EqualFold(filepath.Ext(item.dst), ".json") {
+			src = filepath.Join(src, "health.json")
+			info, err = os.Lstat(src)
+			if err != nil {
+				return err
+			}
+		}
+		if (item.name == "sync" && !info.IsDir()) || (item.name != "sync" && item.name != "health" && info.IsDir()) {
+			return fmt.Errorf("unexpected content type: %s", item.content.Path)
+		}
+		if err := validateRestoreTree(src, item.dst, info.IsDir()); err != nil {
+			return fmt.Errorf("content %s: %w", item.content.Path, err)
+		}
+	}
+	return nil
+}
+
+func validateRestoreTree(src, dst string, directory bool) error {
+	if err := validateRestorePath(src, directory, false); err != nil {
+		return err
+	}
+	if err := validateRestorePath(dst, directory, true); err != nil {
+		return err
+	}
+	if !directory {
+		return nil
+	}
+	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return fmt.Errorf("nonregular restore source: %s", path)
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		return validateRestorePath(filepath.Join(dst, rel), entry.IsDir(), true)
+	})
+}
+
+// Reject links and special files before reads, mkdirs, or writes. The caller's
+// configured root and its nearest existing parent must be real directories;
+// ancestors above that boundary may be trusted aliases (e.g. macOS /var or a
+// symlinked HOME). ValidateManifestPath and tree traversal check every component
+// beneath the root, so bundle-controlled names cannot redirect restoration.
+func validateRestorePath(path string, directory, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if err != nil && !(allowMissing && os.IsNotExist(err)) {
+		return err
+	}
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || (directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
+			return fmt.Errorf("unexpected restore destination type: %s", path)
+		}
+	}
+	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil && !info.IsDir() {
+			return fmt.Errorf("restore parent is not a real directory: %s", parent)
+		}
+		if err == nil {
+			return nil
+		}
+		if filepath.Dir(parent) == parent {
+			return nil
+		}
+	}
 }
 
 // previewImport determines what would happen during import without making changes.
@@ -628,6 +835,9 @@ func (i *VaultImporter) importVault(bundleDir string, manifest *ManifestV1, opts
 // copyProfileDirectory copies a profile directory from bundle to vault atomically.
 // Uses a temporary directory to ensure the original is preserved if the copy fails.
 func copyProfileDirectory(src, dst string) error {
+	if err := validateRestoreTree(src, dst, true); err != nil {
+		return err
+	}
 	// Ensure parent directory exists
 	parentDir := filepath.Dir(dst)
 	if err := os.MkdirAll(parentDir, 0700); err != nil {
@@ -671,15 +881,23 @@ func copyProfileDirectory(src, dst string) error {
 	}
 
 	// Check if destination exists
-	_, statErr := os.Stat(dst)
+	_, statErr := os.Lstat(dst)
 	dstExists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
 
-	// If destination exists, rename it to backup first
-	backupPath := dst + ".bak"
+	// Reserve a private recovery directory. A predictable dst+".bak" may be
+	// another account name; replacing one profile must never erase that account.
+	var backupDir, backupPath string
 	if dstExists {
-		// Remove any existing backup
-		os.RemoveAll(backupPath)
+		backupDir, err = os.MkdirTemp(parentDir, ".caam_import_backup_*")
+		if err != nil {
+			return fmt.Errorf("reserve backup: %w", err)
+		}
+		backupPath = filepath.Join(backupDir, "profile")
 		if err := os.Rename(dst, backupPath); err != nil {
+			os.Remove(backupDir)
 			return fmt.Errorf("backup existing: %w", err)
 		}
 	}
@@ -688,7 +906,10 @@ func copyProfileDirectory(src, dst string) error {
 	if err := os.Rename(tmpDir, dst); err != nil {
 		// Restore backup if rename failed
 		if dstExists {
-			os.Rename(backupPath, dst)
+			if restoreErr := os.Rename(backupPath, dst); restoreErr != nil {
+				return fmt.Errorf("publish profile: %w; restore failed: %v; original preserved at %s", err, restoreErr, backupPath)
+			}
+			os.Remove(backupDir)
 		}
 		return fmt.Errorf("rename to destination: %w", err)
 	}
@@ -696,7 +917,7 @@ func copyProfileDirectory(src, dst string) error {
 	// Success - remove backup and mark success to prevent temp cleanup
 	success = true
 	if dstExists {
-		os.RemoveAll(backupPath)
+		os.RemoveAll(backupDir)
 	}
 
 	return nil
@@ -704,6 +925,9 @@ func copyProfileDirectory(src, dst string) error {
 
 // copyFile copies a single file.
 func copyFile(src, dst string) error {
+	if err := validateRestoreTree(src, dst, false); err != nil {
+		return err
+	}
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -714,17 +938,25 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	dstFile, err := os.CreateTemp(filepath.Dir(dst), ".caam_import_file_*")
 	if err != nil {
 		return err
 	}
+	tmpPath := dstFile.Name()
+	defer os.Remove(tmpPath)
 	defer dstFile.Close()
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return err
 	}
 
-	return dstFile.Sync()
+	if err := dstFile.Sync(); err != nil {
+		return err
+	}
+	if err := dstFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, dst)
 }
 
 // importOptionalFiles imports optional files from the bundle.
@@ -895,6 +1127,9 @@ func (i *VaultImporter) importOptionalFiles(bundleDir string, manifest *Manifest
 // mergeJSONFile merges a JSON file from bundle into an existing local file.
 // Uses atomic write (temp + fsync + rename) to prevent corruption.
 func mergeJSONFile(srcPath, dstPath string) error {
+	if err := validateRestoreTree(srcPath, dstPath, false); err != nil {
+		return err
+	}
 	// Read source
 	srcData, err := os.ReadFile(srcPath)
 	if err != nil {
@@ -931,11 +1166,11 @@ func mergeJSONFile(srcPath, dstPath string) error {
 	}
 
 	// Atomic write: write to temp file, fsync, then rename
-	tmpPath := dstPath + ".tmp"
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	tmpFile, err := os.CreateTemp(filepath.Dir(dstPath), ".caam_import_json_*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
 
 	if _, err := tmpFile.Write(merged); err != nil {
 		tmpFile.Close()
@@ -964,6 +1199,9 @@ func mergeJSONFile(srcPath, dstPath string) error {
 
 // copyDirectory copies an entire directory.
 func copyDirectory(src, dst string) error {
+	if err := validateRestoreTree(src, dst, true); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dst, 0700); err != nil {
 		return err
 	}

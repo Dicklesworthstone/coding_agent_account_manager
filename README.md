@@ -891,6 +891,27 @@ not admit system backups. With `next --usage-aware`, force also retains the
 requirement for measured, available Grok or Cursor quota. `next --dry-run`
 performs selection without switching or saving credentials.
 
+### Portable Vault Bundles
+
+Use a bundle to transfer or recover saved profiles together with CAAM's
+configuration and metadata:
+
+```bash
+caam bundle export --encrypt
+caam bundle import ~/backup.enc.zip --dry-run
+caam bundle import ~/backup.enc.zip
+```
+
+Import verifies the archive's checksums and checks all selected source and
+destination paths before restoring files. A malformed path, a symlink that
+redirects a restore, a missing checksum, or a checksum mismatch stops the
+import. These checks also apply to `--dry-run` and `--force`.
+
+The default `smart` mode compares credential freshness. `--mode merge` adds
+new profiles while preserving existing ones; `--mode replace` replaces the
+selected profiles and leaves other accounts in place. Replacing `work` cannot
+overwrite a separate profile named `work.bak`.
+
 ### Uninstall Notes
 
 `caam uninstall` restores auth from any available `_original` backups first, then removes caam’s data/config. Useful flags:

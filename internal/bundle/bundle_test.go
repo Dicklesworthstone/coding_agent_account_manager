@@ -3,6 +3,7 @@ package bundle
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,6 +184,39 @@ func TestValidateManifest(t *testing.T) {
 	}
 }
 
+func TestValidateManifestPortablePaths(t *testing.T) {
+	for _, name := range []string{"", ".", "..", "../work", `..\work`, "/absolute", `C:work`, `C:\work`, `\\server\share`, "work:stream", "work.", "work ", "CON", "nul.json", "COM1", "LPT²", "work\x00name"} {
+		for _, field := range []string{"provider", "profile", "config", "checksum"} {
+			t.Run(field+"/"+name, func(t *testing.T) {
+				m := NewManifest()
+				m.Source.Hostname = "test"
+				switch field {
+				case "provider":
+					m.AddProfile(name, "work")
+				case "profile":
+					m.AddProfile("codex", name)
+				case "config":
+					m.SetConfig(true, name)
+				case "checksum":
+					m.AddChecksum(name, strings.Repeat("0", 64))
+				}
+				if err := ValidateManifest(m); err == nil {
+					t.Fatal("nonportable path accepted")
+				}
+			})
+		}
+	}
+	for _, name := range []string{"work", "alice@example.com", "release..candidate", "工作", "work.bak"} {
+		m := NewManifest()
+		m.Source.Hostname = "test"
+		m.AddProfile("codex", name)
+		m.SetSyncConfig(true, "sync/")
+		if err := ValidateManifest(m); err != nil {
+			t.Errorf("valid portable profile %q rejected: %v", name, err)
+		}
+	}
+}
+
 func TestIsCompatibleVersion(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -357,6 +391,15 @@ func TestVerifyChecksums(t *testing.T) {
 
 		if len(result.Missing) != 1 {
 			t.Errorf("len(Missing) = %d, want %d", len(result.Missing), 1)
+		}
+	})
+	t.Run("unchecked payload", func(t *testing.T) {
+		result, err := VerifyChecksums(tmpDir, NewManifest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid || len(result.Extra) != 1 || result.Summary() != "Verification failed: 1 extra" {
+			t.Fatalf("unchecked payload reported as verified: %+v (%s)", result, result.Summary())
 		}
 	})
 }
@@ -840,9 +883,9 @@ func TestNewEncryptionMetadataDefaults(t *testing.T) {
 // Tests for ValidationError.Error()
 func TestValidationErrorError(t *testing.T) {
 	tests := []struct {
-		name    string
-		err     *ValidationError
-		want    string
+		name string
+		err  *ValidationError
+		want string
 	}{
 		{
 			name: "with field",

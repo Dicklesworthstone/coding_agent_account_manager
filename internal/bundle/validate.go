@@ -63,6 +63,38 @@ func ValidateManifest(m *ManifestV1) error {
 	if err := validateChecksumInfo(&m.Checksums); err != nil {
 		return err
 	}
+	providers := make(map[string]bool)
+	for provider, profiles := range m.Contents.Vault.Profiles {
+		if err := validatePathSegment(provider); err != nil {
+			return fmt.Errorf("invalid vault provider %q: %w", provider, err)
+		}
+		key := strings.ToLower(provider)
+		if providers[key] {
+			return fmt.Errorf("duplicate vault provider %q", provider)
+		}
+		providers[key] = true
+		seen := make(map[string]bool)
+		for _, profile := range profiles {
+			if err := validatePathSegment(profile); err != nil {
+				return fmt.Errorf("invalid vault profile %q: %w", profile, err)
+			}
+			key := strings.ToLower(profile)
+			if seen[key] {
+				return fmt.Errorf("duplicate vault profile %q for %s", profile, provider)
+			}
+			seen[key] = true
+		}
+	}
+	for _, content := range []OptionalContent{m.Contents.Config, m.Contents.Projects, m.Contents.Health, m.Contents.Database, m.Contents.SyncConfig} {
+		if content.Included {
+			if name := strings.TrimSuffix(content.Path, "/"); strings.EqualFold(name, ManifestFileName) || strings.EqualFold(name, EncryptionMarkerFile) {
+				return fmt.Errorf("reserved bundle metadata cannot be restored as content: %s", content.Path)
+			}
+			if err := validateRelativePath(content.Path); err != nil {
+				return fmt.Errorf("invalid optional content path %q: %w", content.Path, err)
+			}
+		}
+	}
 
 	return nil
 }
@@ -108,6 +140,11 @@ func validateSourceInfo(s *SourceInfo) error {
 
 // validateChecksumInfo validates the checksum information.
 func validateChecksumInfo(c *ChecksumInfo) error {
+	for path := range c.Files {
+		if err := validateRelativePath(path); err != nil {
+			return fmt.Errorf("invalid checksum path %q: %w", path, err)
+		}
+	}
 	validAlgorithms := map[string]bool{
 		"sha256": true,
 		"sha512": true,
@@ -157,28 +194,13 @@ func isHexChar(r rune) bool {
 // ValidateManifestPath checks that a path from the manifest is safe and stays
 // within the bundle directory. Prevents path traversal attacks.
 func ValidateManifestPath(basePath, relPath string) (string, error) {
-	if relPath == "" {
-		return "", &ValidationError{Message: "path is empty"}
+	if err := validateRelativePath(relPath); err != nil {
+		return "", err
 	}
-
-	// Reject absolute paths
-	if filepath.IsAbs(relPath) {
-		return "", &ValidationError{
-			Field:   relPath,
-			Message: "absolute paths are not allowed in manifest",
-		}
-	}
-
-	// Reject paths that attempt traversal
-	if strings.Contains(relPath, "..") {
-		return "", &ValidationError{
-			Field:   relPath,
-			Message: "path traversal not allowed in manifest",
-		}
-	}
+	relPath = strings.TrimSuffix(relPath, "/")
 
 	// Join and clean the path
-	fullPath := filepath.Join(basePath, relPath)
+	fullPath := filepath.Join(basePath, filepath.FromSlash(relPath))
 
 	// Verify the resolved path is within basePath
 	cleanBase := filepath.Clean(basePath)
@@ -193,7 +215,57 @@ func ValidateManifestPath(basePath, relPath string) (string, error) {
 		}
 	}
 
+	// The lexical check alone does not detect a symlink inside the root.
+	current := basePath
+	for _, part := range strings.Split(relPath, "/") {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symlink in bundle path: %s", current)
+		}
+	}
 	return fullPath, nil
+}
+
+// Bundle names must mean the same thing on Unix and Windows, regardless of
+// which platform performs validation. In particular, reject drive names, ADS,
+// device aliases, and either path separator before joining any manifest input.
+func validatePathSegment(name string) error {
+	if name == "" || name == "." || name == ".." || strings.TrimSpace(name) != name || strings.HasSuffix(name, ".") {
+		return fmt.Errorf("expected a nonempty portable path segment")
+	}
+	for _, r := range name {
+		if r < 32 || r == 127 || strings.ContainsRune(`<>:"/\|?*`, r) {
+			return fmt.Errorf("invalid character in path segment")
+		}
+	}
+	stem := strings.ToUpper(strings.SplitN(name, ".", 2)[0])
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return fmt.Errorf("reserved device name")
+	}
+	if strings.HasPrefix(stem, "COM") || strings.HasPrefix(stem, "LPT") {
+		suffix := strings.TrimPrefix(strings.TrimPrefix(stem, "COM"), "LPT")
+		if len([]rune(suffix)) == 1 && strings.ContainsAny(suffix, "123456789¹²³") {
+			return fmt.Errorf("reserved device name")
+		}
+	}
+	return nil
+}
+
+func validateRelativePath(path string) error {
+	for _, segment := range strings.Split(strings.TrimSuffix(path, "/"), "/") {
+		if err := validatePathSegment(segment); err != nil {
+			return fmt.Errorf("invalid relative path %q: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // IsCompatibleVersion checks if a manifest was created by a compatible caam version.
