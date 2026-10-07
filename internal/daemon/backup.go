@@ -2,11 +2,17 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +41,22 @@ type BackupState struct {
 
 	// LastErrorTime is when the last error occurred.
 	LastErrorTime time.Time `json:"last_error_time,omitempty"`
+
+	// OwnedBackups records archives successfully published by this scheduler.
+	// Legacy archives without a record are never eligible for retention.
+	OwnedBackups []BackupRecord `json:"owned_backups,omitempty"`
 }
+
+// BackupRecord binds automatic-backup ownership to exact, verified file bytes.
+type BackupRecord struct {
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"created_at"`
+	Size      int64     `json:"size"`
+	SHA256    string    `json:"sha256"`
+}
+
+const automaticBackupPrefix = "caam_auto_backup_"
+const automaticBackupTimeFormat = "20060102T150405.000000000Z"
 
 // BackupScheduler manages automatic backup scheduling.
 type BackupScheduler struct {
@@ -43,7 +64,10 @@ type BackupScheduler struct {
 	vault  string // Path to the vault to backup
 	state  BackupState
 	mu     sync.RWMutex // Protects state
-	logger interface {
+	// Serialize creation and retention so concurrent calls cannot prune the
+	// recovery copy while another backup is still being prepared.
+	operationMu sync.Mutex
+	logger      interface {
 		Printf(format string, v ...interface{})
 		Println(v ...interface{})
 	}
@@ -54,6 +78,9 @@ func NewBackupScheduler(cfg *config.BackupConfig, vaultPath string, logger inter
 	Printf(format string, v ...interface{})
 	Println(v ...interface{})
 }) *BackupScheduler {
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
 	return &BackupScheduler{
 		config: cfg,
 		vault:  vaultPath,
@@ -125,11 +152,13 @@ func (s *BackupScheduler) LoadState() error {
 		return fmt.Errorf("read backup state: %w", err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := json.Unmarshal(data, &s.state); err != nil {
+	var state BackupState
+	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("parse backup state: %w", err)
 	}
+	s.mu.Lock()
+	s.state = state
+	s.mu.Unlock()
 
 	return nil
 }
@@ -151,11 +180,12 @@ func (s *BackupScheduler) SaveState() error {
 	}
 
 	// Atomic write
-	tmpPath := statePath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	f, err := os.CreateTemp(filepath.Dir(statePath), ".backup_state_*")
 	if err != nil {
 		return fmt.Errorf("create temp backup state file: %w", err)
 	}
+	tmpPath := f.Name()
+	defer os.Remove(tmpPath)
 
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -179,7 +209,7 @@ func (s *BackupScheduler) SaveState() error {
 		return fmt.Errorf("rename backup state file: %w", err)
 	}
 
-	return nil
+	return syncBackupDirectory(filepath.Dir(statePath))
 }
 
 // statePath returns the path to the state file.
@@ -248,6 +278,9 @@ func (s *BackupScheduler) TimeUntilNextBackup() time.Duration {
 // CreateBackup creates a new backup if needed.
 // Returns the backup path if created, empty string if not needed.
 func (s *BackupScheduler) CreateBackup() (string, error) {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+
 	if !s.ShouldBackup() {
 		return "", nil
 	}
@@ -259,6 +292,24 @@ func (s *BackupScheduler) CreateBackup() (string, error) {
 		s.recordError(fmt.Errorf("create backup dir: %w", err))
 		return "", fmt.Errorf("create backup dir: %w", err)
 	}
+	location, err := filepath.EvalSymlinks(location)
+	if err == nil {
+		location, err = filepath.Abs(location)
+	}
+	if err != nil {
+		s.recordError(fmt.Errorf("resolve backup dir: %w", err))
+		return "", fmt.Errorf("resolve backup dir: %w", err)
+	}
+
+	// The exporter retains its ordinary manual-export naming and overwrite
+	// semantics only inside this private directory. Nothing in the user's
+	// backup directory can be replaced by export or failed assembly.
+	staging, err := os.MkdirTemp(location, ".caam-auto-backup-*")
+	if err != nil {
+		s.recordError(fmt.Errorf("create backup staging dir: %w", err))
+		return "", fmt.Errorf("create backup staging dir: %w", err)
+	}
+	defer os.RemoveAll(staging)
 
 	// Create the backup using the bundle package
 	exporter := &bundle.VaultExporter{
@@ -272,7 +323,7 @@ func (s *BackupScheduler) CreateBackup() (string, error) {
 	}
 
 	opts := bundle.DefaultExportOptions()
-	opts.OutputDir = location
+	opts.OutputDir = staging
 	opts.IncludeConfig = true
 	opts.IncludeProjects = true
 	opts.IncludeHealth = true
@@ -285,29 +336,112 @@ func (s *BackupScheduler) CreateBackup() (string, error) {
 		return "", fmt.Errorf("create backup: %w", err)
 	}
 
-	backupPath := result.OutputPath
+	// Exercise the same manifest, checksum, and path validation as recovery
+	// before this archive can displace an older recovery copy. The destinations
+	// are private and dry-run never publishes imported credentials.
+	if err := verifyBackupRecovery(result.OutputPath, staging); err != nil {
+		s.recordError(fmt.Errorf("verify backup: %w", err))
+		return "", fmt.Errorf("verify backup: %w", err)
+	}
+
+	checksum, err := bundle.ComputeFileChecksum(result.OutputPath, bundle.AlgorithmSHA256)
+	if err != nil {
+		s.recordError(fmt.Errorf("checksum backup: %w", err))
+		return "", fmt.Errorf("checksum backup: %w", err)
+	}
+	created := time.Now().UTC()
+	backupPath, err := publishScheduledBackup(result.OutputPath, location, created, rand.Reader)
+	if err != nil {
+		s.recordError(fmt.Errorf("publish backup: %w", err))
+		return "", fmt.Errorf("publish backup: %w", err)
+	}
+	record := BackupRecord{Path: backupPath, CreatedAt: created, Size: result.CompressedSize, SHA256: checksum}
 
 	// Update state
 	s.mu.Lock()
-	s.state.LastBackup = time.Now()
+	previous := s.state
+	s.state.LastBackup = created
 	s.state.LastBackupPath = backupPath
 	s.state.BackupCount++
 	s.state.LastError = ""
 	s.state.LastErrorTime = time.Time{}
+	s.state.OwnedBackups = append(s.state.OwnedBackups, record)
 	s.mu.Unlock()
 
 	if err := s.SaveState(); err != nil {
-		s.logger.Printf("Warning: failed to save backup state: %v", err)
+		// Keep the published archive, but never prune after a failed ownership
+		// commit. A lost state file leaves extra archives, not missing recovery.
+		s.mu.Lock()
+		s.state = previous
+		s.mu.Unlock()
+		s.recordError(fmt.Errorf("save backup ownership: %w", err))
+		return backupPath, fmt.Errorf("save backup ownership: %w", err)
 	}
 
 	s.logger.Printf("Created automatic backup: %s", backupPath)
 
 	// Rotate old backups
-	if err := s.RotateBackups(); err != nil {
+	if err := s.rotateBackups(); err != nil {
+		s.recordError(fmt.Errorf("rotate backups: %w", err))
 		s.logger.Printf("Warning: failed to rotate backups: %v", err)
 	}
 
 	return backupPath, nil
+}
+
+// publishScheduledBackup atomically creates a new name for a completed archive.
+// A hard link is an exclusive publication operation: unlike Rename, it cannot
+// replace an existing file, directory, or symlink. Staging is on the destination
+// filesystem; unsupported filesystems fail closed without pruning old backups.
+func publishScheduledBackup(stagedPath, location string, created time.Time, entropy io.Reader) (string, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		var id [16]byte
+		if _, err := io.ReadFull(entropy, id[:]); err != nil {
+			return "", fmt.Errorf("generate backup name: %w", err)
+		}
+		name := automaticBackupPrefix + created.UTC().Format(automaticBackupTimeFormat) + "_" + hex.EncodeToString(id[:]) + ".zip"
+		path := filepath.Join(location, name)
+		if err := os.Link(stagedPath, path); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return "", err
+		}
+		if err := syncBackupDirectory(location); err != nil {
+			// This complete but unrecorded file is deliberately left untouched.
+			return "", fmt.Errorf("sync published backup: %w", err)
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("could not allocate an unused automatic backup name")
+}
+
+func syncBackupDirectory(path string) error {
+	// Windows does not support Sync on directory handles. The completed
+	// archive and state files have already been synced before publication.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func verifyBackupRecovery(path, staging string) error {
+	_, err := (&bundle.VaultImporter{BundlePath: path}).Import(&bundle.ImportOptions{
+		DryRun:       true,
+		Mode:         bundle.ImportModeReplace,
+		VaultPath:    filepath.Join(staging, "verify", "vault"),
+		ConfigPath:   filepath.Join(staging, "verify", "config.json"),
+		ProjectsPath: filepath.Join(staging, "verify", "projects.json"),
+		HealthPath:   filepath.Join(staging, "verify", "health.json"),
+		DatabasePath: filepath.Join(staging, "verify", "caam.db"),
+		SyncPath:     filepath.Join(staging, "verify", "sync"),
+	})
+	return err
 }
 
 // recordError records an error in the backup state.
@@ -321,107 +455,199 @@ func (s *BackupScheduler) recordError(err error) {
 	}
 }
 
-// RotateBackups removes old backups to stay within the keep_last limit.
+// RotateBackups removes only unchanged, recorded automatic backups. Archives
+// without trustworthy ownership records do not count toward keep_last.
 func (s *BackupScheduler) RotateBackups() error {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	return s.rotateBackups()
+}
+
+func (s *BackupScheduler) rotateBackups() error {
 	keepLast := s.config.GetKeepLast()
-	if keepLast <= 0 {
-		return nil // Unlimited
-	}
-
-	location := s.config.GetLocation()
-
-	entries, err := os.ReadDir(location)
+	backups, err := s.verifiedBackups()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("list backups: %w", err)
+		return err
 	}
-
-	// Filter to caam backup files only
-	// VaultExporter creates files with pattern: caam_export_YYYY-MM-DD_HHMM.zip
-	var backups []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if strings.HasPrefix(name, "caam_export_") && strings.HasSuffix(name, ".zip") {
-			backups = append(backups, name)
-		}
-	}
-
-	// Already within limit?
 	if len(backups) <= keepLast {
 		return nil
 	}
 
-	// Sort by name (which includes timestamp, so oldest first)
-	sort.Strings(backups)
-
-	// Delete oldest until we're within limit
-	toDelete := len(backups) - keepLast
-	for i := 0; i < toDelete; i++ {
-		backupPath := filepath.Join(location, backups[i])
-		if err := os.Remove(backupPath); err != nil {
-			s.logger.Printf("Warning: failed to delete old backup %s: %v", backups[i], err)
-		} else {
-			s.logger.Printf("Deleted old backup: %s", backups[i])
+	removed := make(map[string]bool)
+	var failures []error
+	for i := len(backups) - 1; i >= keepLast; i-- {
+		backup := backups[i]
+		current, err := os.Lstat(backup.record.Path)
+		if err != nil || !sameBackupFile(backup.info, current) {
+			// A missing or replaced path is no longer ours to remove.
+			continue
 		}
+		if err := os.Remove(backup.record.Path); err != nil {
+			failures = append(failures, fmt.Errorf("remove %s: %w", filepath.Base(backup.record.Path), err))
+			continue
+		}
+		removed[backup.record.Path] = true
+		s.logger.Printf("Deleted old automatic backup: %s", filepath.Base(backup.record.Path))
 	}
 
-	return nil
+	if len(removed) > 0 {
+		s.mu.Lock()
+		retained := make([]BackupRecord, 0, len(s.state.OwnedBackups))
+		for _, record := range s.state.OwnedBackups {
+			if !removed[record.Path] {
+				retained = append(retained, record)
+			}
+		}
+		s.state.OwnedBackups = retained
+		s.mu.Unlock()
+		if err := s.SaveState(); err != nil {
+			failures = append(failures, fmt.Errorf("save retained backups: %w", err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 // GetState returns a copy of the current backup state.
 func (s *BackupScheduler) GetState() BackupState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.state
+	state := s.state
+	state.OwnedBackups = append([]BackupRecord(nil), s.state.OwnedBackups...)
+	return state
 }
 
-// ListBackups returns all backup files in the backup location.
+// ListBackups returns verified automatic backups owned by this scheduler.
+// Legacy and manual archives remain on disk but are outside retention.
 func (s *BackupScheduler) ListBackups() ([]BackupInfo, error) {
-	location := s.config.GetLocation()
+	verified, err := s.verifiedBackups()
+	if err != nil {
+		return nil, err
+	}
+	backups := make([]BackupInfo, 0, len(verified))
+	for _, backup := range verified {
+		backups = append(backups, BackupInfo{
+			Name:      filepath.Base(backup.record.Path),
+			Path:      backup.record.Path,
+			Size:      backup.record.Size,
+			CreatedAt: backup.record.CreatedAt,
+		})
+	}
+	return backups, nil
+}
 
-	entries, err := os.ReadDir(location)
+type verifiedBackup struct {
+	record BackupRecord
+	info   os.FileInfo
+}
+
+func (s *BackupScheduler) verifiedBackups() ([]verifiedBackup, error) {
+	location, err := filepath.EvalSymlinks(s.config.GetLocation())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("list backups: %w", err)
+		return nil, fmt.Errorf("resolve backup directory: %w", err)
+	}
+	location, err = filepath.Abs(location)
+	if err != nil {
+		return nil, err
 	}
 
-	// VaultExporter creates files with pattern: caam_export_YYYY-MM-DD_HHMM.zip
-	var backups []BackupInfo
-	for _, e := range entries {
-		if e.IsDir() {
+	records := s.GetState().OwnedBackups
+	counts := make(map[string]int, len(records))
+	for _, record := range records {
+		counts[record.Path]++
+	}
+	var backups []verifiedBackup
+	// Records are appended only after successful publication. Use that durable
+	// order even when clock resolution produces ties or the clock moves back.
+	for index := len(records) - 1; index >= 0; index-- {
+		record := records[index]
+		// Duplicate or conflicting ownership records are ambiguous.
+		if counts[record.Path] != 1 || !validBackupRecord(record, location) {
 			continue
 		}
-		name := e.Name()
-		if !strings.HasPrefix(name, "caam_export_") || !strings.HasSuffix(name, ".zip") {
-			continue
-		}
-
-		info, err := e.Info()
+		info, err := verifyBackupRecord(record)
 		if err != nil {
+			s.logger.Printf("Preserving unverified automatic backup %s: %v", filepath.Base(record.Path), err)
 			continue
 		}
-
-		backups = append(backups, BackupInfo{
-			Name:      name,
-			Path:      filepath.Join(location, name),
-			Size:      info.Size(),
-			CreatedAt: info.ModTime(),
-		})
+		backups = append(backups, verifiedBackup{record: record, info: info})
 	}
-
-	// Sort by creation time, newest first
-	sort.Slice(backups, func(i, j int) bool {
-		return backups[i].CreatedAt.After(backups[j].CreatedAt)
-	})
 
 	return backups, nil
+}
+
+func validBackupRecord(record BackupRecord, location string) bool {
+	if !filepath.IsAbs(record.Path) || filepath.Clean(record.Path) != record.Path || filepath.Dir(record.Path) != location || record.Size <= 0 || record.CreatedAt.IsZero() {
+		return false
+	}
+	name := filepath.Base(record.Path)
+	if !strings.HasPrefix(name, automaticBackupPrefix) || !strings.HasSuffix(name, ".zip") {
+		return false
+	}
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, automaticBackupPrefix), ".zip"), "_")
+	if len(parts) != 2 || len(parts[1]) != 32 {
+		return false
+	}
+	created, err := time.Parse(automaticBackupTimeFormat, parts[0])
+	if err != nil || !created.Equal(record.CreatedAt) {
+		return false
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return false
+	}
+	checksum, err := hex.DecodeString(record.SHA256)
+	return err == nil && len(checksum) == sha256.Size
+}
+
+func verifyBackupRecord(record BackupRecord) (os.FileInfo, error) {
+	before, err := os.Lstat(record.Path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Size() != record.Size {
+		return nil, fmt.Errorf("file type or size changed")
+	}
+	f, err := os.Open(record.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !sameBackupFile(before, opened) {
+		return nil, fmt.Errorf("file changed before verification")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return nil, err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != record.SHA256 {
+		return nil, fmt.Errorf("file changed since backup publication")
+	}
+	staging, err := os.MkdirTemp("", "caam-backup-verify-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(staging)
+	if err := verifyBackupRecovery(record.Path, staging); err != nil {
+		return nil, fmt.Errorf("archive is not recoverable: %w", err)
+	}
+	after, err := os.Lstat(record.Path)
+	if err != nil {
+		return nil, err
+	}
+	if !sameBackupFile(before, after) {
+		return nil, fmt.Errorf("file changed since backup publication")
+	}
+	return after, nil
+}
+
+func sameBackupFile(before, after os.FileInfo) bool {
+	return before != nil && after != nil && after.Mode().IsRegular() && os.SameFile(before, after) && before.Size() == after.Size() && before.ModTime().Equal(after.ModTime())
 }
 
 // BackupInfo contains information about a backup file.

@@ -1,13 +1,18 @@
 package daemon
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/bundle"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 )
 
@@ -192,32 +197,31 @@ func TestBackupScheduler_StatePersistence(t *testing.T) {
 }
 
 func TestBackupScheduler_RotateBackups(t *testing.T) {
-	tmpDir := t.TempDir()
-	backupDir := filepath.Join(tmpDir, "backups")
-	os.MkdirAll(backupDir, 0700)
-
-	// Create test backup files
-	for i := 1; i <= 7; i++ {
-		name := filepath.Join(backupDir, "caam_export_2025-01-0"+string(rune('0'+i))+"_1200.zip")
-		if err := os.WriteFile(name, []byte("test"), 0600); err != nil {
-			t.Fatalf("failed to create test backup: %v", err)
-		}
+	scheduler, authPath := newScheduledBackupFixture(t, 10)
+	manualOptions := bundle.DefaultExportOptions()
+	manualOptions.OutputDir = scheduler.config.Location
+	manual, err := (&bundle.VaultExporter{VaultPath: scheduler.vault}).Export(manualOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualBytes := readBackupTestFile(t, manual.OutputPath)
+	var paths []string
+	for i := 0; i < 7; i++ {
+		writeBackupTestFile(t, authPath, []byte(fmt.Sprintf(`{"OPENAI_API_KEY":"synthetic-account-%d"}`, i)))
+		paths = append(paths, createDueBackup(t, scheduler))
 	}
 
-	cfg := &config.BackupConfig{
-		Enabled:  true,
-		KeepLast: 5,
-		Location: backupDir,
+	// Ownership survives restart. Retention must ignore the older manual
+	// export and preserve the newest five actual, recoverable archives.
+	restarted := NewBackupScheduler(scheduler.config, scheduler.vault, newTestLogger())
+	if err := restarted.LoadState(); err != nil {
+		t.Fatal(err)
 	}
-
-	scheduler := NewBackupScheduler(cfg, filepath.Join(tmpDir, "vault"), newTestLogger())
-
-	// Rotate should delete 2 oldest backups
+	scheduler = restarted
+	scheduler.config.KeepLast = 5
 	if err := scheduler.RotateBackups(); err != nil {
 		t.Fatalf("RotateBackups() error = %v", err)
 	}
-
-	// List remaining backups
 	backups, err := scheduler.ListBackups()
 	if err != nil {
 		t.Fatalf("ListBackups() error = %v", err)
@@ -227,60 +231,66 @@ func TestBackupScheduler_RotateBackups(t *testing.T) {
 		t.Errorf("len(backups) = %d, want 5", len(backups))
 	}
 
-	// Verify oldest backups were deleted
-	for _, b := range backups {
-		if b.Name == "caam_export_2025-01-01_1200.zip" || b.Name == "caam_export_2025-01-02_1200.zip" {
-			t.Errorf("backup %s should have been deleted", b.Name)
+	for i, path := range paths {
+		_, err := os.Stat(path)
+		if i < 2 && !os.IsNotExist(err) {
+			t.Errorf("old automatic backup remains: %s (%v)", path, err)
 		}
+		if i >= 2 && err != nil {
+			t.Errorf("retained automatic backup missing: %s (%v)", path, err)
+		}
+	}
+	if !bytes.Equal(readBackupTestFile(t, manual.OutputPath), manualBytes) {
+		t.Fatal("retention changed the manual export")
+	}
+	if backups[0].Path != paths[len(paths)-1] {
+		t.Fatalf("newest backup = %s, want %s", backups[0].Path, paths[len(paths)-1])
+	}
+
+	restoreRoot := t.TempDir()
+	result, err := (&bundle.VaultImporter{BundlePath: backups[0].Path}).Import(&bundle.ImportOptions{
+		Mode:         bundle.ImportModeReplace,
+		VaultPath:    filepath.Join(restoreRoot, "vault"),
+		ConfigPath:   filepath.Join(restoreRoot, "config.json"),
+		SkipProjects: true,
+		SkipHealth:   true,
+		SkipDatabase: true,
+		SkipSync:     true,
+	})
+	if err != nil {
+		t.Fatalf("restore scheduled backup: %v", err)
+	}
+	if result.NewProfiles != 1 || !result.VerificationResult.Valid || len(result.Errors) != 0 {
+		t.Fatalf("restore result = %+v", result)
+	}
+	if got := readBackupTestFile(t, filepath.Join(restoreRoot, "vault", "codex", "work", "auth.json")); !bytes.Equal(got, readBackupTestFile(t, authPath)) {
+		t.Fatal("restored credentials differ from the backed-up account")
+	}
+	if got := readBackupTestFile(t, filepath.Join(restoreRoot, "config.json")); !bytes.Equal(got, readBackupTestFile(t, config.ConfigPath())) {
+		t.Fatal("restored configuration differs from the backup source")
 	}
 }
 
 func TestBackupScheduler_ListBackups(t *testing.T) {
-	tmpDir := t.TempDir()
-	backupDir := filepath.Join(tmpDir, "backups")
-	os.MkdirAll(backupDir, 0700)
-
-	// Create test backup files with different timestamps
-	// Pattern matches VaultExporter output: caam_export_YYYY-MM-DD_HHMM.zip
-	names := []string{
-		"caam_export_2025-01-15_1200.zip",
-		"caam_export_2025-01-10_1200.zip",
-		"caam_export_2025-01-20_1200.zip",
+	scheduler, _ := newScheduledBackupFixture(t, 10)
+	first := createDueBackup(t, scheduler)
+	second := createDueBackup(t, scheduler)
+	third := createDueBackup(t, scheduler)
+	// Filesystem modification time must not change publication order.
+	future := time.Now().Add(24 * time.Hour)
+	if err := os.Chtimes(first, future, future); err != nil {
+		t.Fatal(err)
 	}
-	for i, name := range names {
-		path := filepath.Join(backupDir, name)
-		if err := os.WriteFile(path, []byte("test data"), 0600); err != nil {
-			t.Fatalf("failed to create test backup: %v", err)
-		}
-		// Set different mod times so sorting works
-		modTime := time.Now().Add(time.Duration(-i) * time.Hour)
-		os.Chtimes(path, modTime, modTime)
+	for _, name := range []string{"caam_export_2025-01-01_1200.zip", "caam_export_notes.zip", "other.txt", "caam_auto_backup_unfinished.zip"} {
+		writeBackupTestFile(t, filepath.Join(scheduler.config.Location, name), []byte("preserve this file"))
 	}
-
-	// Create a non-backup file
-	os.WriteFile(filepath.Join(backupDir, "other.txt"), []byte("other"), 0600)
-
-	cfg := &config.BackupConfig{
-		Enabled:  true,
-		Location: backupDir,
-	}
-
-	scheduler := NewBackupScheduler(cfg, filepath.Join(tmpDir, "vault"), newTestLogger())
-
 	backups, err := scheduler.ListBackups()
 	if err != nil {
 		t.Fatalf("ListBackups() error = %v", err)
 	}
 
-	if len(backups) != 3 {
-		t.Errorf("len(backups) = %d, want 3", len(backups))
-	}
-
-	// Should only include backup files
-	for _, b := range backups {
-		if b.Name == "other.txt" {
-			t.Errorf("non-backup file included: %s", b.Name)
-		}
+	if len(backups) != 3 || backups[0].Path != third || backups[1].Path != second || backups[2].Path != first {
+		t.Fatalf("listed backups = %+v", backups)
 	}
 }
 
@@ -424,31 +434,14 @@ func TestBackupScheduler_ListBackups_NoDir(t *testing.T) {
 }
 
 func TestBackupScheduler_RotateBackups_DefaultKeepLast(t *testing.T) {
-	tmpDir := t.TempDir()
-	backupDir := filepath.Join(tmpDir, "backups")
-	os.MkdirAll(backupDir, 0700)
-
-	// Create test backup files with proper names
-	for i := 1; i <= 10; i++ {
-		name := filepath.Join(backupDir, fmt.Sprintf("caam_export_2025-02-%02d_1200.zip", i))
-		os.WriteFile(name, []byte("test"), 0600)
+	scheduler, _ := newScheduledBackupFixture(t, 0)
+	for i := 0; i < 7; i++ {
+		createDueBackup(t, scheduler)
 	}
-
-	cfg := &config.BackupConfig{
-		Enabled:  true,
-		KeepLast: 0, // 0 means use default (5)
-		Location: backupDir,
+	backups, err := scheduler.ListBackups()
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	scheduler := NewBackupScheduler(cfg, filepath.Join(tmpDir, "vault"), newTestLogger())
-
-	// Should delete older backups, keeping default (5)
-	if err := scheduler.RotateBackups(); err != nil {
-		t.Fatalf("RotateBackups() error = %v", err)
-	}
-
-	backups, _ := scheduler.ListBackups()
-	// GetKeepLast() returns 5 when KeepLast is 0 (default)
 	if len(backups) != 5 {
 		t.Errorf("len(backups) = %d, want 5", len(backups))
 	}
@@ -519,5 +512,405 @@ func TestFormatBackupInterval(t *testing.T) {
 		if got := formatBackupInterval(d); got != want {
 			t.Errorf("formatBackupInterval(%v) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+func newScheduledBackupFixture(t *testing.T, keep int) (*BackupScheduler, string) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	vault := filepath.Join(root, "vault")
+	authPath := filepath.Join(vault, "codex", "work", "auth.json")
+	writeBackupTestFile(t, authPath, []byte(`{"OPENAI_API_KEY":"synthetic-backup-account"}`))
+	writeBackupTestFile(t, config.ConfigPath(), []byte(`{"default_provider":"codex"}`))
+	cfg := &config.BackupConfig{
+		Enabled:  true,
+		Interval: config.Duration(24 * time.Hour),
+		KeepLast: keep,
+		Location: filepath.Join(root, "backups"),
+	}
+	return NewBackupScheduler(cfg, vault, newTestLogger()), authPath
+}
+
+func writeBackupTestFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readBackupTestFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func createDueBackup(t *testing.T, scheduler *BackupScheduler) string {
+	t.Helper()
+	scheduler.mu.Lock()
+	scheduler.state.LastBackup = time.Time{}
+	scheduler.mu.Unlock()
+	path, err := scheduler.CreateBackup()
+	if err != nil {
+		t.Fatalf("CreateBackup() error = %v", err)
+	}
+	if path == "" || !strings.HasPrefix(filepath.Base(path), automaticBackupPrefix) {
+		t.Fatalf("automatic backup path = %q", path)
+	}
+	return path
+}
+
+func TestBackupScheduler_RetentionPreservesUntrustedEntries(t *testing.T) {
+	for _, kind := range []string{
+		"unrecorded", "legacy name", "invalid name", "invalid timestamp", "zero timestamp",
+		"relative path", "unclean path", "outside location", "invalid checksum", "checksum mismatch",
+		"size mismatch", "changed archive", "malformed archive with matching checksum", "duplicate record",
+		"incomplete record", "symlink", "directory",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			scheduler, _ := newScheduledBackupFixture(t, 10)
+			protected := createDueBackup(t, scheduler)
+			older := createDueBackup(t, scheduler)
+			newest := createDueBackup(t, scheduler)
+			record := &scheduler.state.OwnedBackups[0]
+			switch kind {
+			case "unrecorded":
+				scheduler.state.OwnedBackups = scheduler.state.OwnedBackups[1:]
+			case "legacy name", "invalid name":
+				name := "caam_export_2000-01-01_0000.zip"
+				if kind == "invalid name" {
+					name = automaticBackupPrefix + "unfinished.zip"
+				}
+				path := filepath.Join(scheduler.config.Location, name)
+				if err := os.Rename(protected, path); err != nil {
+					t.Fatal(err)
+				}
+				protected, record.Path = path, path
+			case "invalid timestamp":
+				record.CreatedAt = record.CreatedAt.Add(time.Hour)
+			case "zero timestamp":
+				record.CreatedAt = time.Time{}
+			case "relative path":
+				record.Path = filepath.Base(record.Path)
+			case "unclean path":
+				record.Path = filepath.Dir(record.Path) + string(os.PathSeparator) + "." + string(os.PathSeparator) + filepath.Base(record.Path)
+			case "outside location":
+				path := filepath.Join(t.TempDir(), filepath.Base(protected))
+				writeBackupTestFile(t, path, readBackupTestFile(t, protected))
+				protected, record.Path = path, path
+			case "invalid checksum":
+				record.SHA256 = "not-a-checksum"
+			case "checksum mismatch":
+				record.SHA256 = strings.Repeat("0", 64)
+			case "size mismatch":
+				record.Size++
+			case "changed archive":
+				data := readBackupTestFile(t, protected)
+				data[0] ^= 0xff
+				writeBackupTestFile(t, protected, data)
+			case "malformed archive with matching checksum":
+				data := []byte("incomplete archive")
+				writeBackupTestFile(t, protected, data)
+				record.Size = int64(len(data))
+				checksum, err := bundle.ComputeDataChecksum(data, bundle.AlgorithmSHA256)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record.SHA256 = checksum
+			case "duplicate record":
+				scheduler.state.OwnedBackups = append(scheduler.state.OwnedBackups, *record)
+			case "incomplete record":
+				*record = BackupRecord{Path: protected}
+			case "symlink", "directory":
+				saved := protected + ".preserved"
+				if err := os.Rename(protected, saved); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "symlink" {
+					if err := os.Symlink(saved, protected); err != nil {
+						t.Skipf("symlink unavailable: %v", err)
+					}
+				} else if err := os.Mkdir(protected, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Lstat(protected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var beforeBytes []byte
+			if !before.IsDir() {
+				beforeBytes = readBackupTestFile(t, protected)
+			}
+			if err := scheduler.SaveState(); err != nil {
+				t.Fatal(err)
+			}
+			restarted := NewBackupScheduler(scheduler.config, scheduler.vault, newTestLogger())
+			if err := restarted.LoadState(); err != nil {
+				t.Fatal(err)
+			}
+			restarted.config.KeepLast = 1
+			if err := restarted.RotateBackups(); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.Lstat(protected)
+			if err != nil || !os.SameFile(before, after) || before.Mode().Type() != after.Mode().Type() {
+				t.Fatalf("untrusted entry was removed or replaced: %v", err)
+			}
+			if beforeBytes != nil && !bytes.Equal(beforeBytes, readBackupTestFile(t, protected)) {
+				t.Fatal("untrusted entry contents changed")
+			}
+			if _, err := os.Stat(older); !os.IsNotExist(err) {
+				t.Fatalf("older verified backup was not pruned: %v", err)
+			}
+			backups, err := restarted.ListBackups()
+			if err != nil || len(backups) != 1 || backups[0].Path != newest {
+				t.Fatalf("verified retained backups = %+v, error = %v", backups, err)
+			}
+		})
+	}
+}
+
+func TestBackupScheduler_LostOrMalformedOwnershipPreservesArchives(t *testing.T) {
+	for _, data := range []string{"", `{invalid`, `{"backup_count":10}`, `{"owned_backups":[{"path":"not-an-owned-backup"}]}`} {
+		t.Run(fmt.Sprintf("state-%q", data), func(t *testing.T) {
+			scheduler, _ := newScheduledBackupFixture(t, 10)
+			paths := []string{createDueBackup(t, scheduler), createDueBackup(t, scheduler)}
+			before := [][]byte{readBackupTestFile(t, paths[0]), readBackupTestFile(t, paths[1])}
+			if data == "" {
+				if err := os.Rename(scheduler.statePath(), scheduler.statePath()+".preserved"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				writeBackupTestFile(t, scheduler.statePath(), []byte(data))
+			}
+			restarted := NewBackupScheduler(scheduler.config, scheduler.vault, newTestLogger())
+			loadErr := restarted.LoadState()
+			if (data == "{invalid") != (loadErr != nil) {
+				t.Fatalf("LoadState() = %v", loadErr)
+			}
+			restarted.config.KeepLast = 1
+			if err := restarted.RotateBackups(); err != nil {
+				t.Fatal(err)
+			}
+			for i, path := range paths {
+				if !bytes.Equal(before[i], readBackupTestFile(t, path)) {
+					t.Fatalf("archive changed without valid ownership: %s", path)
+				}
+			}
+		})
+	}
+}
+
+func TestBackupScheduler_FailedBackupNeverPrunes(t *testing.T) {
+	for _, failure := range []string{"export", "ownership save"} {
+		t.Run(failure, func(t *testing.T) {
+			scheduler, _ := newScheduledBackupFixture(t, 10)
+			paths := []string{createDueBackup(t, scheduler), createDueBackup(t, scheduler)}
+			manualPath := filepath.Join(scheduler.config.Location, "caam_export_2000-01-01_0000.zip")
+			writeBackupTestFile(t, manualPath, []byte("manual archive"))
+			paths = append(paths, manualPath)
+			before := make(map[string][]byte)
+			for _, path := range paths {
+				before[path] = readBackupTestFile(t, path)
+			}
+			if failure == "export" {
+				scheduler.vault = filepath.Join(t.TempDir(), "missing-vault")
+			} else {
+				if err := os.Rename(scheduler.statePath(), scheduler.statePath()+".preserved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(scheduler.statePath(), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			scheduler.config.KeepLast = 1
+			scheduler.state.LastBackup = time.Time{}
+			published, err := scheduler.CreateBackup()
+			if err == nil {
+				t.Fatal("expected backup failure")
+			}
+			if failure == "export" && published != "" {
+				t.Fatalf("failed export published %s", published)
+			}
+			if failure == "ownership save" && published == "" {
+				t.Fatal("complete archive should remain after ownership save failure")
+			}
+			state := scheduler.GetState()
+			if state.BackupCount != 2 || len(state.OwnedBackups) != 2 {
+				t.Fatalf("failed backup acquired retention ownership: %+v", state)
+			}
+			for _, record := range state.OwnedBackups {
+				if record.Path == published {
+					t.Fatal("uncommitted archive counted toward retention")
+				}
+			}
+			for path, data := range before {
+				if !bytes.Equal(data, readBackupTestFile(t, path)) {
+					t.Fatalf("failed backup changed prior archive %s", path)
+				}
+			}
+			entries, err := os.ReadDir(scheduler.config.Location)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".caam-auto-backup-") {
+					t.Errorf("staging directory leaked: %s", entry.Name())
+				}
+			}
+			if scheduler.GetState().LastError == "" {
+				t.Fatal("backup failure missing from status")
+			}
+		})
+	}
+}
+
+func TestPublishScheduledBackupDoesNotOverwriteCollisions(t *testing.T) {
+	for _, existing := range []string{"file", "directory", "symlink"} {
+		t.Run(existing, func(t *testing.T) {
+			root := t.TempDir()
+			staged := filepath.Join(root, "staged.zip")
+			writeBackupTestFile(t, staged, []byte("completed staged archive"))
+			created := time.Date(2026, time.October, 7, 12, 30, 0, 0, time.UTC)
+			collision := filepath.Join(root, automaticBackupPrefix+created.Format(automaticBackupTimeFormat)+"_"+strings.Repeat("0", 32)+".zip")
+			switch existing {
+			case "file":
+				writeBackupTestFile(t, collision, []byte("preserve the existing archive"))
+			case "directory":
+				if err := os.Mkdir(collision, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				target := filepath.Join(root, "manual.zip")
+				writeBackupTestFile(t, target, []byte("preserve manual target"))
+				if err := os.Symlink(target, collision); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			}
+			before, err := os.Lstat(collision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var original []byte
+			if !before.IsDir() {
+				original = readBackupTestFile(t, collision)
+			}
+			// Force the first candidate to collide, then provide a different ID
+			// at exactly the same timestamp. Both operations use the real filesystem.
+			entropy := append(make([]byte, 16), bytes.Repeat([]byte{1}, 16)...)
+			published, err := publishScheduledBackup(staged, root, created, bytes.NewReader(entropy))
+			if err != nil || published == collision {
+				t.Fatalf("publish = %q, error = %v", published, err)
+			}
+			if !bytes.Equal(readBackupTestFile(t, published), readBackupTestFile(t, staged)) {
+				t.Fatal("published archive differs from completed staging")
+			}
+			if path, err := publishScheduledBackup(staged, root, created, bytes.NewReader(make([]byte, 16*16))); err == nil || path != "" {
+				t.Fatalf("exhausted collisions = %q, %v", path, err)
+			}
+			after, err := os.Lstat(collision)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("colliding entry replaced: %v", err)
+			}
+			if original != nil && !bytes.Equal(original, readBackupTestFile(t, collision)) {
+				t.Fatal("colliding entry content changed")
+			}
+		})
+	}
+}
+
+func TestBackupScheduler_ConcurrentCreationPublishesOnce(t *testing.T) {
+	scheduler, _ := newScheduledBackupFixture(t, 1)
+	var wg sync.WaitGroup
+	type outcome struct {
+		path string
+		err  error
+	}
+	results := make(chan outcome, 6)
+	for i := 0; i < cap(results); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path, err := scheduler.CreateBackup()
+			results <- outcome{path: path, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	created := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.path != "" {
+			created++
+		}
+	}
+	if created != 1 || scheduler.GetState().BackupCount != 1 {
+		t.Fatalf("concurrent calls created %d backups, state = %+v", created, scheduler.GetState())
+	}
+	state := scheduler.GetState()
+	state.OwnedBackups[0].SHA256 = "changed snapshot"
+	if scheduler.GetState().OwnedBackups[0].SHA256 == "changed snapshot" {
+		t.Fatal("GetState leaked mutable ownership records")
+	}
+	var saved BackupState
+	if err := json.Unmarshal(readBackupTestFile(t, scheduler.statePath()), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.OwnedBackups) != 1 || saved.OwnedBackups[0].Path != state.OwnedBackups[0].Path {
+		t.Fatalf("persisted ownership = %+v", saved)
+	}
+}
+
+func TestBackupScheduler_RetentionUsesPublicationOrder(t *testing.T) {
+	for _, backwards := range []bool{false, true} {
+		t.Run(fmt.Sprintf("clock-moved-backwards-%t", backwards), func(t *testing.T) {
+			scheduler, _ := newScheduledBackupFixture(t, 10)
+			source := createDueBackup(t, scheduler)
+			data := readBackupTestFile(t, source)
+			template := scheduler.GetState().OwnedBackups[0]
+			created := time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)
+			var publications []string
+			for _, id := range []byte{0xff, 0x01} {
+				// The older archive sorts later by random ID; publication order
+				// still determines retention when timestamps collide or go back.
+				if backwards && len(publications) > 0 {
+					created = created.Add(-time.Hour)
+				}
+				path, err := publishScheduledBackup(source, scheduler.config.Location, created, bytes.NewReader(bytes.Repeat([]byte{id}, 16)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				record := template
+				record.Path = path
+				record.CreatedAt = created
+				scheduler.state.OwnedBackups = append(scheduler.state.OwnedBackups, record)
+				publications = append(publications, path)
+			}
+			if err := scheduler.SaveState(); err != nil {
+				t.Fatal(err)
+			}
+			scheduler.config.KeepLast = 1
+			if err := scheduler.RotateBackups(); err != nil {
+				t.Fatal(err)
+			}
+			for _, old := range []string{source, publications[0]} {
+				if _, err := os.Stat(old); !os.IsNotExist(err) {
+					t.Fatalf("older publication remains: %s (%v)", old, err)
+				}
+			}
+			if !bytes.Equal(data, readBackupTestFile(t, publications[1])) {
+				t.Fatal("newest publication was not retained")
+			}
+		})
 	}
 }

@@ -939,6 +939,31 @@ new profiles while preserving existing ones; `--mode replace` replaces the
 selected profiles and leaves other accounts in place. Replacing `work` cannot
 overwrite a separate profile named `work.bak`.
 
+#### Scheduled vault backups
+
+The daemon can create periodic recovery archives:
+
+```bash
+caam daemon auto-backup --enable --interval 24h --keep 5 --location ~/Backups/caam
+caam daemon start
+```
+
+Use `caam daemon auto-backup` to inspect the schedule and latest result. Restart
+an already running daemon after changing its backup configuration.
+
+Each scheduled archive is assembled privately, checked through the bundle
+importer's recovery validation, and published under a unique
+`caam_auto_backup_...zip` name without replacing an existing file. Retention
+applies only to completed automatic backups recorded in the daemon's backup
+state whose contents still match their recorded size and SHA-256 checksum.
+Manual exports, older unrecorded archives, altered files, and ambiguous entries
+are preserved. Losing the ownership state leaves extra archives in place.
+
+Scheduled archives contain credentials and are unencrypted ZIP files; keep the
+backup directory private. If the destination filesystem cannot publish an
+archive exclusively using a hard link, the backup fails and keeps the older
+recovery copies.
+
 ### Uninstall Notes
 
 `caam uninstall` restores auth from any available `_original` backups first, then removes caam’s data/config. Useful flags:
