@@ -20,7 +20,8 @@ type DetailInfo struct {
 	CreatedAt          time.Time
 	LastUsedAt         time.Time
 	Account            string
-	Description        string // Free-form notes about this profile's purpose
+	Description        string   // Free-form notes about this profile's purpose
+	Tags               []string // User tags
 	BrowserCmd         string
 	BrowserProf        string
 	HealthStatus       health.HealthStatus
@@ -194,6 +195,9 @@ func (p *DetailPanel) View() string {
 	}
 	if prof.Description != "" {
 		profileRows = append(profileRows, p.renderRow("Notes", prof.Description))
+	}
+	if len(prof.Tags) > 0 {
+		profileRows = append(profileRows, p.renderRow("Tags", strings.Join(prof.Tags, ", ")))
 	}
 	sections = append(sections, lipgloss.JoinVertical(lipgloss.Left,
 		profileHeader,

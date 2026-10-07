@@ -22,7 +22,8 @@ type ProfileInfo struct {
 	Locked             bool
 	LastUsed           time.Time
 	Account            string
-	Description        string // Free-form notes about this profile's purpose
+	Description        string   // Free-form notes about this profile's purpose
+	Tags               []string // User tags (vault and isolated), used by search
 	IsActive           bool
 	HealthStatus       health.HealthStatus
 	TokenExpiry        time.Time

@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -764,5 +767,44 @@ func TestFormatTUIStatus(t *testing.T) {
 				t.Errorf("formatTUIStatus() = %q, want substring %q", got, tt.wantSub)
 			}
 		})
+	}
+}
+
+func TestDetailPanelShowsTags(t *testing.T) {
+	dp := NewDetailPanel()
+	dp.SetSize(80, 40)
+	dp.SetProfile(&DetailInfo{Name: "work", Provider: "codex", Tags: []string{"client-a", "urgent"}})
+	view := dp.View()
+	if !strings.Contains(view, "Tags") || !strings.Contains(view, "client-a, urgent") {
+		t.Fatalf("detail view missing tags:\n%s", view)
+	}
+}
+
+func TestProfileSearchMatchesTags(t *testing.T) {
+	info := ProfileInfo{Name: "work", Tags: []string{"client-a"}}
+	if !profileMatchesQuery(info, "client") {
+		t.Fatal("search should match a tag")
+	}
+	if profileMatchesQuery(info, "nomatch") {
+		t.Fatal("unexpected match")
+	}
+}
+
+func TestVaultMetaIncludesTags(t *testing.T) {
+	root := t.TempDir()
+	vault := authfile.NewVault(root)
+	dir := vault.ProfilePath("codex", "work")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(`{"description":"Client A","tags":["client-a","urgent"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta := loadVaultProfileMeta(vault, "codex", "work")
+	if meta.Description != "Client A" || strings.Join(meta.Tags, ",") != "client-a,urgent" {
+		t.Fatalf("meta = %+v", meta)
+	}
+	if got := mergeTags(meta.Tags, []string{"URGENT", "solo"}); strings.Join(got, ",") != "client-a,urgent,solo" {
+		t.Fatalf("mergeTags = %v", got)
 	}
 }

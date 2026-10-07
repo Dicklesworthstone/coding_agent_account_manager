@@ -114,6 +114,7 @@ type Profile struct {
 
 type vaultProfileMeta struct {
 	Description string
+	Tags        []string
 	Account     string
 }
 
@@ -2054,10 +2055,12 @@ func loadVaultProfileMeta(vault *authfile.Vault, provider, name string) vaultPro
 	metaPath := filepath.Join(profileDir, "meta.json")
 	if raw, err := os.ReadFile(metaPath); err == nil {
 		var stored struct {
-			Description string `json:"description"`
+			Description string   `json:"description"`
+			Tags        []string `json:"tags"`
 		}
 		if err := json.Unmarshal(raw, &stored); err == nil {
 			meta.Description = strings.TrimSpace(stored.Description)
+			meta.Tags = stored.Tags
 		}
 	}
 
@@ -2121,7 +2124,28 @@ func profileMatchesQuery(info ProfileInfo, query string) bool {
 	if info.Description != "" && strings.Contains(strings.ToLower(info.Description), query) {
 		return true
 	}
+	for _, tag := range info.Tags {
+		if strings.Contains(strings.ToLower(tag), query) {
+			return true
+		}
+	}
 	return false
+}
+
+// mergeTags combines tag lists, keeping the first occurrence of each tag.
+func mergeTags(lists ...[]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, tag := range list {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag != "" && !seen[tag] {
+				seen[tag] = true
+				out = append(out, tag)
+			}
+		}
+	}
+	return out
 }
 
 func (m Model) buildProfileInfo(provider string, p Profile, projectDefault string) ProfileInfo {
@@ -2130,6 +2154,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 	description := ""
 	lastUsed := time.Time{}
 	locked := false
+	var tags []string
 
 	meta := m.profileMetaFor(provider, p.Name)
 	if meta != nil {
@@ -2140,6 +2165,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 		description = meta.Description
 		lastUsed = meta.LastUsedAt
 		locked = meta.IsLocked()
+		tags = meta.Tags
 	}
 
 	vmeta := m.vaultMetaFor(provider, p.Name)
@@ -2149,6 +2175,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 	if description == "" {
 		description = vmeta.Description
 	}
+	tags = mergeTags(vmeta.Tags, tags)
 
 	healthStatus := health.StatusUnknown
 	errorCount := 0
@@ -2181,6 +2208,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 		LastUsed:           lastUsed,
 		Account:            account,
 		Description:        description,
+		Tags:               tags,
 		IsActive:           p.IsActive,
 		HealthStatus:       healthStatus,
 		TokenExpiry:        tokenExpiry,
@@ -2302,6 +2330,7 @@ func (m Model) syncDetailPanel() {
 	browserCmd := ""
 	browserProf := ""
 	locked := false
+	var tags []string
 
 	meta := m.profileMetaFor(provider, profileName)
 	if meta != nil {
@@ -2310,6 +2339,7 @@ func (m Model) syncDetailPanel() {
 		}
 		account = profileAccountLabel(meta)
 		description = meta.Description
+		tags = meta.Tags
 		createdAt = meta.CreatedAt
 		lastUsedAt = meta.LastUsedAt
 		browserCmd = meta.BrowserCommand
@@ -2329,6 +2359,7 @@ func (m Model) syncDetailPanel() {
 	if description == "" {
 		description = vmeta.Description
 	}
+	tags = mergeTags(vmeta.Tags, tags)
 
 	if path == "" {
 		vault := authfile.NewVault(m.vaultPath)
@@ -2346,6 +2377,7 @@ func (m Model) syncDetailPanel() {
 		LastUsedAt:         lastUsedAt,
 		Account:            account,
 		Description:        description,
+		Tags:               tags,
 		BrowserCmd:         browserCmd,
 		BrowserProf:        browserProf,
 		HealthStatus:       healthStatus,
