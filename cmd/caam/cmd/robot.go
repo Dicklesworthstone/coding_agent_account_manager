@@ -1340,6 +1340,8 @@ caam robot doctor              # Full diagnostics
 caam robot validate claude     # Token validation
 caam robot paths               # Auth file locations
 caam robot history             # Recent activity
+caam robot docs                # All commands/flags, exit and error codes, JSON Schemas
+caam robot docs schemas ls     # JSON Schema for one output
 ` + "```" + `
 
 ## Configuration

@@ -45,7 +45,13 @@ caam robot validate claude work        # Check saved credentials locally
 caam robot precheck claude             # Plan a session from usable profiles
 caam robot act activate claude work    # Install the selected credentials
 caam robot act refresh codex work      # Refresh through CAAM when supported
+caam robot docs                        # Every command and flag, exit/error codes, JSON Schemas
+caam robot docs schemas ls             # JSON Schema of 'caam ls --json'
 ```
+
+`caam robot docs` is generated from the running binary (commands, flags,
+examples, robot error codes, and JSON Schemas for robot outputs and
+`status`/`ls`/`activate --json`), with `version` and `schema_version`.
 
 `validate` and `robot validate` share the same passive assessment. A Claude
 snapshot containing only account labels or ordinary settings is invalid;
