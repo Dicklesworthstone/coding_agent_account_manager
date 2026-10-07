@@ -346,7 +346,23 @@ scrollback the most recent one decides the state.
 | `PastePrompt` | `Paste code here if prompted` | wait for the code |
 | `LoginSuccess` | `Logged in as`, `Login successful`, `Successfully authenticated/logged in`, `Welcome back` | resume |
 | `PressEnter` | `Press Enter to continue` | while resuming, send one Enter first: text typed on that screen is dropped |
+| `RateLimitMenu` | `What do you want to do?` / `Stop and wait for limit to reset` near the bottom of the pane | close the menu with Esc before typing `/login` |
 | `LoginFailed` | `Login failed`, `Authentication error`, `Invalid code`, `expired`, `Error signing` | retry `/login` within the budget, then fail |
+
+At a usage limit Claude Code opens a `What do you want to do?` menu. Its
+options depend on the account and can put `Switch to usage credits` or `Add
+funds to continue with usage credits` first. Typed into the menu, `/login` is
+ignored and its Enter picks the highlighted option, which could buy extra
+usage. So `/login` is typed as separate keys (`coordinator.LoginKeys`):
+1. Esc, only when the menu is on screen; Claude Code treats it like `Stop and
+   wait for limit to reset`.
+2. Ctrl+E then Ctrl+U, to empty the prompt line. Claude Code can prefill
+   `continue` there, and text in front of `/login` would go to the model as a
+   message. Ctrl+Y brings back what was cleared.
+3. `/login` and Enter.
+
+`caam wezterm recover`, `caam wezterm login-all claude`, and the `caam run`
+handoff type the same keys.
 
 #### HTTP API
 

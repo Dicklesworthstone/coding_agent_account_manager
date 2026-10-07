@@ -2,7 +2,9 @@ package handoff
 
 import (
 	"strings"
+	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
 )
 
@@ -21,8 +23,23 @@ func (h *ClaudeLoginHandler) LoginCommand() string {
 	return "/login"
 }
 
+// loginKeyGap is the pause after each key typed before /login.
+var loginKeyGap = coordinator.KeyGap
+
 // TriggerLogin injects the login command into the PTY.
+//
+// The handoff follows a usage limit, where Claude Code shows a "What do you
+// want to do?" menu whose Enter can buy extra usage. Esc closes it (a single
+// Esc leaves an idle prompt as it is), and Ctrl+E Ctrl+U empty the prompt
+// line, which Claude Code may have prefilled with "continue", before /login
+// is typed (see coordinator.LoginKeys).
 func (h *ClaudeLoginHandler) TriggerLogin(ctrl pty.Controller) error {
+	for _, key := range []string{coordinator.KeyEscape, coordinator.KeyEndOfLine, coordinator.KeyKillLine} {
+		if err := ctrl.InjectRaw([]byte(key)); err != nil {
+			return err
+		}
+		time.Sleep(loginKeyGap)
+	}
 	return ctrl.InjectCommand("/login")
 }
 

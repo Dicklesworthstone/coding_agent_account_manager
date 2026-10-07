@@ -552,14 +552,14 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		// pane to a human.
 		if tracker.TimeSinceStateChange() > c.config.StateTimeout {
 			c.closeRequest(tracker.GetRequestID(), RequestFailed)
-			c.retryOrGiveUp(ctx, tracker)
+			c.retryOrGiveUp(ctx, tracker, output)
 		}
 	}
 }
 
 // retryOrGiveUp re-injects /login into a failed pane while its retry budget
 // lasts, otherwise returns it to IDLE.
-func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker) {
+func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker, output string) {
 	retries := tracker.GetRetryCount()
 	if retries >= c.config.MaxLoginRetries {
 		c.logger.Warn("login retries exhausted; leaving pane for manual recovery",
@@ -571,7 +571,7 @@ func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker) {
 		return
 	}
 
-	if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
+	if err := sendKeys(ctx, c.paneClient, tracker.PaneID, LoginKeys(output)); err != nil {
 		c.logger.Error("injection failed",
 			"pane_id", tracker.PaneID,
 			"state", StateFailed.String(),
@@ -642,8 +642,13 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			return
 		}
 
-		// Auto-inject /login command
-		if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
+		// Auto-inject /login, closing the usage-limit menu first if it is open.
+		if RateLimitMenuOpen(output) {
+			c.logger.Info("closing usage-limit menu before /login",
+				"pane_id", tracker.PaneID,
+				"action", "dismiss_menu")
+		}
+		if err := sendKeys(ctx, c.paneClient, tracker.PaneID, LoginKeys(output)); err != nil {
 			c.logger.Error("injection failed",
 				"pane_id", tracker.PaneID,
 				"state", StateRateLimited.String(),

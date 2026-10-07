@@ -321,9 +321,18 @@ var Patterns = struct {
 	UsageLimitReset  *regexp.Regexp
 	CompactingBanner *regexp.Regexp
 	PressEnter       *regexp.Regexp
+	RateLimitMenu    *regexp.Regexp
 }{
 	// "Login successful. Press Enter to continue…"
 	PressEnter: regexp.MustCompile(`(?i)press\s+enter\s+to\s+continue`),
+
+	// The menu Claude Code opens at a usage limit:
+	//   What do you want to do?
+	//   ❯ 1. Stop and wait for limit to reset
+	//     2. Upgrade your plan
+	// Its options vary by account and can list "Switch to usage credits" or
+	// "Add funds to continue with usage credits" first.
+	RateLimitMenu: regexp.MustCompile(`(?i)what do you want to do\?|stop and wait for limit to reset`),
 
 	// Claude Code's limit banners, followed by their reset time on the same
 	// line (which keeps conversation text about limits from matching):

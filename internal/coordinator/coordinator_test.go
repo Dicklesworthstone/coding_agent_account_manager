@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -602,10 +603,10 @@ func TestE2ERateLimitToAuthComplete(t *testing.T) {
 		t.Errorf("expected StateRateLimited, got %v", tracker.GetState())
 	}
 
-	// Check /login was sent
+	// Check /login was typed into an emptied prompt line
 	sent := client.sentText()
-	if len(sent) < 1 || sent[0] != "/login\n" {
-		t.Errorf("expected /login to be sent, got %v", sent)
+	if want := []string{KeyEndOfLine, KeyKillLine, "/login\n"}; !slices.Equal(sent, want) {
+		t.Errorf("expected %q to be sent, got %q", want, sent)
 	}
 
 	// Phase 2: Method selection appears
@@ -709,9 +710,8 @@ func TestE2ECooldownPreventsRapidInjection(t *testing.T) {
 
 	// First poll should inject /login and transition to RATE_LIMITED
 	coord.pollPanes(ctx)
-	sent := client.sentText()
-	if len(sent) != 1 {
-		t.Fatalf("expected 1 send, got %d", len(sent))
+	if n := countLogins(client.sentText()); n != 1 {
+		t.Fatalf("expected 1 /login, got %d", n)
 	}
 	tracker := coord.trackers[1]
 	if tracker.GetState() != StateRateLimited {
@@ -729,9 +729,8 @@ func TestE2ECooldownPreventsRapidInjection(t *testing.T) {
 
 	// Poll again - rate limit still detected but cooldown should prevent injection
 	coord.pollPanes(ctx)
-	sent = client.sentText()
-	if len(sent) != 1 {
-		t.Errorf("expected cooldown to prevent second injection, got %d sends", len(sent))
+	if n := countLogins(client.sentText()); n != 1 {
+		t.Errorf("expected cooldown to prevent second injection, got %d /login", n)
 	}
 
 	// After cooldown expires, should inject again
@@ -744,10 +743,20 @@ func TestE2ECooldownPreventsRapidInjection(t *testing.T) {
 	tracker.mu.Unlock()
 
 	coord.pollPanes(ctx)
-	sent = client.sentText()
-	if len(sent) != 2 {
-		t.Errorf("expected injection after cooldown, got %d sends", len(sent))
+	if n := countLogins(client.sentText()); n != 2 {
+		t.Errorf("expected injection after cooldown, got %d /login", n)
 	}
+}
+
+// countLogins counts the /login commands submitted among sent texts.
+func countLogins(sent []string) int {
+	n := 0
+	for _, s := range sent {
+		if s == "/login\n" {
+			n++
+		}
+	}
+	return n
 }
 
 // TestE2EPaneDisappears tests cleanup when a pane disappears.
@@ -1087,11 +1096,8 @@ func TestCompactionReminderNotInjectedWhenRateLimited(t *testing.T) {
 	coord.pollPanes(ctx)
 
 	sent := client.sentText()
-	if len(sent) != 1 {
-		t.Fatalf("expected 1 send, got %d: %v", len(sent), sent)
-	}
-	if sent[0] != "/login\n" {
-		t.Errorf("expected /login injection, got %q", sent[0])
+	if want := []string{KeyEndOfLine, KeyKillLine, "/login\n"}; !slices.Equal(sent, want) {
+		t.Fatalf("expected only the /login keys %q, got %q", want, sent)
 	}
 	// Verify no compaction reminder was sent
 	for _, s := range sent {
@@ -1511,13 +1517,7 @@ func TestFailedLoginIsRetriedWithinBudget(t *testing.T) {
 			t.Fatalf("attempt %d: state=%v retries=%d, want RATE_LIMITED/%d", attempt, tracker.GetState(), tracker.GetRetryCount(), attempt)
 		}
 	}
-	logins := 0
-	for _, s := range client.sentText() {
-		if s == "/login\n" {
-			logins++
-		}
-	}
-	if logins != 2 {
+	if logins := countLogins(client.sentText()); logins != 2 {
 		t.Fatalf("/login injected %d times, want 2", logins)
 	}
 
@@ -1526,10 +1526,8 @@ func TestFailedLoginIsRetriedWithinBudget(t *testing.T) {
 	if tracker.GetState() != StateIdle {
 		t.Fatalf("state after exhausted retries = %v, want IDLE", tracker.GetState())
 	}
-	for _, s := range client.sentText()[logins:] {
-		if s == "/login\n" {
-			t.Fatal("no further /login once retries are exhausted")
-		}
+	if countLogins(client.sentText()) != 2 {
+		t.Fatal("no further /login once retries are exhausted")
 	}
 
 	// A fresh rate limit starts a new episode with a full budget.
@@ -1800,6 +1798,114 @@ func TestTypedText(t *testing.T) {
 		if got := TypedText(in); got != want {
 			t.Errorf("TypedText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// usageLimitMenu is the screen Claude Code shows at a usage limit when the
+// account can buy extra usage: the paid option comes first and is highlighted.
+const usageLimitMenu = `⏺ Refactoring the parser…
+  ⎿  You've hit your limit · resets 3pm (America/New_York)
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Switch to usage credits
+     2. Stop and wait for limit to reset
+     3. Wait here, then continue automatically at 3pm
+     4. Upgrade your plan
+
+   Esc to cancel
+`
+
+func TestLoginKeys(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		want   []string
+	}{
+		{"menu open", usageLimitMenu,
+			[]string{KeyEscape, KeyEndOfLine, KeyKillLine, "/login\n"}},
+		{"menu closed", "  ⎿  You've hit your limit · resets 3pm (America/New_York)\n\n────\n❯ continue\n────\n",
+			[]string{KeyEndOfLine, KeyKillLine, "/login\n"}},
+		{"usage-based billing labels its option Stop", "   What do you want to do?\n\n   ❯ 1. Add funds to continue with usage\n     2. Stop\n",
+			[]string{KeyEscape, KeyEndOfLine, KeyKillLine, "/login\n"}},
+		// A menu long gone from the screen is not answered with Esc, which
+		// would interrupt a working session.
+		{"menu only in scrollback", usageLimitMenu + strings.Repeat("⏺ more work\n", bottomLines+1),
+			[]string{KeyEndOfLine, KeyKillLine, "/login\n"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LoginKeys(tc.output); !slices.Equal(got, tc.want) {
+				t.Errorf("LoginKeys = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUsageLimitMenuIsClosedNotAnswered: at a usage limit Claude Code's menu
+// may highlight paid extra usage. Typing "/login" and Enter there would buy
+// it; the coordinator must close the menu with Esc before anything else.
+func TestUsageLimitMenuIsClosedNotAnswered(t *testing.T) {
+	client := &fakePaneClient{panes: []Pane{{PaneID: 1}}, output: usageLimitMenu}
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	coord := New(cfg)
+
+	coord.pollPanes(context.Background())
+
+	want := []string{KeyEscape, KeyEndOfLine, KeyKillLine, "/login\n"}
+	if sent := client.sentText(); !slices.Equal(sent, want) {
+		t.Fatalf("sent %q, want %q", sent, want)
+	}
+	if got := coord.trackers[1].GetState(); got != StateRateLimited {
+		t.Fatalf("state = %v, want RATE_LIMITED", got)
+	}
+}
+
+// TestTmuxDeliversLoginKeys: the control keys reach a raw-mode program as the
+// bytes the keyboard sends, each in order.
+func TestTmuxDeliversLoginKeys(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a tmux server")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
+	want := "\x1b\x05\x15/login\r"
+	out := filepath.Join(t.TempDir(), "bytes")
+	script := fmt.Sprintf("stty raw -echo; head -c %d > '%s'; sleep 30", len(want), out)
+	if b, err := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-x", "80", "-y", "24", script).CombinedOutput(); err != nil {
+		t.Fatalf("start tmux: %v: %s", err, b)
+	}
+	t.Cleanup(func() { exec.Command("tmux", "kill-server").Run() })
+
+	client := NewTmuxClient()
+	ctx := context.Background()
+	var panes []Pane
+	deadline := time.Now().Add(10 * time.Second)
+	for len(panes) == 0 && time.Now().Before(deadline) {
+		panes, _ = client.ListPanes(ctx)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(panes) != 1 {
+		t.Fatal("tmux pane did not start")
+	}
+	time.Sleep(200 * time.Millisecond) // let stty take effect
+	if err := sendKeys(ctx, client, panes[0].PaneID, LoginKeys(usageLimitMenu)); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for time.Now().Before(deadline) {
+		if got, _ = os.ReadFile(out); len(got) == len(want) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if string(got) != want {
+		t.Fatalf("raw-mode program received %q, want %q", got, want)
 	}
 }
 

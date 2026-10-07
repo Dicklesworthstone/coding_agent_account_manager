@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 )
 
 // PaneClient is the interface for terminal multiplexer backends.
@@ -61,6 +62,61 @@ func TypedText(text string) string {
 		return strings.TrimSuffix(trimmed, "\r") + "\r"
 	}
 	return text
+}
+
+// Control keys, each sent on its own: a lone Esc is told apart from the start
+// of an escape sequence by the pause after it.
+const (
+	KeyEscape    = "\x1b"
+	KeyEndOfLine = "\x05" // Ctrl+E
+	KeyKillLine  = "\x15" // Ctrl+U: delete to the start of the line
+)
+
+// KeyGap is the pause between keys sent separately, long enough for Claude
+// Code to handle each one (and for a dismissed menu to hand focus back to the
+// prompt) before the next arrives.
+const KeyGap = 300 * time.Millisecond
+
+// LoginKeys returns the keys, to be sent one at a time KeyGap apart, that run
+// /login in a Claude Code pane whose screen shows output.
+//
+// At a usage limit Claude Code opens a "What do you want to do?" menu. Typed
+// into it, "/login" is ignored and its Enter picks the highlighted option,
+// which can be paid extra usage ("Switch to usage credits") or a plan
+// upgrade. An open menu is therefore closed with Esc, which Claude Code
+// treats like "Stop and wait for limit to reset". Ctrl+E Ctrl+U then empty
+// the prompt line: Claude Code can prefill "continue" there, and text left in
+// front of "/login" would be sent to the model as a message instead of
+// running the command. (Ctrl+Y brings back what was cleared.)
+func LoginKeys(output string) []string {
+	var keys []string
+	if RateLimitMenuOpen(output) {
+		keys = append(keys, KeyEscape)
+	}
+	return append(keys, KeyEndOfLine, KeyKillLine, "/login\n")
+}
+
+// RateLimitMenuOpen reports whether Claude Code's usage-limit menu is on
+// screen in output.
+func RateLimitMenuOpen(output string) bool {
+	return atBottom(output, Patterns.RateLimitMenu)
+}
+
+// sendKeys types keys into a pane one at a time, KeyGap apart.
+func sendKeys(ctx context.Context, client PaneClient, paneID int, keys []string) error {
+	for i, key := range keys {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(KeyGap):
+			}
+		}
+		if err := client.SendText(ctx, paneID, key, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // autoPaneClient follows whichever multiplexer is answering, in preference

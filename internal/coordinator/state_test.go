@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"regexp"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1432,11 +1433,8 @@ func TestCoordinator_CompactionReminderDoesNotTriggerOnRateLimit(t *testing.T) {
 	client.mu.Unlock()
 
 	// Should inject /login, not the compaction reminder
-	if len(sent) != 1 {
-		t.Fatalf("expected 1 injection, got %d: %v", len(sent), sent)
-	}
-	if sent[0] != "/login\n" {
-		t.Errorf("expected /login injection (rate limit takes precedence), got %q", sent[0])
+	if want := []string{KeyEndOfLine, KeyKillLine, "/login\n"}; !slices.Equal(sent, want) {
+		t.Fatalf("expected only the /login keys %q (rate limit takes precedence), got %q", want, sent)
 	}
 }
 

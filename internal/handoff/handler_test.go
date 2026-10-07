@@ -1,7 +1,14 @@
 package handoff
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
 )
 
 func TestNewRegistry(t *testing.T) {
@@ -166,7 +173,7 @@ func TestClaudeLoginHandler(t *testing.T) {
 
 	t.Run("IsLoginFailed", func(t *testing.T) {
 		tests := []struct {
-			output  string
+			output   string
 			wantFail bool
 			wantMsg  string
 		}{
@@ -369,5 +376,42 @@ func TestRegistry_Register(t *testing.T) {
 	got := r.Get("claude")
 	if got != custom {
 		t.Error("custom handler not registered correctly")
+	}
+}
+
+// TestClaudeTriggerLoginClosesUsageLimitMenu: the program in the PTY gets Esc
+// (closing Claude Code's usage-limit menu, whose Enter can buy extra usage),
+// Ctrl+E Ctrl+U (emptying the prompt line) and then /login with Enter.
+func TestClaudeTriggerLoginClosesUsageLimitMenu(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a Unix PTY")
+	}
+	saved := loginKeyGap
+	loginKeyGap = 50 * time.Millisecond
+	defer func() { loginKeyGap = saved }()
+
+	want := "\x1b\x05\x15/login\r"
+	out := filepath.Join(t.TempDir(), "bytes")
+	ctrl, err := pty.NewControllerFromArgs("sh", []string{"-c", fmt.Sprintf("stty raw -echo; head -c %d > '%s'", len(want), out)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+	if err := ctrl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // let stty take effect
+
+	if err := (&ClaudeLoginHandler{}).TriggerLogin(ctrl); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if got, _ = os.ReadFile(out); len(got) == len(want) {
+			break
+		}
+	}
+	if string(got) != want {
+		t.Fatalf("program received %q, want %q", got, want)
 	}
 }
