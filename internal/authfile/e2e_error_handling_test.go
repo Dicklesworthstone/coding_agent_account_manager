@@ -79,6 +79,9 @@ func TestE2E_PermissionDeniedRestore(t *testing.T) {
 	}
 
 	// Make source directory read-only
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; a permission-denied restore cannot be produced")
+	}
 	if err := os.Chmod(sourceDir, 0555); err != nil {
 		t.Skipf("Cannot set read-only permissions: %v", err)
 	}
@@ -87,7 +90,7 @@ func TestE2E_PermissionDeniedRestore(t *testing.T) {
 	// Restore should fail gracefully
 	err := vault.Restore(fileSet, "test-profile")
 	if err == nil {
-		t.Error("Expected error for permission denied")
+		t.Fatal("Expected error for permission denied")
 	}
 
 	h.Log.Info("Permission denied test complete", map[string]interface{}{

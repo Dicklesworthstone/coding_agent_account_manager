@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -170,8 +171,11 @@ func TestTagAndDescribeVaultOnlyProfile(t *testing.T) {
 
 	require.NoError(t, lsCmd.Flags().Set("tag", "client-a"))
 	require.NoError(t, lsCmd.Flags().Set("json", "true"))
-	out, err := captureStdout(t, func() error { return runLs(lsCmd, []string{"codex"}) })
-	require.NoError(t, err)
+	var buf bytes.Buffer
+	lsCmd.SetOut(&buf)
+	t.Cleanup(func() { lsCmd.SetOut(nil) })
+	require.NoError(t, runLs(lsCmd, []string{"codex"}))
+	out := buf.String()
 	var listed struct {
 		Profiles []struct {
 			Name        string   `json:"name"`
