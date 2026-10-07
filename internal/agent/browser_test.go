@@ -237,8 +237,8 @@ func TestChallengeCodePage(t *testing.T) {
 			expected: "WXYZ-5678",
 		},
 		{
-			name: "Simple format",
-			html: `<div>Your code: MNOP-9012</div>`,
+			name:     "Simple format",
+			html:     `<div>Your code: MNOP-9012</div>`,
 			expected: "MNOP-9012",
 		},
 	}
@@ -542,5 +542,45 @@ func TestFormatSelector(t *testing.T) {
 	expected := `div[data-email="test@example.com"]`
 	if selector != expected {
 		t.Errorf("formatSelector() = %q, want %q", selector, expected)
+	}
+}
+
+func TestCodeFromCallbackURL(t *testing.T) {
+	tests := []struct {
+		url, want string
+	}{
+		{"https://console.anthropic.com/oauth/code/callback?code=aB3_dE-fGh1234567890&state=st4te_XYZ", "aB3_dE-fGh1234567890#st4te_XYZ"},
+		{"https://platform.claude.com/oauth/code/callback/?code=onlycode", "onlycode"},
+		{"https://console.anthropic.com/oauth/code/callback?error=access_denied", ""},
+		{"https://claude.ai/oauth/authorize?code=true&client_id=x", ""},
+		{"https://accounts.google.com/o/oauth2/v2/auth?code=nope", ""},
+		{"::not a url", ""},
+	}
+	for _, tt := range tests {
+		if got := codeFromCallbackURL(tt.url); got != tt.want {
+			t.Errorf("codeFromCallbackURL(%q) = %q, want %q", tt.url, got, tt.want)
+		}
+	}
+}
+
+func TestOnCodePage(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"https://console.anthropic.com/oauth/code/success":   true,
+		"https://platform.claude.com/oauth/code/callback":    true,
+		"https://claude.ai/oauth/authorize?code=true":        false, // consent page
+		"https://accounts.google.com/signin/v2/identifier":   false,
+		"https://evil-anthropic.com/oauth/code/callback":     false,
+		"https://claude.ai.evil.example/oauth/code/callback": false,
+	} {
+		if got := onCodePage(raw); got != want {
+			t.Errorf("onCodePage(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+func TestExtractChallengeCodePrefersPasteReadyCode(t *testing.T) {
+	html := `<div class="ABCDEFGHIJ">Paste this into Claude Code:</div><code>xY9_k2-mNpQrStUvWx12#Ab_cd-EF34</code>`
+	if got := extractChallengeCode(html); got != "xY9_k2-mNpQrStUvWx12#Ab_cd-EF34" {
+		t.Fatalf("extractChallengeCode = %q", got)
 	}
 }

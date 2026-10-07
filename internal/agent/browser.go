@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -139,10 +140,20 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			"attempt", attempt,
 			"url", truncateURL(currentURL, 80))
 
-		// Check if we have a challenge code
-		if code = extractChallengeCode(pageHTML); code != "" {
-			b.logger.Info("extracted challenge code")
+		// The OAuth callback carries the code in its URL; that is
+		// authoritative and what Claude Code expects pasted ("code#state").
+		if code = codeFromCallbackURL(currentURL); code != "" {
+			b.logger.Info("extracted authorization code from callback URL")
 			return code, usedAccount, nil
+		}
+		// Otherwise read the code from an Anthropic/Claude code page. Other
+		// pages (Google sign-in, the consent page) are never scraped: their
+		// markup is full of tokens that look like codes.
+		if onCodePage(currentURL) {
+			if code = extractChallengeCode(pageHTML); code != "" {
+				b.logger.Info("extracted challenge code from code page")
+				return code, usedAccount, nil
+			}
 		}
 
 		// Check if on Google account selection page
@@ -265,15 +276,6 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 			continue
 		}
 
-		// Check if on Claude's code display page
-		if strings.Contains(currentURL, "claude.ai") || strings.Contains(currentURL, "anthropic.com") {
-			// Look for code display
-			if code = extractChallengeCode(pageHTML); code != "" {
-				b.logger.Info("found challenge code on Claude page")
-				return code, usedAccount, nil
-			}
-		}
-
 		// Wait and retry
 		time.Sleep(2 * time.Second)
 	}
@@ -281,8 +283,52 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	return "", "", fmt.Errorf("could not complete OAuth flow - no challenge code found")
 }
 
+// codeFromCallbackURL returns the paste-ready authorization code when rawURL
+// is an OAuth code callback (".../oauth/code/callback?code=...&state=...").
+// Claude Code accepts "code#state" at its paste prompt.
+func codeFromCallbackURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/oauth/code/callback") {
+		return ""
+	}
+	q := u.Query()
+	code := strings.TrimSpace(q.Get("code"))
+	if code == "" {
+		return ""
+	}
+	if state := strings.TrimSpace(q.Get("state")); state != "" {
+		return code + "#" + state
+	}
+	return code
+}
+
+// onCodePage reports whether rawURL is an Anthropic or Claude page that can
+// display an authorization code (not the authorize/consent page itself).
+func onCodePage(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	anthropic := false
+	for _, domain := range []string{"anthropic.com", "claude.ai", "claude.com"} {
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			anthropic = true
+		}
+	}
+	return anthropic && !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/oauth/authorize")
+}
+
+// pastedCodePattern matches a displayed "code#state" authorization code.
+var pastedCodePattern = regexp.MustCompile(`([A-Za-z0-9_-]{16,}#[A-Za-z0-9_-]{8,})`)
+
 // extractChallengeCode finds the challenge code in HTML content.
 func extractChallengeCode(html string) string {
+	// A full "code#state" string is what the CLI's paste prompt expects.
+	if m := pastedCodePattern.FindStringSubmatch(html); len(m) > 1 {
+		return m[1]
+	}
+
 	// Look for common patterns:
 	// 1. Code in a dedicated element (class containing "code", "challenge", etc.)
 	// 2. Formatted as XXXX-XXXX or similar
