@@ -71,30 +71,48 @@ func pullClaudeKeychain(fileSet AuthFileSet) error {
 	return nil
 }
 
-// pushClaudeKeychain writes the just-restored credentials file into the login
-// keychain, which is what actually changes the account Claude Code uses.
-//
-// A failure here is fatal to the switch: reporting success while the keychain
-// still holds the previous account is exactly the silent no-op of issue #98.
+// pushClaudeKeychain checks Restore's final publication postcondition. The
+// recoverable batch now publishes the item itself; a second write here could
+// overwrite a native rotation after the rollback copies have been released.
 func pushClaudeKeychain(fileSet AuthFileSet) error {
 	credPath := claudeKeychainPath(fileSet)
 	if credPath == "" {
 		return nil
 	}
-	if _, err := os.Lstat(credPath); os.IsNotExist(err) {
-		// A helper/API-key target deliberately retired its OAuth mirror.
-		// Keeping the old login item would reintroduce the outgoing account.
-		return clearClaudeKeychain(fileSet)
-	} else if err != nil {
-		return fmt.Errorf("inspect restored Claude credentials: %w", err)
+	live, err := readRetiredClaudeCredential(credPath)
+	if err != nil {
+		return err
 	}
-	if err := keychain.PushMirror(credPath); err != nil {
-		if errors.Is(err, keychain.ErrNoKeychain) {
-			return nil
-		}
-		return fmt.Errorf("write Claude credentials to the macOS login keychain: %w", err)
+	read := claudeRetirementMirror(fileSet, credPath)
+	current, err := read()
+	if err != nil {
+		return err
+	}
+	if !sameClaudeAuthority(live, current) {
+		return fmt.Errorf("Claude keychain or credential changed after publication; left untouched")
 	}
 	return nil
+}
+
+func prepareClaudeKeychainPublication(fileSet AuthFileSet) (*claudeRestoreAuthority, error) {
+	path := claudeKeychainPath(fileSet)
+	if path == "" {
+		return nil, nil
+	}
+	authority, err := prepareClaudeRestoreAuthority(path, claudeRetirementMirror(fileSet, path), func(data []byte) error {
+		keychain.ForgetMirrors()
+		if data == nil {
+			return keychain.DeleteClaude()
+		}
+		return keychain.WriteClaude(data)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Restore's subsequent pull must not reuse a status command's cached disk
+	// mirror when the authoritative grant rotated since that inspection.
+	keychain.ForgetMirrors()
+	return authority, nil
 }
 
 // Retirement preflight reads, but does not mirror or mutate, the authoritative

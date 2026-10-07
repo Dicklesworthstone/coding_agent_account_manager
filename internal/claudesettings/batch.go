@@ -35,6 +35,14 @@ func ApplyUpdatesWithRemovals(updates []*Update, removals []*Removal) error {
 	return applyChanges(updates, removals, batchFileOps{os.Rename, os.Remove, os.Link})
 }
 
+// ApplyUpdatesWithFinalizer retains all recovery copies until final publication
+// to an external authority succeeds. A finalizer error rolls back the file
+// batch; the finalizer must recover its own side effects before returning it.
+// It runs once, after all file writes/removals, and never on preflight failure.
+func ApplyUpdatesWithFinalizer(updates []*Update, removals []*Removal, finalize func() error) error {
+	return applyChangesFinal(updates, removals, batchFileOps{os.Rename, os.Remove, os.Link}, finalize)
+}
+
 // rename is injected per invocation for deterministic I/O-failure tests, never
 // via a mutable package global that could affect concurrent activations.
 func applyUpdatesWithRename(updates []*Update, rename func(string, string) error) error {
@@ -42,6 +50,10 @@ func applyUpdatesWithRename(updates []*Update, rename func(string, string) error
 }
 
 func applyChanges(updates []*Update, removals []*Removal, ops batchFileOps) error {
+	return applyChangesFinal(updates, removals, ops, nil)
+}
+
+func applyChangesFinal(updates []*Update, removals []*Removal, ops batchFileOps, finalize func() error) error {
 	writes := make([]*batchWrite, 0, len(updates)+len(removals))
 	for _, update := range updates {
 		if update == nil {
@@ -132,6 +144,77 @@ func applyChanges(updates []*Update, removals []*Removal, ops batchFileOps) erro
 		write.staged = ""
 		write.installed = info
 		applied = append(applied, write)
+	}
+	if finalize != nil {
+		// Before publishing outside the filesystem, confirm the complete
+		// installed bundle and any source not intentionally changed by us.
+		for _, write := range writes {
+			if err := write.checkPublished(seen); err != nil {
+				return rollback(err)
+			}
+		}
+		if err := finalize(); err != nil {
+			return rollback(err)
+		}
+	}
+	return nil
+}
+
+func (write *batchWrite) checkPublished(destinations map[string]bool) error {
+	if write.removal != nil {
+		for _, path := range []string{write.path(), write.removal.snapshot} {
+			if _, err := os.Lstat(path); err == nil {
+				return fmt.Errorf("Claude credential appeared before publication; retry")
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
+	current, err := Read(write.path())
+	if err != nil {
+		return err
+	}
+	expected := write.update.before
+	for _, shared := range write.update.privateSources {
+		if err := CheckPrivate(write.path(), shared); err != nil {
+			return err
+		}
+	}
+	if write.installed == nil && write.update.checkIdentity {
+		info, err := os.Lstat(write.path())
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		original := write.update.identity
+		if (info == nil) != (original == nil) || (info != nil && !os.SameFile(info, original)) {
+			return fmt.Errorf("Claude credential replaced before publication; retry")
+		}
+	}
+	if write.installed != nil {
+		expected = write.data
+		info, err := os.Lstat(write.path())
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || !os.SameFile(info, write.installed) {
+			return fmt.Errorf("Claude destination replaced before publication; retry")
+		}
+	}
+	if (current == nil) != (expected == nil) || !bytes.Equal(current, expected) {
+		return fmt.Errorf("Claude destination changed before publication; retry")
+	}
+	for path, before := range write.update.inputs {
+		if destinations[path] {
+			continue // Validated against its installed result, not its old bytes.
+		}
+		current, err := Read(path)
+		if err != nil {
+			return err
+		}
+		if (current == nil) != (before == nil) || !bytes.Equal(current, before) {
+			return fmt.Errorf("Claude source changed before publication; retry")
+		}
 	}
 	return nil
 }

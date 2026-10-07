@@ -2,10 +2,77 @@ package claudesettings
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+// PrepareCredentialReplacement stages an exact, already validated credential
+// generation in the same batch as settings and removals. after must be either
+// the captured snapshot or the captured live credential (freshness protection).
+// sources includes the snapshot and any identity documents used to make that
+// decision. All buffers are copied; caller mutation cannot change the plan.
+// verify is read-only and guards an external authority before each write.
+func PrepareCredentialReplacement(snapshot, path string, before, after []byte, sources map[string][]byte, verify func() error) (*Update, error) {
+	if snapshot == "" || path == "" {
+		return nil, fmt.Errorf("Claude credential replacement requires snapshot and destination paths")
+	}
+	var err error
+	snapshot, err = filepath.Abs(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckPrivate(path, snapshot); err != nil {
+		return nil, err
+	}
+	inputs := make(settingsInputs, len(sources))
+	for source, data := range sources {
+		if source == "" {
+			return nil, fmt.Errorf("Claude credential source path is required")
+		}
+		abs, err := filepath.Abs(source)
+		if err != nil {
+			return nil, err
+		}
+		if old, exists := inputs[abs]; exists && ((old == nil) != (data == nil) || !bytes.Equal(old, data)) {
+			return nil, fmt.Errorf("conflicting captured Claude credential source")
+		}
+		inputs[abs] = bytes.Clone(data)
+	}
+	selected, ok := inputs[snapshot]
+	if !ok || selected == nil || after == nil || (!bytes.Equal(after, selected) && !bytes.Equal(after, before)) {
+		return nil, fmt.Errorf("Claude replacement must use a captured credential generation")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(selected, &obj) != nil || len(obj) == 0 {
+		return nil, fmt.Errorf("Claude snapshot must contain a nonempty JSON object")
+	}
+	obj = nil
+	if json.Unmarshal(after, &obj) != nil || len(obj) == 0 {
+		return nil, fmt.Errorf("Claude replacement must contain a nonempty JSON object")
+	}
+	update, err := preparedUpdate(path, bytes.Clone(before), bytes.Clone(after))
+	if err != nil {
+		return nil, err
+	}
+	update.identity, err = os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	update.checkIdentity = true
+	update.privateSources = []string{snapshot}
+	update.verify = verify
+	update.inputs = inputs
+	if err := update.checkUnchanged(); err != nil {
+		return nil, err
+	}
+	return update, nil
+}
 
 // Removal is a prepared retirement of a credential absent from the selected
 // snapshot. It participates in the same rollback batch as mixed settings, so a

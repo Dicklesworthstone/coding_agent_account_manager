@@ -1,6 +1,7 @@
 package authfile
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -111,11 +112,10 @@ type claudeSettingsRestore struct {
 	hasAuth bool
 }
 
-// prepareClaudeSettingsRestore runs before any credentials or keychain mirror
-// are changed. Missing settings snapshots still produce a plan: their absence
-// means the target has no settings auth, so outgoing helpers/env must go away.
-// The same rule applies to raw OAuth files and Desktop's token caches: leaving
-// an absent source in place could authenticate as the account we just left.
+// prepareClaudeSettingsRestore runs before credentials or keychain mirrors are
+// changed. Both present and absent raw credentials participate in the same
+// recoverable batch as mixed settings and Desktop caches. Source generations,
+// including the identity used by the existing freshness guard, stay captured.
 func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[string]claudeSettingsRestore, error) {
 	if fileSet.Tool != "claude" {
 		return nil, nil
@@ -124,6 +124,24 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 	if err != nil {
 		return nil, err
 	}
+	identitySources := make(map[string][]byte)
+	liveState := claudeFileSetPath(fileSet, claudeSettingsFile)
+	for _, path := range []string{liveState, filepath.Join(profileDir, claudeSettingsFile), filepath.Join(profileDir, "meta.json")} {
+		if path == "" {
+			continue
+		}
+		data, err := claudesettings.Read(path)
+		if err != nil {
+			return nil, fmt.Errorf("capture Claude restore identity: %w", err)
+		}
+		identitySources[path] = data
+	}
+	var liveObject map[string]interface{}
+	_ = json.Unmarshal(identitySources[liveState], &liveObject)
+	liveKeys := claudeIdentityKeys(liveObject)
+	// The existing freshness helper takes an explicit profileDir; this view
+	// uses that same vault root and does not create or modify any directory.
+	identityVault := NewVault(filepath.Dir(filepath.Dir(profileDir)))
 	var result map[string]claudeSettingsRestore
 	for _, spec := range fileSet.Files {
 		filename := filepath.Base(spec.Path)
@@ -145,14 +163,33 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			}
 			plan = claudeSettingsRestore{update: update, hasAuth: snapshot.hasAuth}
 		case filename == claudeCredentialsFile || filename == "auth.json":
-			retirement, err := prepareClaudeCredentialRetirement(snapshotPath, spec.Path, claudeRetirementMirror(fileSet, spec.Path))
+			mirror := claudeRetirementMirror(fileSet, spec.Path)
+			retirement, err := prepareClaudeCredentialRetirement(snapshotPath, spec.Path, mirror)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude credential retirement: %w", err)
 			}
-			if retirement == nil {
-				continue // Keep the existing same-account freshness guard for real snapshots.
+			if retirement != nil {
+				plan.update = retirement
+				break
 			}
-			plan.update = retirement
+			var keepLive func() bool
+			if filename == claudeCredentialsFile {
+				keepLive = func() bool {
+					return identityVault.claudeLiveIsNewer(liveKeys, profileDir, spec.Path, snapshotPath)
+				}
+			}
+			replacement, err := prepareClaudeCredentialRestore(snapshotPath, spec.Path, identitySources, mirror, keepLive)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Claude credential replacement: %w", err)
+			}
+			hasAuth, err := claudeCredentialMaterial(replacement.target, filename)
+			if err != nil {
+				return nil, fmt.Errorf("%w: Claude credential snapshot %s: %v", ErrInvalidCredentials, snapshotPath, err)
+			}
+			if !hasAuth {
+				return nil, fmt.Errorf("%w: Claude credential snapshot %s contains no access credential", ErrNoCredentials, snapshotPath)
+			}
+			plan = claudeSettingsRestore{update: replacement, hasAuth: true}
 		case isClaudeDesktopConfig(fileSet.Tool, spec.Path):
 			update, err := claudesettings.PrepareFieldsRestore(snapshotPath, spec.Path, claudeDesktopTokenKeys)
 			if err != nil {
@@ -219,9 +256,13 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 	if !required && !optional {
 		return nil, fmt.Errorf("no auth files restored for %s", fileSet.Tool)
 	}
-	// Restore visits plans in file-set order. Do not let its first visit
-	// retire the outgoing OAuth token before another document can be staged.
-	batch := &claudeRestoreBatch{}
+	// Restore visits plans in file-set order. Stage every participant once,
+	// and publish the authoritative keychain while recovery is still possible.
+	authority, err := prepareClaudeKeychainPublication(fileSet)
+	if err != nil {
+		return nil, err
+	}
+	batch := &claudeRestoreBatch{authority: authority}
 	for _, spec := range fileSet.Files {
 		plan, ok := result[spec.Path]
 		if !ok {
@@ -230,6 +271,8 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 		switch update := plan.update.(type) {
 		case *claudesettings.Update:
 			batch.updates = append(batch.updates, update)
+		case *claudeCredentialRestore:
+			batch.credentials = append(batch.credentials, update)
 		case *claudeCredentialRetirement:
 			batch.retirements = append(batch.retirements, update)
 		default:

@@ -50,15 +50,21 @@ target, a vault restore removes live `.credentials.json` and `auth.json` when
 the selected profile has no snapshot for that source. Present credential
 snapshots still use the existing same-account freshness protection.
 
-Vault restoration stages the mixed settings documents and private recovery
-copies for retired credentials as one batch, regardless of file-set order.
-A settings staging failure cannot first remove the outgoing OAuth token.
-Settings are installed before retirement; a later retirement or validation
-failure also rolls those settings back. Recreated native logins are never
-overwritten by credential rollback: recovery into a retired path requires that
-path to remain absent. Otherwise the error reports the retained private copy
-(`credentials.json.rollback.*`). This batch does not encompass the subsequent
-restore of present OAuth snapshots or the final keychain write.
+Vault restoration stages incoming raw OAuth credentials, mixed settings,
+Desktop caches and private recovery copies for retired credentials as one
+batch, regardless of file-set order. A staging failure cannot first replace
+settings or remove the outgoing OAuth token. Freshness decisions use the
+captured outgoing identity before any mixed-state document is changed. Exact
+credential bytes are retained, including when a newer same-account live grant
+must win over its stale snapshot.
+
+Settings and incoming credentials are installed before retirement; a later
+installation, retirement or validation failure rolls back earlier writes where
+still safe. Recreated native logins are never deliberately overwritten by
+credential rollback: recovery into a retired path requires that path to remain
+absent. Otherwise the error reports the retained private copy
+(`credentials.json.rollback.*`). Replaced files likewise require both the
+installed file identity and bytes to match before they can be rolled back.
 
 Desktop's `oauth:tokenCache` and `oauth:tokenCacheV2` fields also come exclusively
 from the target, including absence. Switching to an account without a Desktop
@@ -73,6 +79,29 @@ the source snapshot, live credential or keychain before deleting the file.
 Unknown credential symlinks and nonregular files fail rather than being removed.
 Explicit config directories and a disabled keychain bridge remain isolated from
 the default login item.
+
+### Keychain publication and recovery
+
+Keychain publication is the last step of the recoverable restore batch, not a
+separate unguarded write after file recovery copies have been discarded. CAAM
+checks the installed file bundle, captured source snapshots and outgoing
+keychain item before publication. A cached status lookup cannot substitute an
+older disk mirror for the authoritative grant during this switch.
+
+A rejected keychain write or removal triggers file rollback. If a command
+reports failure after installing the selected item, CAAM restores the captured
+outgoing item only when it can still recognize its own selected result, then
+verifies that recovery. A different native login is left untouched. When the
+keychain outcome or recovery cannot be confirmed, the error reports an original
+`keychain.rollback.*` copy when one existed. These copies are private (0600) and
+contain credentials; treat them like the vault, never paste them into reports,
+and retain a newer native login rather than blindly replaying old tokens.
+
+Successful publication releases the recovery copies. Restore's final check is
+read-only: it cannot replay an older mirror over a native rotation that occurred
+after publication. These keychain writes are not compare-and-swap operations, so these are
+optimistic guards and returned-error recovery, not a lock against native writers
+or a guarantee of crash-atomic switching.
 
 ### Project policy versus project session state
 
@@ -197,12 +226,12 @@ checks: they do not lock the native CLI or guarantee a multi-file transaction.
 
 ### Settings-batch failure recovery
 
-Vault mixed-settings/retirement batches, isolated/shallow settings batches,
-and the settings portion of logout stage
-every replacement and rollback copy before installing any document. A staging
-failure leaves the destination documents unchanged. On a later installation or
-input-validation failure, the batch attempts to restore its earlier writes in
-reverse order, including restoring an originally absent file to absence.
+Vault restore batches, isolated/shallow settings batches, and the settings
+portion of logout stage every replacement and rollback copy before installing
+any document. A staging failure leaves the destination documents unchanged.
+On a later installation, input-validation or vault-keychain publication failure,
+the batch attempts to restore its earlier writes in reverse order, including
+restoring an originally absent file to absence.
 
 Rollback never deliberately overwrites a detected native edit or replacement:
 both the installed file identity and its bytes must still match the batch's
@@ -214,8 +243,10 @@ restore possibly revoked permission rules or authentication. Successful batches
 and completed rollbacks remove their temporary copies.
 
 This is recovery from returned I/O errors, not crash atomicity or a lock against
-Claude Code. It does not make the complete vault/credential/keychain switch one
-transaction, and another process can observe files between individual renames.
+Claude Code. Another process can observe files between individual renames or
+between file installation and keychain publication. Stop concurrent native
+logins before retrying a failed switch; inspect any reported recovery paths
+when a native edit or unavailable keychain prevented complete recovery.
 
 `shallow-spawn --no-sync-config` skips policy refresh, not identity isolation.
 It validates both private `settings.json` and `.claude.json` before repairing

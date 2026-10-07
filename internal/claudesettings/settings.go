@@ -211,6 +211,11 @@ type Update struct {
 	// Non-empty only for read-only validation of an isolated document. Each
 	// entry is a canonical host path that must not alias this private file.
 	privateSources []string
+	// Raw credential replacements also guard the file generation and any
+	// captured external authority (for example the macOS login keychain).
+	identity      os.FileInfo
+	checkIdentity bool
+	verify        func() error
 }
 
 // settingsInputs captures each path once, including absence. In a refresh the
@@ -239,9 +244,23 @@ func (inputs settingsInputs) read(path string) ([]byte, error) {
 }
 
 func (u *Update) checkUnchanged() error {
+	if u.verify != nil {
+		if err := u.verify(); err != nil {
+			return err
+		}
+	}
 	for _, shared := range u.privateSources {
 		if err := CheckPrivate(u.path, shared); err != nil {
 			return err
+		}
+	}
+	if u.checkIdentity {
+		info, err := os.Lstat(u.path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if (info == nil) != (u.identity == nil) || (info != nil && !os.SameFile(info, u.identity)) {
+			return fmt.Errorf("Claude credential replaced before activation; retry")
 		}
 	}
 	current, err := Read(u.path)

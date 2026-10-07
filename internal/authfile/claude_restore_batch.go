@@ -6,20 +6,37 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
 )
 
-// Claude's per-file Restore loop references one shared batch. It is applied
-// once, regardless of which document occurs first in the file set. Settings,
-// legacy identity, Desktop caches and missing OAuth sources are staged before
-// any is changed. Present OAuth snapshots still use Restore's freshness guard;
-// the final keychain write remains outside this file batch.
+// All raw credentials, mixed settings, legacy identity and Desktop caches share
+// one recovery batch. Publication to the native keychain happens last, while
+// the file rollback copies are still available. Repeated Restore visits reuse
+// the same result. This is returned-error recovery, not crash atomicity.
 type claudeRestoreBatch struct {
 	updates     []*claudesettings.Update
+	credentials []*claudeCredentialRestore
 	retirements []*claudeCredentialRetirement
+	authority   *claudeRestoreAuthority
 	once        sync.Once
 	err         error
 }
 
 func (batch *claudeRestoreBatch) Apply() error {
 	batch.once.Do(func() {
+		// Raw freshness decisions use the captured outgoing identity, before
+		// the mixed-state documents are replaced. Their guards must therefore
+		// run first, independent of the caller's file-set ordering.
+		updates := make([]*claudesettings.Update, 0, len(batch.credentials)+len(batch.updates))
+		for _, credential := range batch.credentials {
+			update, after, err := credential.prepareUpdate()
+			if err != nil {
+				batch.err = err
+				return
+			}
+			updates = append(updates, update)
+			if batch.authority != nil && credential.live == batch.authority.path {
+				batch.authority.want = after
+			}
+		}
+		updates = append(updates, batch.updates...)
 		removals := make([]*claudesettings.Removal, 0, len(batch.retirements))
 		for _, retirement := range batch.retirements {
 			removal, err := retirement.prepareRemoval()
@@ -29,7 +46,16 @@ func (batch *claudeRestoreBatch) Apply() error {
 			}
 			removals = append(removals, removal)
 		}
-		batch.err = claudesettings.ApplyUpdatesWithRemovals(batch.updates, removals)
+		var finalize func() error
+		if batch.authority != nil {
+			defer batch.authority.cleanup()
+			if err := batch.authority.stage(); err != nil {
+				batch.err = err
+				return
+			}
+			finalize = batch.authority.publish
+		}
+		batch.err = claudesettings.ApplyUpdatesWithFinalizer(updates, removals, finalize)
 	})
 	return batch.err
 }
