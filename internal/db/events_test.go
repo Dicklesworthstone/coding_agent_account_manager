@@ -221,3 +221,27 @@ func TestDB_ProfileStats_LastErrorIsMonotonic(t *testing.T) {
 		t.Fatalf("LastError = %s, want %s", stats.LastError.Format(time.RFC3339Nano), newer.Format(time.RFC3339Nano))
 	}
 }
+
+func TestSwitchEventCountsAsActivation(t *testing.T) {
+	db, err := OpenAt(filepath.Join(t.TempDir(), "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	at := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	if err := db.LogEvent(Event{Type: EventSwitch, Provider: "codex", ProfileName: "backup", Timestamp: at, Details: map[string]any{"from": "main"}}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := db.GetStats("codex", "backup")
+	if err != nil || stats == nil {
+		t.Fatalf("stats = %+v, %v", stats, err)
+	}
+	if stats.TotalActivations != 1 || !stats.LastActivated.Equal(at) {
+		t.Fatalf("stats = %+v, want one activation at %v", stats, at)
+	}
+	last, err := db.LastActivation("codex", "backup")
+	if err != nil || !last.Equal(at) {
+		t.Fatalf("LastActivation = %v, %v", last, err)
+	}
+}

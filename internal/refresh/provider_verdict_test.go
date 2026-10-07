@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -171,6 +173,79 @@ func TestRefreshProfile_RecordsProviderVerdict(t *testing.T) {
 		})
 		if err := RefreshProfile(context.Background(), "codex", "work", vault, nil); err == nil {
 			t.Fatal("expected an error")
+		}
+	})
+}
+
+func TestRefreshProfile_RecordsActivity(t *testing.T) {
+	setup := func(t *testing.T) (*authfile.Vault, *health.Storage, *caamdb.DB) {
+		t.Helper()
+		root := t.TempDir()
+		vault := authfile.NewVault(filepath.Join(root, "vault"))
+		dir := filepath.Join(root, "vault", "codex", "work")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"tokens":{"access_token":"at","refresh_token":"rt"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		db, err := caamdb.OpenAt(filepath.Join(root, "caam.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return vault, health.NewStorage(filepath.Join(root, "health.json")), db
+	}
+	stub := func(t *testing.T, fn func(context.Context, string) (*TokenResponse, error)) {
+		t.Helper()
+		orig := RefreshCodexToken
+		RefreshCodexToken = fn
+		t.Cleanup(func() { RefreshCodexToken = orig })
+	}
+
+	t.Run("success logs a refresh", func(t *testing.T) {
+		vault, store, db := setup(t)
+		stub(t, func(context.Context, string) (*TokenResponse, error) {
+			return &TokenResponse{AccessToken: "at2", RefreshToken: "rt2", ExpiresIn: 3600}, nil
+		})
+		if err := RefreshProfile(context.Background(), "codex", "work", vault, store, WithActivityLog(db)); err != nil {
+			t.Fatal(err)
+		}
+		events, err := db.GetEvents("codex", "work", time.Time{}, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 || events[0].Type != caamdb.EventRefresh {
+			t.Fatalf("events = %+v, want one refresh", events)
+		}
+	})
+
+	t.Run("rejection logs an error with its reason", func(t *testing.T) {
+		vault, store, db := setup(t)
+		stub(t, func(context.Context, string) (*TokenResponse, error) {
+			return nil, &RefreshRejectedError{Provider: "codex", StatusCode: 401, Code: "refresh_token_invalidated"}
+		})
+		_ = RefreshProfile(context.Background(), "codex", "work", vault, store, WithActivityLog(db))
+		events, err := db.GetEvents("codex", "work", time.Time{}, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 || events[0].Type != caamdb.EventError || events[0].Details["reason"] != "refresh_token_invalidated" {
+			t.Fatalf("events = %+v", events)
+		}
+		stats, err := db.GetStats("codex", "work")
+		if err != nil || stats == nil || stats.TotalErrors != 1 {
+			t.Fatalf("stats = %+v, %v", stats, err)
+		}
+	})
+
+	t.Run("skipped refresh logs nothing", func(t *testing.T) {
+		vault, store, db := setup(t)
+		if err := RefreshProfile(context.Background(), "codex", "missing", vault, store, WithActivityLog(db)); err == nil {
+			t.Fatal("expected missing profile to fail")
+		}
+		if events, _ := db.ListRecentEvents(10); len(events) != 0 {
+			t.Fatalf("a refresh that never reached the provider was logged: %+v", events)
 		}
 	})
 }

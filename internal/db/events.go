@@ -354,7 +354,8 @@ func (d *DB) LastActivation(provider, profile string) (time.Time, error) {
 
 func updateProfileStats(tx *sql.Tx, eventType, provider, profile, ts string, durationSeconds int64) error {
 	switch eventType {
-	case EventActivate:
+	case EventActivate, EventSwitch:
+		// An automatic switch activates its target profile.
 		_, err := tx.Exec(
 			`INSERT INTO profile_stats (provider, profile_name, total_activations, last_activated)
 			 VALUES (?, ?, 1, ?)

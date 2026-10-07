@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	profilepkg "github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
@@ -150,12 +151,21 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 		// credential is dead. Record it so ls/status stop calling the
 		// profile healthy (issue #108).
 		var rejected *RefreshRejectedError
+		reason := "exchange_failed"
 		switch {
 		case errors.Is(err, ErrRefreshTokenReused):
-			recordProviderVerdict(store, provider, profile, false, "refresh_token_reused", fingerprint)
+			reason = "refresh_token_reused"
+			recordProviderVerdict(store, provider, profile, false, reason, fingerprint)
 		case errors.As(err, &rejected):
-			recordProviderVerdict(store, provider, profile, false, rejected.Reason(), fingerprint)
+			reason = rejected.Reason()
+			recordProviderVerdict(store, provider, profile, false, reason, fingerprint)
 		}
+		options.recordActivity(caamdb.Event{
+			Type:        caamdb.EventError,
+			Provider:    provider,
+			ProfileName: profile,
+			Details:     map[string]any{"operation": "refresh", "reason": reason},
+		})
 		// Wrap refresh_token_reused with profile context for actionable error messages.
 		if errors.Is(err, ErrRefreshTokenReused) {
 			return &RefreshTokenReusedError{Provider: provider, Profile: profile}
@@ -180,6 +190,16 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 			skipped = append(skipped, delivery.label)
 		}
 	}
+	details := map[string]any{"operation": "refresh"}
+	if len(skipped) > 0 {
+		details["undelivered"] = skipped
+	}
+	options.recordActivity(caamdb.Event{
+		Type:        caamdb.EventRefresh,
+		Provider:    provider,
+		ProfileName: profile,
+		Details:     details,
+	})
 	if len(skipped) > 0 {
 		return &DeliveryError{Destinations: skipped}
 	}

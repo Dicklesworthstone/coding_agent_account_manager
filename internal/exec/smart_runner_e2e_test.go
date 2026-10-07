@@ -211,6 +211,22 @@ func TestSmartRunner_E2E(t *testing.T) {
 	}
 	assert.True(t, foundSwitch, "Did not notify about switch")
 
+	// The rate limit and the switch are part of the activity history.
+	limited, err := db.GetEvents("gemini", "active", time.Now().Add(-1*time.Hour), 10)
+	require.NoError(t, err)
+	foundLimit := false
+	for _, e := range limited {
+		if e.Type == caamdb.EventError && e.Details["reason"] == "rate_limit" {
+			foundLimit = true
+		}
+	}
+	assert.True(t, foundLimit, "rate limit not logged for the limited profile: %+v", limited)
+	switched, err := db.GetEvents("gemini", "backup", time.Now().Add(-1*time.Hour), 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, switched)
+	assert.Equal(t, caamdb.EventSwitch, switched[0].Type)
+	assert.Equal(t, "active", switched[0].Details["from"])
+
 	// Check DB for Activation Event
 	activations, err := db.GetEvents("gemini", "active", time.Now().Add(-1*time.Hour), 10)
 	require.NoError(t, err)

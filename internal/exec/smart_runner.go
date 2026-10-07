@@ -380,6 +380,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	attempt := r.handoffAttempts
 	r.mu.Unlock()
 
+	if r.db != nil {
+		_ = r.db.Log(caamdb.Event{
+			Type:        caamdb.EventError,
+			Provider:    r.loginHandler.Provider(),
+			ProfileName: currentProfile,
+			Timestamp:   time.Now(),
+			Details:     map[string]any{"operation": "session", "reason": "rate_limit"},
+		})
+	}
+
 	// A known-limited account stays unavailable even if there is no backup,
 	// retries are disabled, or a later handoff fails. The in-session tried set
 	// also protects callers that do not have a database or persistent cooldown.
@@ -535,6 +545,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.setState(LoginComplete)
 	r.currentProfile = nextProfile
 	r.handoffCount++
+
+	if r.db != nil {
+		_ = r.db.Log(caamdb.Event{
+			Type:        caamdb.EventSwitch,
+			Provider:    r.loginHandler.Provider(),
+			ProfileName: nextProfile,
+			Timestamp:   time.Now(),
+			Details:     map[string]any{"from": currentProfile, "reason": "rate_limit"},
+		})
+	}
 
 	r.notifier.Notify(&notify.Alert{
 		Level:   notify.Info,

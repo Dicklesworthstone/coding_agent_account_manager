@@ -13,13 +13,40 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	profilepkg "github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 // RefreshOption supplies the isolated profile store used by the caller.
 type RefreshOption func(*refreshOptions)
 
-type refreshOptions struct{ profiles *profilepkg.Store }
+type refreshOptions struct {
+	profiles *profilepkg.Store
+	// activity receives refresh outcomes; nil uses the default database.
+	activity caamdb.EventLogger
+}
+
+// WithActivityLog records refresh outcomes in the given log instead of the
+// default activity database.
+func WithActivityLog(log caamdb.EventLogger) RefreshOption {
+	return func(options *refreshOptions) { options.activity = log }
+}
+
+// recordActivity appends a refresh outcome to the activity log so history
+// and usage reports show refreshes and their failures. Best-effort: the log
+// must never fail or delay a refresh beyond opening the database.
+func (o refreshOptions) recordActivity(event caamdb.Event) {
+	if o.activity != nil {
+		_ = o.activity.Log(event)
+		return
+	}
+	db, err := caamdb.Open()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	_ = db.Log(event)
+}
 
 func clearCredentialExpiry(auth map[string]interface{}) {
 	for _, field := range []string{"expires_at", "expiresAt", "expiry", "expires_in", "expiresIn"} {
