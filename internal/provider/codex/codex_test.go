@@ -1162,6 +1162,179 @@ func writeJSON(t *testing.T, path string, data interface{}) {
 // under the last table. Appending at end-of-file (the old behavior) would make
 // it mcp_servers.<last>.cli_auth_credentials_store, silently failing to enforce
 // the file store.
+func TestEnsureFileCredentialStorePreservesTOML(t *testing.T) {
+	const setting = "cli_auth_credentials_store = \"file\"\n"
+	for _, tc := range []struct {
+		name, input, want string
+	}{
+		{
+			name:  "literal root value",
+			input: "cli_auth_credentials_store = 'keychain' # native store\nmodel = 'synthetic-model'\n",
+			want:  "cli_auth_credentials_store = \"file\" # native store\nmodel = 'synthetic-model'\n",
+		},
+		{
+			name:  "quoted root key and literal value",
+			input: "  \"cli_auth_credentials_store\"\t=\t'keychain'\r\n[features]\r\nfast = true\r\n",
+			want:  "  \"cli_auth_credentials_store\"\t=\t\"file\"\r\n[features]\r\nfast = true\r\n",
+		},
+		{
+			name:  "literal root key",
+			input: "'cli_auth_credentials_store' = \"keychain\"",
+			want:  "'cli_auth_credentials_store' = \"file\"",
+		},
+		{
+			name:  "escaped root key",
+			input: "\"cli_auth_credentials_stor\\u0065\" = \"keychain\"\n",
+			want:  "\"cli_auth_credentials_stor\\u0065\" = \"file\"\n",
+		},
+		{
+			name:  "already literal file",
+			input: "cli_auth_credentials_store = 'file' # keep spelling\n",
+			want:  "cli_auth_credentials_store = 'file' # keep spelling\n",
+		},
+		{
+			name:  "already escaped file",
+			input: "cli_auth_credentials_store = \"fi\\u006ce\"\n",
+			want:  "cli_auth_credentials_store = \"fi\\u006ce\"\n",
+		},
+		{
+			name:  "nested file value does not select root",
+			input: "[profiles.work]\ncli_auth_credentials_store = \"file\"\n",
+			want:  setting + "[profiles.work]\ncli_auth_credentials_store = \"file\"\n",
+		},
+		{
+			name:  "nested keychain is not rewritten",
+			input: "cli_auth_credentials_store = 'keychain'\n[profiles.work]\ncli_auth_credentials_store = \"keychain\"\n",
+			want:  "cli_auth_credentials_store = \"file\"\n[profiles.work]\ncli_auth_credentials_store = \"keychain\"\n",
+		},
+		{
+			name:  "dotted unrelated key",
+			input: "profiles.work.cli_auth_credentials_store = 'keychain'\n",
+			want:  setting + "profiles.work.cli_auth_credentials_store = 'keychain'\n",
+		},
+		{
+			name:  "multiline literal string decoy",
+			input: "instructions = '''\n[not_a_table]\ncli_auth_credentials_store = \"keychain\"\n'''\n",
+			want:  setting + "instructions = '''\n[not_a_table]\ncli_auth_credentials_store = \"keychain\"\n'''\n",
+		},
+		{
+			name:  "multiline basic escaped delimiter decoy",
+			input: "instructions = \"\"\"\n\\\"\"\"\ncli_auth_credentials_store = \"keychain\"\n\"\"\"\n",
+			want:  setting + "instructions = \"\"\"\n\\\"\"\"\ncli_auth_credentials_store = \"keychain\"\n\"\"\"\n",
+		},
+		{
+			name:  "multiline target string",
+			input: "cli_auth_credentials_store = '''keychain''' # select file\n",
+			want:  "cli_auth_credentials_store = \"file\" # select file\n",
+		},
+		{
+			name:  "array and inline table decoys",
+			input: "mcp = [\n  { cli_auth_credentials_store = 'keychain' }, # keep\n  { arguments = [']', '#', '='] },\n]\n",
+			want:  setting + "mcp = [\n  { cli_auth_credentials_store = 'keychain' }, # keep\n  { arguments = [']', '#', '='] },\n]\n",
+		},
+		{
+			name:  "quoted table path",
+			input: "[mcp_servers.\"odd]#=name\"]\ncommand = 'synthetic-command'\n",
+			want:  setting + "[mcp_servers.\"odd]#=name\"]\ncommand = 'synthetic-command'\n",
+		},
+		{
+			name:  "array table is not root",
+			input: "[[profiles]]\ncli_auth_credentials_store = 'keychain'\n",
+			want:  setting + "[[profiles]]\ncli_auth_credentials_store = 'keychain'\n",
+		},
+		{
+			name:  "leading comments retained",
+			input: "# native config\n\n[features]\nfast = true\n",
+			want:  "# native config\n\n" + setting + "[features]\nfast = true\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.toml")
+			if err := os.WriteFile(path, []byte(tc.input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := EnsureFileCredentialStore(home); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("configuration mismatch\ngot:  %q\nwant: %q", got, tc.want)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := EnsureFileCredentialStore(home); err != nil {
+				t.Fatalf("repeat enforcement: %v", err)
+			}
+			after, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatal("idempotent enforcement rewrote the native config")
+			}
+			got, err = os.ReadFile(path)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("repeat enforcement changed contents: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestEnsureFileCredentialStoreRejectsAmbiguousSource(t *testing.T) {
+	for _, input := range []string{
+		"cli_auth_credentials_store = 'keychain'\ncli_auth_credentials_store = \"file\"\n",
+		"cli_auth_credentials_store = 'keychain'\n\"cli_auth_credentials_stor\\u0065\" = 'file'\n",
+		"cli_auth_credentials_store =\n",
+		"cli_auth_credentials_store = true\n",
+		"cli_auth_credentials_store = 'keychain' trailing\n",
+		"cli_auth_credentials_store = \"keychain\n",
+		"cli_auth_credentials_store = '''keychain\n",
+		"cli_auth_credentials_store = \"bad\\q\"\n",
+		"cli_auth_credentials_store = \"bad\\uD800\"\n",
+		"cli_auth_credentials_store = \"\"\"key\\ chain\"\"\"\n",
+		"cli_auth_credentials_store.nested = 'keychain'\n",
+		"[cli_auth_credentials_store]\nmode = 'keychain'\n",
+		"cli_auth_credentials_store = 'file'\n[broken\n",
+		"cli_auth_credentials_store = 'file'\n[broken] trailing\n",
+		"cli_auth_credentials_store = 'file'\nargs = ['unfinished'\n",
+		"cli_auth_credentials_store = 'file'\nargs = [}\n",
+		"cli_auth_credentials_store = 'file'\nmodel =\n",
+		"cli_auth_credentials_store = 'file'\nnot an assignment\n",
+	} {
+		t.Run(input, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "config.toml")
+			if err := os.WriteFile(path, []byte(input), 0640); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := EnsureFileCredentialStore(home); err == nil {
+				t.Fatal("malformed or ambiguous configuration accepted")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != input {
+				t.Fatalf("rejected configuration changed: %q, %v", got, err)
+			}
+			after, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() {
+				t.Fatal("rejected configuration was replaced or its metadata changed")
+			}
+		})
+	}
+}
+
 func TestEnsureFileCredentialStore(t *testing.T) {
 	const settingLine = `cli_auth_credentials_store = "file"`
 

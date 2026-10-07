@@ -26,7 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,8 +84,6 @@ func ResolveHome() string {
 	return codexHome()
 }
 
-var codexCredentialsStoreRe = regexp.MustCompile(`(?m)^\s*cli_auth_credentials_store\s*=\s*\"[^\"]*\"`)
-
 // EnsureFileCredentialStore ensures Codex uses file-based credential storage.
 // This is required for CAAM to manage auth.json reliably.
 func EnsureFileCredentialStore(home string) error {
@@ -110,12 +108,18 @@ func EnsureFileCredentialStore(home string) error {
 		return fmt.Errorf("read config.toml: %w", err)
 	}
 
-	if match := codexCredentialsStoreRe.Find(data); match != nil {
-		if strings.Contains(string(match), `"file"`) {
+	start, end, err := codexCredentialStoreValue(string(data))
+	if err != nil {
+		return fmt.Errorf("inspect config.toml credential store: %w", err)
+	}
+	if start >= 0 {
+		value := string(data[start:end])
+		decoded, _ := strconv.Unquote(value)
+		if decoded == "file" || value == `'file'` {
 			return nil
 		}
-		updated := codexCredentialsStoreRe.ReplaceAll(data, []byte(settingLine))
-		return atomicWriteFile(configPath, updated, 0600)
+		updated := string(data[:start]) + `"file"` + string(data[end:])
+		return atomicWriteFile(configPath, []byte(updated), 0600)
 	}
 
 	// The key is absent, so we must add it as a TOP-LEVEL key. Appending to the
@@ -143,6 +147,236 @@ func EnsureFileCredentialStore(home string) error {
 	newLines = append(newLines, settingLine)
 	newLines = append(newLines, lines[insertAt:]...)
 	return atomicWriteFile(configPath, []byte(strings.Join(newLines, "\n")), 0600)
+}
+
+// codexCredentialStoreValue finds the root setting's value without re-emitting
+// unrelated TOML. This is a bounded source editor, not a general TOML validator:
+// it rejects malformed structure and ambiguous target assignments before any
+// write, while leaving unrelated settings and string contents verbatim.
+// shallow's source editor cannot be imported here: shallow depends on codex.
+func codexCredentialStoreValue(data string) (int, int, error) {
+	const key = "cli_auth_credentials_store"
+	start, end := -1, -1
+	root := true
+	for pos := 0; pos < len(data); {
+		statement := pos
+		equals, comment := -1, -1
+		var brackets []byte
+		for pos < len(data) {
+			c := data[pos]
+			if c == '\'' || c == '"' {
+				next, err := codexConfigStringEnd(data, pos)
+				if err != nil {
+					return -1, -1, err
+				}
+				pos = next
+				continue
+			}
+			if c == '#' {
+				if len(brackets) == 0 {
+					comment = pos
+				}
+				for pos < len(data) && data[pos] != '\n' {
+					pos++
+				}
+				continue
+			}
+			if c == '\n' && len(brackets) == 0 {
+				break
+			}
+			switch c {
+			case '[', '{':
+				brackets = append(brackets, c)
+			case ']', '}':
+				if len(brackets) == 0 || (c == ']' && brackets[len(brackets)-1] != '[') || (c == '}' && brackets[len(brackets)-1] != '{') {
+					return -1, -1, fmt.Errorf("unbalanced TOML delimiters")
+				}
+				brackets = brackets[:len(brackets)-1]
+			case '=':
+				if len(brackets) == 0 {
+					if equals >= 0 {
+						return -1, -1, fmt.Errorf("multiple assignment operators")
+					}
+					equals = pos
+				}
+			}
+			pos++
+		}
+		if len(brackets) != 0 {
+			return -1, -1, fmt.Errorf("unterminated TOML container")
+		}
+		limit := pos
+		if comment >= 0 {
+			limit = comment
+		}
+		text := strings.TrimSpace(data[statement:limit])
+		pos++ // A final statement need not end in a newline.
+		if text == "" {
+			continue
+		}
+		if strings.HasPrefix(text, "[") {
+			width := 1
+			if strings.HasPrefix(text, "[[") {
+				width = 2
+			}
+			if len(text) < 2*width || !strings.HasSuffix(text, strings.Repeat("]", width)) {
+				return -1, -1, fmt.Errorf("malformed TOML table header")
+			}
+			path, err := codexConfigKey(text[width : len(text)-width])
+			if err != nil {
+				return -1, -1, err
+			}
+			if path[0] == key {
+				return -1, -1, fmt.Errorf("credential store must be a root string, not a table")
+			}
+			root = false
+			continue
+		}
+		if equals < 0 || equals >= limit {
+			return -1, -1, fmt.Errorf("missing TOML assignment")
+		}
+		path, err := codexConfigKey(data[statement:equals])
+		if err != nil {
+			return -1, -1, err
+		}
+		value := strings.TrimSpace(data[equals+1 : limit])
+		if value == "" {
+			return -1, -1, fmt.Errorf("missing TOML value")
+		}
+		if !root || path[0] != key {
+			continue
+		}
+		if len(path) != 1 || start >= 0 {
+			return -1, -1, fmt.Errorf("ambiguous root credential store assignment")
+		}
+		if value[0] != '\'' && value[0] != '"' {
+			return -1, -1, fmt.Errorf("credential store must be a string")
+		}
+		next, err := codexConfigStringEnd(value, 0)
+		if err != nil || next != len(value) {
+			return -1, -1, fmt.Errorf("malformed credential store string")
+		}
+		start = equals + 1 + strings.Index(data[equals+1:limit], value)
+		end = start + len(value)
+	}
+	return start, end, nil
+}
+
+// codexConfigStringEnd skips both TOML string forms, including multiline strings
+// with escaped delimiters. The returned offset is just after the closing quote.
+func codexConfigStringEnd(data string, pos int) (int, error) {
+	quote := data[pos]
+	multi := strings.HasPrefix(data[pos:], strings.Repeat(string(quote), 3))
+	pos++
+	if multi {
+		pos += 2
+	}
+	for pos < len(data) {
+		c := data[pos]
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f || (c == '\r' && (pos+1 >= len(data) || data[pos+1] != '\n')) {
+			return 0, fmt.Errorf("invalid control character in TOML string")
+		}
+		if c == '\n' && !multi {
+			return 0, fmt.Errorf("newline in single-line TOML string")
+		}
+		if c == '\\' && quote == '"' {
+			pos++
+			if pos >= len(data) {
+				break
+			}
+			if multi && strings.ContainsRune(" \t\r\n", rune(data[pos])) {
+				newline := false
+				for pos < len(data) && strings.ContainsRune(" \t\r\n", rune(data[pos])) {
+					newline = newline || data[pos] == '\n'
+					pos++
+				}
+				if !newline {
+					return 0, fmt.Errorf("TOML string continuation requires a newline")
+				}
+				continue
+			}
+			if !strings.ContainsRune("btnfr\"\\uU", rune(data[pos])) {
+				return 0, fmt.Errorf("invalid TOML string escape")
+			}
+			if data[pos] == 'u' || data[pos] == 'U' {
+				count := 4
+				if data[pos] == 'U' {
+					count = 8
+				}
+				if pos+count >= len(data) {
+					return 0, fmt.Errorf("incomplete TOML unicode escape")
+				}
+				if _, err := strconv.Unquote(`"\` + data[pos:pos+count+1] + `"`); err != nil {
+					return 0, fmt.Errorf("invalid TOML unicode escape")
+				}
+				pos += count
+			}
+			pos++
+			continue
+		}
+		if c == quote {
+			if !multi {
+				return pos + 1, nil
+			}
+			end := pos
+			for end < len(data) && data[end] == quote {
+				end++
+			}
+			if end-pos >= 3 {
+				if end-pos > 5 {
+					return 0, fmt.Errorf("invalid TOML closing quotes")
+				}
+				return end, nil
+			}
+			pos = end
+			continue
+		}
+		pos++
+	}
+	return 0, fmt.Errorf("unterminated TOML string")
+}
+
+func codexConfigKey(text string) ([]string, error) {
+	var path []string
+	for {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil, fmt.Errorf("empty TOML key")
+		}
+		end := 0
+		key := ""
+		if text[0] == '\'' || text[0] == '"' {
+			var err error
+			end, err = codexConfigStringEnd(text, 0)
+			if err != nil || strings.HasPrefix(text, `"""`) || strings.HasPrefix(text, `'''`) {
+				return nil, fmt.Errorf("malformed quoted TOML key")
+			}
+			key = text[1 : end-1]
+			if text[0] == '"' {
+				key, err = strconv.Unquote(text[:end])
+				if err != nil {
+					return nil, fmt.Errorf("malformed quoted TOML key")
+				}
+			}
+		} else {
+			for end < len(text) && ((text[end] >= 'a' && text[end] <= 'z') || (text[end] >= 'A' && text[end] <= 'Z') || (text[end] >= '0' && text[end] <= '9') || text[end] == '_' || text[end] == '-') {
+				end++
+			}
+			if end == 0 {
+				return nil, fmt.Errorf("malformed TOML key")
+			}
+			key = text[:end]
+		}
+		path = append(path, key)
+		text = strings.TrimSpace(text[end:])
+		if text == "" {
+			return path, nil
+		}
+		if text[0] != '.' {
+			return nil, fmt.Errorf("malformed dotted TOML key")
+		}
+		text = text[1:]
+	}
 }
 
 // AuthFiles returns the auth file specifications for Codex.
