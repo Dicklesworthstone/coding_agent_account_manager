@@ -333,6 +333,7 @@ func (a *Agent) Start(ctx context.Context) error {
 		Headless:    a.config.Headless,
 		Logger:      a.logger,
 	})
+	a.logger.Info("using Chrome profile", "dir", a.browser.UserDataDir())
 	if a.oauth == nil {
 		a.oauth = a.browser
 	}

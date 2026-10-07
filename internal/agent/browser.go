@@ -2,24 +2,30 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/chromedp/chromedp"
 )
 
 // BrowserConfig configures the browser automation.
 type BrowserConfig struct {
 	// UserDataDir is the Chrome profile directory.
-	// If empty, uses a temporary profile.
+	// If empty, DefaultChromeUserDataDir is used.
 	UserDataDir string
+
+	// ExecPath is the Chrome executable. If empty, it is auto-detected.
+	ExecPath string
 
 	// Headless runs Chrome without UI.
 	// Note: Google OAuth may require visible browser.
@@ -27,6 +33,21 @@ type BrowserConfig struct {
 
 	// Logger for structured logging.
 	Logger *slog.Logger
+}
+
+// DefaultChromeUserDataDir is the agent's own persistent Chrome profile.
+// Google and Claude sign-ins made there (see 'caam auth-agent signin') carry
+// over to every OAuth flow. Chrome refuses automation of the user's everyday
+// profile and locks a profile while it is open, so the agent keeps its own.
+func DefaultChromeUserDataDir() string {
+	return filepath.Join(config.DefaultDataPath(), "auth-agent-chrome")
+}
+
+// SignInURLs are opened by 'caam auth-agent signin': adding Google accounts
+// and signing in to Claude.
+var SignInURLs = []string{
+	"https://accounts.google.com/AddSession",
+	"https://claude.ai/login",
 }
 
 // Browser handles Chrome automation for OAuth flows.
@@ -42,11 +63,80 @@ func NewBrowser(config BrowserConfig) *Browser {
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
+	config.UserDataDir = ResolveChromeUserDataDir(config.UserDataDir)
 
 	return &Browser{
 		config: config,
 		logger: config.Logger,
 	}
+}
+
+// ResolveChromeUserDataDir resolves an empty profile directory to
+// DefaultChromeUserDataDir and a leading "~/" to the home directory (config
+// files are not shell-expanded).
+func ResolveChromeUserDataDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return DefaultChromeUserDataDir()
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(dir[1:], "/"))
+		}
+	}
+	return dir
+}
+
+// UserDataDir returns the Chrome profile directory this browser uses.
+func (b *Browser) UserDataDir() string {
+	return b.config.UserDataDir
+}
+
+func (b *Browser) execPath() string {
+	if b.config.ExecPath != "" {
+		return b.config.ExecPath
+	}
+	return findChrome()
+}
+
+// ensureProfileDir creates the profile directory owner-only: it holds
+// Google and Claude session cookies.
+func (b *Browser) ensureProfileDir() error {
+	if err := os.MkdirAll(b.config.UserDataDir, 0o700); err != nil {
+		return fmt.Errorf("create chrome profile dir: %w", err)
+	}
+	return nil
+}
+
+// OpenForSignIn opens a visible Chrome window on the agent's profile at urls
+// and returns once the user closes it, so sign-ins persist for later OAuth
+// flows. If Chrome already has this profile open, the URLs open there and
+// OpenForSignIn returns immediately.
+func (b *Browser) OpenForSignIn(ctx context.Context, urls ...string) error {
+	chromePath := b.execPath()
+	if chromePath == "" {
+		return errors.New("Chrome not found: install Google Chrome or Chromium")
+	}
+	if err := b.ensureProfileDir(); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, chromePath, signInArgs(b.config.UserDataDir, urls)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("chrome exited: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func signInArgs(userDataDir string, urls []string) []string {
+	args := []string{
+		"--user-data-dir=" + userDataDir,
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+	return append(args, urls...)
 }
 
 // Close releases browser resources.
@@ -67,15 +157,16 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	b.logger.Info("starting OAuth flow",
 		"has_preferred_account", preferredAccount != "")
 
+	if err := b.ensureProfileDir(); err != nil {
+		return "", "", err
+	}
+
 	// Create browser context with options
 	opts := []chromedp.ExecAllocatorOption{
 		chromedp.NoFirstRun,
 		chromedp.NoDefaultBrowserCheck,
 		chromedp.DisableGPU,
-	}
-
-	if b.config.UserDataDir != "" {
-		opts = append(opts, chromedp.UserDataDir(b.config.UserDataDir))
+		chromedp.UserDataDir(b.config.UserDataDir),
 	}
 
 	if b.config.Headless {
@@ -89,7 +180,7 @@ func (b *Browser) CompleteOAuth(ctx context.Context, oauthURL, preferredAccount 
 	}
 
 	// Find Chrome executable
-	chromePath := findChrome()
+	chromePath := b.execPath()
 	if chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(chromePath))
 	}

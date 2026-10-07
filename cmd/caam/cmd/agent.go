@@ -24,8 +24,9 @@ var agentCmd = &cobra.Command{
 	Long: `Receive OAuth URLs from the remote coordinator and complete authentication
 using browser automation.
 
-The auth-agent runs on your local machine (e.g., Mac) where your browser has
-existing Google account sessions. It:
+The auth-agent runs on your local machine (e.g., Mac) and drives its own
+Chrome profile; sign in to your Google accounts there once with
+'caam auth-agent signin'. It:
 1. Receives auth request URLs from the remote coordinator
 2. Opens Chrome and navigates to the OAuth URL
 3. Selects the appropriate Google account (using LRU strategy by default)
@@ -52,8 +53,11 @@ Examples:
   caam auth-agent --coordinator http://localhost:7890 \
     --accounts alice@gmail.com,bob@gmail.com
 
-  # Use specific Chrome profile
-  caam auth-agent --chrome-profile ~/Library/Application\ Support/Google/Chrome/Default
+  # Sign in to the Google accounts the agent should use (once per machine)
+  caam auth-agent signin
+
+  # Use a different Chrome user data directory
+  caam auth-agent --chrome-profile ~/caam-chrome
 
   # Verbose logging
   caam auth-agent --verbose`,
@@ -85,7 +89,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agentStrategy, "strategy", "lru",
 		"Account selection strategy: lru, round_robin, random")
 	agentCmd.Flags().StringVar(&agentChromeProfile, "chrome-profile", "",
-		"Chrome user data directory (uses temp profile if empty)")
+		"Chrome user data directory (default: the agent's persistent profile)")
 	agentCmd.Flags().BoolVar(&agentHeadless, "headless", false,
 		"Run Chrome in headless mode (may not work with Google OAuth)")
 	agentCmd.Flags().BoolVar(&agentVerbose, "verbose", false, "Verbose output")
@@ -222,9 +226,7 @@ func runSingleAgent(cmd *cobra.Command, logger *slog.Logger, config agent.Config
 	if len(accounts) > 0 {
 		fmt.Printf("  Accounts: %v\n", accounts)
 	}
-	if chromeProfile != "" {
-		fmt.Printf("  Chrome profile: %s\n", chromeProfile)
-	}
+	fmt.Printf("  Chrome profile: %s\n", agent.ResolveChromeUserDataDir(chromeProfile))
 	fmt.Println("\nWaiting for auth requests...")
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -297,9 +299,7 @@ func runMultiAgent(cmd *cobra.Command, logger *slog.Logger, config agent.MultiCo
 	if len(config.Accounts) > 0 {
 		fmt.Printf("  Accounts: %v\n", config.Accounts)
 	}
-	if config.ChromeUserDataDir != "" {
-		fmt.Printf("  Chrome profile: %s\n", config.ChromeUserDataDir)
-	}
+	fmt.Printf("  Chrome profile: %s\n", agent.ResolveChromeUserDataDir(config.ChromeUserDataDir))
 	fmt.Println("\nWaiting for auth requests...")
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -450,6 +450,63 @@ var testAuthCmd = &cobra.Command{
 }
 
 var (
+	agentSignInConfig  string
+	agentSignInProfile string
+)
+
+// agentSignInCmd opens the agent's Chrome profile so the user can sign in to
+// the Google accounts (and Claude) that unattended OAuth flows will use.
+var agentSignInCmd = &cobra.Command{
+	Use:   "signin",
+	Short: "Sign in to Google accounts in the auth agent's Chrome profile",
+	Long: `Open a Chrome window on the auth agent's own profile with tabs for adding
+Google accounts and signing in to Claude. Sign in to every Google account the
+agent should rotate through, then close the window.
+
+The agent reuses these sessions for every OAuth flow, so this is needed once
+per machine (and again only when Google signs a session out). The profile is
+the config's chrome_profile, or by default <caam data dir>/auth-agent-chrome
+(~/.local/share/caam/auth-agent-chrome, or $CAAM_HOME/data/auth-agent-chrome).`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		profile, err := signInProfileDir(cmd)
+		if err != nil {
+			return err
+		}
+		browser := agent.NewBrowser(agent.BrowserConfig{UserDataDir: profile})
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Opening Chrome with profile %s\n", browser.UserDataDir())
+		fmt.Fprintln(out, "Sign in to each Google account the agent should use (and to Claude), then close the window.")
+		if err := browser.OpenForSignIn(cmd.Context(), agent.SignInURLs...); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Done. Running auth agents pick up the sign-ins on their next OAuth flow.")
+		return nil
+	},
+}
+
+// signInProfileDir picks the profile: --chrome-profile, then the agent
+// config's chrome_profile, then the default.
+func signInProfileDir(cmd *cobra.Command) (string, error) {
+	if cmd.Flags().Changed("chrome-profile") {
+		return agentSignInProfile, nil
+	}
+	path := agentSignInConfig
+	if path == "" {
+		path = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(path)
+	switch {
+	case err == nil:
+		return fc.ChromeUserDataDir(), nil
+	case errors.Is(err, os.ErrNotExist) && !cmd.Flags().Changed("config"):
+		return "", nil
+	default:
+		return "", fmt.Errorf("agent config %s: %w", path, err)
+	}
+}
+
+var (
 	agentServiceConfig string
 	agentServiceJSON   bool
 )
@@ -578,6 +635,14 @@ func init() {
 	agentServiceCmd.PersistentFlags().StringVar(&agentServiceConfig, "config", "",
 		"agent config file (default: the 'caam setup distributed' config)")
 	agentServiceStatusCmd.Flags().BoolVar(&agentServiceJSON, "json", false, "print status as JSON")
+}
+
+func init() {
+	agentCmd.AddCommand(agentSignInCmd)
+	agentSignInCmd.Flags().StringVar(&agentSignInConfig, "config", "",
+		"agent config whose chrome_profile to use (default: the 'caam setup distributed' config)")
+	agentSignInCmd.Flags().StringVar(&agentSignInProfile, "chrome-profile", "",
+		"Chrome user data directory (overrides the config)")
 }
 
 func init() {

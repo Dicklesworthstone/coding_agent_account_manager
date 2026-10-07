@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -962,5 +963,87 @@ func TestCoordinatorEndpointProbe(t *testing.T) {
 	down := &CoordinatorEndpoint{Name: "c", URL: "http://127.0.0.1:1"}
 	if probe := down.Probe(context.Background()); probe.Healthy || probe.Error == "" {
 		t.Fatalf("probe of a closed port = %+v", probe)
+	}
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestInfoLogsNeverContainCodesOrOAuthQueries(t *testing.T) {
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	pane := &scriptedPane{}
+	cfg := coordinator.DefaultConfig()
+	cfg.PaneClient = pane
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.LoginCooldown = time.Millisecond
+	cfg.ResumeCooldown = time.Millisecond
+	cfg.AuthToken = "secret-token"
+	cfg.Logger = logger
+	coord := coordinator.New(cfg)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := coordinator.NewAPIServer(coord, "127.0.0.1", 0, logger)
+	go api.Serve(listener)
+	defer api.Shutdown(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coord.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer coord.Stop()
+
+	endpoint := &CoordinatorEndpoint{Name: "remote", URL: "http://" + listener.Addr().String(), Token: "secret-token"}
+	var pending []pendingRequest
+	deadline := time.Now().Add(5 * time.Second)
+	for len(pending) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		pending, _ = fetchPending(ctx, endpoint.httpClient(), endpoint.URL, endpoint.Token)
+	}
+	if len(pending) == 0 {
+		t.Fatal("no auth request published")
+	}
+
+	mcfg := DefaultMultiConfig()
+	mcfg.Logger = logger
+	ma := NewMulti(mcfg)
+	ma.delivery = fastDelivery
+	ma.oauth = &fakeOAuth{code: "CODE-SECRET-9f8e7d", account: "a@example.com"}
+	ma.processAuthRequest(ctx, endpoint, pending[0].ID, pending[0].URL)
+
+	deadline = time.Now().Add(5 * time.Second)
+	for len(pane.injectedCodes()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := pane.injectedCodes(); len(got) != 1 || got[0] != "CODE-SECRET-9f8e7d\n" {
+		t.Fatalf("injected codes = %q, want the delivered code once", got)
+	}
+
+	out := logs.String()
+	for _, secret := range []string{"CODE-SECRET-9f8e7d", "state=abc", "secret-token"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("info-level logs contain %q:\n%s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "request_id") {
+		t.Errorf("logs should correlate by request_id:\n%s", out)
 	}
 }

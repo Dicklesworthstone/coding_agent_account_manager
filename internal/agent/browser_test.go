@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -582,5 +584,82 @@ func TestExtractChallengeCodePrefersPasteReadyCode(t *testing.T) {
 	html := `<div class="ABCDEFGHIJ">Paste this into Claude Code:</div><code>xY9_k2-mNpQrStUvWx12#Ab_cd-EF34</code>`
 	if got := extractChallengeCode(html); got != "xY9_k2-mNpQrStUvWx12#Ab_cd-EF34" {
 		t.Fatalf("extractChallengeCode = %q", got)
+	}
+}
+
+func TestResolveChromeUserDataDir(t *testing.T) {
+	caamHome := t.TempDir()
+	t.Setenv("CAAM_HOME", caamHome)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := filepath.Join(caamHome, "data", "auth-agent-chrome")
+	for _, in := range []string{"", "  "} {
+		if got := ResolveChromeUserDataDir(in); got != want {
+			t.Errorf("ResolveChromeUserDataDir(%q) = %q, want the persistent default %q", in, got, want)
+		}
+	}
+	if got := ResolveChromeUserDataDir("~/chrome"); got != filepath.Join(home, "chrome") {
+		t.Errorf("tilde not expanded: %q", got)
+	}
+	if got := ResolveChromeUserDataDir("/opt/chrome"); got != "/opt/chrome" {
+		t.Errorf("absolute dir changed: %q", got)
+	}
+	if got := NewBrowser(BrowserConfig{}).UserDataDir(); got != want {
+		t.Errorf("NewBrowser default profile = %q, want %q", got, want)
+	}
+}
+
+// fakeChrome writes a script that records its arguments and exits with code.
+func fakeChrome(t *testing.T, code int) (execPath, argsFile string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stand-in for Chrome")
+	}
+	dir := t.TempDir()
+	argsFile = filepath.Join(dir, "args")
+	execPath = filepath.Join(dir, "chrome")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %q\necho 'profile in use' >&2\nexit %d\n", argsFile, code)
+	if err := os.WriteFile(execPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return execPath, argsFile
+}
+
+func TestOpenForSignInLaunchesChromeOnAgentProfile(t *testing.T) {
+	execPath, argsFile := fakeChrome(t, 0)
+	profile := filepath.Join(t.TempDir(), "nested", "profile")
+
+	b := NewBrowser(BrowserConfig{UserDataDir: profile, ExecPath: execPath})
+	if err := b.OpenForSignIn(context.Background(), SignInURLs...); err != nil {
+		t.Fatalf("OpenForSignIn: %v", err)
+	}
+
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := append([]string{"--user-data-dir=" + profile, "--no-first-run", "--no-default-browser-check"}, SignInURLs...)
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("chrome args = %q, want %q", got, want)
+	}
+	info, err := os.Stat(profile)
+	if err != nil {
+		t.Fatalf("profile dir not created: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("profile dir mode = %o, want 700 (it holds session cookies)", perm)
+	}
+}
+
+func TestOpenForSignInReportsChromeFailure(t *testing.T) {
+	execPath, _ := fakeChrome(t, 3)
+	b := NewBrowser(BrowserConfig{UserDataDir: t.TempDir(), ExecPath: execPath})
+	err := b.OpenForSignIn(context.Background(), "https://accounts.google.com/AddSession")
+	if err == nil || !strings.Contains(err.Error(), "profile in use") {
+		t.Fatalf("OpenForSignIn error = %v, want Chrome's exit status and output", err)
 	}
 }

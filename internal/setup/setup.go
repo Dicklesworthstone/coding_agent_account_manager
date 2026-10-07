@@ -443,7 +443,8 @@ func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
 
 	b.WriteString("# 2) Inspect and edit the local agent config\n")
 	b.WriteString(fmt.Sprintf("CONFIG_PATH=%s\n", shellQuote(configPath)))
-	b.WriteString("echo \"Edit $CONFIG_PATH to set chrome_profile and accounts\"\n\n")
+	b.WriteString("echo \"Sign in to the agent's Google accounts with: caam auth-agent signin\"\n")
+	b.WriteString("echo \"Then list them under accounts in $CONFIG_PATH\"\n\n")
 
 	b.WriteString("# 3) Check coordinator service status on remotes\n")
 	for _, m := range o.remoteMachines {

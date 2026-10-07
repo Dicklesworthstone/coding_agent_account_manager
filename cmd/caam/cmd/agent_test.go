@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/spf13/cobra"
 )
 
 func TestLoadAgentConfigMulti(t *testing.T) {
@@ -95,5 +96,70 @@ func TestLoadAgentConfigSingle(t *testing.T) {
 	}
 	if cfg.CoordinatorToken != "shhh" {
 		t.Fatalf("CoordinatorToken = %q, want %q", cfg.CoordinatorToken, "shhh")
+	}
+}
+
+func newSignInCmd(t *testing.T) *cobra.Command {
+	t.Helper()
+	// Flags are package-level and shared; start clean and leave clean.
+	reset := func() {
+		for _, name := range []string{"config", "chrome-profile"} {
+			f := agentSignInCmd.Flags().Lookup(name)
+			f.Value.Set(f.DefValue)
+			f.Changed = false
+		}
+	}
+	reset()
+	t.Cleanup(reset)
+	c := &cobra.Command{}
+	c.Flags().AddFlagSet(agentSignInCmd.Flags())
+	return c
+}
+
+func TestSignInProfileDirPrecedence(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"chrome_profile": "/from/config", "coordinators": []}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// No config anywhere: the agent's default profile ("" resolves to it).
+	if dir, err := signInProfileDir(newSignInCmd(t)); err != nil || dir != "" {
+		t.Fatalf("no config: dir=%q err=%v, want default", dir, err)
+	}
+
+	c := newSignInCmd(t)
+	c.Flags().Set("config", cfgPath)
+	if dir, err := signInProfileDir(c); err != nil || dir != "/from/config" {
+		t.Fatalf("config: dir=%q err=%v, want the config's chrome_profile", dir, err)
+	}
+
+	c = newSignInCmd(t)
+	c.Flags().Set("config", cfgPath)
+	c.Flags().Set("chrome-profile", "/from/flag")
+	if dir, err := signInProfileDir(c); err != nil || dir != "/from/flag" {
+		t.Fatalf("flag: dir=%q err=%v, want --chrome-profile to win", dir, err)
+	}
+
+	c = newSignInCmd(t)
+	c.Flags().Set("config", filepath.Join(t.TempDir(), "missing.json"))
+	if _, err := signInProfileDir(c); err == nil {
+		t.Fatal("an explicit --config that does not exist must be an error")
+	}
+}
+
+func TestSignInProfileDirReadsDefaultConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	path := agent.DefaultConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"chrome_profile": "~/agent-chrome"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if dir, err := signInProfileDir(newSignInCmd(t)); err != nil || dir != "~/agent-chrome" {
+		t.Fatalf("dir=%q err=%v, want the setup config's chrome_profile", dir, err)
 	}
 }

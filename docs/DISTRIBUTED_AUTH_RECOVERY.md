@@ -478,14 +478,25 @@ prompt to ensure the AGENTS reminder is injected after successful auth.
 #### Command
 
 ```bash
-caam auth-agent [--port 7891] [--chrome-profile default] [--headless]
+caam auth-agent [--port 7891] [--chrome-profile DIR] [--headless]
 caam auth-agent --config ~/.config/caam/distributed-agent.json
+
+# Sign in to the Google accounts (and Claude) the agent will use; once per machine
+caam auth-agent signin [--config PATH] [--chrome-profile DIR]
 
 # Run at login and restart on crash (launchd on macOS, systemd --user on Linux)
 caam auth-agent service install [--config PATH]
 caam auth-agent service status [--json]
 caam auth-agent service uninstall
 ```
+
+The agent drives its own persistent Chrome profile,
+`~/.local/share/caam/auth-agent-chrome` (`$CAAM_HOME/data/auth-agent-chrome`
+when `CAAM_HOME` is set), unless `chrome_profile` names another. Chrome locks
+a profile while it is open and refuses automation of the everyday default
+profile, so the agent never uses your normal browser profile; `signin` opens
+the agent's profile so the Google sessions it needs persist across OAuth
+flows.
 
 On macOS the service is `~/Library/LaunchAgents/com.dicklesworthstone.caam.auth-agent.plist`
 (logs in `~/Library/Logs/caam-auth-agent.log`), started in the GUI session so it
@@ -595,71 +606,93 @@ with `--bind <tailscale-ip> --auth-token <secret>` and point the agent at
 
 ## Configuration
 
-### Remote Configuration (~/.config/caam/coordinator.yaml)
+Both files are JSON, written with mode 0600 by `caam setup distributed`, and
+can be edited by hand. Omitted keys keep their defaults.
 
-```yaml
-coordinator:
-  port: 7890
-  poll_interval: 500ms
-  wezterm_socket: /run/user/1000/wezterm-mux-server
+### Remote: `~/.config/caam/coordinator.json`
 
-  # Which panes to monitor (optional filter)
-  pane_filter:
-    # Only monitor panes with these titles or commands
-    commands: ["claude", "claude-code"]
-    # Or by tab title pattern
-    title_pattern: ".*claude.*"
+Read by `caam auth-coordinator --config <path>` (the systemd unit that setup
+installs passes it) and by `caam auth-coordinator status`.
 
-  # Text injection settings
-  injection:
-    # Prompt to inject after successful auth
-    resume_prompt: |
-      proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.
-    # Delay between injections
-    inject_delay: 100ms
-
-  # Timeouts
-  auth_timeout: 60s
-  state_timeout: 30s
-
-  # Optional shared secret (enforces Bearer auth on coordinator API)
-  auth_token: "shared-secret"
+```json
+{
+  "bind": "127.0.0.1",
+  "port": 7890,
+  "poll_interval": "500ms",
+  "auth_timeout": "60s",
+  "state_timeout": "30s",
+  "resume_prompt": "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
+  "resume_cooldown": "10s",
+  "output_lines": 100,
+  "backend": "auto",
+  "auth_token": "<generated per host>"
+}
 ```
 
-### Local Configuration (~/.config/caam/agent.yaml)
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `bind` | `127.0.0.1` | Listen host. A non-loopback bind is refused unless `auth_token` is set. |
+| `port` | `7890` | Listen port. |
+| `poll_interval` | `500ms` | How often panes are scanned. |
+| `auth_timeout` | `60s` | How long a published auth request waits for the agent before failing. |
+| `state_timeout` | `30s` | How long a pane may sit in a transitional state. |
+| `resume_prompt` | see above | Text injected after a successful login. |
+| `resume_cooldown` | `10s` | Wait after login success before injecting the resume prompt. |
+| `output_lines` | `100` | Scrollback lines read per poll. |
+| `backend` | `auto` | `auto` (WezTerm, then tmux), `wezterm`, or `tmux`. |
+| `auth_token` | none | Bearer token required on every endpoint except `/health`. |
 
-```yaml
-agent:
-  port: 7891
-  # Optional shared secret for coordinator API calls
-  coordinator_token: "shared-secret"
+Command-line flags (`--bind`, `--port`, `--backend`, `--poll-interval`,
+`--resume-prompt`, `--auth-token`) override the file; `CAAM_COORDINATOR_TOKEN`
+overrides `auth_token` when `--auth-token` is not given.
 
-  browser:
-    # Chrome executable path (auto-detected on Mac)
-    executable: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
-    # Chrome profile directory (uses default if empty)
-    profile_dir: ""
-    # Run headless (not recommended for Google auth)
-    headless: false
+### Local: `~/.config/caam/distributed-agent.json`
 
-  accounts:
-    # Account selection strategy
-    strategy: lru  # lru, round_robin, manual
-    # Accounts to cycle through (optional, auto-detected from Google)
-    emails:
-      - alice@gmail.com
-      - bob@gmail.com
-      - carol@gmail.com
-      - dave@gmail.com
-      - eve@gmail.com
-      - frank@gmail.com
-      - grace@gmail.com
-    # Minimum time before reusing an account
-    min_reuse_interval: 30m
+Read by `caam auth-agent --config <path>`, by the login service that
+`caam auth-agent service install` registers, and by `caam serve` and
+`caam robot status` to report coordinator health.
+
+```json
+{
+  "port": 7891,
+  "poll_interval": "2s",
+  "coordinators": [
+    {
+      "name": "build1",
+      "display_name": "build1.example.net",
+      "url": "http://127.0.0.1:7890",
+      "token": "<same as the remote auth_token>",
+      "ssh": {
+        "host": "build1.example.net",
+        "port": 22,
+        "user": "ubuntu",
+        "identity_file": "~/.ssh/id_ed25519"
+      }
+    }
+  ],
+  "chrome_profile": "",
+  "headless": false,
+  "strategy": "lru",
+  "accounts": ["alice@example.com", "bob@example.com"]
+}
 ```
 
-For multi-coordinator configs, each coordinator entry can include a `token` field
-to use a different shared secret per endpoint.
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `port` | `7891` | Port of the agent's local status API. |
+| `poll_interval` | `2s` | How often each coordinator is polled for pending requests. |
+| `coordinators[].url` | — | Coordinator base URL. With `ssh` set it is resolved on the remote host, so loopback is correct. |
+| `coordinators[].token` | none | Bearer token for that coordinator. |
+| `coordinators[].ssh` | none | Reach `url` through an SSH connection to this host (port 22, current user, and default keys/agent when omitted). The connection is redialed on failure. |
+| `chrome_profile` | `<caam data>/auth-agent-chrome` | Chrome user-data directory holding the Google sessions; `~/` is expanded. Sign in with `caam auth-agent signin` (`chrome_user_data_dir` and `chrome_profile_dir` are accepted aliases). |
+| `headless` | `false` | Run Chrome headless; Google sign-in usually needs a visible window. |
+| `strategy` | `lru` | Account selection: `lru`, `round_robin`, or `random`. |
+| `accounts` | `[]` | Accounts to rotate through; empty lets the OAuth page choose. |
+
+A single-coordinator config may use `coordinator_url` and `coordinator_token`
+instead of `coordinators`. Re-running `caam setup distributed` merges newly
+discovered hosts into this file and keeps existing tokens (`--rotate-tokens`
+issues new ones).
 
 ## Implementation Plan
 
