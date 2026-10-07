@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -1745,5 +1746,43 @@ func TestIdleDoesNotAdoptPaneLeftForManualRecovery(t *testing.T) {
 	coord.pollPanes(context.Background())
 	if tracker.HasGivenUp() || tracker.GetState() != StateRateLimited {
 		t.Fatalf("new episode: gaveUp=%v state=%v", tracker.HasGivenUp(), tracker.GetState())
+	}
+}
+
+// TestTmuxCaptureJoinsWrappedOAuthURL runs a real tmux server (on a private
+// socket) whose 60-column pane prints an OAuth URL several times wider.
+func TestTmuxCaptureJoinsWrappedOAuthURL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a tmux server")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed")
+	}
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX", "")
+	url := "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG&code_challenge_method=S256&state=zyxwvutsrqponmlkjihgfedcba9876543210"
+	script := fmt.Sprintf("printf 'Browse to:\\n%%s\\nPaste code here if prompted > ' '%s'; sleep 30", url)
+	if out, err := exec.Command("tmux", "-f", "/dev/null", "new-session", "-d", "-x", "60", "-y", "30", script).CombinedOutput(); err != nil {
+		t.Fatalf("start tmux: %v: %s", err, out)
+	}
+	t.Cleanup(func() { exec.Command("tmux", "kill-server").Run() })
+
+	client := NewTmuxClient()
+	ctx := context.Background()
+	var got string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		panes, err := client.ListPanes(ctx)
+		if err == nil && len(panes) == 1 {
+			text, err := client.GetText(ctx, panes[0].PaneID, -50)
+			if err == nil && strings.Contains(text, "Paste code here") {
+				got = ExtractOAuthURL(text)
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got != url {
+		t.Fatalf("extracted %q\nwant      %q", got, url)
 	}
 }

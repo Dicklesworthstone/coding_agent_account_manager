@@ -336,8 +336,9 @@ var Patterns = struct {
 	// "Select login method:"
 	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
 
-	// OAuth URL: https://claude.ai/oauth/authorize?code=true&...
-	OAuthURL: regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
+	// OAuth URL: https://claude.ai/oauth/authorize?code=true&... (or on a
+	// claude.com host, which the agent also accepts)
+	OAuthURL: regexp.MustCompile(`https://(?:[a-z0-9-]+\.)?claude\.(?:ai|com)/(?:[A-Za-z0-9_-]+/)*oauth/authorize\?[^\s]+`),
 
 	// "Paste code here if prompted >"
 	PastePrompt: regexp.MustCompile(`(?i)paste code here if prompted`),

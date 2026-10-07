@@ -1543,3 +1543,23 @@ func TestRateLimitBannerVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractOAuthURLOnClaudeHosts(t *testing.T) {
+	for _, url := range []string{
+		"https://claude.ai/oauth/authorize?code=true&state=a",
+		"https://claude.com/cai/oauth/authorize?code=true&state=b",
+		"https://www.claude.com/oauth/authorize?code=true&state=c",
+	} {
+		if got := ExtractOAuthURL("Browse to " + url + "\nPaste code here if prompted >"); got != url {
+			t.Errorf("ExtractOAuthURL = %q, want %q", got, url)
+		}
+	}
+	for _, text := range []string{
+		"https://evil.example/claude.ai/oauth/authorize?x=1",
+		"https://claude.ai.evil.example/oauth/authorize?x=1",
+	} {
+		if got := ExtractOAuthURL(text); got != "" {
+			t.Errorf("ExtractOAuthURL(%q) = %q, want no foreign URL", text, got)
+		}
+	}
+}
