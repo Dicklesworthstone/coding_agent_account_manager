@@ -72,10 +72,10 @@ test.describe("with a running caam serve", () => {
       JSON.stringify({ oauthAccount: { emailAddress: "e2e@example.com", accountUuid: "e2e-account" } }),
     );
 
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined && !/^(CAAM_|CLAUDE_|CODEX_|GEMINI_|ANTHROPIC_|OPENAI_)/.test(k)) {
-        env[k] = v;
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (/^(CAAM_|CLAUDE_|CODEX_|GEMINI_|ANTHROPIC_|OPENAI_)/.test(k)) {
+        delete env[k];
       }
     }
     Object.assign(env, {
