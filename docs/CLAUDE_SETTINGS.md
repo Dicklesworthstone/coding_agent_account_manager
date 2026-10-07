@@ -30,6 +30,28 @@ robot/API callers, the TUI, wrap and workspace switches. Shared workflow fields
 in `.claude.json`, including user/project MCP configuration and trust decisions,
 are also preserved without copying the outgoing account's identity/session state.
 
+### Switching authentication sources
+
+An account that authenticates through a helper or settings environment must not
+inherit the outgoing account's OAuth fallback. After validating the complete
+target, a vault restore removes live `.credentials.json` and `auth.json` when
+the selected profile has no snapshot for that source. Present credential
+snapshots still use the existing same-account freshness protection.
+
+Desktop's `oauth:tokenCache` and `oauth:tokenCacheV2` fields also come exclusively
+from the target, including absence. Switching to an account without a Desktop
+cache removes the outgoing caches while preserving live Desktop preferences
+such as theme and window placement. This does not copy a whole Desktop config.
+
+When the default macOS keychain bridge is active, a target without an OAuth
+mirror also removes the old login-keychain item. A later keychain read therefore
+cannot resurrect the outgoing OAuth identity. Retirement preflight is read-only,
+accepts the explicitly captured keychain mirror, and rejects detected changes to
+the source snapshot, live credential or keychain before deleting the file.
+Unknown credential symlinks and nonregular files fail rather than being removed.
+Explicit config directories and a disabled keychain bridge remain isolated from
+the default login item.
+
 ### Project policy versus project session state
 
 A `.claude.json` project record is not a single shared setting. Only known
@@ -150,6 +172,27 @@ application, activation fails instead of reinstalling revoked permissions or
 stale authentication settings. Batch updates check all inputs before the first
 write, and each file is checked again after staging. These are optimistic edit
 checks: they do not lock the native CLI or guarantee a multi-file transaction.
+
+### Settings-batch failure recovery
+
+Isolated/shallow settings batches, and the settings portion of logout, stage
+every replacement and rollback copy before installing any document. A staging
+failure leaves the destination documents unchanged. On a later installation or
+input-validation failure, the batch attempts to restore its earlier writes in
+reverse order, including restoring an originally absent file to absence.
+
+Rollback never deliberately overwrites a detected native edit or replacement:
+both the installed file identity and its bytes must still match the batch's
+write. If recovery is unsafe or fails, the error includes the preserved original
+file's path (`settings.json.rollback.*`). Regular recovery copies are mode 0600;
+they can contain credentials. Review them locally alongside the current files,
+retain the newest login, and do not paste them into issue reports or blindly
+restore possibly revoked permission rules or authentication. Successful batches
+and completed rollbacks remove their temporary copies.
+
+This is recovery from returned I/O errors, not crash atomicity or a lock against
+Claude Code. It does not make the complete vault/credential/keychain switch one
+transaction, and another process can observe files between individual renames.
 
 `shallow-spawn --no-sync-config` skips policy refresh, not identity isolation.
 It validates both private `settings.json` and `.claude.json` before repairing

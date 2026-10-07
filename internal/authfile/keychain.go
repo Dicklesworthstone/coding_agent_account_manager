@@ -81,11 +81,12 @@ func pushClaudeKeychain(fileSet AuthFileSet) error {
 	if credPath == "" {
 		return nil
 	}
-	if !fileExists(credPath) {
-		// An API-key or helper-based profile carries no OAuth blob, and the
-		// restore left the live files alone; leave the keychain alone too, so
-		// the bridge stays exactly as (in)active as the file path it mirrors.
-		return nil
+	if _, err := os.Lstat(credPath); os.IsNotExist(err) {
+		// A helper/API-key target deliberately retired its OAuth mirror.
+		// Keeping the old login item would reintroduce the outgoing account.
+		return clearClaudeKeychain(fileSet)
+	} else if err != nil {
+		return fmt.Errorf("inspect restored Claude credentials: %w", err)
 	}
 	if err := keychain.PushMirror(credPath); err != nil {
 		if errors.Is(err, keychain.ErrNoKeychain) {
@@ -94,6 +95,25 @@ func pushClaudeKeychain(fileSet AuthFileSet) error {
 		return fmt.Errorf("write Claude credentials to the macOS login keychain: %w", err)
 	}
 	return nil
+}
+
+// Retirement preflight reads, but does not mirror or mutate, the authoritative
+// keychain. The callback also detects a native keychain rotation before Apply.
+func claudeRetirementMirror(fileSet AuthFileSet, path string) func() ([]byte, error) {
+	bridge := claudeKeychainPath(fileSet)
+	if bridge == "" || filepath.Clean(bridge) != filepath.Clean(path) {
+		return nil
+	}
+	return func() ([]byte, error) {
+		data, err := keychain.ReadClaude()
+		if errors.Is(err, keychain.ErrNoKeychain) || errors.Is(err, keychain.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read Claude keychain before credential retirement: %w", err)
+		}
+		return data, nil
+	}
 }
 
 // clearClaudeKeychain removes the Claude item as part of a logout.
