@@ -510,13 +510,41 @@ func lastMatchStart(re *regexp.Regexp, s string) int {
 // retried login never reuses the URL of an earlier, abandoned attempt.
 // Matching runs on ANSI-stripped output so escape codes never become part of
 // the URL (e.g., a trailing \x1b[0m).
+//
+// A URL that runs to the end of its line continues on the following lines
+// that hold nothing but URL characters (inside optional indentation or
+// dialog borders): the terminal wrapped it (WezTerm's get-text keeps soft
+// wraps as line breaks) or Claude Code's layout did. A blank line or prose
+// ends it.
 func ExtractOAuthURL(output string) string {
-	matches := Patterns.OAuthURL.FindAllString(StripANSI(output), -1)
-	if len(matches) == 0 {
-		return ""
+	lines := strings.Split(StripANSI(output), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		locs := Patterns.OAuthURL.FindAllStringIndex(lines[i], -1)
+		if len(locs) == 0 {
+			continue
+		}
+		start, end := locs[len(locs)-1][0], locs[len(locs)-1][1]
+		url := strings.TrimRight(lines[i][start:end], boxBorders)
+		if strings.Trim(lines[i][end:], " \t"+boxBorders) != "" {
+			return url // text follows the URL on its line: it is whole
+		}
+		for _, next := range lines[i+1:] {
+			m := urlContinuation.FindStringSubmatch(next)
+			if m == nil {
+				break
+			}
+			url += m[1]
+		}
+		return url
 	}
-	return matches[len(matches)-1]
+	return ""
 }
+
+// boxBorders frame Claude Code's dialogs.
+const boxBorders = "│┃|"
+
+// urlContinuation is a line holding only the next piece of a wrapped URL.
+var urlContinuation = regexp.MustCompile(`^[\s│┃|]*([A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)[\s│┃|]*$`)
 
 // DetectCompactingBanner checks if the output contains a Claude Code compacting banner.
 // Returns true if detected, along with the matched text (useful for logging/debugging).

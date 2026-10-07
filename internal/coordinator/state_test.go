@@ -173,6 +173,54 @@ func TestDetectStateMetadata(t *testing.T) {
 	}
 }
 
+// TestExtractOAuthURLJoinsWrappedLines: WezTerm's get-text returns a soft-
+// wrapped URL as several lines, and Claude Code's layout can wrap it itself;
+// the agent needs the whole URL.
+func TestExtractOAuthURLJoinsWrappedLines(t *testing.T) {
+	url := "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG&code_challenge_method=S256&state=zyxwvutsrqponmlkjihgfedcba9876543210"
+	chunks := func(width int) []string {
+		var out []string
+		for s := url; s != ""; {
+			n := min(width, len(s))
+			out = append(out, s[:n])
+			s = s[n:]
+		}
+		return out
+	}
+	wrap := func(width int, prefix, suffix string) string {
+		var b strings.Builder
+		for _, c := range chunks(width) {
+			b.WriteString(prefix + c + suffix + "\n")
+		}
+		return b.String()
+	}
+
+	for name, output := range map[string]string{
+		"soft-wrapped at 80 columns": "Browser didn't open? Use the url below to sign in:\n\n" + wrap(80, "", "") +
+			"\nPaste code here if prompted > ",
+		"wrapped with indentation": "  Use the url below to sign in:\n\n" + wrap(70, "  ", "") + "\n  Paste code here if prompted >",
+		"wrapped inside a dialog": "│ Use the url below to sign in:" + strings.Repeat(" ", 40) + "│\n" +
+			wrap(72, "│ ", " │") + "│" + strings.Repeat(" ", 74) + "│\n",
+		"prompt right below the URL": wrap(60, "", "") + "Paste code here if prompted > ",
+		"an older URL above": "https://claude.ai/oauth/authorize?code=stale\nLogin failed\n\n" + wrap(90, "", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ExtractOAuthURL(output); got != url {
+				t.Fatalf("ExtractOAuthURL =\n%q\nwant\n%q", got, url)
+			}
+		})
+	}
+
+	// A URL followed by text on its line is whole, whatever comes below.
+	if got := ExtractOAuthURL("Open https://claude.ai/oauth/authorize?a=b in a browser\nxyz123\n"); got != "https://claude.ai/oauth/authorize?a=b" {
+		t.Fatalf("got %q", got)
+	}
+	// A blank line ends the URL.
+	if got := ExtractOAuthURL("https://claude.ai/oauth/authorize?a=b\n\nWaiting\n"); got != "https://claude.ai/oauth/authorize?a=b" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestExtractOAuthURL(t *testing.T) {
 	tests := []struct {
 		name     string
