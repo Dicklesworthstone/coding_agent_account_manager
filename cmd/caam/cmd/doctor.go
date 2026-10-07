@@ -1615,6 +1615,17 @@ func checkDistributed(ctx context.Context, configPath string) []CheckResult {
 		Status:  "pass",
 		Message: fmt.Sprintf("%d coordinator(s) in %s", len(endpoints), shortenPath(configPath)),
 	}}
+	// Without accounts the agent cannot rotate: every recovery logs in with
+	// whichever account Claude or Google offers first, usually the one that
+	// just hit its limit.
+	if len(fc.Accounts) == 0 {
+		results = append(results, CheckResult{Name: "Account rotation", Status: "warn",
+			Message: "no accounts configured; recoveries reuse whichever account is offered first",
+			Details: "list the Google accounts to rotate through under \"accounts\" in " + shortenPath(configPath)})
+	} else {
+		results = append(results, CheckResult{Name: "Account rotation", Status: "pass",
+			Message: fmt.Sprintf("%d account(s), strategy %s", len(fc.Accounts), firstNonEmpty(fc.Strategy, "lru"))})
+	}
 
 	if chrome := agent.GetChromePath(); chrome != "" {
 		results = append(results, CheckResult{Name: "Chrome", Status: "pass", Message: chrome})

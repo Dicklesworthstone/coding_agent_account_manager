@@ -276,3 +276,34 @@ func (stubPanes) IsAvailable(ctx context.Context) bool { return true }
 func (stubPanes) Backend() string                      { return "stub" }
 
 func discardSlog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestCheckDistributedFlagsMissingAccounts(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := agent.WriteFileConfig(cfgPath, agent.FileConfig{
+		Coordinators: []*agent.CoordinatorEndpoint{{Name: "dead", URL: "http://127.0.0.1:1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var rotation CheckResult
+	for _, c := range checkDistributed(context.Background(), cfgPath) {
+		if c.Name == "Account rotation" {
+			rotation = c
+		}
+	}
+	if rotation.Status != "warn" || !strings.Contains(rotation.Details, "accounts") {
+		t.Fatalf("rotation check = %+v, want a warning to list accounts", rotation)
+	}
+
+	if err := agent.WriteFileConfig(cfgPath, agent.FileConfig{
+		Accounts:     []string{"a@example.com", "b@example.com"},
+		Strategy:     "round_robin",
+		Coordinators: []*agent.CoordinatorEndpoint{{Name: "dead", URL: "http://127.0.0.1:1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range checkDistributed(context.Background(), cfgPath) {
+		if c.Name == "Account rotation" && (c.Status != "pass" || !strings.Contains(c.Message, "2 account(s), strategy round_robin")) {
+			t.Fatalf("rotation check = %+v", c)
+		}
+	}
+}

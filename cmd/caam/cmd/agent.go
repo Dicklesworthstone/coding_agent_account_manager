@@ -481,6 +481,12 @@ the config's chrome_profile, or by default <caam data dir>/auth-agent-chrome
 			return err
 		}
 		fmt.Fprintln(out, "Done. Running auth agents pick up the sign-ins on their next OAuth flow.")
+		cfgPath := agentSignInConfig
+		if cfgPath == "" {
+			cfgPath = agent.DefaultConfigPath()
+		}
+		fmt.Fprintf(out, "List the accounts to rotate through under \"accounts\" in %s;\n", cfgPath)
+		fmt.Fprintln(out, "without them every recovery reuses whichever account is offered first. Check with: caam doctor")
 		return nil
 	},
 }
