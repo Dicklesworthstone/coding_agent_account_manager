@@ -467,12 +467,29 @@ func importAuthProfile(ctx context.Context, prov provider.Provider, name, source
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		return result, fmt.Errorf("inspect source credential: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
-		return result, fmt.Errorf("source credential must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+	// The selected native Claude credential may exist only in the login
+	// keychain. Inspect that authority without creating a disk mirror; the
+	// provider captures it again when importing into the unpublished profile.
+	claudeFiles := authfile.ClaudeAuthFiles()
+	if prov.ID() == "claude" && filepath.Clean(sourcePath) == filepath.Clean(claudeFiles.Files[0].Path) {
+		name, data, readErr := authfile.ReadLiveCredential(claudeFiles)
+		if readErr != nil {
+			return result, fmt.Errorf("inspect native Claude credential: %w", readErr)
+		}
+		if name != ".credentials.json" {
+			return result, fmt.Errorf("selected native Claude credential is unavailable")
+		}
+		if err := authfile.ValidateCredentialData("claude", name, data); err != nil {
+			return result, fmt.Errorf("validate native Claude credential: %w", err)
+		}
+	} else {
+		info, err := os.Stat(sourcePath)
+		if err != nil {
+			return result, fmt.Errorf("inspect source credential: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+			return result, fmt.Errorf("source credential must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+		}
 	}
 	var relativeFiles []string
 	imported, err := profileStore.Import(ctx, prov.ID(), name, string(provider.AuthModeOAuth), force, func(prof *profile.Profile) error {

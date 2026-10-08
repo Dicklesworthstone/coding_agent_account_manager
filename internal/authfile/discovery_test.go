@@ -43,6 +43,174 @@ func discoveryJWT(t *testing.T, claims map[string]interface{}) string {
 	return "e30." + base64.RawURLEncoding.EncodeToString(data) + ".synthetic-signature"
 }
 
+func TestDiscoveryOwnerCannotBorrowUnusedRefreshToken(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, liveKey, savedKey string
+		want                    bool
+	}{
+		{"oauth-to-key", "", "synthetic-saved-key", false},
+		{"key-to-oauth", "synthetic-live-key", "", false},
+		{"different-keys", "synthetic-live-key", "synthetic-saved-key", false},
+		{"same-key", "synthetic-same-key", "synthetic-same-key", true},
+		{"opaque-oauth-continuity", "", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No JWT identity exists, so OAuth ownership must exercise the
+			// shared-refresh-token fallback rather than account matching.
+			makeState := func(key string, stamp time.Time) switchState {
+				auth := map[string]interface{}{
+					"auth_mode": "chatgpt", "last_refresh": stamp.Format(time.RFC3339),
+					"tokens": map[string]interface{}{"access_token": "synthetic-access-" + stamp.Format("15:04"), "refresh_token": "synthetic-shared-refresh"},
+				}
+				if key != "" {
+					auth["auth_mode"], auth["OPENAI_API_KEY"] = "apikey", key
+				}
+				data, err := json.Marshal(auth)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state := switchState{files: map[string][]byte{"auth.json": data}}
+				state.identify(AuthFileSet{Tool: "codex"})
+				return state
+			}
+			live := discoverySnapshot{state: makeState(tc.liveKey, old.Add(time.Hour))}
+			saved := discoverySnapshot{state: makeState(tc.savedKey, old)}
+			if got := sameDiscoveryOwner(live, saved); got != tc.want {
+				t.Fatalf("shared unused OAuth refresh token changed ownership: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptureDiscoveryPreservesSelectedKeyBesideUnusedOAuth(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	credential := func(key string, stamp time.Time) string {
+		auth := map[string]interface{}{
+			"auth_mode": "chatgpt", "last_refresh": stamp.Format(time.RFC3339),
+			"tokens": map[string]interface{}{"access_token": "synthetic-access-" + stamp.Format("15:04"), "refresh_token": "synthetic-shared-refresh"},
+		}
+		if key != "" {
+			auth["auth_mode"], auth["OPENAI_API_KEY"] = "apikey", key
+		}
+		data, err := json.Marshal(auth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	saved := credential("synthetic-selected-key", old)
+	live := credential("", old.Add(time.Hour))
+	v, fs, liveDir := discoveryFixture(t, "codex", map[string]string{"auth.json": live})
+	writeSwitchProfile(t, v, "codex", "api-account", map[string]string{"auth.json": saved})
+	result, err := v.CaptureDiscovery(fs)
+	if err != nil || !result.Created || result.Updated || result.Profile == "api-account" {
+		t.Fatalf("discovery attributed unused OAuth rotation to selected key: %+v, %v", result, err)
+	}
+	if got := readFixtureFile(t, v.BackupPath("codex", "api-account", "auth.json")); got != saved {
+		t.Fatal("discovery erased the named account's selected API key")
+	}
+	if got := readFixtureFile(t, v.BackupPath("codex", result.Profile, "auth.json")); got != live {
+		t.Fatal("discovery did not retain the new OAuth login separately")
+	}
+	if got := readFixtureFile(t, filepath.Join(liveDir, "auth.json")); got != live {
+		t.Fatal("discovery modified the native login")
+	}
+}
+
+func TestCaptureDiscoveryUsesSelectedKeyAcrossUnusedOAuthChanges(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		t.Run(tool, func(t *testing.T) {
+			saved := selectedSwitchFiles(t, tool, "synthetic-selected-key", "old-cache@example.test", old)
+			live := selectedSwitchFiles(t, tool, "synthetic-selected-key", "new-cache@example.test", old.Add(time.Hour))
+			if tool == "gemini" {
+				live["oauth_creds.json"] = "{"
+			}
+			v, fs, liveDir := discoveryFixture(t, tool, live)
+			writeSwitchProfile(t, v, tool, "selected", saved)
+			result, err := v.CaptureDiscovery(fs)
+			if err != nil || !result.Unchanged || result.Updated || result.Created || result.Profile != "selected" {
+				t.Fatalf("unused cache changed the selected key's discovery: %+v, %v", result, err)
+			}
+			if result.Identity == nil || result.Identity.Email != "" || result.Identity.AccountID != "" || !result.Identity.ExpiresAt.IsZero() {
+				t.Fatalf("selected key borrowed an unused OAuth identity or deadline: %+v", result.Identity)
+			}
+			for file, want := range saved {
+				if got := readFixtureFile(t, v.BackupPath(tool, "selected", file)); got != want {
+					t.Fatalf("discovery rewrote saved %s for unused cache churn", file)
+				}
+			}
+			for file, want := range live {
+				if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+					t.Fatalf("discovery changed native %s", file)
+				}
+			}
+		})
+	}
+}
+
+func TestCaptureDiscoverySelectedGeminiKeyDoesNotRequireUnusedCache(t *testing.T) {
+	files := map[string]string{
+		"settings.json":    `{"selectedAuthType":"gemini-api-key"}`,
+		".env":             "export GEMINI_API_KEY='synthetic-selected-key' # native comment\n",
+		"oauth_creds.json": "{",
+	}
+	v, fs, liveDir := discoveryFixture(t, "gemini", files)
+	result, err := v.CaptureDiscovery(fs)
+	if err != nil || !result.Created {
+		t.Fatalf("unused broken cache blocked selected key capture: %+v, %v", result, err)
+	}
+	for _, file := range []string{"settings.json", ".env"} {
+		if got := readFixtureFile(t, v.BackupPath("gemini", result.Profile, file)); got != files[file] {
+			t.Fatalf("selected %s was not saved exactly", file)
+		}
+	}
+	for file, want := range files {
+		if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+			t.Fatalf("capture changed native %s", file)
+		}
+	}
+	if err := v.Restore(fs, result.Profile); err != nil {
+		t.Fatalf("captured selected key is not restorable: %v", err)
+	}
+}
+
+func TestCaptureDiscoveryGeminiSelectorOnlyChangeCreatesSeparateGrant(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, selectedAPI := range []bool{false, true} {
+		name := "key-to-oauth"
+		beforeMode, afterMode := "gemini-api-key", "oauth-personal"
+		if selectedAPI {
+			name, beforeMode, afterMode = "oauth-to-key", "oauth-personal", "gemini-api-key"
+		}
+		t.Run(name, func(t *testing.T) {
+			saved := selectedSwitchFiles(t, "gemini", "synthetic-selected-key", "oauth@example.test", old)
+			saved[".env"] = "GEMINI_API_KEY=synthetic-selected-key\n"
+			saved["settings.json"] = `{"selectedAuthType":"` + beforeMode + `"}`
+			live := make(map[string]string)
+			for file, data := range saved {
+				live[file] = data
+			}
+			live["settings.json"] = `{"selectedAuthType":"` + afterMode + `"}`
+			v, fs, _ := discoveryFixture(t, "gemini", live)
+			writeSwitchProfile(t, v, "gemini", "previous-method", saved)
+			result, err := v.CaptureDiscovery(fs)
+			if err != nil || !result.Created || result.Unchanged || result.Updated || result.Profile == "previous-method" {
+				t.Fatalf("selector-only change reused another selected method: %+v, %v", result, err)
+			}
+			for file, want := range saved {
+				if got := readFixtureFile(t, v.BackupPath("gemini", "previous-method", file)); got != want {
+					t.Fatalf("selector-only change modified previous %s", file)
+				}
+			}
+			if got := readFixtureFile(t, v.BackupPath("gemini", result.Profile, "settings.json")); got != live["settings.json"] {
+				t.Fatal("new discovery did not capture the selected native method")
+			}
+		})
+	}
+}
+
 func TestCaptureDiscoveryRecognizesCompleteNativeSources(t *testing.T) {
 	for _, test := range []struct {
 		name, tool, primary, credential, profile string
@@ -624,6 +792,25 @@ func TestDiscoveryFileFingerprintIgnoresPolicyButTracksAuth(t *testing.T) {
 	}
 	if DiscoveryFileFingerprint("codex", "auth.json", []byte(`null`)) == DiscoveryFileFingerprint("codex", "auth.json", []byte(`[]`)) {
 		t.Fatal("different malformed states cannot be observed independently")
+	}
+}
+
+func TestDiscoveryFingerprintTracksGeminiSelectorWithoutTreatingItAsCredential(t *testing.T) {
+	oauth := []byte(`{"selectedAuthType":"oauth-personal","theme":"light"}`)
+	key := []byte(`{"security":{"auth":{"selectedType":"gemini-api-key"}},"theme":"dark"}`)
+	keyPolicy := []byte(`{"selectedAuthType":"gemini-api-key","theme":"light"}`)
+	fingerprint := func(data []byte) string { return DiscoveryFileFingerprint("gemini", "settings.json", data) }
+	if fingerprint(oauth) == "" || fingerprint(oauth) == fingerprint(key) {
+		t.Fatal("changing only the selected auth method cannot trigger discovery")
+	}
+	if fingerprint(key) != fingerprint(keyPolicy) {
+		t.Fatal("equivalent native selector or unrelated policy changed the auth fingerprint")
+	}
+	if fingerprint([]byte(`{"selectedAuthType":7}`)) == fingerprint([]byte(`{"selectedAuthType":8}`)) {
+		t.Fatal("malformed selector changes cannot trigger a recovery attempt")
+	}
+	if err := ValidateCredentialData("gemini", "settings.json", key); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("a selector alone became an access credential: %v", err)
 	}
 }
 

@@ -121,7 +121,8 @@ func (v *Vault) CaptureDiscovery(fileSet AuthFileSet) (*DiscoveryResult, error) 
 		if err != nil {
 			continue
 		}
-		if !IsSystemProfile(profile) && sameSwitchFiles(live.material, candidate.material) {
+		if !IsSystemProfile(profile) && live.state.authMethod == candidate.state.authMethod &&
+			live.state.selectedKey == candidate.state.selectedKey && sameSwitchFiles(live.material, candidate.material) {
 			result.Profile, result.Unchanged = profile, true
 			return result, nil
 		}
@@ -194,6 +195,18 @@ func DiscoveryFileFingerprint(tool, filename string, data []byte) string {
 			}
 		}
 	}
+	if tool == "gemini" && filename == "settings.json" && err == nil {
+		var selected string
+		selected, err = GeminiSelectedAuthType(data)
+		if err == nil && selected != "" {
+			mode, _ := json.Marshal(selected)
+			fields := map[string]json.RawMessage{"selectedAuthType": mode}
+			if len(material) > 0 {
+				fields["credential"] = material
+			}
+			material, err = json.Marshal(fields)
+		}
+	}
 	if err != nil {
 		material = data
 	}
@@ -220,6 +233,9 @@ func onlyDiscoveryPrimaryChanged(live, saved discoverySnapshot) bool {
 }
 
 func sameDiscoveryOwner(live, saved discoverySnapshot) bool {
+	if live.state.authMethod != saved.state.authMethod || live.state.selectedKey != saved.state.selectedKey {
+		return false // An unused OAuth refresh token cannot identify a selected key.
+	}
 	if discoveryAccountsConflict(live.observedAccount, saved.observedAccount) {
 		return false
 	}
@@ -294,6 +310,17 @@ func inspectDiscovery(fileSet AuthFileSet, state switchState) (discoverySnapshot
 	snapshot := discoverySnapshot{state: state, material: make(map[string][]byte), observedAccount: state.account}
 	if state.identityConflict {
 		return snapshot, fmt.Errorf("%w: %s credential identity conflicts with its captured account state", ErrInvalidCredentials, fileSet.Tool)
+	}
+	if state.selectedKey != "" {
+		// Native selection was validated while identifying the captured state.
+		// An unused cache is neither this key's identity nor a second grant
+		// whose rotation can authorize replacing the selected account.
+		snapshot.material[state.credentialName] = []byte(state.selectedKey)
+		snapshot.identity = &identity.Identity{Provider: fileSet.Tool}
+		return snapshot, nil
+	}
+	if state.authMethod == "vertex-ai" {
+		return snapshot, fmt.Errorf("%w: selected Vertex ADC is outside the captured Gemini file set", ErrNoCredentials)
 	}
 	for _, spec := range fileSet.Files {
 		name := filepath.Base(spec.Path)

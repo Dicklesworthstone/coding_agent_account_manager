@@ -118,7 +118,7 @@ func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
 			info, err = parseLiveOAuthJSON(data)
 		}
 	case "codex":
-		if key, selected, modeErr := codexSelectedAPIKey(data); modeErr != nil {
+		if key, selected, modeErr := authfile.CodexSelectedAPIKey(data); modeErr != nil {
 			return nil, modeErr
 		} else if selected {
 			info = &ExpiryInfo{Renewable: true, SelfRefreshing: true, Fingerprint: credentialFingerprint("codex-api-key\x00" + key)}
@@ -194,44 +194,9 @@ func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
 // Parse only the captured .env, following Gemini's stored-key syntax and mode
 // conflicts. Ambient keys and unrelated dotenv entries cannot identify a grant.
 func parseLiveGeminiAPIKey(data []byte) (*ExpiryInfo, error) {
-	values := make(map[string]string)
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		key, value, ok := strings.Cut(line, "=")
-		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
-		if !ok || key == "" || strings.ContainsAny(key, " \t\r\x00") {
-			return nil, fmt.Errorf("%w: expected a Gemini dotenv assignment", authfile.ErrInvalidCredentials)
-		}
-		if len(value) > 0 && (value[0] == '\'' || value[0] == '"') {
-			quote := value[0]
-			end := strings.IndexByte(value[1:], quote)
-			if end < 0 {
-				return nil, fmt.Errorf("%w: unterminated Gemini dotenv value", authfile.ErrInvalidCredentials)
-			}
-			end++
-			tail := strings.TrimSpace(value[end+1:])
-			if tail != "" && !strings.HasPrefix(tail, "#") {
-				return nil, fmt.Errorf("%w: unexpected text after Gemini dotenv value", authfile.ErrInvalidCredentials)
-			}
-			value = value[1:end]
-		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
-			value = strings.TrimSpace(value[:comment])
-		}
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("%w: invalid Gemini dotenv value", authfile.ErrInvalidCredentials)
-		}
-		if key == "GEMINI_API_KEY" && (strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t")) {
-			return nil, fmt.Errorf("%w: Gemini API key is empty or contains whitespace", authfile.ErrInvalidCredentials)
-		}
-		values[key] = value
-	}
-	key := values["GEMINI_API_KEY"]
-	if key == "" || strings.ContainsAny(key, " \t") || values["GOOGLE_API_KEY"] != "" || values["GOOGLE_GENAI_USE_GCA"] == "true" || values["GOOGLE_GENAI_USE_VERTEXAI"] == "true" {
-		return nil, fmt.Errorf("%w: selected Gemini API key is absent or conflicts with another auth method", authfile.ErrInvalidCredentials)
+	key, err := authfile.GeminiSelectedAPIKey(data)
+	if err != nil {
+		return nil, err
 	}
 	return &ExpiryInfo{Renewable: true, SelfRefreshing: true, Fingerprint: credentialFingerprint(key)}, nil
 }
@@ -525,7 +490,7 @@ func ParseCodexExpiry(authPath string) (*ExpiryInfo, error) {
 		return nil, err
 	}
 
-	if key, selected, err := codexSelectedAPIKey(data); err != nil {
+	if key, selected, err := authfile.CodexSelectedAPIKey(data); err != nil {
 		return nil, fmt.Errorf("%w: %v", authfile.ErrInvalidCredentials, err)
 	} else if selected {
 		return &ExpiryInfo{

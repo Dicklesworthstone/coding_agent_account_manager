@@ -175,6 +175,12 @@ retains the complete previous profile outside the routable profile layout and
 reports its backup path; imported credentials and helper paths belong to the
 selected account.
 
+Claude detection reads the selected native authority without materializing a
+keychain mirror. An explicit config directory remains isolated from the default
+keychain. Both import entrypoints can capture a keychain-only login directly
+into the unpublished profile, preserving native files and surfacing denied
+keychain reads instead of importing a stale account.
+
 #### 2.3 Init Wizard Enhancement
 
 **What:** Integrate auth detection and import into the init wizard.
@@ -422,6 +428,11 @@ and isolated destinations receive a renewed grant only when their captured
 credentials match and their files remain unchanged. Partial delivery is
 reported without discarding a successful vault renewal or poisoning pool
 eligibility. The default daemon can recover expired renewable access tokens.
+
+Switch ownership, discovery and Codex restore also honor the selected native
+authentication method. API-key profiles use the selected key as their identity;
+unused OAuth tokens and timestamps cannot skip activation or authorize an
+overwrite of that saved key. Health and mutation paths share the same selectors.
 
 Profile runners, native login commands, shallow launches and shell exports
 use a shared provider environment policy. Conflicting ambient credentials

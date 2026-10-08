@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/agy"
@@ -333,6 +334,103 @@ func setupAuthImportStore(t *testing.T) *profile.Store {
 	profileStore = profile.NewStore(filepath.Join(t.TempDir(), "profiles"))
 	t.Cleanup(func() { profileStore = original })
 	return profileStore
+}
+
+func TestClaudeNativeImportPreservesSourceAuthority(t *testing.T) {
+	const keychainCredential = `{"claudeAiOauth":{"accessToken":"synthetic-personal-access","refreshToken":"synthetic-personal-refresh","expiresAt":4102444800000}}`
+	const fileCredential = `{"claudeAiOauth":{"accessToken":"synthetic-work-access","refreshToken":"synthetic-work-refresh","expiresAt":4102444800000}}`
+	for _, flow := range []string{"auth import", "init"} {
+		for _, layout := range []string{"keychain only", "stale mirror", "explicit config directory"} {
+			t.Run(flow+"/"+layout, func(t *testing.T) {
+				fixtureRoot := setupInitImport(t)
+				t.Setenv("CLAUDE_CONFIG_DIR", "")
+				nativeDir := filepath.Join(fixtureRoot, "home", ".claude")
+				if layout == "explicit config directory" {
+					nativeDir = filepath.Join(t.TempDir(), "work-account")
+					t.Setenv("CLAUDE_CONFIG_DIR", nativeDir)
+				}
+				items := testutil.FakeKeychain(t)
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), keychainCredential)
+				nativePath := filepath.Join(nativeDir, ".credentials.json")
+				var before os.FileInfo
+				if layout != "keychain only" {
+					writeInitCredential(t, nativePath, fileCredential)
+					var err error
+					before, err = os.Stat(nativePath)
+					require.NoError(t, err)
+				}
+				assertNativeUnchanged := func() {
+					t.Helper()
+					if before == nil {
+						_, err := os.Stat(nativePath)
+						require.True(t, os.IsNotExist(err), "read-only discovery/import created a native mirror: %v", err)
+					} else {
+						data, err := os.ReadFile(nativePath)
+						require.NoError(t, err)
+						assert.Equal(t, fileCredential, string(data))
+						after, err := os.Stat(nativePath)
+						require.NoError(t, err)
+						assert.True(t, os.SameFile(before, after))
+						assert.Equal(t, before.ModTime(), after.ModTime())
+						assert.Equal(t, before.Mode(), after.Mode())
+					}
+					secret, exists := testutil.FakeKeychainRead(t, items, keychain.ClaudeService)
+					assert.True(t, exists)
+					assert.Equal(t, keychainCredential, secret)
+				}
+				prov := claude.New()
+				registry = provider.NewRegistry()
+				registry.Register(prov)
+				detections := detectProviderAuth()
+				require.Len(t, detections, 1)
+				require.NoError(t, detections[0].Error)
+				require.True(t, detections[0].Detection.Found)
+				assertNativeUnchanged()
+
+				name := "work"
+				if flow == "init" {
+					name = "default"
+					_, err := captureStdout(t, func() error {
+						count, err := importDetectedAuth(context.Background(), detections, true)
+						assert.Equal(t, 1, count)
+						return err
+					})
+					require.NoError(t, err)
+				} else {
+					cmd := &cobra.Command{}
+					cmd.SetContext(context.Background())
+					cmd.Flags().String("name", name, "")
+					cmd.Flags().String("source", "", "")
+					cmd.Flags().String("description", "", "")
+					cmd.Flags().Bool("force", false, "")
+					cmd.Flags().Bool("json", true, "")
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					require.NoError(t, runAuthImport(cmd, []string{"claude"}))
+					var result AuthImportResult
+					require.NoError(t, json.Unmarshal(output.Bytes(), &result))
+					require.True(t, result.Success)
+					assert.NotContains(t, output.String(), "synthetic-personal")
+					assert.NotContains(t, output.String(), "synthetic-work")
+				}
+				prof, err := profileStore.Load("claude", name)
+				require.NoError(t, err)
+				env, err := prov.Env(context.Background(), prof)
+				require.NoError(t, err)
+				imported, err := os.ReadFile(filepath.Join(env["CLAUDE_CONFIG_DIR"], ".credentials.json"))
+				require.NoError(t, err)
+				expected := keychainCredential
+				if layout == "explicit config directory" {
+					expected = fileCredential
+				}
+				assert.Equal(t, expected, string(imported))
+				validation, err := prov.ValidateToken(context.Background(), prof, true)
+				require.NoError(t, err)
+				require.True(t, validation.Valid)
+				assertNativeUnchanged()
+			})
+		}
+	}
 }
 
 func TestAuthImportForcePreservesClaudeHelper(t *testing.T) {

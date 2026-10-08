@@ -90,6 +90,10 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 		return result, fmt.Errorf("%w: incoming credential has conflicting account identities", ErrInvalidCredentials)
 	}
 	for name, data := range incoming.files {
+		if fileSet.Tool == "gemini" && name == "oauth_creds.json" &&
+			(incoming.authMethod == "api-key" || incoming.authMethod == "vertex-ai") {
+			continue // Native selection ignores this cache, including malformed leftovers.
+		}
 		if filepath.Ext(name) == ".json" {
 			var obj map[string]json.RawMessage
 			if json.Unmarshal(data, &obj) != nil || obj == nil {
@@ -268,6 +272,118 @@ func ReadLiveCredential(fileSet AuthFileSet) (name string, data []byte, err erro
 	return live.credentialName, live.credential, nil
 }
 
+// CodexSelectedAPIKey resolves the stored key selected by native auth.json.
+// Explicit key mode ignores leftover OAuth fields; an implicit key-only record
+// also selects the key. Callers must not attribute unused OAuth identity or
+// freshness to the returned credential.
+func CodexSelectedAPIKey(data []byte) (string, bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return "", false, err
+	}
+	readAliases := func(object map[string]json.RawMessage, names ...string) (string, error) {
+		var selected string
+		for _, name := range names {
+			var value string
+			if raw, ok := object[name]; ok {
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return "", fmt.Errorf("Codex %s must be a string or null", name)
+				}
+			}
+			value = strings.TrimSpace(value)
+			if selected != "" && value != "" && selected != value {
+				return "", fmt.Errorf("Codex credential aliases conflict")
+			}
+			if value != "" {
+				selected = value
+			}
+		}
+		return selected, nil
+	}
+	key, err := readAliases(root, "OPENAI_API_KEY", "api_key", "apiKey")
+	if err != nil {
+		return "", false, err
+	}
+	mode, err := readAliases(root, "auth_mode")
+	if err != nil {
+		return "", false, err
+	}
+	switch strings.ToLower(mode) {
+	case "apikey", "api-key":
+		if key == "" {
+			return "", false, fmt.Errorf("Codex API-key auth mode has no API key")
+		}
+		return key, true, nil
+	case "":
+		if key == "" {
+			return "", false, nil
+		}
+		var tokens map[string]json.RawMessage
+		if raw, ok := root["tokens"]; ok {
+			if err := json.Unmarshal(raw, &tokens); err != nil {
+				return "", false, fmt.Errorf("Codex tokens must be an object or null")
+			}
+		}
+		for _, object := range []map[string]json.RawMessage{root, tokens} {
+			access, err := readAliases(object, "access_token", "accessToken", "token")
+			if err != nil {
+				return "", false, err
+			}
+			if access != "" {
+				return "", false, nil
+			}
+		}
+		return key, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+// GeminiSelectedAPIKey resolves a selected API key from captured native dotenv
+// bytes without consulting ambient credentials or an unused OAuth cache.
+func GeminiSelectedAPIKey(data []byte) (string, error) {
+	values := make(map[string]string)
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" || strings.ContainsAny(key, " \t\r\x00") {
+			return "", fmt.Errorf("%w: expected a Gemini dotenv assignment", ErrInvalidCredentials)
+		}
+		if len(value) > 0 && (value[0] == '\'' || value[0] == '"') {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return "", fmt.Errorf("%w: unterminated Gemini dotenv value", ErrInvalidCredentials)
+			}
+			end++
+			tail := strings.TrimSpace(value[end+1:])
+			if tail != "" && !strings.HasPrefix(tail, "#") {
+				return "", fmt.Errorf("%w: unexpected text after Gemini dotenv value", ErrInvalidCredentials)
+			}
+			value = value[1:end]
+		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return "", fmt.Errorf("%w: invalid Gemini dotenv value", ErrInvalidCredentials)
+		}
+		if key == "GEMINI_API_KEY" && (strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t")) {
+			return "", fmt.Errorf("%w: Gemini API key is empty or contains whitespace", ErrInvalidCredentials)
+		}
+		values[key] = value
+	}
+	key := values["GEMINI_API_KEY"]
+	if key == "" || strings.ContainsAny(key, " \t") || values["GOOGLE_API_KEY"] != "" || values["GOOGLE_GENAI_USE_GCA"] == "true" || values["GOOGLE_GENAI_USE_VERTEXAI"] == "true" {
+		return "", fmt.Errorf("%w: selected Gemini API key is absent or conflicts with another auth method", ErrInvalidCredentials)
+	}
+	return key, nil
+}
+
 // Native Gemini settings select the credential method before the OAuth cache.
 // Read the same legacy/current selectors as the provider's directory importer,
 // using only the settings bytes already captured with the live credential.
@@ -391,6 +507,8 @@ func (a switchAccount) matches(b switchAccount) bool {
 type switchState struct {
 	files            map[string][]byte
 	provider         string
+	authMethod       string
+	selectedKey      string
 	credentialName   string
 	credential       []byte
 	account          switchAccount
@@ -402,8 +520,11 @@ type switchState struct {
 func (s switchState) hasAuth() bool { return len(bytes.TrimSpace(s.credential)) != 0 }
 
 func (s switchState) sameCredential(other switchState) bool {
-	if s.identityConflict || other.identityConflict {
+	if s.identityConflict || other.identityConflict || s.provider != other.provider || s.authMethod != other.authMethod {
 		return false
+	}
+	if s.selectedKey != "" || other.selectedKey != "" {
+		return s.selectedKey != "" && s.selectedKey == other.selectedKey
 	}
 	if s.account != (switchAccount{}) && other.account != (switchAccount{}) && !s.account.matches(other.account) {
 		return false
@@ -412,6 +533,12 @@ func (s switchState) sameCredential(other switchState) bool {
 }
 
 func (s switchState) sameAccount(other switchState) bool {
+	if s.provider != other.provider || s.authMethod != other.authMethod {
+		return false
+	}
+	if s.selectedKey != "" || other.selectedKey != "" {
+		return s.sameCredential(other)
+	}
 	// OpenAI's subject identifies a person, not their selected workspace.
 	// A workspace-scoped grant cannot match an unscoped snapshot by email.
 	if s.provider == "codex" && (s.account.account != "" || other.account.account != "") &&
@@ -570,6 +697,52 @@ func (s *switchState) identify(fileSet AuthFileSet) {
 			if s.credentialName != "" {
 				break
 			}
+		}
+	}
+	// A selected key and its leftover OAuth cache are different grants. Keep
+	// the exact artifact for recovery, but derive ownership solely from the key
+	// and leave OAuth freshness unset so it cannot authorize a named overwrite.
+	switch fileSet.Tool {
+	case "codex":
+		s.authMethod = "oauth"
+		if data, present := s.files["auth.json"]; present {
+			key, selected, err := CodexSelectedAPIKey(data)
+			if err != nil {
+				s.identityConflict = true
+				return
+			}
+			if selected {
+				s.authMethod = "api-key"
+				s.selectedKey = hashBytes([]byte("codex:api-key:" + key))
+				s.credentialName, s.credential, s.complete = "auth.json", data, true
+				return
+			}
+		}
+	case "gemini":
+		s.authMethod = "oauth"
+		selected, err := GeminiSelectedAuthType(s.files["settings.json"])
+		if err != nil {
+			s.identityConflict = true
+			return
+		}
+		switch selected {
+		case "gemini-api-key":
+			s.authMethod = "api-key"
+			s.credentialName, s.credential = ".env", s.files[".env"]
+			key, err := GeminiSelectedAPIKey(s.credential)
+			if err != nil {
+				s.identityConflict = true
+				return
+			}
+			s.selectedKey = hashBytes([]byte("gemini:api-key:" + key))
+			s.complete = true
+			return
+		case "vertex-ai":
+			// The captured fileset has no ADC grant. Its OAuth cache cannot
+			// identify or refresh the account selected by Vertex settings.
+			s.authMethod = "vertex-ai"
+			s.credentialName, s.credential = "settings.json", s.files["settings.json"]
+			return
 		}
 	}
 	var root map[string]interface{}

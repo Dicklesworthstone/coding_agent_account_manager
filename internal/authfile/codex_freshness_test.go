@@ -214,6 +214,31 @@ func TestCodexRestoreFreshnessGuard(t *testing.T) {
 	})
 }
 
+func TestCodexRestoreDoesNotAttributeUnusedOAuthFreshness(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ name, liveKey, targetKey string }{
+		{"oauth-to-key", "", "synthetic-target-key"},
+		{"key-to-oauth", "synthetic-live-key", ""},
+		{"different-key", "synthetic-live-key", "synthetic-target-key"},
+		{"same-key", "synthetic-same-key", "synthetic-same-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := []byte(selectedSwitchFiles(t, "codex", tc.liveKey, "shared@example.test", old.Add(time.Hour))["auth.json"])
+			target := []byte(selectedSwitchFiles(t, "codex", tc.targetKey, "shared@example.test", old)["auth.json"])
+			v, fs, livePath := setupCodexRestore(t, target, live)
+			if CodexLiveIsNewer(livePath, v.BackupPath("codex", "acct", "auth.json")) {
+				t.Fatal("unused OAuth timestamps activated the renewal/replay guard")
+			}
+			if err := v.Restore(fs, "acct"); err != nil {
+				t.Fatal(err)
+			}
+			if got := readBytes(t, livePath); string(got) != string(target) {
+				t.Fatal("restore did not select the requested credential")
+			}
+		})
+	}
+}
+
 func TestCodexRestoreFreshnessRequiresConsistentWorkspace(t *testing.T) {
 	type identity struct {
 		accountID       string

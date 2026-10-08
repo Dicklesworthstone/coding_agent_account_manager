@@ -8,6 +8,13 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Switching honors the selected Codex or Gemini authentication method.** Leftover OAuth tokens in an API-key profile no longer cause activation to keep the wrong live login, or allow outgoing OAuth preservation to overwrite the saved API key. Discovery and Codex restore use the same account boundary, while newer credentials for the same OAuth account remain protected.
+- **Claude auth detection and import preserve native credentials.** Detection reads the path-scoped native authority without creating or updating a keychain mirror. An explicit `CLAUDE_CONFIG_DIR` keeps its own account, and a denied or malformed keychain read cannot silently select a stale file. `caam auth import claude` and first-run `caam init` can import a keychain-only login directly into the new profile while leaving native files and the keychain unchanged.
+
 ## [0.1.23] - 2026-10-07
 
 ### Changed

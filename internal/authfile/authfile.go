@@ -2593,9 +2593,8 @@ func CodexLiveIsNewer(livePath, snapshotPath string) bool {
 		return false
 	}
 
-	liveTS, liveOK := codexFreshness(liveData)
-	snapTS, snapOK := codexFreshness(snapData)
-	if !liveOK || !snapOK {
+	liveTS, snapTS := live.freshness, snapshot.freshness
+	if liveTS.IsZero() || snapTS.IsZero() {
 		return false // can't compare -> normal copy
 	}
 

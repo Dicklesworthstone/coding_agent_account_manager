@@ -117,6 +117,200 @@ func TestSwitchPreservesRotatedCodexCredential(t *testing.T) {
 	}
 }
 
+// Both modes deliberately retain the same OAuth identity. Native selection,
+// not the mere presence of that old cache, determines which grant is active.
+func selectedSwitchFiles(t *testing.T, tool, key, email string, stamp time.Time) map[string]string {
+	t.Helper()
+	grant := map[string]interface{}{
+		"access_token":  makeCodexJWT(t, email, stamp),
+		"id_token":      makeCodexJWT(t, email, stamp),
+		"refresh_token": "synthetic-shared-refresh",
+	}
+	files := make(map[string]string)
+	if tool == "codex" {
+		auth := map[string]interface{}{"auth_mode": "chatgpt", "tokens": grant, "last_refresh": stamp.Format(time.RFC3339)}
+		if key != "" {
+			auth["auth_mode"], auth["OPENAI_API_KEY"] = "apikey", key
+		}
+		data, err := json.Marshal(auth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["auth.json"] = string(data)
+	} else {
+		grant["expiry_date"] = stamp.UnixMilli()
+		data, err := json.Marshal(grant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["oauth_creds.json"] = string(data)
+		files["settings.json"] = `{"security":{"auth":{"selectedType":"oauth-personal"}}}`
+		if key != "" {
+			files["settings.json"] = `{"security":{"auth":{"selectedType":"gemini-api-key"}}}`
+			files[".env"] = "export GEMINI_API_KEY='" + key + "' # selected grant\n"
+		}
+	}
+	return files
+}
+
+func TestSwitchDoesNotOverwriteAnotherSelectedMethod(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		for _, selectedLive := range []bool{false, true} {
+			name := "oauth-live"
+			liveKey, savedKey := "", "synthetic-saved-key"
+			if selectedLive {
+				name, liveKey, savedKey = "key-live", "synthetic-live-key", ""
+			}
+			t.Run(tool+"/"+name, func(t *testing.T) {
+				live := selectedSwitchFiles(t, tool, liveKey, "shared@example.test", old.Add(time.Hour))
+				saved := selectedSwitchFiles(t, tool, savedKey, "shared@example.test", old)
+				target := selectedSwitchFiles(t, tool, "", "other@example.test", old)
+				v, fs, liveDir := discoveryFixture(t, tool, live)
+				writeSwitchProfile(t, v, tool, "saved", saved)
+				writeSwitchProfile(t, v, tool, "target", target)
+				result, err := v.Switch(fs, "target", SwitchOptions{})
+				if err != nil || result.ResnapshottedProfile != "" || result.PreviousProfile != "" || result.AutoBackup == "" || !result.RestoreStarted {
+					t.Fatalf("unused OAuth claimed ownership of another method: %+v, %v", result, err)
+				}
+				for file, want := range saved {
+					if got := readFixtureFile(t, v.BackupPath(tool, "saved", file)); got != want {
+						t.Fatalf("outgoing preservation overwrote saved %s", file)
+					}
+				}
+				for file, want := range live {
+					if got := readFixtureFile(t, v.BackupPath(tool, result.AutoBackup, file)); got != want {
+						t.Fatalf("outgoing %s was not retained in recovery", file)
+					}
+				}
+				for file, want := range target {
+					if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+						t.Fatalf("requested %s was not activated", file)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSwitchActivatesSelectedMethodDespiteUnusedOAuthFreshness(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		for _, tc := range []struct{ name, liveKey, targetKey string }{
+			{"oauth-to-key", "", "synthetic-target-key"},
+			{"key-to-oauth", "synthetic-live-key", ""},
+			{"different-key", "synthetic-live-key", "synthetic-target-key"},
+			{"same-key", "synthetic-same-key", "synthetic-same-key"},
+		} {
+			t.Run(tool+"/"+tc.name, func(t *testing.T) {
+				live := selectedSwitchFiles(t, tool, tc.liveKey, "shared@example.test", old.Add(time.Hour))
+				target := selectedSwitchFiles(t, tool, tc.targetKey, "shared@example.test", old)
+				v, fs, liveDir := discoveryFixture(t, tool, live)
+				writeSwitchProfile(t, v, tool, "target", target)
+				result, err := v.Switch(fs, "target", SwitchOptions{})
+				if err != nil || result.KeptLive || !result.RestoreStarted {
+					t.Fatalf("unused OAuth suppressed requested method: %+v, %v", result, err)
+				}
+				for file, want := range target {
+					if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+						t.Fatalf("selected target %s was not restored", file)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCurrentProfileMatchesSelectedKeyAcrossUnusedOAuthChurn(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		t.Run(tool, func(t *testing.T) {
+			live := selectedSwitchFiles(t, tool, "synthetic-selected-key", "new-cache@example.test", old.Add(time.Hour))
+			v, fs, _ := discoveryFixture(t, tool, live)
+			writeSwitchProfile(t, v, tool, "selected", selectedSwitchFiles(t, tool, "synthetic-selected-key", "old-cache@example.test", old))
+			writeSwitchProfile(t, v, tool, "other-key", selectedSwitchFiles(t, tool, "synthetic-other-key", "new-cache@example.test", old.Add(time.Hour)))
+			writeSwitchProfile(t, v, tool, "oauth", selectedSwitchFiles(t, tool, "", "new-cache@example.test", old.Add(time.Hour)))
+			owner, err := v.CurrentProfile(fs)
+			if err != nil || owner != "selected" {
+				t.Fatalf("current profile follows unused cache rather than selected key: %q, %v", owner, err)
+			}
+		})
+	}
+}
+
+func TestSwitchGeminiSelectedKeyIgnoresMalformedUnusedCache(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	live := selectedSwitchFiles(t, "gemini", "", "live@example.test", old.Add(time.Hour))
+	target := selectedSwitchFiles(t, "gemini", "synthetic-selected-key", "unused@example.test", old)
+	target["oauth_creds.json"] = "{"
+	v, fs, liveDir := discoveryFixture(t, "gemini", live)
+	writeSwitchProfile(t, v, "gemini", "target", target)
+	result, err := v.Switch(fs, "target", SwitchOptions{})
+	if err != nil || result.KeptLive || !result.RestoreStarted {
+		t.Fatalf("unused malformed cache blocked a complete selected key: %+v, %v", result, err)
+	}
+	for file, want := range target {
+		if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+			t.Fatalf("selected target %s was not restored", file)
+		}
+	}
+}
+
+func TestSwitchRetainsGenuineOAuthFreshnessProtection(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		t.Run(tool, func(t *testing.T) {
+			live := selectedSwitchFiles(t, tool, "", "shared@example.test", old.Add(time.Hour))
+			v, fs, liveDir := discoveryFixture(t, tool, live)
+			writeSwitchProfile(t, v, tool, "target", selectedSwitchFiles(t, tool, "", "shared@example.test", old))
+			result, err := v.Switch(fs, "target", SwitchOptions{})
+			if err != nil || !result.KeptLive || result.RestoreStarted {
+				t.Fatalf("same-OAuth freshness protection was lost: %+v, %v", result, err)
+			}
+			for file, want := range live {
+				if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+					t.Fatalf("newer native %s was replaced", file)
+				}
+			}
+		})
+	}
+}
+
+func TestSwitchRejectsSelectedKeyMissingItsCredential(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tool := range []string{"codex", "gemini"} {
+		t.Run(tool, func(t *testing.T) {
+			live := selectedSwitchFiles(t, tool, "", "live@example.test", old)
+			target := selectedSwitchFiles(t, tool, "synthetic-key", "live@example.test", old)
+			if tool == "codex" {
+				var auth map[string]interface{}
+				if err := json.Unmarshal([]byte(target["auth.json"]), &auth); err != nil {
+					t.Fatal(err)
+				}
+				delete(auth, "OPENAI_API_KEY")
+				data, err := json.Marshal(auth)
+				if err != nil {
+					t.Fatal(err)
+				}
+				target["auth.json"] = string(data)
+			} else {
+				delete(target, ".env")
+			}
+			v, fs, liveDir := discoveryFixture(t, tool, live)
+			writeSwitchProfile(t, v, tool, "target", target)
+			result, err := v.Switch(fs, "target", SwitchOptions{BackupMode: "always", PreserveOriginal: true})
+			if err == nil || result.KeptLive || result.RestoreStarted || result.AutoBackup != "" || result.OriginalBackup {
+				t.Fatalf("missing selected key borrowed unused OAuth: %+v, %v", result, err)
+			}
+			for file, want := range live {
+				if got := readFixtureFile(t, filepath.Join(liveDir, file)); got != want {
+					t.Fatalf("rejected target changed native %s", file)
+				}
+			}
+		})
+	}
+}
+
 func TestSwitchPreservesRotatedClaudeCredential(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))

@@ -928,6 +928,54 @@ func quietWatcherConfig(providers []string, events chan<- string) WatcherConfig 
 		}}
 }
 
+func TestWatcherCapturesGeminiSelectorOnlyChanges(t *testing.T) {
+	for _, selectedAPI := range []bool{false, true} {
+		name := "key-to-oauth"
+		beforeMode, afterMode := "gemini-api-key", "oauth-personal"
+		if selectedAPI {
+			name, beforeMode, afterMode = "oauth-to-key", "oauth-personal", "gemini-api-key"
+		}
+		t.Run(name, func(t *testing.T) {
+			vault, home := watcherFixture(t)
+			dir := filepath.Join(home, ".gemini")
+			settings := func(mode string) string { return `{"selectedAuthType":"` + mode + `"}` }
+			writeWatcherFile(t, filepath.Join(dir, "settings.json"), settings(beforeMode))
+			writeWatcherFile(t, filepath.Join(dir, ".env"), "GEMINI_API_KEY=synthetic-selected-key\n")
+			writeWatcherFile(t, filepath.Join(dir, "oauth_creds.json"), `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","email":"oauth@example.test"}`)
+			events := make(chan string, 8)
+			watcher, err := NewWatcher(vault, quietWatcherConfig([]string{"gemini"}, events))
+			require.NoError(t, err)
+			require.NoError(t, watcher.Start(context.Background()))
+			t.Cleanup(func() { require.NoError(t, watcher.Stop()) })
+			next := func() string {
+				t.Helper()
+				select {
+				case event := <-events:
+					provider, profile, ok := strings.Cut(event, "/")
+					require.True(t, ok)
+					require.Equal(t, "gemini", provider)
+					return profile
+				case <-time.After(5 * time.Second):
+					t.Fatal("watcher did not capture the selected Gemini method")
+					return ""
+				}
+			}
+			previous := next()
+			// OAuth and dotenv bytes do not change; the settings selector is
+			// the only filesystem event which can discover the other grant.
+			writeWatcherFile(t, filepath.Join(dir, "settings.json"), settings(afterMode))
+			current := next()
+			require.NotEqual(t, previous, current)
+			require.NoError(t, watcher.Stop())
+			require.Equal(t, settings(beforeMode), readWatcherFile(t, vault.BackupPath("gemini", previous, "settings.json")))
+			require.Equal(t, settings(afterMode), readWatcherFile(t, vault.BackupPath("gemini", current, "settings.json")))
+			profiles, err := vault.List("gemini")
+			require.NoError(t, err)
+			require.Len(t, profiles, 2)
+		})
+	}
+}
+
 func TestWatcherRoutesSharedBasenamesToTheirExactProviders(t *testing.T) {
 	vault, home := watcherFixture(t)
 	providers := []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}

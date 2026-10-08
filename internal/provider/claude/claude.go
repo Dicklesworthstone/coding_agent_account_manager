@@ -33,6 +33,7 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -42,9 +43,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -650,11 +651,11 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		Locations: []provider.AuthLocation{},
 	}
 
-	// On macOS the OAuth blob lives in the login keychain; ~/.claude/.credentials.json
-	// is its mirror. Refresh it or detection reports "no credentials found"
-	// for a perfectly good login (issue #98).
+	// Capture native authority without creating a keychain mirror. The shared
+	// reader also keeps an explicit CLAUDE_CONFIG_DIR isolated from the default
+	// login keychain and refuses to substitute a stale mirror after a denied read.
 	files := p.AuthFiles()
-	_, _ = keychain.EnsureMirror(files[0].Path)
+	credentialName, credential, captureErr := authfile.ReadLiveCredential(authfile.ClaudeAuthFiles())
 
 	// Define locations to check
 	locations := []struct {
@@ -679,8 +680,6 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		},
 	}
 
-	var mostRecent *provider.AuthLocation
-
 	for _, loc := range locations {
 		authLoc := provider.AuthLocation{
 			Path:        loc.path,
@@ -689,39 +688,52 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 
 		info, err := os.Stat(loc.path)
 		if err != nil {
-			if os.IsNotExist(err) {
-				authLoc.Exists = false
-			} else {
+			if !os.IsNotExist(err) {
 				authLoc.ValidationError = fmt.Sprintf("stat error: %v", err)
 			}
-			detection.Locations = append(detection.Locations, authLoc)
-			continue
+		} else {
+			authLoc.Exists = true
+			authLoc.LastModified = info.ModTime()
+			authLoc.FileSize = info.Size()
 		}
 
-		authLoc.Exists = true
-		authLoc.LastModified = info.ModTime()
-		authLoc.FileSize = info.Size()
-
-		hasAuth, err := claudeDocumentHasAuth(loc.path)
-		authLoc.IsValid = err == nil && hasAuth
-		if err != nil {
-			authLoc.ValidationError = fmt.Sprintf("invalid auth: %v", err)
-		} else if !hasAuth {
-			authLoc.ValidationError = "no credential material in document"
+		selected := captureErr == nil && filepath.Base(loc.path) == credentialName
+		if selected || authLoc.Exists {
+			var hasAuth bool
+			if selected {
+				// Exists refers to the captured source here: a keychain-only
+				// login can be imported through this canonical path without a
+				// mirror ever being materialized by discovery.
+				if !authLoc.Exists {
+					authLoc.Description += " (captured from native credential store)"
+				}
+				authLoc.Exists = true
+				authLoc.FileSize = int64(len(credential))
+				hasAuth, err = claudeDocumentBytesHaveAuth(credentialName, credential)
+			} else {
+				hasAuth, err = claudeDocumentHasAuth(loc.path)
+			}
+			authLoc.IsValid = err == nil && hasAuth
+			if err != nil {
+				authLoc.ValidationError = fmt.Sprintf("invalid auth: %v", err)
+			} else if !hasAuth {
+				authLoc.ValidationError = "no credential material in document"
+			}
 		}
 		detection.Locations = append(detection.Locations, authLoc)
 
-		// Track most recent valid auth
-		if authLoc.Exists && authLoc.IsValid {
+		// Native precedence, rather than unrelated file mtimes, determines
+		// which account is live. An invalid primary cannot revive a stale login.
+		if selected && authLoc.IsValid {
 			detection.Found = true
-			if mostRecent == nil || authLoc.LastModified.After(mostRecent.LastModified) {
-				locCopy := authLoc // Copy to avoid pointer issues
-				mostRecent = &locCopy
-			}
+			locCopy := authLoc
+			detection.Primary = &locCopy
 		}
 	}
 
-	detection.Primary = mostRecent
+	if captureErr != nil && !errors.Is(captureErr, authfile.ErrNoCredentials) {
+		return detection, fmt.Errorf("capture native Claude authentication: %w", captureErr)
+	}
 
 	// Set warning if multiple valid auth files found
 	validCount := 0
@@ -731,7 +743,7 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 		}
 	}
 	if validCount > 1 {
-		detection.Warning = "multiple auth files found; using most recent"
+		detection.Warning = "multiple auth files found; using the native credential source"
 	}
 
 	return detection, nil
@@ -739,13 +751,30 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 
 // ImportAuth imports detected auth files into a profile directory.
 func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
-	// Validate source file exists
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		return nil, fmt.Errorf("source auth file not found: %w", err)
-	}
-	if info.IsDir() {
-		return nil, fmt.Errorf("source path is a directory, not a file")
+	// The canonical native primary follows native authority, including a
+	// keychain-only login. Arbitrary explicit files remain file-only imports.
+	var captured []byte
+	if filepath.Clean(sourcePath) == filepath.Clean(p.AuthFiles()[0].Path) {
+		name, data, err := authfile.ReadLiveCredential(authfile.ClaudeAuthFiles())
+		if err != nil {
+			return nil, fmt.Errorf("capture native Claude authentication: %w", err)
+		}
+		if name != ".credentials.json" {
+			return nil, fmt.Errorf("native Claude primary credential is unavailable")
+		}
+		hasAuth, err := claudeDocumentBytesHaveAuth(name, data)
+		if err != nil || !hasAuth {
+			return nil, fmt.Errorf("native Claude primary does not contain usable authentication")
+		}
+		captured = data
+	} else {
+		info, err := os.Stat(sourcePath)
+		if err != nil {
+			return nil, fmt.Errorf("source auth file not found: %w", err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("source path is a directory, not a file")
+		}
 	}
 	configDir, err := effectiveClaudeConfigDir(prof)
 	if err != nil {
@@ -766,9 +795,11 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 	// Determine target based on source file type
 	basename := filepath.Base(sourcePath)
 	if basename == ".credentials.json" || basename == "auth.json" || basename == "settings.json" || basename == ".claude.json" {
-		hasAuth, err := claudeDocumentHasAuth(sourcePath)
-		if err != nil || !hasAuth {
-			return nil, fmt.Errorf("source does not contain usable Claude authentication: %s", basename)
+		if captured == nil {
+			hasAuth, err := claudeDocumentHasAuth(sourcePath)
+			if err != nil || !hasAuth {
+				return nil, fmt.Errorf("source does not contain usable Claude authentication: %s", basename)
+			}
 		}
 		ignoredDir, ignoredState := claudeLegacyDirForProfile(prof), legacyClaudeStatePath(prof)
 		if configDir == ignoredDir {
@@ -780,6 +811,10 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 			return nil, err
 		}
 		sourceID, ignoredID := claudeDirAccountID(filepath.Dir(sourcePath)), claudeDirAccountID(ignoredDir)
+		if captured != nil {
+			creds, _ := parseClaudeCredentials(captured)
+			sourceID = creds.ClaudeAiOauth.AccountID
+		}
 		if ignoredAuth && sourceID != "" && ignoredID != "" && sourceID != ignoredID {
 			return nil, fmt.Errorf("import would create conflicting Claude accounts in legacy and XDG config directories")
 		}
@@ -792,8 +827,14 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 			return nil, fmt.Errorf("create Claude config dir: %w", err)
 		}
 		targetPath := filepath.Join(configDir, ".credentials.json")
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return nil, fmt.Errorf("copy .credentials.json: %w", err)
+		if captured != nil {
+			if err := atomicWriteFile(targetPath, captured, 0600); err != nil {
+				return nil, fmt.Errorf("import native .credentials.json: %w", err)
+			}
+		} else {
+			if err := copyFile(sourcePath, targetPath); err != nil {
+				return nil, fmt.Errorf("copy .credentials.json: %w", err)
+			}
 		}
 		copiedFiles = append(copiedFiles, targetPath)
 
@@ -1203,11 +1244,15 @@ func claudeDocumentHasAuth(path string) (bool, error) {
 	if err != nil || data == nil {
 		return false, err
 	}
+	return claudeDocumentBytesHaveAuth(filepath.Base(path), data)
+}
+
+func claudeDocumentBytesHaveAuth(name string, data []byte) (bool, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
-		return false, fmt.Errorf("%s must contain a JSON object", filepath.Base(path))
+		return false, fmt.Errorf("%s must contain a JSON object", name)
 	}
-	switch filepath.Base(path) {
+	switch name {
 	case ".credentials.json":
 		creds, err := parseClaudeCredentials(data)
 		if err != nil {

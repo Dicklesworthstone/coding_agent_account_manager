@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,8 +14,10 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
 
 // =============================================================================
@@ -1229,6 +1232,181 @@ func TestDetectExistingAuth(t *testing.T) {
 			t.Error("Should have validation error")
 		}
 	})
+}
+
+func TestDetectExistingAuthReadOnlyNativeAuthority(t *testing.T) {
+	const keychainA = `{"claudeAiOauth":{"accessToken":"keychain-access-A","refreshToken":"keychain-refresh-A","expiresAt":4102444800000,"accountId":"account-A"}}`
+	const configuredB = `{"claudeAiOauth":{"accessToken":"configured-access-B","expiresAt":4102444800000,"accountId":"account-B"}}`
+	for _, tc := range []struct {
+		name           string
+		configured     bool
+		defaultDir     bool
+		mirror         string
+		item           string
+		locked         bool
+		unavailable    bool
+		legacy         bool
+		wantFound      bool
+		wantErr        bool
+		wantCredential string
+	}{
+		{name: "explicit_directory_keeps_B", configured: true, mirror: configuredB, item: keychainA, wantFound: true, wantCredential: configuredB},
+		{name: "explicit_directory_does_not_inherit_A", configured: true, item: keychainA},
+		{name: "explicit_default_directory_still_isolated", configured: true, defaultDir: true, item: keychainA},
+		{name: "default_keychain_only", item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_stale_mirror", mirror: configuredB, item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_malformed_mirror", mirror: "{invalid", item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_newer_legacy_account", item: keychainA, legacy: true, wantFound: true, wantCredential: keychainA},
+		{name: "missing_item_uses_file", mirror: configuredB, wantFound: true, wantCredential: configuredB},
+		{name: "missing_item_no_file"},
+		{name: "unavailable_keychain_uses_file", unavailable: true, mirror: configuredB, wantFound: true, wantCredential: configuredB},
+		{name: "unavailable_keychain_no_file", unavailable: true},
+		{name: "denied_keychain_cannot_use_stale_mirror", locked: true, item: keychainA, mirror: configuredB, wantErr: true},
+		{name: "malformed_keychain_cannot_use_stale_mirror", item: "{invalid", mirror: configuredB, wantErr: true},
+		{name: "empty_keychain_grant_cannot_use_stale_mirror", item: `{"claudeAiOauth":null}`, mirror: configuredB},
+		{name: "malformed_file_cannot_use_legacy_account", mirror: "{invalid", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			items := testutil.FakeKeychain(t)
+			if tc.item != "" {
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), tc.item)
+			}
+			if tc.locked {
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			if tc.unavailable {
+				bin := filepath.Join(t.TempDir(), "security")
+				const script = "#!/bin/sh\necho 'security: A default keychain could not be found.' >&2\nexit 44\n"
+				if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CAAM_KEYCHAIN_BIN", bin)
+			}
+			dir := filepath.Join(home, ".claude")
+			if tc.configured {
+				if !tc.defaultDir {
+					dir = filepath.Join(home, "configured-B")
+				}
+				t.Setenv("CLAUDE_CONFIG_DIR", dir)
+			}
+			path := filepath.Join(dir, ".credentials.json")
+			stamp := time.Unix(1700000000, 0)
+			if tc.mirror != "" {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tc.mirror), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(path, stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.legacy {
+				writeJSON(t, filepath.Join(home, ".claude.json"), map[string]string{"oauthToken": "legacy-account-B"})
+			}
+			for i := 0; i < 2; i++ {
+				detection, err := New().DetectExistingAuth()
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("DetectExistingAuth error = %v, want error %v", err, tc.wantErr)
+				}
+				if tc.locked && !errors.Is(err, keychain.ErrDenied) {
+					t.Fatalf("denied keychain error = %v", err)
+				}
+				if detection == nil || detection.Found != tc.wantFound {
+					t.Fatalf("detection = %+v, want Found %v", detection, tc.wantFound)
+				}
+				if tc.wantFound {
+					loc := detection.Primary
+					if loc == nil || loc.Path != path || !loc.Exists || !loc.IsValid || loc.FileSize != int64(len(tc.wantCredential)) {
+						t.Fatalf("detection did not select the captured native credential: %+v", loc)
+					}
+				} else if detection.Primary != nil {
+					t.Fatal("unavailable authentication selected a stale primary")
+				}
+				data, err := os.ReadFile(path)
+				if tc.mirror == "" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("discovery materialized a native mirror: %v", err)
+					}
+				} else {
+					if err != nil || string(data) != tc.mirror {
+						t.Fatalf("discovery changed the native credential: %v", err)
+					}
+					info, err := os.Stat(path)
+					if err != nil || !info.ModTime().Equal(stamp) || info.Mode().Perm() != 0600 {
+						t.Fatalf("discovery changed native credential metadata: %v", err)
+					}
+				}
+				if item, exists := testutil.FakeKeychainRead(t, items, keychain.ClaudeService); item != tc.item || exists != (tc.item != "") {
+					t.Fatal("discovery changed the authoritative keychain item")
+				}
+			}
+		})
+	}
+}
+
+func TestImportAuthRecapturesNativeAuthority(t *testing.T) {
+	const initial = `{"claudeAiOauth":{"accessToken":"initial-grant","expiresAt":4102444800000,"accountId":"account-A"}}`
+	const current = `{"claudeAiOauth":{"accessToken":"current-grant","expiresAt":4102444800000,"accountId":"account-B"}}`
+	for _, mode := range []string{"rotated_keychain", "denied_keychain", "malformed_keychain", "explicit_file"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			items := testutil.FakeKeychain(t)
+			testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), initial)
+			p := New()
+			detection, err := p.DetectExistingAuth()
+			if err != nil || detection == nil || !detection.Found || detection.Primary == nil {
+				t.Fatalf("detect keychain-only login: %v, %+v", err, detection)
+			}
+			source := detection.Primary.Path
+			wantErr := false
+			switch mode {
+			case "rotated_keychain":
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), current)
+			case "denied_keychain":
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+				wantErr = true
+			case "malformed_keychain":
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), `{"claudeAiOauth":{"accessToken":null}}`)
+				wantErr = true
+			case "explicit_file":
+				source = filepath.Join(t.TempDir(), ".credentials.json")
+				if err := os.WriteFile(source, []byte(current), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prof := &profile.Profile{Name: "imported", Provider: "claude", BasePath: t.TempDir()}
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			files, err := p.ImportAuth(context.Background(), source, prof)
+			if (err != nil) != wantErr {
+				t.Fatalf("ImportAuth error = %v, want error %v", err, wantErr)
+			}
+			target := filepath.Join(claudeConfigDirForProfile(prof), ".credentials.json")
+			data, readErr := os.ReadFile(target)
+			if wantErr {
+				if len(files) != 0 || !os.IsNotExist(readErr) {
+					t.Fatal("failed native capture published a profile credential")
+				}
+			} else if readErr != nil || string(data) != current || len(files) != 1 || files[0] != target {
+				t.Fatalf("import did not capture the selected current credential: %v", readErr)
+			}
+			if _, err := os.Stat(detection.Primary.Path); !os.IsNotExist(err) {
+				t.Fatalf("detection or import materialized a native mirror: %v", err)
+			}
+		})
+	}
 }
 
 // =============================================================================
