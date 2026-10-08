@@ -722,7 +722,7 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 		}
 	}
 	if fileSet.Tool == "gemini" {
-		settings, err := readPoolCredentialFile(filepath.Join(dir, "settings.json"))
+		settings, err := readPoolCredentialFile(filepath.Join(dir, "settings.json"), authfile.MaxDiscoveryFileBytes)
 		if err != nil && !os.IsNotExist(err) {
 			return "", fmt.Errorf("invalid saved Gemini settings")
 		}
@@ -748,7 +748,11 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 	for _, spec := range files {
 		filename := filepath.Base(spec.Path)
 		path := filepath.Join(dir, filename)
-		data, err := readPoolCredentialFile(path)
+		limit := authfile.MaxDiscoveryFileBytes
+		if fileSet.Tool == "claude" && (filename == ".claude.json" || filename == "settings.json") {
+			limit = authfile.MaxSettingsDocumentBytes // per-project state grows with use (#120)
+		}
+		data, err := readPoolCredentialFile(path, limit)
 		if os.IsNotExist(err) {
 			continue
 		}
@@ -812,21 +816,21 @@ func (p *AuthPool) vaultCredentialGeneration(fileSet authfile.AuthFileSet, name 
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
-func readPoolCredentialFile(path string) ([]byte, error) {
+func readPoolCredentialFile(path string, limit int64) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
+	if !info.Mode().IsRegular() || info.Size() > limit {
 		return nil, fmt.Errorf("invalid saved auth source")
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
+	data, readErr := io.ReadAll(io.LimitReader(f, limit+1))
 	closeErr := f.Close()
-	if readErr != nil || closeErr != nil || int64(len(data)) > authfile.MaxDiscoveryFileBytes {
+	if readErr != nil || closeErr != nil || int64(len(data)) > limit {
 		return nil, fmt.Errorf("unreadable saved auth source")
 	}
 	return data, nil
