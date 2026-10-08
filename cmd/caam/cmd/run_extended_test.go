@@ -392,6 +392,23 @@ func TestRunDoesNotWaitForOpenStdinPipe(t *testing.T) {
 	require.Len(t, readRunInvocations(t, logPath), 1)
 }
 
+func TestRunInputReplayable(t *testing.T) {
+	regular, err := os.CreateTemp(t.TempDir(), "prompt")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = regular.Close() })
+	null, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = null.Close() })
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close() })
+
+	require.True(t, runInputReplayable(strings.NewReader("prompt")), "in-memory input is finite")
+	require.True(t, runInputReplayable(regular), "a redirected regular file is finite")
+	require.True(t, runInputReplayable(null), "/dev/null is finite; retries must keep working")
+	require.False(t, runInputReplayable(r), "a pipe may never close")
+}
+
 func setupHeadlessRun(t *testing.T, settings, mode string) (*cobra.Command, *bytes.Buffer, *bytes.Buffer, string, string) {
 	t.Helper()
 	root := t.TempDir()

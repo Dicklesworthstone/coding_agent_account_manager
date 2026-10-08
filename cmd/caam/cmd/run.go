@@ -442,7 +442,16 @@ func runInputReplayable(input io.Reader) bool {
 		return true
 	}
 	info, err := file.Stat()
-	return err == nil && info.Mode().IsRegular()
+	if err != nil {
+		return false
+	}
+	if info.Mode().IsRegular() {
+		return true
+	}
+	// /dev/null is finite too (systemd, ssh -n, `< /dev/null`); replaying its
+	// zero bytes keeps rate-limit retries working.
+	null, err := os.Stat(os.DevNull)
+	return err == nil && os.SameFile(info, null)
 }
 
 // runUsesHeadless recognizes native batch forms even when launched from a
