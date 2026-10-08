@@ -577,7 +577,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	a.server = &http.Server{
 		Addr:         addr,
-		Handler:      a.withLogging(mux),
+		Handler:      a.withLogging(loopbackOnly(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 120 * time.Second, // Long timeout for OAuth
 	}
@@ -1018,6 +1018,10 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "url required", http.StatusBadRequest)
 		return
 	}
+	if err := validateAuthorizeURL(req.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	account, code, usedAccount, err := a.runOAuth(r.Context(), req.URL, req.Account, nil)
 	if err != nil {
@@ -1033,6 +1037,34 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 		Code:    code,
 		Account: usedAccount,
 	})
+}
+
+// loopbackOnly rejects requests whose Host header names anything but a
+// loopback address. The agent listens on 127.0.0.1, but a web page can still
+// reach it through DNS rebinding, and then sends its own host name.
+func loopbackOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHost(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackHost reports whether a Host header value (host or host:port)
+// names localhost or a loopback IP such as 127.0.0.1 or [::1].
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Helpers

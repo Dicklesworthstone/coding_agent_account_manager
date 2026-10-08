@@ -422,3 +422,65 @@ func TestLimitResetTime(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAuthorizeURL(t *testing.T) {
+	for _, tc := range []struct {
+		url string
+		ok  bool
+	}{
+		{"https://claude.ai/oauth/authorize?code=true&client_id=c&state=st", true},
+		{"https://claude.com/cai/oauth/authorize?code=true&state=st", true},
+		{"https://CLAUDE.AI/oauth/authorize", true},
+		{"http://claude.ai/oauth/authorize", false},
+		{"https://evil.example/oauth/authorize", false},
+		{"https://claude.ai.evil.example/oauth/authorize", false},
+		{"https://sub.claude.ai/oauth/authorize", false},
+		{"https://claude.ai:8443/oauth/authorize", false},
+		{"https://user@claude.ai/oauth/authorize", false},
+		{"https://claude.ai/login", false},
+		{"https://claude.ai/oauth/authorize/../../logout", false},
+		{"javascript:alert(1)", false},
+	} {
+		if err := validateAuthorizeURL(tc.url); (err == nil) != tc.ok {
+			t.Errorf("validateAuthorizeURL(%q) = %v, want ok=%v", tc.url, err, tc.ok)
+		}
+	}
+}
+
+func TestAuthEndpointsRejectNonClaudeAuthorizeURL(t *testing.T) {
+	for name, handle := range map[string]func(http.ResponseWriter, *http.Request){
+		"single": (&Agent{}).handleAuth,
+		"multi":  (&MultiAgent{}).handleAuth,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/auth", strings.NewReader(`{"url":"https://evil.example/oauth/authorize"}`))
+		handle(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: POST /auth with a foreign URL = %d, want 400", name, rec.Code)
+		}
+	}
+}
+
+func TestLoopbackOnlyRejectsForeignHostHeader(t *testing.T) {
+	h := loopbackOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for host, want := range map[string]int{
+		"127.0.0.1:7891":          http.StatusNoContent,
+		"localhost:7891":          http.StatusNoContent,
+		"[::1]:7891":              http.StatusNoContent,
+		"127.0.0.1":               http.StatusNoContent,
+		"evil.example:7891":       http.StatusForbidden,
+		"127.0.0.1.nip.io:7891":   http.StatusForbidden,
+		"attacker.localhost.test": http.StatusForbidden,
+		"":                        http.StatusForbidden,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		req.Host = host
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("Host %q = %d, want %d", host, rec.Code, want)
+		}
+	}
+}

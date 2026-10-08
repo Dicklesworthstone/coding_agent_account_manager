@@ -461,6 +461,24 @@ func onClaudeAuthorize(rawURL string) bool {
 	return isClaudeHost(u.Hostname()) && strings.Contains(u.Path, "/oauth/authorize")
 }
 
+// authorizePath matches the path of a Claude OAuth authorize URL, with the
+// optional leading segments the coordinator also accepts (/cai/oauth/authorize).
+var authorizePath = regexp.MustCompile(`^(?:/[A-Za-z0-9_-]+)*/oauth/authorize$`)
+
+// validateAuthorizeURL admits only a Claude OAuth authorize URL to the auth
+// endpoints: https, host exactly claude.ai or claude.com, no port or user info,
+// and an authorize path. Anything else is refused before Chrome opens it.
+func validateAuthorizeURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err == nil && u.Scheme == "https" && u.User == nil && u.Port() == "" {
+		host := strings.ToLower(u.Hostname())
+		if (host == "claude.ai" || host == "claude.com") && authorizePath.MatchString(u.Path) {
+			return nil
+		}
+	}
+	return fmt.Errorf("url must be a https://claude.ai or https://claude.com OAuth authorize URL")
+}
+
 // onGoogleSignIn reports whether rawURL is on Google's account sign-in host.
 func onGoogleSignIn(rawURL string) bool {
 	u, err := url.Parse(rawURL)

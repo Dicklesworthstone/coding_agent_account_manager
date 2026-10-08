@@ -517,7 +517,7 @@ func (a *MultiAgent) Start(ctx context.Context) error {
 
 	a.server = &http.Server{
 		Addr:         addr,
-		Handler:      a.withLogging(mux),
+		Handler:      a.withLogging(loopbackOnly(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 120 * time.Second,
 	}
@@ -1045,6 +1045,10 @@ func (a *MultiAgent) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	if req.URL == "" {
 		http.Error(w, "url required", http.StatusBadRequest)
+		return
+	}
+	if err := validateAuthorizeURL(req.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
