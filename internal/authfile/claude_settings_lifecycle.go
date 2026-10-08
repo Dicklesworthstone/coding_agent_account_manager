@@ -139,6 +139,10 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 	}
 	identitySources := make(map[string][]byte)
 	liveState := claudeFileSetPath(fileSet, claudeSettingsFile)
+	if liveState != "" {
+		// Keyed like the batch destinations, which resolve parent symlinks.
+		liveState = resolveLiveParent(liveState)
+	}
 	for _, path := range []string{liveState, filepath.Join(profileDir, claudeSettingsFile), filepath.Join(profileDir, "meta.json")} {
 		if path == "" {
 			continue

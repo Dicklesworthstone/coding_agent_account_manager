@@ -101,7 +101,9 @@ func prepareClaudeKeychainPublication(fileSet AuthFileSet) (*claudeRestoreAuthor
 	if path == "" {
 		return nil, nil
 	}
-	authority, err := prepareClaudeRestoreAuthority(path, readClaudeKeychainForPublication, func(data []byte) error {
+	// The restore batch matches its credential destination against this path,
+	// and that destination has its parent symlinks resolved (#120).
+	authority, err := prepareClaudeRestoreAuthority(resolveLiveParent(path), readClaudeKeychainForPublication, func(data []byte) error {
 		keychain.ForgetMirrors()
 		if data == nil {
 			return keychain.DeleteClaude()
