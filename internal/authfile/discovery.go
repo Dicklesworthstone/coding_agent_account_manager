@@ -31,7 +31,11 @@ const MaxSettingsDocumentBytes int64 = 256 << 20
 // artifact without reading or modifying its source. Callers that import a
 // complete bundle must also validate the provider's selected runtime layout.
 func ValidateCredentialData(tool, filename string, data []byte) error {
-	if int64(len(data)) > MaxDiscoveryFileBytes {
+	limit := MaxDiscoveryFileBytes
+	if isClaudeSettingsDocument(tool, filename) {
+		limit = MaxSettingsDocumentBytes // per-project state grows with use (#120)
+	}
+	if int64(len(data)) > limit {
 		return fmt.Errorf("%w: credential file exceeds size limit", ErrInvalidCredentials)
 	}
 	material, err := discoveryMaterial(tool, filepath.Base(filename), data)

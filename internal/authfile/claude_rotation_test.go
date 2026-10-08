@@ -7,6 +7,7 @@ package authfile
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -599,6 +600,15 @@ func TestClaudeBackupAcceptsLargeStateDocument(t *testing.T) {
 	}
 	if got := readFixtureFile(t, f.profileFile("alice", ".claude.json")); got != string(big) {
 		t.Fatalf("saved ~/.claude.json is %d bytes, want %d", len(got), len(big))
+	}
+
+	// The auth pool validates saved files the same way: a large state document
+	// carries no credential (skipped), it is not invalid material.
+	if err := ValidateCredentialData("claude", ".claude.json", big); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("ValidateCredentialData(large .claude.json) = %v, want ErrNoCredentials", err)
+	}
+	if err := ValidateCredentialData("claude", ".credentials.json", make([]byte, MaxDiscoveryFileBytes+1)); err == nil {
+		t.Fatal("ValidateCredentialData accepted an oversized credential file")
 	}
 
 	if err := os.Truncate(f.liveCreds, MaxDiscoveryFileBytes+1); err != nil {
