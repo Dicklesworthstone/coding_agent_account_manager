@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNativeCredentialLocatorsStayInSelectedFile(t *testing.T) {
@@ -82,7 +83,8 @@ func nativeLiveAuth(t *testing.T, provider, account, email, marker string) []byt
 		}
 		value = map[string]string{"accessToken": "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".SYNTHETIC"}
 	} else {
-		entry := map[string]string{"access_token": "SYNTHETIC-" + marker, "refresh_token": "SYNTHETIC-RENEWAL-" + marker}
+		entry := map[string]string{"access_token": "SYNTHETIC-" + marker, "refresh_token": "SYNTHETIC-RENEWAL-" + marker,
+			"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)}
 		if account != "" {
 			entry["user_id"] = account
 		}

@@ -135,6 +135,13 @@ func refreshAllForTool(ctx context.Context, tool string, threshold time.Duration
 }
 
 func refreshTool(ctx context.Context, tool string, threshold time.Duration, dryRun, force, quiet bool) (refreshed, skipped, failed int, err error) {
+	if tool == "grok" && !dryRun {
+		// Grok renews its own login, so "refresh" means re-syncing saved
+		// snapshots from the live home (no token exchange, no Grok run).
+		if n := syncGrokVaultFromLive(ctx, vault, os.Stderr); n > 0 && !quiet {
+			fmt.Printf("  grok: synced %d saved profile(s) from the live login\n", n)
+		}
+	}
 	profiles, err := vault.List(tool)
 	if err != nil {
 		return 0, 0, 0, err

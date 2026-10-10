@@ -17,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keepalive"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
@@ -666,6 +667,24 @@ func (d *Daemon) checkAndBackup() {
 	}
 }
 
+// syncGrokVaultFromLive keeps saved Grok snapshots current. Grok renews its own
+// login, so the daemon only copies the newer live credential into snapshots of
+// the same account; it never runs Grok or exchanges a refresh token.
+func (d *Daemon) syncGrokVaultFromLive() {
+	if d.vault == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	results, err := keepalive.SyncVaultFromLive(ctx, d.vault, keepalive.DiscoverOptions{})
+	if err != nil {
+		d.logger.Printf("Grok vault sync failed: %v", err)
+	}
+	if n := keepalive.Synced(results); n > 0 {
+		d.logger.Printf("Grok vault sync: updated %d saved profile(s) from the live login", n)
+	}
+}
+
 // checkAndRefresh checks all profiles and refreshes those that need it.
 func (d *Daemon) checkAndRefresh() {
 	d.mu.Lock()
@@ -676,6 +695,8 @@ func (d *Daemon) checkAndRefresh() {
 	if d.isVerbose() {
 		d.logger.Println("Checking profiles for refresh...")
 	}
+
+	d.syncGrokVaultFromLive()
 
 	providers := []string{"claude", "codex", "gemini", "grok", "cursor"}
 	var totalChecked int64

@@ -45,7 +45,8 @@ func setupGrokResetProfiles(t *testing.T) (map[string]string, time.Time) {
 		"fresh": "SYNTHETIC-FRESH", "spent": "SYNTHETIC-SPENT", "malformed": "SYNTHETIC-MALFORMED",
 	} {
 		writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("grok", name), "auth.json"),
-			fmt.Sprintf(`{"key":%q,"email":%q}`, key, name+"@example.com"))
+			fmt.Sprintf(`{"key":%q,"email":%q,"expires_at":%q}`, key, name+"@example.com",
+				time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339)))
 	}
 	now := time.Now().UTC()
 	reset := now.Add(7 * 24 * time.Hour)

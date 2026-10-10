@@ -216,6 +216,11 @@ func runLimits(cmd *cobra.Command, args []string) error {
 
 	vaultDir := getVaultDir()
 	out := cmd.OutOrStdout()
+	if (source == "" || source == credNamespaceVault) && !cached && containsProvider(providers, "grok") {
+		// Grok renews its own login; refresh the saved snapshot from it first
+		// so the probe sees the current credential (local files only).
+		syncGrokVaultFromLive(ctx, authfile.NewVault(vaultDir), cmd.ErrOrStderr())
+	}
 	lookup := buildCredentialLookup(vaultDir)
 	now := time.Now()
 	var sourceNotes []string
@@ -1085,4 +1090,13 @@ func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.Profile
 			})
 		}
 	}
+}
+
+func containsProvider(providers []string, name string) bool {
+	for _, p := range providers {
+		if p == name {
+			return true
+		}
+	}
+	return false
 }
