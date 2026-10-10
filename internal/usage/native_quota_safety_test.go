@@ -421,7 +421,11 @@ func TestGrokStagesOnlyCredentialsAndIsolatesConfig(t *testing.T) {
 	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "GROK_AUTH", "GROK_AUTH_PATH", "GROK_API_KEY", "GROK_DEPLOYMENT_KEY", "XAI_API_KEY", "XAI_API_TOKEN"} {
 		t.Setenv(key, "SYNTHETIC-AMBIENT")
 	}
-	for _, entry := range grokChildEnv(stage) {
+	guardDir, err := grokBrowserGuardDir(stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range grokChildEnv(stage, guardDir) {
 		if strings.Contains(entry, "SYNTHETIC-AMBIENT") {
 			t.Errorf("ambient configuration/credential inherited: %s", entry)
 		}
@@ -433,7 +437,7 @@ func TestGrokDeadlineClosesInheritedProtocolPipes(t *testing.T) {
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC"}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "grok")
@@ -486,7 +490,7 @@ func TestGrokBillingOnlyUsesReadProtocolAndLeavesCredentialUnchanged(t *testing.
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	auth := `{"key":"SYNTHETIC","email":"test@example.com"}`
+	auth := `{"key":"SYNTHETIC","email":"test@example.com","expires_at":"2099-01-01T00:00:00Z"}`
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(auth), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +584,7 @@ func TestGrokAuthRejectionClassification(t *testing.T) {
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC"}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "grok")
@@ -615,5 +619,258 @@ printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$CAAM_TEST_GROK_AUTH_ERRO
 				t.Fatal("error echoed provider credential text")
 			}
 		})
+	}
+}
+
+func TestGrokProbeReadyRejectsUnusableCredential(t *testing.T) {
+	now := time.Now()
+	valid := func(expires string) string {
+		return fmt.Sprintf(`{"https://auth.x.ai::client":{"key":"SYNTHETIC-ACCESS","expires_at":%q}}`, expires)
+	}
+	cases := []struct {
+		name string
+		auth string
+		want error // nil means usable
+	}{
+		{"valid dynamic-key", valid("2099-01-01T00:00:00Z"), nil},
+		{"valid flat", `{"access_token":"SYNTHETIC-ACCESS","expires_at":"2099-01-01T00:00:00Z"}`, nil},
+		{"expired", valid(now.Add(-time.Hour).Format(time.RFC3339)), errGrokNeedsLogin},
+		{"near expiry", valid(now.Add(10 * time.Minute).Format(time.RFC3339)), errGrokNeedsLogin},
+		{"missing access token", `{"https://auth.x.ai::client":{"expires_at":"2099-01-01T00:00:00Z"}}`, errGrokNeedsLogin},
+		{"no expiry", `{"https://auth.x.ai::client":{"key":"SYNTHETIC-ACCESS"}}`, errGrokNeedsLogin},
+		{"not an object", `[]`, errGrokNeedsLogin},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "auth.json")
+			if err := os.WriteFile(path, []byte(tc.auth), 0600); err != nil {
+				t.Fatal(err)
+			}
+			err := grokProbeReady(path, now)
+			if (err == nil) != (tc.want == nil) {
+				t.Fatalf("grokProbeReady = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestGrokFetcherSkipsCLIForUnusableCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	for _, tc := range []struct {
+		name    string
+		expires string
+	}{
+		{"expired", time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)},
+		{"near expiry", time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			auth := fmt.Sprintf(`{"key":"SYNTHETIC-ACCESS","expires_at":%q}`, tc.expires)
+			if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(auth), 0600); err != nil {
+				t.Fatal(err)
+			}
+			started := filepath.Join(t.TempDir(), "started")
+			t.Setenv("CAAM_TEST_GROK_STARTED", started)
+			bin := filepath.Join(t.TempDir(), "grok")
+			script := `#!/bin/sh
+touch "$CAAM_TEST_GROK_STARTED"
+`
+			if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() {
+				t.Fatalf("unusable credential reported quota: %+v", info)
+			}
+			if !strings.Contains(info.QuotaNote, "run grok") {
+				t.Fatalf("unusable credential note = %q, want a hint to run grok", info.QuotaNote)
+			}
+			if _, statErr := os.Stat(started); !os.IsNotExist(statErr) {
+				t.Fatal("grok binary was started for an unusable credential")
+			}
+		})
+	}
+}
+
+func TestGrokFetcherRejectsMissingCachedTokenMethod(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC-ACCESS","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	methods := filepath.Join(t.TempDir(), "methods")
+	t.Setenv("CAAM_TEST_GROK_METHODS", methods)
+	bin := filepath.Join(t.TempDir(), "grok")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  printf '%s\n' "$method" >> "$CAAM_TEST_GROK_METHODS"
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"authMethods":[{"id":"xai.api_key"},{"id":"grok.com"}]}}\n' "$id"
+      ;;
+    *) exit 1 ;;
+  esac
+done
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+	if err != nil || info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() || !strings.Contains(info.QuotaNote, "run grok") {
+		t.Fatalf("missing cached_token should be unavailable: %+v err=%v", info, err)
+	}
+	got, _ := os.ReadFile(methods)
+	if strings.TrimSpace(string(got)) != "initialize" {
+		t.Fatalf("authenticate was attempted after cached_token was absent: %q", got)
+	}
+}
+
+func TestGrokFetcherBoundsAuthenticateWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC-ACCESS","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "grok")
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"authMethods":[{"id":"cached_token"}]}}\n' "$id"
+      ;;
+    authenticate)
+      sleep 30
+      ;;
+    *) exit 1 ;;
+  esac
+done
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+	if err != nil || info.QuotaStatus != QuotaUnavailable {
+		t.Fatalf("hung authenticate should be unavailable: %+v err=%v", info, err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("authenticate wait was not bounded: %s", elapsed)
+	}
+}
+
+func TestGrokFetcherSuccessPathAdvertisesCachedToken(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell process fixture")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC-ACCESS","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	envLog := filepath.Join(t.TempDir(), "env")
+	t.Setenv("CAAM_TEST_GROK_ENV", envLog)
+	bin := filepath.Join(t.TempDir(), "grok")
+	script := `#!/bin/sh
+env | sort > "$CAAM_TEST_GROK_ENV"
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"authMethods":[{"id":"cached_token"},{"id":"grok.com"}]}}\n' "$id"
+      ;;
+    authenticate|session/new)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic"}}\n' "$id"
+      ;;
+    _x.ai/billing)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"config":{"creditUsagePercent":42.5}}}\n' "$id"
+      exit 0
+      ;;
+    *) exit 1 ;;
+  esac
+done
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := (&GrokFetcher{Bin: bin}).Fetch(context.Background(), home)
+	if err != nil || !info.NumericQuotaKnown() || info.PrimaryWindow.Utilization != 0.425 {
+		t.Fatalf("billing = %+v, err=%v", info, err)
+	}
+	raw, err := os.ReadFile(envLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envStr := string(raw)
+	if !strings.Contains(envStr, "BROWSER=/usr/bin/false") {
+		t.Fatalf("child did not receive the BROWSER guard: %q", envStr)
+	}
+	if !strings.Contains(envStr, "browser-guard") {
+		t.Fatalf("child PATH does not contain the browser guard dir: %q", envStr)
+	}
+}
+
+func TestGrokChildEnvCarriesBrowserGuards(t *testing.T) {
+	stage := t.TempDir()
+	guardDir, err := grokBrowserGuardDir(stage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BROWSER", "SYNTHETIC-AMBIENT-BROWSER")
+	env := grokChildEnv(stage, guardDir)
+
+	var (
+		sawBrowser bool
+		pathEntry  string
+		hasPath    bool
+	)
+	browserCount := 0
+	for _, kv := range env {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "BROWSER":
+			sawBrowser = true
+			browserCount++
+			if val != "/usr/bin/false" {
+				t.Fatalf("BROWSER = %q, want /usr/bin/false", val)
+			}
+		case "PATH":
+			pathEntry = val
+			hasPath = true
+		}
+	}
+	if !sawBrowser {
+		t.Fatal("BROWSER not set in child environment")
+	}
+	if browserCount != 1 {
+		t.Fatalf("BROWSER appears %d times, want 1 (inherited value must be dropped)", browserCount)
+	}
+	if !hasPath {
+		t.Fatal("PATH not present in child environment")
+	}
+	if !strings.HasPrefix(pathEntry, guardDir+string(os.PathListSeparator)) {
+		t.Fatalf("PATH does not lead with browser guard dir: %q", pathEntry)
+	}
+	for _, name := range []string{"open", "xdg-open"} {
+		st, err := os.Stat(filepath.Join(guardDir, name))
+		if err != nil || st.Mode()&0111 == 0 {
+			t.Fatalf("guard script %s missing or not executable: %v", name, err)
+		}
 	}
 }

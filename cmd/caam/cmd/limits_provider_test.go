@@ -78,8 +78,8 @@ func TestLimitsLiveSourceReportsMeasuredAccountAndRefusesMismatch(t *testing.T) 
 	// in-memory vault object. Give it an old snapshot of the same account.
 	savedPath := filepath.Join(getVaultDir(), "grok", "fresh", "auth.json")
 	livePath := filepath.Join(os.Getenv("GROK_HOME"), "auth.json")
-	saved := `{"user_id":"seat-A","key":"SYNTHETIC-STALE","email":"fresh@example.com"}`
-	live := `{"user_id":"seat-A","key":"SYNTHETIC-FRESH","email":"fresh@example.com"}`
+	saved := `{"user_id":"seat-A","key":"SYNTHETIC-STALE","email":"fresh@example.com","expires_at":"2099-01-01T00:00:00Z"}`
+	live := `{"user_id":"seat-A","key":"SYNTHETIC-FRESH","email":"fresh@example.com","expires_at":"2099-01-01T00:00:00Z"}`
 	writeNativeTestCredential(t, savedPath, saved)
 	writeNativeTestCredential(t, livePath, live)
 	cmd := &cobra.Command{Use: "limits"}

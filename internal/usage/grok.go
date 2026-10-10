@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 // GrokFetcher reads Grok Build billing through the authenticated native ACP
@@ -84,6 +87,130 @@ func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, e
 	return parsed, nil
 }
 
+// grokAccessSafetyMargin is how long before an access token's expiry the probe
+// refuses to launch Grok. The staged credential is stripped of its refresh
+// token, so it cannot renew itself, and a token this close to expiring would
+// risk the CLI falling into its interactive (browser) login during the probe.
+const grokAccessSafetyMargin = 15 * time.Minute
+
+// grokAuthTimeout bounds the ACP authenticate exchange. initialize and the
+// billing read are fast; authenticate is the step that can drag the CLI into
+// an interactive login, so it is not allowed to hang out the 25 s probe.
+const grokAuthTimeout = 5 * time.Second
+
+// errGrokNeedsLogin is the note reported when a staged Grok credential is not
+// usable for a read-only probe. Running the CLI then could start its
+// interactive (browser) login, which the probe must never trigger.
+var errGrokNeedsLogin = errors.New("grok login needs refreshing; run grok")
+
+// grokProbeReady inspects a staged credential (structure and expiry fields
+// only, never token values) and returns nil only when it carries an access
+// token that expires later than now plus grokAccessSafetyMargin. A stripped
+// credential has no refresh token, so anything short of that cannot answer a
+// read-only billing probe and must be re-logged-in interactively by the
+// operator.
+func grokProbeReady(stagedPath string, now time.Time) error {
+	info, err := health.ParseGrokExpiry(stagedPath)
+	if err != nil || info == nil || info.ExpiresAt.IsZero() {
+		return errGrokNeedsLogin
+	}
+	if !info.ExpiresAt.After(now.Add(grokAccessSafetyMargin)) {
+		return errGrokNeedsLogin
+	}
+	data, err := os.ReadFile(stagedPath)
+	if err != nil || !grokJSONHasAccessToken(data) {
+		return errGrokNeedsLogin
+	}
+	return nil
+}
+
+// grokJSONHasAccessToken reports whether a credential object carries a
+// non-empty access token. It accepts the field names Grok and its fixtures use
+// (`key`, `access_token`, `accessToken`) and recurses through nested objects
+// and arrays so a dynamic-key credential file is scanned entry by entry. It
+// inspects structure only and never reads a token value.
+func grokJSONHasAccessToken(data []byte) bool {
+	var root any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return false
+	}
+	return grokValueHasAccessToken(root)
+}
+
+func grokValueHasAccessToken(v any) bool {
+	switch v := v.(type) {
+	case map[string]any:
+		for key, child := range v {
+			switch strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key)) {
+			case "key", "accesstoken":
+				if s, ok := child.(string); ok && strings.TrimSpace(s) != "" {
+					return true
+				}
+			}
+		}
+		for _, child := range v {
+			if grokValueHasAccessToken(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if grokValueHasAccessToken(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// grokHasCachedTokenMethod fails when the initialize result advertises auth
+// methods but cached_token is not among them. A stripped credential the CLI
+// cannot use as a cached token would otherwise fall back to the grok.com
+// (browser) flow; the probe must stop instead. When no auth methods are
+// advertised the field cannot be checked, and the pre-flight credential check
+// plus the BROWSER/PATH guards remain in force.
+func grokHasCachedTokenMethod(raw json.RawMessage) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var result struct {
+		AuthMethods []struct {
+			ID string `json:"id"`
+		} `json:"authMethods"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil
+	}
+	if result.AuthMethods == nil {
+		return nil
+	}
+	for _, m := range result.AuthMethods {
+		if m.ID == "cached_token" {
+			return nil
+		}
+	}
+	return errGrokNeedsLogin
+}
+
+// grokBrowserGuardDir creates a directory of no-op `open`/`xdg-open` scripts
+// that is later placed ahead of PATH. Best effort only: Grok may launch a
+// browser by other means (an absolute path, a bundled opener, the WebKit API),
+// so this is layered under the credential and ACP guards rather than relied on.
+func grokBrowserGuardDir(stage string) (string, error) {
+	dir := filepath.Join(stage, "browser-guard")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	for _, name := range []string{"open", "xdg-open"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
 // queryBilling copies the profile's auth into a private GROK_HOME and asks
 // the CLI for `_x.ai/billing`. The copy is removed before returning. Nothing
 // from the credential file is written to the error text.
@@ -94,6 +221,14 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 	}
 	defer os.RemoveAll(stage)
 
+	// Fail closed before spawning: the staged credential has no refresh token,
+	// so it cannot renew itself, and a missing/expired/near-expiry access token
+	// would drive the CLI into its interactive (browser) login. The probe must
+	// never start that login.
+	if err := grokProbeReady(filepath.Join(stage, "auth.json"), time.Now()); err != nil {
+		return nil, err
+	}
+
 	bin := f.Bin
 	if bin == "" {
 		p, lookErr := exec.LookPath("grok")
@@ -103,11 +238,16 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 		bin = p
 	}
 
+	guardDir, err := grokBrowserGuardDir(stage)
+	if err != nil {
+		return nil, fmt.Errorf("grok billing: %w", err)
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	sock := filepath.Join(stage, "leader.sock")
 	cmd := exec.CommandContext(cctx, bin, "agent", "--no-leader", "stdio", "--leader-socket", sock)
-	cmd.Env = grokChildEnv(stage)
+	cmd.Env = grokChildEnv(stage, guardDir)
 	cmd.Dir = stage
 	// Bound os/exec's stderr-copy goroutine too if a descendant retains it.
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -143,7 +283,7 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	nextID := 1
-	call := func(method string, params any) (json.RawMessage, error) {
+	call := func(method string, params any, timeout time.Duration) (json.RawMessage, error) {
 		want := nextID
 		nextID++
 		body, err := json.Marshal(map[string]any{
@@ -157,6 +297,18 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 		}
 		if _, err := stdin.Write(append(body, '\n')); err != nil {
 			return nil, fmt.Errorf("grok billing request failed")
+		}
+		// A non-zero timeout bounds this exchange by closing stdout, which
+		// unblocks the scan below. The child is killed on the way out, so a
+		// timed-out exchange never resumes on the shared scanner.
+		callCtx := cctx
+		var stopCall func() bool
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			callCtx, cancel = context.WithTimeout(cctx, timeout)
+			defer cancel()
+			stopCall = context.AfterFunc(callCtx, func() { _ = stdout.Close() })
+			defer stopCall()
 		}
 		for sc.Scan() {
 			line := bytes.TrimSpace(sc.Bytes())
@@ -184,31 +336,41 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 			}
 			return msg.Result, nil
 		}
+		if callCtx.Err() != nil {
+			return nil, fmt.Errorf("grok %s timed out", method)
+		}
 		if err := sc.Err(); err != nil {
 			return nil, fmt.Errorf("grok billing response was not readable")
 		}
 		return nil, fmt.Errorf("grok closed before %s completed", method)
 	}
 
-	if _, err := call("initialize", map[string]any{
+	initResult, err := call("initialize", map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
 			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
 			"terminal": false,
 		},
 		"clientInfo": map[string]string{"name": "caam", "version": "0"},
-	}); err != nil {
+	}, 0)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := call("authenticate", map[string]any{"methodId": "cached_token"}); err != nil {
+	// cached_token must be the only authentication method ever attempted. If
+	// the CLI no longer offers it, stop before authenticate can fall through
+	// to the grok.com (browser) login.
+	if err := grokHasCachedTokenMethod(initResult); err != nil {
+		return nil, err
+	}
+	if _, err := call("authenticate", map[string]any{"methodId": "cached_token"}, grokAuthTimeout); err != nil {
 		return nil, err
 	}
 	// session/new establishes the ACP session the extension is served on.
 	// It is not a model prompt; no session/prompt is sent.
-	if _, err := call("session/new", map[string]any{"cwd": stage, "mcpServers": []any{}}); err != nil {
+	if _, err := call("session/new", map[string]any{"cwd": stage, "mcpServers": []any{}}, 0); err != nil {
 		return nil, err
 	}
-	return call("_x.ai/billing", map[string]any{})
+	return call("_x.ai/billing", map[string]any{}, 0)
 }
 
 func stageGrokHome(auth []byte) (string, error) {
@@ -266,12 +428,13 @@ func stripGrokRenewalSecrets(value any) {
 	}
 }
 
-func grokChildEnv(home string) []string {
+func grokChildEnv(home, guardDir string) []string {
 	drop := map[string]struct{}{
 		"HOME": {}, "GROK_HOME": {}, "GROK_AUTH": {}, "GROK_AUTH_PATH": {},
 		"GROK_API_KEY": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {}, "XAI_API_TOKEN": {},
 		"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_CACHE_HOME": {},
 		"XDG_STATE_HOME": {}, "XDG_CONFIG_DIRS": {}, "XDG_DATA_DIRS": {},
+		"BROWSER": {},
 	}
 	out := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
@@ -284,7 +447,9 @@ func grokChildEnv(home string) []string {
 		}
 		out = append(out, kv)
 	}
+	out = prependEnvPath(out, guardDir)
 	out = append(out, "HOME="+home, "GROK_HOME="+home,
+		"BROWSER=/usr/bin/false",
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 		"XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
@@ -292,6 +457,19 @@ func grokChildEnv(home string) []string {
 		"XDG_CONFIG_DIRS="+filepath.Join(home, ".config"),
 		"XDG_DATA_DIRS="+filepath.Join(home, ".local", "share"))
 	return out
+}
+
+// prependEnvPath rewrites the single inherited PATH entry so guardDir is
+// searched first. os.Environ returns each key once, so there is at most one
+// PATH entry to replace.
+func prependEnvPath(env []string, guardDir string) []string {
+	for i, kv := range env {
+		if key, _, ok := strings.Cut(kv, "="); ok && key == "PATH" {
+			env[i] = "PATH=" + guardDir + string(os.PathListSeparator) + strings.TrimPrefix(kv, "PATH=")
+			return env
+		}
+	}
+	return append(env, "PATH="+guardDir)
 }
 
 // Provider errors may echo opaque credentials with no recognizable prefix.
