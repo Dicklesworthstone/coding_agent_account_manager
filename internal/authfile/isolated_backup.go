@@ -163,20 +163,8 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	var metadata struct {
-		Name     string `json:"name"`
-		Provider string `json:"provider"`
-		BasePath string `json:"base_path"`
-	}
-	if err := json.Unmarshal(s.metadata.data, &metadata); err != nil ||
-		metadata.Provider != "claude" || metadata.Name != filepath.Base(root) {
-		return nil, fmt.Errorf("isolated source metadata does not identify this Claude profile")
-	}
-	if metadata.BasePath != "" {
-		base, err := filepath.Abs(metadata.BasePath)
-		if err != nil || base != root {
-			return nil, fmt.Errorf("isolated profile metadata points outside its store location")
-		}
+	if err := validateIsolatedClaudeMetadata(s.metadata.data, root); err != nil {
+		return nil, err
 	}
 	state := switchState{files: make(map[string][]byte)}
 	for _, name := range []string{claudeCredentialsFile, claudeSettingsFile, "auth.json", "settings.json"} {

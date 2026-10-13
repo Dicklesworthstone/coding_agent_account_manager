@@ -49,7 +49,11 @@ host's login, Desktop cache, or keychain.
 A complete OAuth credential (access and refresh tokens) and an account identity
 in `.claude.json` are required. Thus a credentials-only `caam auth import` profile
 with a stub `.claude.json` is not silently treated as a completed login. Finish
-`/login` in the isolated profile before saving it.
+`/login` in the isolated profile before saving it. The registered profile must
+also explicitly select `auth_mode: oauth`. An API-key, unknown-mode, or
+mode-less profile is rejected before its credential files are read, even if
+it retains a complete OAuth cache from an earlier login. Create and authenticate
+an OAuth profile rather than relabeling another mode's cached credentials.
 
 The normal vault snapshot engine validates credentials and settings, checks
 conflicting identity evidence, generates identity metadata, and writes private

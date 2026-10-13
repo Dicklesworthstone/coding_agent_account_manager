@@ -2,9 +2,11 @@ package authfile
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // isolatedSourceFile records absence as well as presence. A settings file
@@ -106,6 +108,37 @@ func (s isolatedSourceDir) unchanged() error {
 	}
 	if !os.SameFile(s.info, current.info) {
 		return fmt.Errorf("isolated source directory changed; retry: %s", s.path)
+	}
+	return nil
+}
+
+// validateIsolatedClaudeMetadata checks the registered source before any
+// credential is read. A complete OAuth cache is not evidence that the profile
+// selects OAuth: an API-key profile may retain credentials from an older login
+// while caam exec deliberately permits API-key environment/helper inputs.
+// Never reinterpret those leftovers as the account the user asked to save.
+func validateIsolatedClaudeMetadata(data []byte, root string) error {
+	if root == "" || !filepath.IsAbs(root) {
+		return fmt.Errorf("isolated profile root must be absolute")
+	}
+	var metadata struct {
+		Name     string `json:"name"`
+		Provider string `json:"provider"`
+		AuthMode string `json:"auth_mode"`
+		BasePath string `json:"base_path"`
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil ||
+		metadata.Provider != "claude" || metadata.Name != filepath.Base(root) {
+		return fmt.Errorf("isolated source metadata does not identify this Claude profile")
+	}
+	if metadata.AuthMode != "oauth" {
+		return fmt.Errorf("isolated source must select OAuth (auth_mode=oauth); cached OAuth files in other profile modes cannot be imported")
+	}
+	if metadata.BasePath != "" {
+		base, err := filepath.Abs(metadata.BasePath)
+		if err != nil || base != root {
+			return fmt.Errorf("isolated profile metadata points outside its store location")
+		}
 	}
 	return nil
 }

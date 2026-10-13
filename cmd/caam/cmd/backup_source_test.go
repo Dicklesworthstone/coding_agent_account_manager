@@ -207,3 +207,56 @@ func TestBackupWithoutSourceKeepsNativeStartupAndReader(t *testing.T) {
 		t.Fatal("--from-profile is not registered on the real backup command")
 	}
 }
+
+func TestBackupFromProfileRejectsNonOAuthSelectionBeforeCredentials(t *testing.T) {
+	for _, mode := range []string{"api-key", "vertex-adc", "", "unknown"} {
+		t.Run("mode="+mode, func(t *testing.T) {
+			config, live := setupProfileBackupCommand(t)
+			root := filepath.Dir(filepath.Dir(config))
+			path := filepath.Join(root, "profile.json")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata map[string]any
+			if err := json.Unmarshal(data, &metadata); err != nil {
+				t.Fatal(err)
+			}
+			metadata["auth_mode"] = mode
+			data, err = json.Marshal(metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := captureBackupTree(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := captureBackupTree(filepath.Dir(live))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, stderr, err := executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+			if err == nil || stderr != "" || !strings.Contains(out, "must select OAuth") {
+				t.Fatalf("non-OAuth source exported cached OAuth: %s; %s; %v", out, stderr, err)
+			}
+			assertBackupTreeUnchanged(t, root, before)
+			assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+			v := authfile.NewVault(authfile.DefaultVaultPath())
+			if _, err := os.Lstat(v.ProfilePath("claude", "saved")); !os.IsNotExist(err) {
+				t.Fatalf("wrong selected auth published: %v", err)
+			}
+			// Make the credential invalid too. Mode selection must still be
+			// the first failure, rather than reading/parsing the cached grant.
+			if err := os.WriteFile(filepath.Join(config, ".credentials.json"), []byte("not JSON"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			out, _, err = executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+			if err == nil || !strings.Contains(out, "must select OAuth") {
+				t.Fatalf("credential validation preceded selection: %s: %v", out, err)
+			}
+		})
+	}
+}
