@@ -16,6 +16,37 @@ const isolatedBackupWarning = "This is a snapshot, not an independent OAuth logi
 func init() {
 	profileCmd.AddCommand(newProfileBackupCommand())
 	configureBackupSource(backupCmd)
+	configureClaudeLoginVaultGuidance(loginCmd)
+}
+
+// configureClaudeLoginVaultGuidance closes the workflow loop for Claude.
+// CAAM cannot drive Claude Code's /login flow, so point users directly from
+// isolated authentication to the non-disruptive vault handoff.
+func configureClaudeLoginVaultGuidance(cmd *cobra.Command) {
+	cmd.Long += "\n\nClaude isolated-to-vault workflow:\n" +
+		"  caam profile add claude isolated-name\n" +
+		"  caam exec claude isolated-name\n" +
+		"  # Inside Claude: /login, then /exit\n" +
+		"  caam backup claude new-vault-name --from-profile isolated-name\n\n" +
+		"The final backup does not activate or refresh either copy. The isolated source\n" +
+		"must be stopped first, and the two copies share one OAuth grant: refreshing one\n" +
+		"copy can make the other stale or invalid."
+
+	liveRun := cmd.RunE
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if len(args) >= 2 && strings.EqualFold(strings.TrimSpace(args[0]), "claude") {
+			name := strings.TrimSpace(args[1])
+			if name == "" {
+				name = "<name>"
+			}
+			return fmt.Errorf("caam login is not supported for the claude provider — use Claude Code's built-in /login flow instead. "+
+				"For an isolated profile: 'caam profile add claude %s', then 'caam exec claude %s' and run /login followed by /exit. "+
+				"To save that authenticated profile into the vault without touching the live login, run "+
+				"'caam backup claude <new-vault-name> --from-profile %s'. The vault snapshot and isolated profile share one OAuth grant; "+
+				"do not use both copies concurrently after either one refreshes", name, name, name)
+		}
+		return liveRun(cmd, args)
+	}
 }
 
 // configureBackupSource adds isolated source selection to the ordinary backup
