@@ -8,7 +8,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
 
@@ -261,87 +260,6 @@ func TestE2E_ConcurrentBackups(t *testing.T) {
 
 	h.Log.Info("Concurrent backups test complete", map[string]interface{}{
 		"profiles_created": len(profiles),
-	})
-}
-
-// TestE2E_ProfileLockingConcurrency tests concurrent profile access with locking.
-func TestE2E_ProfileLockingConcurrency(t *testing.T) {
-	h := testutil.NewHarness(t)
-	defer h.Close()
-
-	h.Log.SetStep("test_profile_locking")
-
-	profileDir := h.SubDir("profiles")
-	store := profile.NewStore(profileDir)
-
-	// Create a profile
-	prof, err := store.Create("codex", "lock-test", "oauth")
-	if err != nil {
-		t.Fatalf("Create profile failed: %v", err)
-	}
-
-	// Lock the profile
-	if err := prof.Lock(); err != nil {
-		t.Fatalf("Lock failed: %v", err)
-	}
-
-	// Verify locked
-	if !prof.IsLocked() {
-		t.Error("Profile should be locked")
-	}
-
-	// Try to lock again from same process (should succeed or update lock)
-	lockInfo, err := prof.GetLockInfo()
-	if err != nil {
-		t.Fatalf("GetLockInfo failed: %v", err)
-	}
-	if lockInfo.PID != os.Getpid() {
-		t.Errorf("Expected PID %d, got %d", os.Getpid(), lockInfo.PID)
-	}
-
-	// Unlock
-	if err := prof.Unlock(); err != nil {
-		t.Fatalf("Unlock failed: %v", err)
-	}
-
-	// Verify unlocked
-	if prof.IsLocked() {
-		t.Error("Profile should be unlocked")
-	}
-
-	h.Log.Info("Profile locking test complete")
-}
-
-// TestE2E_CorruptedProfileJSON tests handling of corrupted profile.json.
-func TestE2E_CorruptedProfileJSON(t *testing.T) {
-	h := testutil.NewHarness(t)
-	defer h.Close()
-
-	h.Log.SetStep("test_corrupted_profile")
-
-	profileDir := h.SubDir("profiles")
-	store := profile.NewStore(profileDir)
-
-	// Create a valid profile first
-	prof, err := store.Create("codex", "corrupt-test", "oauth")
-	if err != nil {
-		t.Fatalf("Create profile failed: %v", err)
-	}
-
-	// Corrupt the profile.json
-	profileFile := filepath.Join(prof.BasePath, "profile.json")
-	if err := os.WriteFile(profileFile, []byte("{ invalid json"), 0600); err != nil {
-		t.Fatalf("Failed to corrupt file: %v", err)
-	}
-
-	// Try to load corrupted profile
-	_, err = store.Load("codex", "corrupt-test")
-	if err == nil {
-		t.Error("Expected error loading corrupted profile")
-	}
-
-	h.Log.Info("Corrupted profile test complete", map[string]interface{}{
-		"error_occurred": err != nil,
 	})
 }
 

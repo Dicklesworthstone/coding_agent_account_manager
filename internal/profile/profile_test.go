@@ -642,6 +642,46 @@ func TestStoreLoad(t *testing.T) {
 	}
 }
 
+// Moved from the authfile package, whose tests may not import profile
+// (profile imports authfile for the isolated-to-vault backup bridge).
+func TestStoreLoadCorruptedProfileJSON(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("codex", "corrupt-test", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(prof.BasePath, "profile.json"), []byte("{ invalid json"), 0600); err != nil {
+		t.Fatalf("corrupt profile.json: %v", err)
+	}
+	if _, err := store.Load("codex", "corrupt-test"); err == nil {
+		t.Fatal("expected Load() to fail for a corrupted profile.json")
+	}
+}
+
+func TestStoreCreatedProfileLockRoundTrip(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("codex", "lock-test", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := prof.Lock(); err != nil {
+		t.Fatalf("Lock() error = %v", err)
+	}
+	if !prof.IsLocked() {
+		t.Fatal("profile should be locked")
+	}
+	info, err := prof.GetLockInfo()
+	if err != nil || info == nil || info.PID != os.Getpid() {
+		t.Fatalf("GetLockInfo() = %+v, %v; want this process", info, err)
+	}
+	if err := prof.Unlock(); err != nil {
+		t.Fatalf("Unlock() error = %v", err)
+	}
+	if prof.IsLocked() {
+		t.Fatal("profile should be unlocked")
+	}
+}
+
 func TestStoreDelete(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewStore(tmpDir)
