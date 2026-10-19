@@ -133,11 +133,17 @@ type AuthImportResult struct {
 
 var authImportCmd = &cobra.Command{
 	Use:   "import <tool>",
-	Short: "Import detected auth into a profile",
-	Long: `Import existing authentication files into a new caam profile.
+	Short: "Import detected auth into an isolated profile",
+	Long: `Import existing authentication files into a new isolated caam profile.
 
 This detects existing auth credentials and imports them into a new profile,
 allowing you to manage multiple accounts without re-authenticating.
+
+The result is an isolated profile, used by 'caam exec' and listed by
+'caam profile ls'. It is not a vault entry for 'caam activate'; 'caam backup'
+creates those. To save an isolated Claude login to the vault without touching
+the live login:
+  caam backup claude <vault-name> --from-profile <isolated-name>
 
 Credentials are validated before the profile becomes available. With --force,
 the previous profile is retained at the backup path printed in the result.

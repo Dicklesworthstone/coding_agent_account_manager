@@ -583,7 +583,7 @@ carol@gmail.com
 | `caam paths [tool]` | Show auth file locations for each tool |
 | `caam clear <tool>` | Remove auth files (logout state) |
 | `caam alias <tool> <profile> <alias>` | Create a short alias for a profile |
-| `caam rename <tool> <old> <new>` | Copy profile to a new name (non-destructive) |
+| `caam rename <tool> <old> <new>` | Copy a vault profile to a new name (non-destructive). Isolated profiles are not renamed; save an isolated Claude login to the vault with `caam backup claude <name> --from-profile <isolated>` |
 | `caam keepalive [claude\|grok\|live-profile ...]` | Renew idle native logins in their owning homes; `--dry-run`, `--json`, `--print-systemd` |
 | `caam uninstall` | Restore originals from `_original` and remove caam data/config |
 

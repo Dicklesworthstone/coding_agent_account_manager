@@ -12,6 +12,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 // setupAliasRenameEnv gives the test its own vault and config directory and
@@ -97,6 +98,46 @@ func TestRenameRefusesMissingSourceAndExistingDestination(t *testing.T) {
 	}
 	if err := runRename(c, []string{"codex", "a", "b"}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("existing destination: err = %v", err)
+	}
+}
+
+// Rename works on vault profiles only. A source that exists only as an
+// isolated profile used to get a bare "not found"; the error now says which
+// store it is in and, for Claude, how to save it to the vault (issue #125).
+func TestRenameExplainsIsolatedOnlySource(t *testing.T) {
+	vaultDir := setupAliasRenameEnv(t)
+	oldStore := profileStore
+	t.Cleanup(func() { profileStore = oldStore })
+	profileStore = profile.NewStore(filepath.Join(t.TempDir(), "profiles"))
+	for _, tool := range []string{"claude", "codex"} {
+		if _, err := profileStore.Create(tool, "iso", "oauth"); err != nil {
+			t.Fatalf("create isolated %s profile: %v", tool, err)
+		}
+	}
+
+	c, _ := newTestCmd(t, "rename", "", nil)
+	err := runRename(c, []string{"claude", "iso", "work"})
+	if err == nil {
+		t.Fatal("rename of an isolated-only Claude profile succeeded")
+	}
+	for _, want := range []string{"claude/iso is an isolated profile", "caam backup claude work --from-profile iso"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("claude error %q does not contain %q", err, want)
+		}
+	}
+
+	err = runRename(c, []string{"codex", "iso", "work"})
+	if err == nil || !strings.Contains(err.Error(), "codex/iso is an isolated profile") || strings.Contains(err.Error(), "--from-profile") {
+		t.Errorf("codex error = %v, want the isolated-profile explanation without the Claude-only --from-profile hint", err)
+	}
+
+	if err := runRename(c, []string{"codex", "missing", "work"}); err == nil || !strings.Contains(err.Error(), "codex/missing not found") {
+		t.Errorf("missing everywhere: err = %v", err)
+	}
+	for _, tool := range []string{"claude", "codex"} {
+		if _, statErr := os.Stat(filepath.Join(vaultDir, tool, "work")); !os.IsNotExist(statErr) {
+			t.Errorf("refused rename created vault entry %s/work (stat err %v)", tool, statErr)
+		}
 	}
 }
 
