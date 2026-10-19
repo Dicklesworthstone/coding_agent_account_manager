@@ -35,7 +35,8 @@ func TestStorageCurrentVaultRenewalAcrossProviders(t *testing.T) {
 	}{
 		{"claude", ".credentials.json", map[string]any{"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": expiry.UnixMilli()}}, true},
 		{"codex", "auth.json", map[string]any{"tokens": map[string]any{"access_token": unsignedJWT(t, map[string]any{"exp": expiry.Unix()}), "refresh_token": "synthetic-refresh"}}, false},
-		{"gemini", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expiry.Unix()}, false},
+		{"gemini", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "client_id": "synthetic-client", "client_secret": "synthetic-secret", "expires_at": expiry.Unix()}, false},
+		{"gemini", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expiry_date": expiry.UnixMilli()}, true},
 		{"grok", "auth.json", map[string]any{"https://auth.x.ai::synthetic": map[string]any{"key": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expiry.Format(time.RFC3339)}}, false},
 		{"cursor", "auth.json", map[string]any{"accessToken": unsignedJWT(t, map[string]any{"exp": expiry.Unix()}), "apiKey": "synthetic-key"}, true},
 	} {

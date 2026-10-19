@@ -348,6 +348,74 @@ func TestUpdateGeminiAuth_ExpiresAtFormat(t *testing.T) {
 	}
 }
 
+// Health reads Gemini CLI's expiry_date first (issue #123). A refresh must
+// renew that field, in Unix milliseconds, and drop any other spelling an
+// earlier refresh left beside it; otherwise the renewed grant reads as lapsed
+// and the daemon refreshes it again on every tick.
+func TestUpdateGeminiAuth_NativeExpiryDate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		expiresIn int
+	}{
+		{"renewed lifetime", 3600},
+		{"no lifetime", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "oauth_creds.json")
+			stale := time.Now().Add(-48 * time.Hour)
+			original := map[string]any{
+				"access_token": "old-access", "refresh_token": "old-refresh",
+				"client_id": "synthetic-client", "client_secret": "synthetic-secret",
+				"expiry_date": stale.UnixMilli(), "expiry": stale.Add(time.Hour).UTC().Format(time.RFC3339),
+			}
+			raw, err := json.Marshal(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now()
+			if err := UpdateGeminiAuth(path, &GoogleTokenResponse{AccessToken: "new-access", ExpiresIn: tc.expiresIn}); err != nil {
+				t.Fatalf("UpdateGeminiAuth: %v", err)
+			}
+			updatedRaw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var updated map[string]any
+			if err := json.Unmarshal(updatedRaw, &updated); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := updated["expiry"]; ok {
+				t.Fatalf("stale secondary deadline survived the refresh: %s", updatedRaw)
+			}
+			info, err := health.ParseGeminiExpiry(dir)
+			if err != nil {
+				t.Fatalf("ParseGeminiExpiry: %v", err)
+			}
+			if tc.expiresIn == 0 {
+				if _, ok := updated["expiry_date"]; ok || !info.ExpiresAt.IsZero() {
+					t.Fatalf("new opaque token inherited the previous deadline: %s", updatedRaw)
+				}
+				return
+			}
+			millis, ok := updated["expiry_date"].(float64)
+			if !ok {
+				t.Fatalf("expiry_date = %#v, want Unix milliseconds", updated["expiry_date"])
+			}
+			want := before.Add(time.Duration(tc.expiresIn) * time.Second)
+			if got := time.UnixMilli(int64(millis)); got.Before(want.Add(-time.Second)) || got.After(want.Add(time.Minute)) {
+				t.Fatalf("expiry_date = %s, want about %s", got, want)
+			}
+			if !info.ExpiresAt.Equal(time.UnixMilli(int64(millis))) {
+				t.Fatalf("health expiry = %s, want the renewed expiry_date", info.ExpiresAt)
+			}
+		})
+	}
+}
+
 func TestUpdateGeminiAuth_NoExpiresIn(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "settings.json")

@@ -49,7 +49,11 @@ func TestPoolReconcilesRealVaultCredentialsAndMembership(t *testing.T) {
 	writePoolCredential(t, vault.BasePath(), "unrecognized", "ignored", "auth.json", poolCodexCredential(expired, "synthetic-other"))
 	writePoolCredential(t, vault.BasePath(), "codex", "api", "auth.json", map[string]any{"OPENAI_API_KEY": "synthetic-api"})
 	writePoolCredential(t, vault.BasePath(), "codex", "broken", "auth.json", map[string]any{"policy": true})
-	writePoolCredential(t, vault.BasePath(), "gemini", "renewable", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expired.Unix()})
+	// caam renews a Gemini cache only when it carries its own OAuth client.
+	// Gemini CLI's native cache has none and is renewed by the CLI itself, so
+	// it is ready, like Claude's, and never a pool refresh candidate.
+	writePoolCredential(t, vault.BasePath(), "gemini", "renewable", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "client_id": "synthetic-client", "client_secret": "synthetic-secret", "expires_at": expired.Unix()})
+	writePoolCredential(t, vault.BasePath(), "gemini", "native", "oauth_creds.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expiry_date": expired.UnixMilli()})
 	writePoolCredential(t, vault.BasePath(), "claude", "native", ".credentials.json", map[string]any{"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": expired.UnixMilli()}})
 	writePoolCredential(t, vault.BasePath(), "grok", "native", "auth.json", map[string]any{"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_at": expired.Unix()})
 	jwt := poolCodexCredential(expired, "unused")["tokens"].(map[string]any)["access_token"]
@@ -67,6 +71,7 @@ func TestPoolReconcilesRealVaultCredentialsAndMembership(t *testing.T) {
 	for key, want := range map[string]PoolStatus{
 		"codex:renewable": PoolStatusExpired, "codex:api": PoolStatusReady,
 		"codex:broken": PoolStatusError, "gemini:renewable": PoolStatusExpired,
+		"gemini:native": PoolStatusReady,
 		"claude:native": PoolStatusReady, "grok:native": PoolStatusReady,
 		"cursor:session": PoolStatusExpired, "cursor:api": PoolStatusReady,
 	} {
@@ -77,7 +82,7 @@ func TestPoolReconcilesRealVaultCredentialsAndMembership(t *testing.T) {
 			t.Errorf("%s = %+v, want %s", key, got, want)
 		}
 	}
-	if pool.Count() != 8 || len(pool.GetProfilesNeedingRefresh("")) != 2 {
+	if pool.Count() != 9 || len(pool.GetProfilesNeedingRefresh("")) != 2 {
 		t.Fatalf("membership/renewal candidates are wrong: %+v / %+v", pool.GetAllProfiles(""), pool.GetProfilesNeedingRefresh(""))
 	}
 	after, _ := os.ReadFile(path)

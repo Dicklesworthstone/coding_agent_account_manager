@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -168,18 +169,28 @@ func updateGeminiTokenMap(m map[string]interface{}, resp *GoogleTokenResponse) {
 
 	// Prefer the existing spelling, but never attach an older generation's
 	// deadline to a new opaque token when its response carries no lifetime.
+	// Every Gemini deadline spelling is cleared: health reads expiry_date
+	// first (Gemini CLI's own field, Unix milliseconds), so leaving a stale
+	// one beside a fresh "expiry" would report the renewed token as lapsed
+	// and schedule the same refresh on every daemon tick (issue #123).
 	expiryKey := "expiry"
-	if _, ok := m["expiry"]; !ok {
-		if _, ok := m["expires_at"]; ok {
-			expiryKey = "expires_at"
-		} else if _, ok := m["expiresAt"]; ok {
-			expiryKey = "expiresAt"
+	for _, key := range []string{"expiry_date", "expiry", "expires_at", "expiresAt"} {
+		if _, ok := m[key]; ok {
+			expiryKey = key
+			break
 		}
 	}
 	clearCredentialExpiry(m)
+	for _, key := range authfile.GeminiExpiryKeys {
+		delete(m, key)
+	}
 	if resp.ExpiresIn > 0 {
-		expiresAt := time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).UTC().Format(time.RFC3339)
-		m[expiryKey] = expiresAt
+		deadline := time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
+		if expiryKey == "expiry_date" {
+			m[expiryKey] = deadline.UnixMilli()
+		} else {
+			m[expiryKey] = deadline.UTC().Format(time.RFC3339)
+		}
 	}
 }
 

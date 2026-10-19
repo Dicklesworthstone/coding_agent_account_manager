@@ -28,7 +28,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -37,6 +36,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -866,39 +866,16 @@ func parseGeminiOAuth(data []byte) (map[string]json.RawMessage, error) {
 			return nil, err
 		}
 	}
-	for _, key := range []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"} {
+	for _, key := range authfile.GeminiExpiryKeys {
 		raw, exists := obj[key]
 		if !exists {
 			continue
 		}
-		if _, err := parseGeminiCredentialExpiry(key, raw); err != nil {
+		if _, err := authfile.GeminiCredentialExpiry(key, raw); err != nil {
 			return nil, err
 		}
 	}
 	return obj, nil
-}
-
-func parseGeminiCredentialExpiry(key string, raw json.RawMessage) (time.Time, error) {
-	// This is the final millisecond of year 9999. Bounding before converting
-	// to int64 also rejects values rounded up to 2^63 by JSON float decoding.
-	const maxUnixMillis = 253402300799999
-	var expires time.Time
-	var number float64
-	if json.Unmarshal(raw, &number) == nil && number > 0 && number <= maxUnixMillis && math.Trunc(number) == number {
-		expires = parseGeminiUnixTime(number)
-		if key == "expiry_date" {
-			expires = time.UnixMilli(int64(number))
-		}
-	} else {
-		var stamp string
-		if json.Unmarshal(raw, &stamp) == nil {
-			expires, _ = parseGeminiExpiryTime(stamp)
-		}
-	}
-	if !expires.After(time.Unix(0, 0)) || expires.UTC().Year() > 9999 {
-		return time.Time{}, fmt.Errorf("%s is not a valid credential expiry", key)
-	}
-	return expires, nil
 }
 
 func sameGeminiGrant(a, b []byte) bool {
@@ -1216,12 +1193,12 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 				grant, _ = parseGeminiOAuth(file.data) // Already validated by the loader.
 			}
 		}
-		for _, key := range []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"} {
+		for _, key := range authfile.GeminiExpiryKeys {
 			raw, exists := grant[key]
 			if !exists {
 				continue
 			}
-			result.ExpiresAt, _ = parseGeminiCredentialExpiry(key, raw)
+			result.ExpiresAt, _ = authfile.GeminiCredentialExpiry(key, raw)
 			break
 		}
 		refresh, _ := geminiCredentialString(grant, "refresh_token", "refreshToken")
@@ -1253,28 +1230,6 @@ func (p *Provider) validateTokenActive(ctx context.Context, prof *profile.Profil
 	// to verify the token. For now, we rely on passive validation.
 	result.Valid = true
 	return result, nil
-}
-
-func parseGeminiExpiryTime(s string) (time.Time, error) {
-	formats := []string{
-		time.RFC3339,
-		time.RFC3339Nano,
-		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04:05-07:00",
-	}
-	for _, format := range formats {
-		if t, err := time.Parse(format, s); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("cannot parse time: %s", s)
-}
-
-func parseGeminiUnixTime(f float64) time.Time {
-	if f > 1e12 {
-		return time.UnixMilli(int64(f))
-	}
-	return time.Unix(int64(f), 0)
 }
 
 // Ensure Provider implements the interface.

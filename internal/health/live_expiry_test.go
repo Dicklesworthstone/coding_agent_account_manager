@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,7 +105,10 @@ func TestParseLiveExpiryCredentialModes(t *testing.T) {
 		{"codex_opaque", "codex", "auth.json", `{"tokens":{"access_token":"synthetic-opaque"}}`, false, false, true},
 		{"claude_renewable", "claude", ".credentials.json", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","expiresAt":%d}}`, expiry.UnixMilli()), true, true, false},
 		{"claude_session", "claude", ".credentials.json", fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"synthetic-access","expiresAt":%d}}`, expiry.UnixMilli()), false, false, false},
-		{"gemini_renewable", "gemini", "oauth_creds.json", fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_at":%d}`, expiry.Unix()), true, false, false},
+		// caam can renew a cache that carries its own OAuth client; Gemini
+		// CLI's native cache has none, so only the CLI renews it.
+		{"gemini_renewable", "gemini", "oauth_creds.json", fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","client_secret":"synthetic-secret","expires_at":%d}`, expiry.Unix()), true, false, false},
+		{"gemini_native", "gemini", "oauth_creds.json", fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","expiry_date":%d}`, expiry.UnixMilli()), true, true, false},
 		{"gemini_opaque", "gemini", "oauth_creds.json", `{"access_token":"synthetic-opaque"}`, false, false, true},
 		{"gemini_api_key", "gemini", ".env", "GEMINI_API_KEY=synthetic-key\n", true, true, true},
 		{"grok_renewable", "grok", "auth.json", fmt.Sprintf(`{"https://synthetic.example::client":{"key":"synthetic-access","refresh_token":"synthetic-refresh","expires_at":%d}}`, expiry.Unix()), true, false, false},
@@ -320,6 +324,99 @@ func TestParseLiveExpiryGeminiSelectedAPIKey(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Gemini CLI writes the access-token deadline only as expiry_date, in Unix
+// milliseconds. Health ignored it, so a lapsed grant carried no expiry at all
+// and one with nothing to renew it read healthy (issue #123).
+func TestGeminiNativeExpiryDateDrivesHealth(t *testing.T) {
+	lapsed := time.Now().Add(-69 * 24 * time.Hour).Truncate(time.Millisecond)
+	for _, tc := range []struct {
+		name          string
+		cache         string
+		wantExpiry    time.Time
+		renewable     bool
+		self          bool
+		loginRequired bool
+		status        HealthStatus
+	}{
+		{
+			// Native cache: only Gemini CLI holds the OAuth client that
+			// renews it, so the lapse is routine and caam schedules nothing.
+			name:       "lapsed native cache with refresh token renews in the CLI",
+			cache:      fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","token_type":"Bearer","expiry_date":%d}`, lapsed.UnixMilli()),
+			wantExpiry: lapsed, renewable: true, self: true, status: StatusHealthy,
+		},
+		{
+			name:       "lapsed cache with its own OAuth client is due for a caam refresh",
+			cache:      fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","client_secret":"synthetic-secret","expiry_date":%d}`, lapsed.UnixMilli()),
+			wantExpiry: lapsed, renewable: true, status: StatusHealthy,
+		},
+		{
+			name:       "lapsed without refresh token needs a login",
+			cache:      fmt.Sprintf(`{"access_token":"synthetic-access","expiry_date":%d}`, lapsed.UnixMilli()),
+			wantExpiry: lapsed, loginRequired: true, status: StatusCritical,
+		},
+		{
+			// A seconds-vs-milliseconds guess would read this as 1000 s.
+			name:       "expiry_date is always milliseconds",
+			cache:      `{"access_token":"synthetic-access","expiry_date":1000}`,
+			wantExpiry: time.UnixMilli(1000), loginRequired: true, status: StatusCritical,
+		},
+		{
+			name:       "expiry_date outranks a secondary field",
+			cache:      fmt.Sprintf(`{"access_token":"synthetic-access","expires_at":4102444800,"expiry_date":%d}`, lapsed.UnixMilli()),
+			wantExpiry: lapsed, loginRequired: true, status: StatusCritical,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("GEMINI_HOME", root)
+			writeLiveExpiryFile(t, filepath.Join(root, "settings.json"), `{"security":{"auth":{"selectedType":"oauth-personal"}}}`)
+			writeLiveExpiryFile(t, filepath.Join(root, "oauth_creds.json"), tc.cache)
+
+			saved, savedErr := ParseGeminiExpiry(root)
+			live, liveErr := ParseLiveExpiry(authfile.GeminiAuthFiles())
+			for label, got := range map[string]struct {
+				info *ExpiryInfo
+				err  error
+			}{"saved": {saved, savedErr}, "live": {live, liveErr}} {
+				if got.err != nil || got.info == nil {
+					t.Fatalf("%s: ParseExpiry = %+v, %v", label, got.info, got.err)
+				}
+				if !got.info.ExpiresAt.Equal(tc.wantExpiry) || got.info.Renewable != tc.renewable || got.info.SelfRefreshing != tc.self {
+					t.Fatalf("%s: expiry=%s renewable=%v self=%v, want expiry=%s renewable=%v self=%v", label,
+						got.info.ExpiresAt, got.info.Renewable, got.info.SelfRefreshing, tc.wantExpiry, tc.renewable, tc.self)
+				}
+				h := &ProfileHealth{TokenExpiresAt: got.info.ExpiresAt, TokenRenewable: got.info.Renewable, SelfRefreshing: got.info.SelfRefreshing}
+				if status := CalculateStatus(h); status != tc.status {
+					t.Fatalf("%s: status = %s, want %s", label, status, tc.status)
+				}
+				signals := CredentialSignals(h, DefaultHealthConfig())
+				if signals.LoginRequired == nil || *signals.LoginRequired != tc.loginRequired {
+					t.Fatalf("%s: login_required = %v, want %v", label, signals.LoginRequired, tc.loginRequired)
+				}
+				// A lapsed grant is due for a caam refresh only when caam can
+				// renew it: a refresh token plus the cache's own OAuth client.
+				if want := tc.renewable && !tc.self; signals.RefreshDue == nil || *signals.RefreshDue != want {
+					t.Fatalf("%s: refresh_due = %v, want %v", label, signals.RefreshDue, want)
+				}
+				// Never steer the operator to a refresh caam cannot perform.
+				if rec := FormatRecommendation("gemini", "work", h); tc.self && strings.Contains(rec, "caam refresh") {
+					t.Fatalf("%s: recommendation %q for a CLI-renewed grant", label, rec)
+				}
+			}
+		})
+	}
+
+	// A malformed expiry_date is not a deadline: it must neither expire the
+	// grant nor hide a valid secondary field.
+	root := t.TempDir()
+	writeLiveExpiryFile(t, filepath.Join(root, "oauth_creds.json"), `{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expiry_date":1.25,"expiry":"2030-01-01T00:00:00Z"}`)
+	info, err := ParseGeminiExpiry(root)
+	if err != nil || info == nil || info.ExpiresAt.Year() != 2030 {
+		t.Fatalf("malformed expiry_date: %+v, %v", info, err)
 	}
 }
 

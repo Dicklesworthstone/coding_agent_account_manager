@@ -51,8 +51,9 @@ type ExpiryInfo struct {
 	//
 	// It answers only "must caam stay out of the way?". Cursor API-key logins
 	// also qualify: cursor-agent re-mints their tokens from the stored API
-	// key. Whether a lapsed token needs a human is the separate Renewable
-	// question below.
+	// key. So do Gemini CLI's native OAuth caches, which only the CLI's
+	// built-in OAuth client can renew (issue #123). Whether a lapsed token
+	// needs a human is the separate Renewable question below.
 	SelfRefreshing bool
 
 	// Renewable reports that an expired or expiring access token here can be
@@ -165,6 +166,9 @@ func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
 			info, err = parseLiveGeminiAPIKey(data)
 		} else {
 			info, err = parseLiveOAuthJSON(data)
+			if info != nil {
+				info.SelfRefreshing = geminiCLIRenews(data, info)
+			}
 		}
 	case "grok":
 		info, err = parseLiveGrokJSON(data)
@@ -770,10 +774,10 @@ func parseGrokAuthJSON(data []byte) (*ExpiryInfo, error) {
 // Note: Google OAuth tokens via ADC may not include expiry in the file itself.
 // The expiry is typically short-lived and requires refresh.
 //
-// SelfRefreshing stays unset (caam may refresh Gemini); Renewable follows the
-// stored refresh token, so an ADC credential — which carries a refresh token
-// and no expiry at all — is never mistaken for one that needs a re-login
-// (issue #102).
+// Renewable follows the stored refresh token, so an ADC credential — which
+// carries a refresh token and no expiry at all — is never mistaken for one
+// that needs a re-login (issue #102). SelfRefreshing is set only for an OAuth
+// cache that caam cannot renew itself (see geminiCLIRenews).
 func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	checkSystem := false
 	if authDir == "" {
@@ -845,19 +849,17 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 		if !fi.Mode().IsRegular() {
 			return nil, fmt.Errorf("gemini credential source is not a regular file")
 		}
-		info, err := parseOAuthFile(path)
+		info, err := parseGeminiOAuthFile(path)
 		if err != nil {
 			return nil, err
 		}
-		info.Renewable = info.HasRefreshToken
 		info.Source = path
 		return info, nil
 	}
 
 	// Settings-only OAuth profiles predate the separate credential cache.
-	info, err := parseOAuthFile(settingsPath)
+	info, err := parseGeminiOAuthFile(settingsPath)
 	if err == nil {
-		info.Renewable = info.HasRefreshToken
 		info.Source = settingsPath
 		return info, nil
 	}
@@ -889,6 +891,43 @@ func ParseGeminiExpiry(authDir string) (*ExpiryInfo, error) {
 	}
 
 	return nil, ErrNoExpiry
+}
+
+// parseGeminiOAuthFile parses a Gemini OAuth cache, or the grant in a legacy
+// settings-only profile, and records who renews it.
+func parseGeminiOAuthFile(path string) (*ExpiryInfo, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := parseOAuthJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	info.Renewable = info.HasRefreshToken
+	info.SelfRefreshing = geminiCLIRenews(data, info)
+	return info, nil
+}
+
+// geminiCLIRenews reports a refreshable grant that only Gemini CLI can renew:
+// the CLI refreshes its cache in place with the OAuth client built into it,
+// and the cache it writes carries no client_id/client_secret. caam renews a
+// Gemini grant only when the cache holds its own client credentials
+// (refresh.ReadADC), so for the native shape the access token's one-hour TTL
+// is routine lifecycle, as for Claude (PR #84): recommending or scheduling
+// "caam refresh" for it would only fail (issue #123).
+func geminiCLIRenews(data []byte, info *ExpiryInfo) bool {
+	if info == nil || !info.HasRefreshToken {
+		return false
+	}
+	var client struct {
+		ID     string `json:"client_id"`
+		Secret string `json:"client_secret"`
+	}
+	if json.Unmarshal(data, &client) != nil {
+		return false
+	}
+	return client.ID == "" || client.Secret == ""
 }
 
 // readGeminiModeFile bounds the small settings/key files required to choose a
@@ -951,6 +990,10 @@ type oauthJSON struct {
 	ExpiresAtCamel    any    `json:"expiresAt"`
 	ExpiresInCamel    any    `json:"expiresIn"`
 
+	// Gemini CLI's google-auth-library cache stores the access-token deadline
+	// here, in Unix milliseconds (issue #123).
+	ExpiryDate json.RawMessage `json:"expiry_date"`
+
 	// Other common fields
 	Expiry     string `json:"expiry"`
 	Key        string `json:"key"` // Grok dynamic credential entries
@@ -981,7 +1024,15 @@ func parseOAuthJSON(data []byte) (*ExpiryInfo, error) {
 		Fingerprint:     credentialFingerprint(oauth.RefreshToken, oauth.RefreshTokenCamel, oauth.AccessToken, oauth.AccessTokenCamel, oauth.Key),
 	}
 
-	// Try to extract expiry from various fields
+	// Try to extract expiry from various fields. expiry_date goes first, in
+	// the same precedence and with the same parser as Gemini's import
+	// validation, so health and import agree on when a grant lapses.
+	if len(oauth.ExpiryDate) > 0 {
+		if expiry, err := authfile.GeminiCredentialExpiry("expiry_date", oauth.ExpiryDate); err == nil {
+			info.ExpiresAt = expiry
+			return info, nil
+		}
+	}
 	if expiry := parseExpiryField(oauth.ExpiresAt); !expiry.IsZero() {
 		info.ExpiresAt = expiry
 		return info, nil

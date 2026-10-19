@@ -443,6 +443,45 @@ func GeminiSelectedAuthType(data []byte) (string, error) {
 	}
 }
 
+// GeminiExpiryKeys lists the access-token deadline fields a Gemini OAuth cache
+// may carry, in precedence order. Gemini CLI (google-auth-library) writes
+// expiry_date; the others come from hand-written and older caches.
+var GeminiExpiryKeys = []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"}
+
+// GeminiCredentialExpiry parses one Gemini OAuth expiry field. It is the single
+// definition shared by import validation and passive health, so the two can
+// never disagree about when a cached grant lapses (issue #123).
+//
+// expiry_date is always Unix milliseconds, as google-auth-library stores it.
+// Other numeric fields are Unix seconds, or milliseconds when larger than
+// 1e12. Strings are RFC 3339 timestamps. Non-integral, non-positive and
+// post-9999 values are errors rather than a guessed deadline.
+func GeminiCredentialExpiry(key string, raw json.RawMessage) (time.Time, error) {
+	// This is the final millisecond of year 9999. Bounding before converting
+	// to int64 also rejects values rounded up to 2^63 by JSON float decoding.
+	const maxUnixMillis = 253402300799999
+	var expires time.Time
+	var number float64
+	if json.Unmarshal(raw, &number) == nil && number > 0 && number <= maxUnixMillis && math.Trunc(number) == number {
+		switch {
+		case key == "expiry_date", number > 1e12:
+			expires = time.UnixMilli(int64(number))
+		default:
+			expires = time.Unix(int64(number), 0)
+		}
+	} else {
+		var stamp string
+		if json.Unmarshal(raw, &stamp) == nil {
+			// The Nano layout also accepts stamps without fractional seconds.
+			expires, _ = time.Parse(time.RFC3339Nano, stamp)
+		}
+	}
+	if !expires.After(time.Unix(0, 0)) || expires.UTC().Year() > 9999 {
+		return time.Time{}, fmt.Errorf("%s is not a valid credential expiry", key)
+	}
+	return expires, nil
+}
+
 // HasAuthFilesReadOnly checks live credential presence without creating a
 // keychain mirror, migrating filenames, or changing native settings. It applies
 // the same credential validation as restore, not an online provider check.
