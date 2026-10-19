@@ -2,10 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 )
@@ -234,6 +237,59 @@ func TestCostTokensFlags(t *testing.T) {
 	}
 }
 
+// `caam cost tokens` returned [] on a host with fresh Claude Code transcripts
+// and Codex rollouts: neither scanner read where those CLIs write (issue #126).
+func TestCostTokensReadsClaudeAndCodexSessionLogs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("GEMINI_HOME", filepath.Join(home, "no-gemini"))
+	ts := time.Now().UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000Z")
+	write := func(path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(home, ".claude", "projects", "-work-proj", "s.jsonl"),
+		`{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"`+ts+`"}`+"\n"+
+			`{"type":"assistant","sessionId":"s","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":300,"output_tokens":40,"output_tokens_details":{},"server_tool_use":{}}},"timestamp":"`+ts+`"}`+"\n")
+	write(filepath.Join(home, ".codex", "sessions", "2026", "10", "15", "rollout-x.jsonl"),
+		`{"timestamp":"`+ts+`","type":"turn_context","payload":{"model":"gpt-5-codex"}}`+"\n"+
+			`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":7,"total_tokens":107},"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":7,"total_tokens":107}}}}`+"\n")
+
+	c := &cobra.Command{RunE: runCostTokens}
+	c.Flags().String("last", "48h", "")
+	c.Flags().String("format", "json", "")
+	var out bytes.Buffer
+	c.SetOut(&out)
+	if err := runCostTokens(c, nil); err != nil {
+		t.Fatalf("cost tokens: %v", err)
+	}
+	var analyses []TokenCostAnalysis
+	if err := json.Unmarshal(out.Bytes(), &analyses); err != nil {
+		t.Fatalf("decode %q: %v", out.String(), err)
+	}
+	got := map[string]TokenCostAnalysis{}
+	for _, a := range analyses {
+		got[a.Provider] = a
+	}
+	claude, codex := got["claude"], got["codex"]
+	if len(analyses) != 2 || claude.TotalTokens != 370 || codex.TotalTokens != 107 {
+		t.Fatalf("analyses = %s, want claude 370 and codex 107 tokens", out.String())
+	}
+	if len(claude.ByModel) != 1 || claude.ByModel[0].Model != "claude-opus-5-5" || claude.CacheReadTokens != 300 {
+		t.Fatalf("claude per-model = %+v", claude)
+	}
+	if len(codex.ByModel) != 1 || codex.ByModel[0].Model != "gpt-5-codex" || codex.CacheReadTokens != 60 || codex.InputTokens != 40 {
+		t.Fatalf("codex per-model = %+v", codex)
+	}
+}
+
 func TestFormatTokenCount(t *testing.T) {
 	tests := []struct {
 		tokens   int64
@@ -353,15 +409,15 @@ func TestRenderTokenCostTable_Empty(t *testing.T) {
 func TestRenderTokenCostTable_WithData(t *testing.T) {
 	analyses := []TokenCostAnalysis{
 		{
-			Provider:          "claude",
-			Period:            "7d",
-			TotalTokens:       1000000,
-			InputTokens:       400000,
-			OutputTokens:      600000,
-			TotalAPICost:      15.50,
-			SubscriptionCost:  46.67,
-			Savings:           -31.17,
-			SavingsPercent:    -201.1,
+			Provider:         "claude",
+			Period:           "7d",
+			TotalTokens:      1000000,
+			InputTokens:      400000,
+			OutputTokens:     600000,
+			TotalAPICost:     15.50,
+			SubscriptionCost: 46.67,
+			Savings:          -31.17,
+			SavingsPercent:   -201.1,
 			ByModel: []TokenModelCost{
 				{Model: "claude-3-opus", TotalTokens: 1000000, Percent: 100, APICost: 15.50},
 			},

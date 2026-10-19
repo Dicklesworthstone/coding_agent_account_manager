@@ -66,6 +66,9 @@ type MultiProfileFetcher struct {
 	logScanner    logs.Scanner // Optional scanner for burn rate calculation
 }
 
+// burnRateWindow is how much recent log history feeds a profile's burn rate.
+const burnRateWindow = 24 * time.Hour
+
 // FetcherOption configures the MultiProfileFetcher.
 type FetcherOption func(*MultiProfileFetcher)
 
@@ -100,6 +103,27 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 	var wg sync.WaitGroup
 	results := make([]ProfileUsage, 0, len(profiles))
 	var mu sync.Mutex
+
+	// The logs are the same for every profile, and a busy machine has many
+	// megabytes of recent transcripts, so read them once per call rather than
+	// once per profile.
+	var burnOnce sync.Once
+	var burnScan []*logs.LogEntry
+	burnEntries := func() []*logs.LogEntry {
+		burnOnce.Do(func() {
+			scanner := m.logScanner
+			if ms, ok := scanner.(*logs.MultiScanner); ok {
+				scanner = ms.Scanner(provider)
+			}
+			if scanner == nil {
+				return
+			}
+			if res, err := scanner.Scan(ctx, "", time.Now().Add(-burnRateWindow)); err == nil && res != nil {
+				burnScan = res.Entries
+			}
+		})
+		return burnScan
+	}
 
 	for name, token := range profiles {
 		wg.Add(1)
@@ -187,55 +211,13 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 			if info != nil {
 				info.ProfileName = name
 
-				// Calculate burn rate if scanner is available
-				if m.logScanner != nil {
-					// Scan logs for this provider.
-					// Note: Currently logs.Scanner interface takes logDir.
-					// We might need to know the specific log directory for the profile if isolated,
-					// or use the provider's default log dir and filter by user?
-					// For now, we'll scan the provider's default logs and we might need to filter by profile?
-					//
-					// CAAM usually runs one profile at a time in Vault mode, so the logs in ~/.local/share/claude/logs
-					// belong to the *active* profile at that time. But historical logs might be mixed.
-					//
-					// However, typical CLI usage is sequential.
-					// We'll scan the last 24 hours of logs.
-
-					// Use a 24-hour window for burn rate calculation
-					window := 24 * time.Hour
-					since := time.Now().Add(-window)
-
-					// We need to find the correct log directory.
-					// For Vault mode, it's the standard provider log dir.
-					// But MultiProfileFetcher doesn't know about file system paths easily.
-					// We'll rely on the scanner's default behavior if logDir is empty.
-					//
-					// If using MultiScanner, we need to cast or select the right scanner.
-					var scanner logs.Scanner
-					if ms, ok := m.logScanner.(*logs.MultiScanner); ok {
-						scanner = ms.Scanner(provider)
-					} else {
-						scanner = m.logScanner
-					}
-
-					if scanner != nil {
-						scanRes, err := scanner.Scan(ctx, "", since)
-						if err == nil && scanRes != nil {
-							// Filter logs?
-							// If we have profile-specific logs, great.
-							// For now, assume all logs for the provider are relevant usage
-							// (as we are usually checking *our* usage).
-							//
-							// TODO: If we want to be precise per-profile, we'd need logs to contain
-							// some identity info, which they often don't.
-							// But for "burn rate", recent usage is what matters.
-
-							burnRate := CalculateBurnRate(scanRes.Entries, window, DefaultBurnRateOptions())
-							if burnRate != nil {
-								info.BurnRate = burnRate
-								info.UpdateDepletion()
-							}
-						}
+				// Burn rate comes from the provider's local session logs. They
+				// carry no account identity, so every profile of the provider
+				// gets the machine's recent rate; see burnEntries.
+				if entries := burnEntries(); len(entries) > 0 {
+					if burnRate := CalculateBurnRate(entries, burnRateWindow, DefaultBurnRateOptions()); burnRate != nil {
+						info.BurnRate = burnRate
+						info.UpdateDepletion()
 					}
 				}
 			}

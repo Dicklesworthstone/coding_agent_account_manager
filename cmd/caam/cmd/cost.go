@@ -86,6 +86,12 @@ what the equivalent API cost would be. This helps you understand the value
 you're getting from your subscription.
 
 Token-cost analysis is available for providers with log scanners (claude, codex, gemini).
+Usage is read from:
+  claude  Claude Code session transcripts: $CLAUDE_CONFIG_DIR/projects when set,
+          otherwise ~/.claude/projects and ~/.config/claude/projects
+  codex   Codex session rollouts: $CODEX_HOME/sessions and
+          $CODEX_HOME/archived_sessions (CODEX_HOME defaults to ~/.codex)
+  gemini  $GEMINI_HOME/logs (GEMINI_HOME defaults to ~/.gemini)
 
 Examples:
   caam cost tokens                    # Show costs for providers with log scanners (claude, codex, gemini)

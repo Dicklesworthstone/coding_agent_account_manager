@@ -8,8 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 )
 
 func TestUsageInfo_AvailabilityScore(t *testing.T) {
@@ -311,6 +314,49 @@ func TestMultiProfileFetcher_NilFetcherDoesNotPanic(t *testing.T) {
 			t.Fatal("results[0].Usage.Error is empty, want error")
 		}
 	})
+}
+
+type countingLogScanner struct {
+	mu    sync.Mutex
+	scans int
+}
+
+func (s *countingLogScanner) Scan(ctx context.Context, logDir string, since time.Time) (*logs.ScanResult, error) {
+	s.mu.Lock()
+	s.scans++
+	s.mu.Unlock()
+	now := time.Now()
+	return &logs.ScanResult{Provider: "claude", Since: since, Until: now, Entries: []*logs.LogEntry{
+		{Timestamp: now.Add(-3 * time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+		{Timestamp: now.Add(-2 * time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+		{Timestamp: now.Add(-time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+	}}, nil
+}
+
+func (s *countingLogScanner) LogDir() string { return "" }
+
+// Local session logs carry no account identity, so they are read once per
+// call and shared by every profile instead of once per profile.
+func TestMultiProfileFetcherScansLogsOncePerCall(t *testing.T) {
+	scanner := &countingLogScanner{}
+	multi := logs.NewMultiScanner()
+	multi.Register("claude", scanner)
+	m := &MultiProfileFetcher{logScanner: multi}
+	results := m.FetchAllProfiles(context.Background(), "claude", map[string]string{"a": "t", "b": "t", "c": "t", "d": "t"})
+	if len(results) != 4 {
+		t.Fatalf("results = %d, want 4", len(results))
+	}
+	for _, r := range results {
+		if r.Usage == nil || r.Usage.BurnRate == nil {
+			t.Fatalf("%s has no burn rate: %+v", r.ProfileName, r.Usage)
+		}
+	}
+	if scanner.scans != 1 {
+		t.Fatalf("logs scanned %d times for 4 profiles, want once", scanner.scans)
+	}
+	if rows := (&MultiProfileFetcher{logScanner: multi}).FetchAllProfiles(context.Background(), "codex", map[string]string{"x": "t"}); rows[0].Usage.BurnRate != nil {
+		t.Fatal("a provider without a scanner got another provider's burn rate")
+	}
 }
 
 func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {

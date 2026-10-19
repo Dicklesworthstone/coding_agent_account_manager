@@ -2,244 +2,136 @@ package logs
 
 import (
 	"context"
-	"os"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestNewCodexScanner(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome) // Mock HOME for os.UserHomeDir()
-	t.Setenv("CODEX_HOME", "") // Ensure CODEX_HOME is unset
-
-	scanner := NewCodexScanner()
-	if scanner == nil {
-		t.Fatal("NewCodexScanner() returned nil")
+func codexTokenCount(ts string, last, total *codexTokenUsage) string {
+	usage := func(u *codexTokenUsage) string {
+		if u == nil {
+			return "null"
+		}
+		return fmt.Sprintf(`{"input_tokens":%d,"cached_input_tokens":%d,"cache_write_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":0,"total_tokens":%d}`,
+			u.InputTokens, u.CachedInputTokens, u.CacheWriteInputTokens, u.OutputTokens, u.TotalTokens)
 	}
+	return fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":%s,"last_token_usage":%s,"model_context_window":272000},"rate_limits":{"primary":{"used_percent":9.0}}}}`,
+		ts, usage(total), usage(last))
+}
 
-	expected := filepath.Join(tmpHome, ".codex", "logs")
-	if scanner.LogDir() != expected {
-		t.Errorf("LogDir() = %q, want %q", scanner.LogDir(), expected)
+func TestNewCodexScannerDefaultRoots(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	got := NewCodexScanner().logDirs
+	want := []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex", "archived_sessions")}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("default roots = %q, want %q", got, want)
+	}
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex-alt"))
+	if got := NewCodexScanner().LogDir(); got != filepath.Join(home, "codex-alt", "sessions") {
+		t.Fatalf("CODEX_HOME root = %q", got)
 	}
 }
 
 func TestNewCodexScannerWithDir(t *testing.T) {
-	customDir := "/custom/codex/logs"
-	scanner := NewCodexScannerWithDir(customDir)
-	if scanner.LogDir() != customDir {
-		t.Errorf("LogDir() = %q, want %q", scanner.LogDir(), customDir)
+	if got := NewCodexScannerWithDir("/custom/codex").LogDir(); got != "/custom/codex" {
+		t.Errorf("LogDir() = %q", got)
 	}
 }
 
-func TestCodexScanner_ScanMissingDirectory(t *testing.T) {
-	scanner := NewCodexScannerWithDir("/nonexistent/codex/logs")
-
-	ctx := context.Background()
-	result, err := scanner.Scan(ctx, "", time.Time{})
-	if err != nil {
-		t.Fatalf("Scan() error = %v, want nil for missing directory", err)
-	}
-
-	if result.Provider != "codex" {
-		t.Errorf("Provider = %q, want codex", result.Provider)
-	}
-	if len(result.Entries) != 0 {
-		t.Errorf("Entries = %d, want 0 for missing directory", len(result.Entries))
+func TestCodexScanner_ScanMissingAndEmptyDirectory(t *testing.T) {
+	for _, dir := range []string{filepath.Join(t.TempDir(), "absent"), t.TempDir()} {
+		result, err := NewCodexScannerWithDir(dir).Scan(context.Background(), "", time.Time{})
+		if err != nil || result.Provider != "codex" || len(result.Entries) != 0 {
+			t.Fatalf("Scan(%s) = %+v, %v; want an empty codex result", dir, result, err)
+		}
 	}
 }
 
-func TestCodexScanner_ScanEmptyDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-	scanner := NewCodexScannerWithDir(tmpDir)
+// The reported symptom: `caam cost tokens codex` returned [] because the
+// scanner read $CODEX_HOME/logs, while Codex records usage in session
+// rollouts under $CODEX_HOME/sessions (issue #126).
+func TestCodexScannerReadsSessionRollouts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	now := time.Now().UTC()
+	at := func(ago time.Duration) string { return now.Add(-ago).Format("2006-01-02T15:04:05.000Z") }
 
-	ctx := context.Background()
-	result, err := scanner.Scan(ctx, "", time.Time{})
-	if err != nil {
-		t.Fatalf("Scan() error = %v", err)
-	}
+	first := &codexTokenUsage{InputTokens: 1000, CachedInputTokens: 600, CacheWriteInputTokens: 100, OutputTokens: 50, TotalTokens: 1050}
+	second := &codexTokenUsage{InputTokens: 2000, CachedInputTokens: 1500, OutputTokens: 80, TotalTokens: 2080}
+	running := &codexTokenUsage{InputTokens: 3000, CachedInputTokens: 2100, CacheWriteInputTokens: 100, OutputTokens: 130, TotalTokens: 3130}
+	third := &codexTokenUsage{InputTokens: 500, OutputTokens: 20, TotalTokens: 520}
+	finalTotal := &codexTokenUsage{InputTokens: 3500, CachedInputTokens: 2100, CacheWriteInputTokens: 100, OutputTokens: 150, TotalTokens: 3650}
 
-	if len(result.Entries) != 0 {
-		t.Errorf("Entries = %d, want 0 for empty directory", len(result.Entries))
-	}
-}
+	rollout := filepath.Join(home, ".codex", "sessions", now.Format("2006"), now.Format("01"), now.Format("02"), "rollout-2026-10-15T16-38-00-abc.jsonl")
+	writeTranscript(t, rollout,
+		`{"timestamp":"`+at(3*time.Hour)+`","type":"session_meta","payload":{"id":"sess-codex","cwd":"/work/proj","cli_version":"0.48.0","instructions":"..."}}`,
+		`{"timestamp":"`+at(3*time.Hour)+`","type":"turn_context","payload":{"cwd":"/work/proj","approval_policy":"on-request","model":"gpt-5-codex","effort":"high"}}`,
+		`{"timestamp":"`+at(3*time.Hour)+`","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"token_count please"}]}}`,
+		// A rate-limit-only update carries no usage.
+		`{"timestamp":"`+at(3*time.Hour)+`","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":8.0}}}}`,
+		codexTokenCount(at(3*time.Hour), first, first),
+		codexTokenCount(at(2*time.Hour), second, running),
+		// Codex re-emits the same running total: not new usage.
+		codexTokenCount(at(2*time.Hour), second, running),
+		`{"timestamp":"`+at(time.Hour)+`","type":"turn_context","payload":{"model":"gpt-5-mini"}}`,
+		// Older rollouts may omit last_token_usage: use the running-total delta.
+		codexTokenCount(at(time.Hour), nil, finalTotal),
+	)
+	// Archived sessions count too; this one is outside the window.
+	writeTranscript(t, filepath.Join(home, ".codex", "archived_sessions", "rollout-old.jsonl"),
+		`{"timestamp":"`+at(72*time.Hour)+`","type":"turn_context","payload":{"model":"gpt-5-codex"}}`,
+		codexTokenCount(at(72*time.Hour), third, third),
+		`{"timestamp":"`+at(10*time.Minute)+`","type":"turn_context","payload":{"model":"gpt-5-codex"}}`,
+		codexTokenCount(at(10*time.Minute), third, &codexTokenUsage{InputTokens: 1000, OutputTokens: 40, TotalTokens: 1040}),
+	)
 
-func TestCodexScanner_ScanValidJSONL(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	logContent := `{"timestamp":"2025-01-10T12:00:00Z","event":"response","model":"gpt-4o","session_id":"sess-1","request_id":"req-1","usage":{"prompt_tokens":100,"completion_tokens":200,"total_tokens":300}}
-{"time":1736510460,"type":"response","request":{"model":"gpt-4o-mini"},"response":{"usage":{"input_tokens":50,"output_tokens":75}},"sessionId":"sess-2","message_id":"msg-2"}
-`
-	logFile := filepath.Join(tmpDir, "session-test.jsonl")
-	if err := os.WriteFile(logFile, []byte(logContent), 0600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	scanner := NewCodexScannerWithDir(tmpDir)
-	ctx := context.Background()
-	result, err := scanner.Scan(ctx, "", time.Time{})
-	if err != nil {
-		t.Fatalf("Scan() error = %v", err)
-	}
-
-	if result.TotalEntries != 2 {
-		t.Errorf("TotalEntries = %d, want 2", result.TotalEntries)
-	}
-	if result.ParsedEntries != 2 {
-		t.Errorf("ParsedEntries = %d, want 2", result.ParsedEntries)
-	}
-	if len(result.Entries) != 2 {
-		t.Fatalf("Entries = %d, want 2", len(result.Entries))
-	}
-
-	entry := result.Entries[0]
-	if entry.Model != "gpt-4o" {
-		t.Errorf("Entry[0].Model = %q, want gpt-4o", entry.Model)
-	}
-	if entry.InputTokens != 100 {
-		t.Errorf("Entry[0].InputTokens = %d, want 100", entry.InputTokens)
-	}
-	if entry.OutputTokens != 200 {
-		t.Errorf("Entry[0].OutputTokens = %d, want 200", entry.OutputTokens)
-	}
-	if entry.TotalTokens != 300 {
-		t.Errorf("Entry[0].TotalTokens = %d, want 300", entry.TotalTokens)
-	}
-	if entry.ConversationID != "sess-1" {
-		t.Errorf("Entry[0].ConversationID = %q, want sess-1", entry.ConversationID)
-	}
-	if entry.MessageID != "req-1" {
-		t.Errorf("Entry[0].MessageID = %q, want req-1", entry.MessageID)
-	}
-
-	second := result.Entries[1]
-	if second.Model != "gpt-4o-mini" {
-		t.Errorf("Entry[1].Model = %q, want gpt-4o-mini", second.Model)
-	}
-	if second.InputTokens != 50 {
-		t.Errorf("Entry[1].InputTokens = %d, want 50", second.InputTokens)
-	}
-	if second.OutputTokens != 75 {
-		t.Errorf("Entry[1].OutputTokens = %d, want 75", second.OutputTokens)
-	}
-	if second.TotalTokens != 125 {
-		t.Errorf("Entry[1].TotalTokens = %d, want 125", second.TotalTokens)
-	}
-	if second.ConversationID != "sess-2" {
-		t.Errorf("Entry[1].ConversationID = %q, want sess-2", second.ConversationID)
-	}
-	if second.MessageID != "msg-2" {
-		t.Errorf("Entry[1].MessageID = %q, want msg-2", second.MessageID)
-	}
-}
-
-func TestCodexScanner_ScanMalformedLines(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	logContent := `{"timestamp":"2025-01-10T12:00:00Z","event":"response","model":"gpt-4o","usage":{"prompt_tokens":100,"completion_tokens":200}}
-not valid json
-{"timestamp":"2025-01-10T12:01:00Z","event":"response","model":"gpt-4o-mini","usage":{"prompt_tokens":50,"completion_tokens":100}}
-also not valid {
-`
-	logFile := filepath.Join(tmpDir, "session-bad.jsonl")
-	if err := os.WriteFile(logFile, []byte(logContent), 0600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
-	}
-
-	scanner := NewCodexScannerWithDir(tmpDir)
-	ctx := context.Background()
-	result, err := scanner.Scan(ctx, "", time.Time{})
+	result, err := NewCodexScanner().Scan(context.Background(), "", now.Add(-48*time.Hour))
 	if err != nil {
 		t.Fatalf("Scan() error = %v", err)
 	}
-
-	if result.TotalEntries != 4 {
-		t.Errorf("TotalEntries = %d, want 4", result.TotalEntries)
+	if result.ParseErrors != 0 || len(result.Entries) != 4 {
+		t.Fatalf("entries=%d parse_errors=%d, want 4 responses and no errors", len(result.Entries), result.ParseErrors)
 	}
-	if result.ParsedEntries != 2 {
-		t.Errorf("ParsedEntries = %d, want 2", result.ParsedEntries)
+	usage := result.TokenUsage()
+	codex, mini := usage.ByModel["gpt-5-codex"], usage.ByModel["gpt-5-mini"]
+	if codex == nil || mini == nil {
+		t.Fatalf("ByModel = %+v, want gpt-5-codex and gpt-5-mini", usage.ByModel)
 	}
-	if result.ParseErrors != 2 {
-		t.Errorf("ParseErrors = %d, want 2", result.ParseErrors)
+	// Codex's own totals are input + output; cached and cache-write input are
+	// part of input_tokens and must not be counted twice.
+	if codex.TotalTokens != 1050+2080+520 || mini.TotalTokens != 3650-3130 {
+		t.Fatalf("totals codex=%d mini=%d, want %d and %d", codex.TotalTokens, mini.TotalTokens, 1050+2080+520, 3650-3130)
 	}
-}
-
-func TestCodexScanner_ScanWithTimestampFilter(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	logContent := `{"timestamp":"2025-01-10T10:00:00Z","event":"response","model":"old","usage":{"prompt_tokens":100,"completion_tokens":200}}
-{"timestamp":"2025-01-10T12:00:00Z","event":"response","model":"new","usage":{"prompt_tokens":50,"completion_tokens":100}}
-`
-	logFile := filepath.Join(tmpDir, "session-filter.jsonl")
-	if err := os.WriteFile(logFile, []byte(logContent), 0600); err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
+	if usage.CacheReadTokens != 600+1500 || usage.CacheCreateTokens != 100 {
+		t.Fatalf("cache read=%d write=%d, want 2100 and 100", usage.CacheReadTokens, usage.CacheCreateTokens)
 	}
-
-	scanner := NewCodexScannerWithDir(tmpDir)
-	ctx := context.Background()
-
-	since := time.Date(2025, 1, 10, 11, 0, 0, 0, time.UTC)
-	result, err := scanner.Scan(ctx, "", since)
-	if err != nil {
-		t.Fatalf("Scan() error = %v", err)
+	if codex.InputTokens != 300+500+500 || codex.OutputTokens != 50+80+20 {
+		t.Fatalf("codex uncached input=%d output=%d, want 1300 and 150", codex.InputTokens, codex.OutputTokens)
 	}
-
-	if len(result.Entries) != 1 {
-		t.Fatalf("Entries = %d, want 1", len(result.Entries))
-	}
-	if result.Entries[0].Model != "new" {
-		t.Errorf("Entry[0].Model = %q, want new", result.Entries[0].Model)
+	if result.Entries[0].ConversationID != "sess-codex" || result.Entries[0].Timestamp.IsZero() {
+		t.Fatalf("entry lost its session or time: %+v", result.Entries[0])
 	}
 }
 
-func TestCodexScanner_ScanMultipleFiles(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	log1 := `{"timestamp":"2025-01-10T12:00:00Z","event":"response","model":"file1","usage":{"prompt_tokens":100,"completion_tokens":200}}
-`
-	log2 := `{"timestamp":"2025-01-10T12:01:00Z","event":"response","model":"file2","usage":{"prompt_tokens":50,"completion_tokens":100}}
-`
-	if err := os.WriteFile(filepath.Join(tmpDir, "session-one.jsonl"), []byte(log1), 0600); err != nil {
-		t.Fatalf("Failed to write log1: %v", err)
+func TestCodexScannerSurvivesMalformedLines(t *testing.T) {
+	dir := t.TempDir()
+	u := &codexTokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}
+	writeTranscript(t, filepath.Join(dir, "2026", "10", "15", "rollout-x.jsonl"),
+		`{"timestamp":"2026-10-15T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":`, // truncated write
+		`{"timestamp":"2026-10-15T12:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"`+strings.Repeat("y", 2<<20)+`"}}`,
+		codexTokenCount("2026-10-15T12:00:02Z", u, u),
+	)
+	result, err := NewCodexScannerWithDir(dir).Scan(context.Background(), "", time.Time{})
+	if err != nil || len(result.Entries) != 1 || result.ParseErrors != 1 || result.TotalEntries != 3 {
+		t.Fatalf("entries=%d parse_errors=%d total=%d err=%v, want 1/1/3", len(result.Entries), result.ParseErrors, result.TotalEntries, err)
 	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "session-two.jsonl"), []byte(log2), 0600); err != nil {
-		t.Fatalf("Failed to write log2: %v", err)
-	}
-
-	scanner := NewCodexScannerWithDir(tmpDir)
-	ctx := context.Background()
-	result, err := scanner.Scan(ctx, "", time.Time{})
-	if err != nil {
-		t.Fatalf("Scan() error = %v", err)
-	}
-
-	if len(result.Entries) != 2 {
-		t.Errorf("Entries = %d, want 2", len(result.Entries))
-	}
-}
-
-func TestCodexScanner_ParseMissingFields(t *testing.T) {
-	scanner := NewCodexScannerWithDir("/ignored")
-	entry, err := scanner.parseLine([]byte(`{"event":"response"}`))
-	if err != nil {
-		t.Fatalf("parseLine() error = %v", err)
-	}
-	if entry.Model != "" {
-		t.Errorf("Model = %q, want empty", entry.Model)
-	}
-	if !entry.Timestamp.IsZero() {
-		t.Errorf("Timestamp = %v, want zero", entry.Timestamp)
-	}
-}
-
-func TestCodexScanner_TimestampParsing(t *testing.T) {
-	scanner := NewCodexScannerWithDir("/ignored")
-	entry, err := scanner.parseLine([]byte(`{"time":1736510460}`))
-	if err != nil {
-		t.Fatalf("parseLine() error = %v", err)
-	}
-	if entry.Timestamp.IsZero() {
-		t.Fatal("Timestamp should be parsed")
+	if result.Entries[0].Model != "" || result.Entries[0].TotalTokens != 15 {
+		t.Fatalf("entry = %+v, want 15 tokens and no model before any turn_context", result.Entries[0])
 	}
 }
 

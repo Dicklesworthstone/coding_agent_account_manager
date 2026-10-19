@@ -1,44 +1,65 @@
 package logs
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
-// ClaudeScanner parses Claude Code JSONL logs.
-// Claude Code stores logs at ~/.local/share/claude/logs/ in JSONL format.
+// ClaudeScanner reads token usage from Claude Code session transcripts.
+//
+// Claude Code appends one JSONL transcript per session under
+// <config>/projects/<munged-project-path>/, with subagent transcripts in
+// nested directories. <config> is $CLAUDE_CONFIG_DIR when set; otherwise
+// both ~/.config/claude and ~/.claude are read, since Claude Code has used
+// each as its default. Every API response is an "assistant" line whose
+// message carries id, model and usage; a response with several content
+// blocks is written as several lines repeating the same message id and
+// request id, so usage is counted once per (message id, request id).
 type ClaudeScanner struct {
-	logDir string
+	logDirs []string
 }
 
-// NewClaudeScanner creates a scanner with default log directory.
+// NewClaudeScanner creates a scanner over Claude Code's transcript stores.
 func NewClaudeScanner() *ClaudeScanner {
-	homeDir, _ := os.UserHomeDir()
-	return &ClaudeScanner{
-		logDir: filepath.Join(homeDir, ".local", "share", "claude", "logs"),
+	return &ClaudeScanner{logDirs: defaultClaudeProjectDirs()}
+}
+
+// NewClaudeScannerWithDir creates a scanner over one custom transcript root.
+// Useful for testing.
+func NewClaudeScannerWithDir(logDir string) *ClaudeScanner {
+	return &ClaudeScanner{logDirs: []string{logDir}}
+}
+
+func defaultClaudeProjectDirs() []string {
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); dir != "" {
+		return []string{filepath.Join(dir, "projects")}
+	}
+	home, _ := os.UserHomeDir()
+	return []string{
+		filepath.Join(home, ".config", "claude", "projects"),
+		filepath.Join(home, ".claude", "projects"),
 	}
 }
 
-// NewClaudeScannerWithDir creates a scanner with a custom log directory.
-// Useful for testing.
-func NewClaudeScannerWithDir(logDir string) *ClaudeScanner {
-	return &ClaudeScanner{logDir: logDir}
-}
-
-// LogDir returns the default log directory.
+// LogDir returns the primary transcript root.
 func (s *ClaudeScanner) LogDir() string {
-	return s.logDir
+	if len(s.logDirs) == 0 {
+		return ""
+	}
+	return s.logDirs[0]
 }
 
-// Scan parses logs since the given time.
-// If logDir is empty, uses the default log directory.
+// Scan returns one entry per Claude API response at or after since. If logDir
+// is empty, every default transcript root is read.
 func (s *ClaudeScanner) Scan(ctx context.Context, logDir string, since time.Time) (*ScanResult, error) {
-	if logDir == "" {
-		logDir = s.logDir
+	roots := s.logDirs
+	if logDir != "" {
+		roots = []string{logDir}
 	}
 
 	result := &ScanResult{
@@ -47,97 +68,72 @@ func (s *ClaudeScanner) Scan(ctx context.Context, logDir string, since time.Time
 		Until:    time.Now(),
 		Entries:  make([]*LogEntry, 0),
 	}
-
-	// Check if directory exists
-	if _, err := os.Stat(logDir); os.IsNotExist(err) {
-		// No logs directory = no logs, not an error
-		return result, nil
-	}
-
-	// Find all .jsonl files
-	files, err := filepath.Glob(filepath.Join(logDir, "*.jsonl"))
-	if err != nil {
-		return result, err
-	}
-
-	for _, file := range files {
-		select {
-		case <-ctx.Done():
-			return result, ctx.Err()
-		default:
+	responses := make(map[string]*LogEntry)
+	seenRoots := make(map[string]bool)
+	for _, root := range roots {
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			if seenRoots[resolved] {
+				continue // Both defaults can point at one store.
+			}
+			seenRoots[resolved] = true
 		}
-
-		// Check file modification time for quick filtering
-		info, err := os.Stat(file)
+		skipped, err := walkJSONLFiles(ctx, root, since, func(path string) error {
+			return s.scanFile(ctx, path, since, result, responses)
+		})
+		result.ParseErrors += skipped
 		if err != nil {
-			result.ParseErrors++
-			continue
-		}
-
-		// Skip files that haven't been modified since our cutoff
-		// (they can't contain new entries)
-		if !since.IsZero() && info.ModTime().Before(since) {
-			continue
-		}
-
-		if err := s.scanFile(ctx, file, since, result); err != nil {
-			// Log error but continue with other files
-			result.ParseErrors++
+			return result, err
 		}
 	}
-
 	return result, nil
 }
 
-// scanFile parses a single JSONL file.
-func (s *ClaudeScanner) scanFile(ctx context.Context, filePath string, since time.Time, result *ScanResult) error {
-	f, err := os.Open(filePath)
+func (s *ClaudeScanner) scanFile(ctx context.Context, path string, since time.Time, result *ScanResult, responses map[string]*LogEntry) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	// Increase buffer size for potentially large log lines
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024) // 1MB max line size
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
+	skipped, err := forEachJSONLLine(ctx, f, func(line []byte) {
 		result.TotalEntries++
-		line := scanner.Bytes()
-
-		entry, err := s.parseLine(line)
+		// Most transcript bytes are user turns and tool output. Only decode
+		// lines that can be an assistant response with usage.
+		if !bytes.Contains(line, []byte(`"usage"`)) || !bytes.Contains(line, []byte(`"assistant"`)) {
+			return
+		}
+		entry, key, err := parseClaudeTranscriptLine(line)
 		if err != nil {
 			result.ParseErrors++
-			continue
+			return
 		}
-
-		// Filter by timestamp
-		if !since.IsZero() && entry.Timestamp.Before(since) {
-			continue
+		if entry == nil || (!since.IsZero() && entry.Timestamp.Before(since)) {
+			return
 		}
-
+		if key != "" {
+			if prev := responses[key]; prev != nil {
+				mergeClaudeResponse(prev, entry)
+				return
+			}
+			responses[key] = entry
+		}
 		result.Entries = append(result.Entries, entry)
 		result.ParsedEntries++
-	}
-
-	return scanner.Err()
+	})
+	result.ParseErrors += skipped
+	return err
 }
 
-// claudeLogEntry represents the raw JSON structure from Claude logs.
-type claudeLogEntry struct {
-	Timestamp        string       `json:"timestamp"`
-	Type             string       `json:"type"`
-	Model            string       `json:"model"`
-	ConversationUUID string       `json:"conversation_uuid"`
-	MessageUUID      string       `json:"message_uuid"`
-	Usage            *claudeUsage `json:"usage"`
+type claudeTranscriptLine struct {
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	SessionID string `json:"sessionId"`
+	RequestID string `json:"requestId"`
+	Message   *struct {
+		ID    string       `json:"id"`
+		Model string       `json:"model"`
+		Usage *claudeUsage `json:"usage"`
+	} `json:"message"`
 }
 
 type claudeUsage struct {
@@ -147,41 +143,53 @@ type claudeUsage struct {
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 }
 
-// parseLine parses a single JSONL line into a LogEntry.
-func (s *ClaudeScanner) parseLine(line []byte) (*LogEntry, error) {
-	var raw claudeLogEntry
+// parseClaudeTranscriptLine returns the usage entry of one assistant line and
+// the key that identifies its API response. It returns a nil entry for lines
+// that carry no billable usage: other line types, Claude Code's "<synthetic>"
+// placeholder replies, and all-zero usage.
+func parseClaudeTranscriptLine(line []byte) (*LogEntry, string, error) {
+	var raw claudeTranscriptLine
 	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-
+	if raw.Type != "assistant" || raw.Message == nil || raw.Message.Usage == nil || raw.Message.Model == "<synthetic>" {
+		return nil, "", nil
+	}
+	u := raw.Message.Usage
 	entry := &LogEntry{
-		Type:           raw.Type,
-		Model:          raw.Model,
-		ConversationID: raw.ConversationUUID,
-		MessageID:      raw.MessageUUID,
-		Raw:            make(map[string]any),
+		Type:              raw.Type,
+		Model:             raw.Message.Model,
+		ConversationID:    raw.SessionID,
+		MessageID:         raw.Message.ID,
+		InputTokens:       max(u.InputTokens, 0),
+		OutputTokens:      max(u.OutputTokens, 0),
+		CacheReadTokens:   max(u.CacheReadInputTokens, 0),
+		CacheCreateTokens: max(u.CacheCreationInputTokens, 0),
 	}
-
-	// Parse timestamp
-	if raw.Timestamp != "" {
-		if t, err := time.Parse(time.RFC3339Nano, raw.Timestamp); err == nil {
-			entry.Timestamp = t
-		} else if t, err := time.Parse(time.RFC3339, raw.Timestamp); err == nil {
-			entry.Timestamp = t
-		}
-		// If parsing fails, leave as zero time
+	entry.TotalTokens = entry.CalculateTotalTokens()
+	if entry.TotalTokens == 0 {
+		return nil, "", nil
 	}
-
-	// Extract token counts
-	if raw.Usage != nil {
-		entry.InputTokens = raw.Usage.InputTokens
-		entry.OutputTokens = raw.Usage.OutputTokens
-		entry.CacheReadTokens = raw.Usage.CacheReadInputTokens
-		entry.CacheCreateTokens = raw.Usage.CacheCreationInputTokens
-		entry.TotalTokens = entry.CalculateTotalTokens()
+	if t, err := time.Parse(time.RFC3339Nano, raw.Timestamp); err == nil {
+		entry.Timestamp = t
 	}
+	key := ""
+	if raw.Message.ID != "" || raw.RequestID != "" {
+		key = raw.Message.ID + "\x00" + raw.RequestID
+	}
+	return entry, key, nil
+}
 
-	return entry, nil
+// mergeClaudeResponse folds a repeated line of one API response into the
+// entry already counted. The repeats normally carry identical usage; when an
+// earlier line was written mid-stream with a partial count, the larger value
+// is the response's real total.
+func mergeClaudeResponse(dst, src *LogEntry) {
+	dst.InputTokens = max(dst.InputTokens, src.InputTokens)
+	dst.OutputTokens = max(dst.OutputTokens, src.OutputTokens)
+	dst.CacheReadTokens = max(dst.CacheReadTokens, src.CacheReadTokens)
+	dst.CacheCreateTokens = max(dst.CacheCreateTokens, src.CacheCreateTokens)
+	dst.TotalTokens = dst.CalculateTotalTokens()
 }
 
 // Ensure ClaudeScanner implements Scanner interface.

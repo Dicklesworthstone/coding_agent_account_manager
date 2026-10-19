@@ -1,48 +1,60 @@
 package logs
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 )
 
-// CodexScanner parses Codex CLI JSONL logs.
-// Codex stores logs at $CODEX_HOME/logs/session-*.jsonl (default: ~/.codex/logs/).
+// CodexScanner reads token usage from Codex CLI session rollouts.
+//
+// Codex appends one JSONL rollout per session under
+// $CODEX_HOME/sessions/YYYY/MM/DD/ (default CODEX_HOME: ~/.codex), and moves
+// archived ones to $CODEX_HOME/archived_sessions/. Each model response is
+// followed by an event_msg line of payload.type "token_count" whose
+// info.last_token_usage is that response's usage and info.total_token_usage
+// the session's running total. The model comes from the latest turn_context
+// line before it.
 type CodexScanner struct {
-	logDir string
+	logDirs []string
 }
 
-// NewCodexScanner creates a scanner with the default log directory.
+// NewCodexScanner creates a scanner over Codex's rollout stores.
 func NewCodexScanner() *CodexScanner {
 	codexHome := os.Getenv("CODEX_HOME")
 	if codexHome == "" {
 		homeDir, _ := os.UserHomeDir()
 		codexHome = filepath.Join(homeDir, ".codex")
 	}
-	return &CodexScanner{logDir: filepath.Join(codexHome, "logs")}
+	return &CodexScanner{logDirs: []string{
+		filepath.Join(codexHome, "sessions"),
+		filepath.Join(codexHome, "archived_sessions"),
+	}}
 }
 
-// NewCodexScannerWithDir creates a scanner with a custom log directory.
+// NewCodexScannerWithDir creates a scanner over one custom rollout root.
 // Useful for testing.
 func NewCodexScannerWithDir(logDir string) *CodexScanner {
-	return &CodexScanner{logDir: logDir}
+	return &CodexScanner{logDirs: []string{logDir}}
 }
 
-// LogDir returns the default log directory.
+// LogDir returns the primary rollout root.
 func (s *CodexScanner) LogDir() string {
-	return s.logDir
+	if len(s.logDirs) == 0 {
+		return ""
+	}
+	return s.logDirs[0]
 }
 
-// Scan parses logs since the given time.
-// If logDir is empty, uses the default log directory.
+// Scan returns one entry per Codex model response at or after since. If logDir
+// is empty, every default rollout root is read.
 func (s *CodexScanner) Scan(ctx context.Context, logDir string, since time.Time) (*ScanResult, error) {
-	if logDir == "" {
-		logDir = s.logDir
+	roots := s.logDirs
+	if logDir != "" {
+		roots = []string{logDir}
 	}
 
 	result := &ScanResult{
@@ -51,287 +63,161 @@ func (s *CodexScanner) Scan(ctx context.Context, logDir string, since time.Time)
 		Until:    time.Now(),
 		Entries:  make([]*LogEntry, 0),
 	}
-
-	if _, err := os.Stat(logDir); os.IsNotExist(err) {
-		return result, nil
-	}
-
-	entries, err := os.ReadDir(logDir)
-	if err != nil {
-		return result, err
-	}
-
-	for _, entry := range entries {
-		select {
-		case <-ctx.Done():
-			return result, ctx.Err()
-		default:
-		}
-
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-
-		info, err := entry.Info()
+	for _, root := range roots {
+		skipped, err := walkJSONLFiles(ctx, root, since, func(path string) error {
+			return s.scanFile(ctx, path, since, result)
+		})
+		result.ParseErrors += skipped
 		if err != nil {
-			result.ParseErrors++
-			continue
-		}
-
-		if !since.IsZero() && info.ModTime().Before(since) {
-			continue
-		}
-
-		path := filepath.Join(logDir, name)
-		if err := s.scanFile(ctx, path, since, result); err != nil {
-			result.ParseErrors++
+			return result, err
 		}
 	}
-
 	return result, nil
 }
 
-func (s *CodexScanner) scanFile(ctx context.Context, filePath string, since time.Time, result *ScanResult) error {
-	f, err := os.Open(filePath)
+type codexRolloutLine struct {
+	Timestamp string          `json:"timestamp"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+type codexRolloutPayload struct {
+	Type  string `json:"type"`
+	ID    string `json:"id"`
+	Model string `json:"model"`
+	Info  *struct {
+		TotalTokenUsage *codexTokenUsage `json:"total_token_usage"`
+		LastTokenUsage  *codexTokenUsage `json:"last_token_usage"`
+	} `json:"info"`
+}
+
+// codexTokenUsage follows OpenAI's accounting: input_tokens includes the
+// cached and cache-write input, output_tokens includes reasoning, and
+// total_tokens is input plus output.
+type codexTokenUsage struct {
+	InputTokens           int64 `json:"input_tokens"`
+	CachedInputTokens     int64 `json:"cached_input_tokens"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+	TotalTokens           int64 `json:"total_tokens"`
+}
+
+func (u codexTokenUsage) sub(prev codexTokenUsage) (codexTokenUsage, bool) {
+	d := codexTokenUsage{
+		InputTokens:           u.InputTokens - prev.InputTokens,
+		CachedInputTokens:     u.CachedInputTokens - prev.CachedInputTokens,
+		CacheWriteInputTokens: u.CacheWriteInputTokens - prev.CacheWriteInputTokens,
+		OutputTokens:          u.OutputTokens - prev.OutputTokens,
+		TotalTokens:           u.TotalTokens - prev.TotalTokens,
+	}
+	ok := d.InputTokens >= 0 && d.CachedInputTokens >= 0 && d.CacheWriteInputTokens >= 0 && d.OutputTokens >= 0 && d.TotalTokens >= 0
+	return d, ok
+}
+
+// scanFile replays one rollout in order: the model is carried from the latest
+// turn_context, and a token_count that repeats the previous running total
+// (Codex re-emits it, for example with a rate-limit update) is not counted
+// twice.
+func (s *CodexScanner) scanFile(ctx context.Context, path string, since time.Time, result *ScanResult) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
+	var model, sessionID string
+	var prevTotal *codexTokenUsage
+	skipped, err := forEachJSONLLine(ctx, f, func(line []byte) {
 		result.TotalEntries++
-		line := scanner.Bytes()
-
-		entry, err := s.parseLine(line)
-		if err != nil {
+		if !bytes.Contains(line, []byte(`"token_count"`)) && !bytes.Contains(line, []byte(`"turn_context"`)) &&
+			!bytes.Contains(line, []byte(`"session_meta"`)) {
+			return
+		}
+		var raw codexRolloutLine
+		if err := json.Unmarshal(line, &raw); err != nil {
 			result.ParseErrors++
-			continue
+			return
+		}
+		var payload codexRolloutPayload
+		if len(raw.Payload) > 0 {
+			if err := json.Unmarshal(raw.Payload, &payload); err != nil {
+				result.ParseErrors++
+				return
+			}
+		}
+		switch {
+		case raw.Type == "session_meta":
+			sessionID = payload.ID
+			if payload.Model != "" {
+				model = payload.Model
+			}
+			return
+		case raw.Type == "turn_context":
+			if payload.Model != "" {
+				model = payload.Model
+			}
+			return
+		case raw.Type != "event_msg" || payload.Type != "token_count" || payload.Info == nil:
+			return // Rate-limit-only token_count events carry no info.
 		}
 
+		var usage codexTokenUsage
+		total := payload.Info.TotalTokenUsage
+		switch {
+		case total != nil && prevTotal != nil && *total == *prevTotal:
+			return // The same running total again: nothing new was used.
+		case payload.Info.LastTokenUsage != nil:
+			usage = *payload.Info.LastTokenUsage
+		case total != nil && prevTotal != nil:
+			delta, ok := total.sub(*prevTotal)
+			if !ok {
+				delta = *total // The running total restarted.
+			}
+			usage = delta
+		case total != nil:
+			usage = *total
+		default:
+			return
+		}
+		if total != nil {
+			t := *total
+			prevTotal = &t
+		}
+
+		entry := codexEntry(usage)
+		if entry.TotalTokens == 0 {
+			return
+		}
+		if t, err := time.Parse(time.RFC3339Nano, raw.Timestamp); err == nil {
+			entry.Timestamp = t
+		}
 		if !since.IsZero() && entry.Timestamp.Before(since) {
-			continue
+			return
 		}
-
+		entry.Model = model
+		entry.ConversationID = sessionID
 		result.Entries = append(result.Entries, entry)
 		result.ParsedEntries++
-	}
-
-	return scanner.Err()
+	})
+	result.ParseErrors += skipped
+	return err
 }
 
-func (s *CodexScanner) parseLine(line []byte) (*LogEntry, error) {
-	var raw map[string]any
-	if err := json.Unmarshal(line, &raw); err != nil {
-		return nil, err
+// codexEntry maps OpenAI accounting onto LogEntry's disjoint buckets, so that
+// CalculateTotalTokens equals Codex's own total (input + output).
+func codexEntry(u codexTokenUsage) *LogEntry {
+	input := max(u.InputTokens, 0)
+	cached := min(max(u.CachedInputTokens, 0), input)
+	written := min(max(u.CacheWriteInputTokens, 0), input-cached)
+	entry := &LogEntry{
+		Type:              "token_count",
+		InputTokens:       input - cached - written,
+		CacheReadTokens:   cached,
+		CacheCreateTokens: written,
+		OutputTokens:      max(u.OutputTokens, 0),
 	}
-
-	entry := &LogEntry{Raw: raw}
-	entry.Timestamp = extractCodexTimestamp(raw)
-	entry.Type = extractCodexString(raw, "type", "event", "event_type", "kind")
-	entry.Model = extractCodexString(raw, "model", "model_name", "modelId", "model_id")
-	if entry.Model == "" {
-		if req, ok := asCodexMap(raw["request"]); ok {
-			entry.Model = extractCodexString(req, "model", "model_name", "modelId", "model_id")
-		}
-	}
-	if entry.Model == "" {
-		if resp, ok := asCodexMap(raw["response"]); ok {
-			entry.Model = extractCodexString(resp, "model", "model_name", "modelId", "model_id")
-		}
-	}
-
-	entry.ConversationID = extractCodexString(raw,
-		"session_id",
-		"sessionId",
-		"conversation_id",
-		"conversationId",
-		"thread_id",
-	)
-
-	entry.MessageID = extractCodexString(raw,
-		"message_id",
-		"messageId",
-		"request_id",
-		"requestId",
-		"response_id",
-	)
-
-	if usage, ok := asCodexMap(raw["usage"]); ok {
-		applyCodexTokenFields(entry, usage)
-	}
-	if req, ok := asCodexMap(raw["request"]); ok {
-		if usage, ok := asCodexMap(req["usage"]); ok {
-			applyCodexTokenFields(entry, usage)
-		}
-	}
-	if resp, ok := asCodexMap(raw["response"]); ok {
-		if usage, ok := asCodexMap(resp["usage"]); ok {
-			applyCodexTokenFields(entry, usage)
-		}
-	}
-	applyCodexTokenFields(entry, raw)
-
-	if entry.TotalTokens == 0 {
-		entry.TotalTokens = entry.CalculateTotalTokens()
-	}
-
-	return entry, nil
-}
-
-func extractCodexTimestamp(raw map[string]any) time.Time {
-	for _, key := range []string{"timestamp", "time", "ts", "created_at", "createdAt", "created"} {
-		if ts, ok := raw[key]; ok {
-			if t, ok := parseCodexTimeAny(ts); ok {
-				return t
-			}
-		}
-	}
-	if req, ok := asCodexMap(raw["request"]); ok {
-		for _, key := range []string{"timestamp", "time", "ts", "created_at", "created"} {
-			if ts, ok := req[key]; ok {
-				if t, ok := parseCodexTimeAny(ts); ok {
-					return t
-				}
-			}
-		}
-	}
-	if resp, ok := asCodexMap(raw["response"]); ok {
-		for _, key := range []string{"timestamp", "time", "ts", "created_at", "created"} {
-			if ts, ok := resp[key]; ok {
-				if t, ok := parseCodexTimeAny(ts); ok {
-					return t
-				}
-			}
-		}
-	}
-	return time.Time{}
-}
-
-func parseCodexTimeAny(value any) (time.Time, bool) {
-	switch v := value.(type) {
-	case string:
-		if v == "" {
-			return time.Time{}, false
-		}
-		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
-			return t, true
-		}
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t, true
-		}
-		if num, err := strconv.ParseFloat(v, 64); err == nil {
-			return parseCodexUnixTime(num), true
-		}
-	case float64:
-		return parseCodexUnixTime(v), true
-	case int64:
-		return time.Unix(v, 0), true
-	case int:
-		return time.Unix(int64(v), 0), true
-	case json.Number:
-		if num, err := v.Float64(); err == nil {
-			return parseCodexUnixTime(num), true
-		}
-	}
-	return time.Time{}, false
-}
-
-func parseCodexUnixTime(value float64) time.Time {
-	switch {
-	case value > 1e18:
-		return time.Unix(0, int64(value))
-	case value > 1e15:
-		return time.Unix(0, int64(value*1e3))
-	case value > 1e12:
-		return time.Unix(0, int64(value*1e6))
-	default:
-		sec := int64(value)
-		ns := int64((value - float64(sec)) * 1e9)
-		return time.Unix(sec, ns)
-	}
-}
-
-func extractCodexString(raw map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if val, ok := raw[key]; ok {
-			if s, ok := val.(string); ok && s != "" {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
-func applyCodexTokenFields(entry *LogEntry, raw map[string]any) {
-	if entry.InputTokens == 0 {
-		entry.InputTokens = extractCodexInt64(raw, "input_tokens", "inputTokens", "prompt_tokens", "promptTokens")
-	}
-	if entry.OutputTokens == 0 {
-		entry.OutputTokens = extractCodexInt64(raw, "output_tokens", "outputTokens", "completion_tokens", "completionTokens")
-	}
-	if entry.CacheReadTokens == 0 {
-		entry.CacheReadTokens = extractCodexInt64(raw, "cache_read_tokens", "cacheReadTokens", "cache_read_input_tokens")
-	}
-	if entry.CacheCreateTokens == 0 {
-		entry.CacheCreateTokens = extractCodexInt64(raw, "cache_create_tokens", "cacheCreateTokens", "cache_creation_tokens", "cacheCreationTokens")
-	}
-	if entry.TotalTokens == 0 {
-		entry.TotalTokens = extractCodexInt64(raw, "total_tokens", "totalTokens")
-	}
-}
-
-func extractCodexInt64(raw map[string]any, keys ...string) int64 {
-	for _, key := range keys {
-		if val, ok := raw[key]; ok {
-			if n, ok := asCodexInt64(val); ok {
-				return n
-			}
-		}
-	}
-	return 0
-}
-
-func asCodexInt64(value any) (int64, bool) {
-	switch v := value.(type) {
-	case float64:
-		return int64(v), true
-	case int64:
-		return v, true
-	case int:
-		return int64(v), true
-	case json.Number:
-		if n, err := v.Int64(); err == nil {
-			return n, true
-		}
-		if n, err := v.Float64(); err == nil {
-			return int64(n), true
-		}
-	case string:
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n, true
-		}
-	}
-	return 0, false
-}
-
-func asCodexMap(value any) (map[string]any, bool) {
-	m, ok := value.(map[string]any)
-	return m, ok
+	entry.TotalTokens = entry.CalculateTotalTokens()
+	return entry
 }
 
 // Ensure CodexScanner implements Scanner interface.
