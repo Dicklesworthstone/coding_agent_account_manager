@@ -134,6 +134,7 @@ Do not keep using the isolated session after handing its snapshot to the vault.
 
 type profileBackupResult struct {
 	Success       bool     `json:"success"`
+	Published     bool     `json:"published,omitempty"`
 	Tool          string   `json:"tool"`
 	Profile       string   `json:"profile"`
 	SourceProfile string   `json:"source_profile"`
@@ -173,6 +174,7 @@ func runIsolatedVaultBackup(cmd *cobra.Command, tool, source, target string) err
 			return err
 		}
 		result.Success = true
+		result.Published = true
 		result.Path = vault.ProfilePath("claude", target)
 		result.Warnings = []string{isolatedBackupWarning}
 		return nil
@@ -180,6 +182,14 @@ func runIsolatedVaultBackup(cmd *cobra.Command, tool, source, target string) err
 	err = backup()
 	if err != nil {
 		result.Error = err.Error()
+		var published *authfile.SnapshotPublishedError
+		if errors.As(err, &published) {
+			// Publication cannot be undone after a failed directory flush:
+			// another process may already be using this complete snapshot.
+			result.Published = true
+			result.Path = published.Path
+			result.Warnings = []string{isolatedBackupWarning}
+		}
 	}
 	if jsonOutput {
 		// Match ordinary backup's machine-readable failure contract: one JSON

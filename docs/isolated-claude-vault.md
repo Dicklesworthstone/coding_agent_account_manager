@@ -172,3 +172,25 @@ behavior. `caam auth import` creates an isolated profile, not a vault entry.
 `caam backup --from-profile` and `caam profile backup` create vault entries from
 existing isolated Claude logins. They currently support Claude OAuth profiles
 only.
+
+## Publication and storage errors
+
+On Unix, the isolated importer flushes every prepared credential/settings file,
+metadata, and the prepared directory before publishing. For a newly created
+vault, it also flushes each new destination directory and the existing ancestor
+that contains it. Source-generation checks run again after these potentially
+slow flushes. Publication still uses the existing atomic no-replace rename, then
+flushes the destination directory before reporting success.
+
+A preparation/flush failure before the rename publishes no new entry. An error
+from the final directory flush is different: the complete snapshot has already
+been published and is retained. The command returns a nonzero exit status and
+reports its path; JSON includes `success: false`, `published: true`, `path`, and
+`error`. Inspect that entry before retrying. Do not automatically delete it or
+retry under another name, since another process may already be using it. Normal
+successful isolated imports also include `published: true`.
+
+These flushes use the filesystem's durability facilities, not an independent
+backup device or a guarantee against failing hardware. Windows retains its
+existing atomic no-replace publication and writer-side file flushes; the Unix
+directory-flush protocol does not add a Windows power-loss guarantee.

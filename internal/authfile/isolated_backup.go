@@ -45,6 +45,10 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 		return err
 	}
 	toolDir := filepath.Dir(destination)
+	ancestor, err := existingIsolatedBackupAncestor(toolDir)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(toolDir, 0700); err != nil {
 		return fmt.Errorf("create vault directory: %w", err)
 	}
@@ -121,16 +125,20 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 	// absent optional file, directory identity and the isolated session lock.
 	switchMu.Lock()
 	defer switchMu.Unlock()
-	if err := source.unchanged(); err != nil {
-		return err
-	}
-	if err := parent.unchanged(); err != nil {
-		return fmt.Errorf("vault directory changed during isolated backup: %w", err)
-	}
-	if err := workDir.unchanged(); err != nil {
-		return fmt.Errorf("snapshot transaction changed during isolated backup: %w", err)
-	}
-	return publishBackupSnapshot(stage, destination, "", nil, renameBackupNoReplace)
+	return publishIsolatedBackupDurably(stage, destination, ancestor, func() error {
+		// Flushing may block long enough for a native source writer to finish.
+		// Recheck AFTER flushing, immediately before the no-replace rename.
+		if err := source.unchanged(); err != nil {
+			return err
+		}
+		if err := parent.unchanged(); err != nil {
+			return fmt.Errorf("vault directory changed during isolated backup: %w", err)
+		}
+		if err := workDir.unchanged(); err != nil {
+			return fmt.Errorf("snapshot transaction changed during isolated backup: %w", err)
+		}
+		return publishBackupSnapshot(stage, destination, "", nil, renameBackupNoReplace)
+	})
 }
 
 type isolatedClaudeSource struct {
