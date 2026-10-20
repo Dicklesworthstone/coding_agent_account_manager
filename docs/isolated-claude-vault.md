@@ -55,6 +55,24 @@ mode-less profile is rejected before its credential files are read, even if
 it retains a complete OAuth cache from an earlier login. Create and authenticate
 an OAuth profile rather than relabeling another mode's cached credentials.
 
+The captured `settings.json` and `.claude.json` must also select that stored
+OAuth login. A helper, another API key/token, a named Anthropic profile,
+federation settings, an enabled cloud-provider selector, a config-directory or
+API-endpoint override, custom authentication headers, or a non-subscription
+`forceLoginMethod` causes the import to fail before vault preparation. These
+settings can override a complete cached OAuth login even when the registered
+profile still says `auth_mode: oauth`. Relevant selectors must have the expected
+string types; malformed or ambiguous selections fail closed. The importer never
+executes helpers, prints their values, refreshes tokens, or silently strips the
+settings to manufacture a different login.
+
+Ordinary workflow settings and other providers' environment variables remain
+unchanged. Empty overrides and explicitly disabled cloud switches (`0`,
+`false`, `no`, or `off`, case-insensitively) are allowed. Environment selector
+names are checked case-insensitively so a snapshot cannot select a different
+account when moved to Windows. These checks concern the saved profile files,
+not external project/managed policy or the caller's ambient credentials.
+
 The normal vault snapshot engine validates credentials and settings, checks
 conflicting identity evidence, generates identity metadata, and writes private
 files. The importer records the actual isolated source paths and publishes the

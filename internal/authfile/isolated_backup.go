@@ -187,6 +187,9 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 		}
 		state.files[name] = file.data
 	}
+	if err := validateIsolatedClaudeOAuthSelection(state.files); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentials, err)
+	}
 	state.identify(AuthFileSet{Tool: "claude"})
 	if state.identityConflict {
 		return nil, fmt.Errorf("%w: isolated credentials and account identity conflict", ErrInvalidCredentials)

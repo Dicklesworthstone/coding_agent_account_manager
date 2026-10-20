@@ -260,3 +260,100 @@ func TestBackupFromProfileRejectsNonOAuthSelectionBeforeCredentials(t *testing.T
 		})
 	}
 }
+
+func TestIsolatedBackupCommandsRejectSettingsCredentialOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		document string
+		settings map[string]any
+	}{
+		{"helper", "settings.json", map[string]any{"apiKeyHelper": "never-run-this-helper"}},
+		{"api-key", "settings.json", map[string]any{"apiKey": "must-not-print-secret"}},
+		{"environment-token", "settings.json", map[string]any{"env": map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": "must-not-print-secret"}}},
+		{"environment-key-case", "settings.json", map[string]any{"env": map[string]string{"anthropic_api_key": "must-not-print-secret"}}},
+		{"provider", "settings.json", map[string]any{"env": map[string]string{"CLAUDE_CODE_USE_VERTEX": "1"}}},
+		{"profile", "settings.json", map[string]any{"env": map[string]string{"ANTHROPIC_PROFILE": "another-account"}}},
+		{"endpoint", "settings.json", map[string]any{"env": map[string]string{"ANTHROPIC_BASE_URL": "https://gateway.invalid"}}},
+		{"redirect", "settings.json", map[string]any{"env": map[string]string{"CLAUDE_CONFIG_DIR": "/different/login"}}},
+		{"login-method", "settings.json", map[string]any{"forceLoginMethod": "console"}},
+		{"malformed-selector", "settings.json", map[string]any{"apiKeyHelper": []string{"must-not-print-secret"}}},
+		{"legacy-key", ".claude.json", map[string]any{"primaryApiKey": "must-not-print-secret"}},
+		{"legacy-token", ".claude.json", map[string]any{"oauthToken": "must-not-print-secret"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config, live := setupProfileBackupCommand(t)
+			path := filepath.Join(config, tc.document)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var object map[string]any
+			if err := json.Unmarshal(data, &object); err != nil {
+				t.Fatal(err)
+			}
+			for key, value := range tc.settings {
+				object[key] = value
+			}
+			data, err = json.Marshal(object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			sourceRoot := filepath.Dir(filepath.Dir(config))
+			sourceBefore, err := captureBackupTree(sourceRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := captureBackupTree(filepath.Dir(live))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, legacyCommand := range []bool{false, true} {
+				var out, stderr string
+				if legacyCommand {
+					out, stderr, err = executeProfileBackupTest(t, "claude", "isolated", "--as", "saved", "--json")
+				} else {
+					out, stderr, err = executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+				}
+				var result profileBackupResult
+				if !errors.Is(err, authfile.ErrInvalidCredentials) || json.Unmarshal([]byte(out), &result) != nil || result.Success || result.Error == "" || stderr != "" {
+					t.Fatalf("override not refused as a structured failure: stdout=%s; stderr=%s; error=%v", out, stderr, err)
+				}
+				if strings.Contains(out+stderr+err.Error(), "must-not-print-secret") {
+					t.Fatal("credential leaked into command diagnostics")
+				}
+				assertBackupTreeUnchanged(t, sourceRoot, sourceBefore)
+				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+				// Selection failure must occur before creating even a private
+				// vault transaction, not merely before publishing the final name.
+				if _, err := os.Lstat(authfile.DefaultVaultPath()); !os.IsNotExist(err) {
+					t.Fatalf("rejected source reached vault preparation: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestBackupFromProfilePreservesNonAuthSettingsVerbatim(t *testing.T) {
+	config, live := setupProfileBackupCommand(t)
+	data := []byte(`{"model":"opus","permissions":{"allow":["Read"]},"forceLoginMethod":"claudeai","env":{"OPENAI_API_KEY":"unrelated-provider","CLAUDE_CODE_USE_BEDROCK":"off"}}`)
+	if err := os.WriteFile(filepath.Join(config, "settings.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := captureBackupTree(filepath.Dir(live))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, err := executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+	if err != nil {
+		t.Fatalf("ordinary settings rejected: stdout=%s; stderr=%s; error=%v", out, stderr, err)
+	}
+	v := authfile.NewVault(authfile.DefaultVaultPath())
+	got, err := os.ReadFile(v.BackupPath("claude", "saved", "settings.json"))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("ordinary settings were stripped or changed: %v", err)
+	}
+	assertBackupTreeUnchanged(t, filepath.Dir(live), before)
+}

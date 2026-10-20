@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // isolatedSourceFile records absence as well as presence. A settings file
@@ -141,4 +143,102 @@ func validateIsolatedClaudeMetadata(data []byte, root string) error {
 		}
 	}
 	return nil
+}
+
+// validateIsolatedClaudeOAuthSelection checks the frozen settings, not the
+// caller's environment. auth_mode=oauth and a complete token cache do not prove
+// that Claude selects that cache: settings can supply a different credential,
+// provider, or endpoint after CAAM sanitizes the inherited environment.
+//
+// Fail before staging rather than stripping settings, executing a helper, or
+// exporting an account whose identity describes an ignored OAuth cache. Only
+// known selectors are inspected; unrelated workflow settings remain verbatim.
+func validateIsolatedClaudeOAuthSelection(files map[string][]byte) error {
+	for _, name := range []string{"settings.json", ".claude.json"} {
+		data, present := files[name]
+		if !present {
+			continue
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(data, &object) != nil || object == nil {
+			return fmt.Errorf("isolated %s must contain a JSON object", name)
+		}
+		for _, key := range []string{"apiKeyHelper", "apiKey", "api_key", "primaryApiKey", "oauthToken", "sessionKey", "forceLoginGatewayUrl"} {
+			value, err := isolatedSelectionString(object, key)
+			if err != nil {
+				return fmt.Errorf("isolated %s: %w", name, err)
+			}
+			if value != "" {
+				return fmt.Errorf("isolated %s selects %s instead of an unambiguous stored OAuth login", name, key)
+			}
+		}
+		method, err := isolatedSelectionString(object, "forceLoginMethod")
+		if err != nil {
+			return fmt.Errorf("isolated %s: %w", name, err)
+		}
+		if method != "" && method != "claudeai" {
+			return fmt.Errorf("isolated %s forceLoginMethod does not select Claude subscription OAuth", name)
+		}
+		raw, present := object["env"]
+		if !present {
+			continue
+		}
+		var env map[string]json.RawMessage
+		if json.Unmarshal(raw, &env) != nil || env == nil {
+			return fmt.Errorf("isolated %s env must contain a JSON object", name)
+		}
+		// Portable vault entries must not become different accounts on Windows,
+		// where environment variable names are case-insensitive. Inspect every
+		// spelling, including duplicate case variants, in deterministic order.
+		keys := make([]string, 0, len(env))
+		for key := range env {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			canonical := strings.ToUpper(key)
+			cloudSwitch := false
+			switch canonical {
+			case "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+				"CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE":
+				cloudSwitch = true
+			case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+				"CLAUDE_CONFIG_DIR",
+				"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+				"CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+				"ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_IDENTITY_TOKEN_FILE":
+			default:
+				continue
+			}
+			value, err := isolatedSelectionString(env, key)
+			if err != nil {
+				return fmt.Errorf("isolated %s env.%s must be a string", name, canonical)
+			}
+			if value == "" {
+				continue
+			}
+			if cloudSwitch {
+				switch strings.ToLower(value) {
+				case "0", "false", "no", "off":
+					continue
+				}
+			}
+			return fmt.Errorf("isolated %s env.%s overrides the stored OAuth login; use a profile with unambiguous OAuth settings", name, canonical)
+		}
+	}
+	return nil
+}
+
+// Never embed JSON values or decoder errors in diagnostics: selectors may hold
+// API keys, bearer tokens, custom headers, or helper commands containing secrets.
+func isolatedSelectionString(object map[string]json.RawMessage, key string) (string, error) {
+	raw, present := object[key]
+	if !present {
+		return "", nil
+	}
+	var value *string
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return "", fmt.Errorf("%s must be a string", key)
+	}
+	return *value, nil
 }
