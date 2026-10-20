@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/spf13/cobra"
 )
 
@@ -356,4 +359,126 @@ func TestBackupFromProfilePreservesNonAuthSettingsVerbatim(t *testing.T) {
 		t.Fatalf("ordinary settings were stripped or changed: %v", err)
 	}
 	assertBackupTreeUnchanged(t, filepath.Dir(live), before)
+}
+
+// A legacy-only profile is still a supported caam exec source. Import must use
+// the same namespace, not require the user to copy/migrate authentication files.
+func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
+	for _, command := range []string{"backup", "profile-backup"} {
+		for _, nested := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/nested=%v", command, nested), func(t *testing.T) {
+				xdg, live := setupProfileBackupCommand(t)
+				t.Setenv("CAAM_KEYCHAIN", "0")
+				root := filepath.Dir(filepath.Dir(xdg))
+				legacy := filepath.Join(root, "home", ".claude")
+				if err := os.MkdirAll(legacy, 0700); err != nil {
+					t.Fatal(err)
+				}
+				var paths []string
+				for _, name := range []string{".credentials.json", ".claude.json", "settings.json"} {
+					target := filepath.Join(legacy, name)
+					if name == ".claude.json" && !nested {
+						target = filepath.Join(root, "home", name)
+					}
+					if err := os.Rename(filepath.Join(xdg, name), target); err != nil {
+						t.Fatal(err)
+					}
+					paths = append(paths, target)
+				}
+				// Benign XDG policy cannot shadow the legacy login or leak into
+				// its vault snapshot. Account state alone does not select XDG.
+				for name, data := range map[string]string{
+					"settings.json": `{"model":"different-xdg-model"}`,
+					".claude.json":  `{"oauthAccount":{"accountUuid":"ignored-xdg"}}`,
+				} {
+					if err := os.WriteFile(filepath.Join(xdg, name), []byte(data), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				prof, err := profile.NewStore(profile.DefaultStorePath()).Load("claude", "isolated")
+				if err != nil {
+					t.Fatal(err)
+				}
+				env, err := claude.New().Env(context.Background(), prof)
+				if err != nil || env["CLAUDE_CONFIG_DIR"] != legacy {
+					t.Fatalf("test does not represent a legacy execution source: %v", err)
+				}
+				sourceBefore, err := captureBackupTree(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				liveBefore, err := captureBackupTree(filepath.Dir(live))
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Track home-level native state separately from ~/.claude.
+				nativeState := filepath.Join(os.Getenv("HOME"), ".claude.json")
+				if err := os.WriteFile(nativeState, []byte(`{"running":"native-account"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				stateBefore, err := captureBackupTree(nativeState)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out, stderr string
+				if command == "backup" {
+					out, stderr, err = executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+				} else {
+					out, stderr, err = executeProfileBackupTest(t, "claude", "isolated", "--as", "saved", "--json")
+				}
+				if err != nil || stderr != "" {
+					t.Fatalf("legacy import: %v; stdout=%s; stderr=%s", err, out, stderr)
+				}
+				var result profileBackupResult
+				if err := json.Unmarshal([]byte(out), &result); err != nil || !result.Success {
+					t.Fatalf("invalid result: %v: %s", err, out)
+				}
+				assertBackupTreeUnchanged(t, root, sourceBefore)
+				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+				assertBackupTreeUnchanged(t, nativeState, stateBefore)
+				for _, path := range paths {
+					want, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := os.ReadFile(filepath.Join(result.Path, filepath.Base(path)))
+					if err != nil || !bytes.Equal(want, got) {
+						t.Fatalf("source state not preserved: %s: %v", path, err)
+					}
+				}
+				data, err := os.ReadFile(filepath.Join(result.Path, "meta.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var metadata struct {
+					ConfigDir     string   `json:"source_config_dir"`
+					OriginalPaths []string `json:"original_paths"`
+					Identity      string   `json:"identity"`
+				}
+				if err := json.Unmarshal(data, &metadata); err != nil || metadata.ConfigDir != env["CLAUDE_CONFIG_DIR"] || !reflect.DeepEqual(paths, metadata.OriginalPaths) || !strings.Contains(metadata.Identity, "new@example.test") {
+					t.Fatalf("wrong source metadata: %+v: %v", metadata, err)
+				}
+				v := authfile.NewVault(authfile.DefaultVaultPath())
+				// Activation deliberately targets another synthetic HOME, so
+				// the original running account never changes even in the test.
+				home := t.TempDir()
+				t.Setenv("HOME", home)
+				t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+				if _, err := v.Switch(authfile.ClaudeAuthFiles(), "saved", authfile.SwitchOptions{BackupMode: "always"}); err != nil {
+					t.Fatalf("legacy vault snapshot cannot activate: %v", err)
+				}
+				got, err := os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
+				if err != nil || !bytes.Contains(got, []byte("new-access")) {
+					t.Fatalf("wrong activated credential: %v", err)
+				}
+				got, err = os.ReadFile(filepath.Join(home, ".claude.json"))
+				if err != nil || !bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("ignored-xdg")) {
+					t.Fatalf("wrong activated identity: %v", err)
+				}
+				assertBackupTreeUnchanged(t, root, sourceBefore)
+				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+				assertBackupTreeUnchanged(t, nativeState, stateBefore)
+			})
+		}
+	}
 }

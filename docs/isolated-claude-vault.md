@@ -39,12 +39,24 @@ in metadata are provenance, **not** restore destinations.
 
 ## Which files are saved?
 
-The authoritative source is the registered profile's
-`xdg_config/claude-code/` directory, which `caam exec` selects through
-`CLAUDE_CONFIG_DIR`. The snapshot includes `.credentials.json`, `.claude.json`,
-and, when present, `settings.json` and `auth.json`. It does not combine a fresh
-XDG login with stale files under the profile's legacy `home/.claude`, or with the
-host's login, Desktop cache, or keychain.
+The authoritative source is the registered profile's selected Claude config
+directory. Existing authentication in `xdg_config/claude-code/` takes precedence,
+as it does for `caam exec`. If XDG has no credential cache or alternate-auth
+settings, a legacy-only login under `home/.claude/` can also be saved. No migration
+or manual file copying is needed. An empty, malformed, expired, or incomplete
+XDG credential still selects XDG and cannot be rescued by a legacy login.
+
+The snapshot includes `.credentials.json`, `.claude.json`, and, when present,
+`settings.json` and `auth.json`, from that one source. For a legacy login,
+`home/.claude/.claude.json` takes precedence; only when it is absent does
+`home/.claude.json` supply the account state. A malformed nested file never falls
+back to the home-level copy. Identity-only XDG state and shared XDG workflow
+settings are not mixed into a legacy snapshot. Neither source uses the host's
+login, Desktop cache, or keychain. Source symlinks remain unsupported.
+
+Vault metadata records `source_config_dir` and the actual `original_paths`,
+including a home-level legacy state file when used. These remain provenance,
+not activation destinations; activation uses the ordinary live fileset.
 
 A complete OAuth credential (access and refresh tokens) and an account identity
 in `.claude.json` are required. Thus a credentials-only `caam auth import` profile
@@ -102,7 +114,11 @@ commands do not remove it.
 The profile store holds its cross-process mutation lock throughout capture and
 publication. The importer also checks source file identities and bytes, absent
 optional files, profile metadata, directory identities, and the isolated session
-lock again before publication. An observed login, token-refresh, or directory
+lock again before publication. Legacy imports also guard the absent XDG
+credentials/directories and the absent nested legacy state that selected their
+source. An XDG login or nested state appearing during preparation aborts the
+import rather than publishing an account no longer selected for execution.
+An observed login, token-refresh, or directory
 change causes an error with no new vault entry. Existing source credentials and
 vault entries are left intact. Native writers that bypass CAAM's locking still
 require a quiescent isolated source: finish login/refresh before taking its

@@ -130,3 +130,192 @@ func TestIsolatedSourceDirectoryIdentity(t *testing.T) {
 		t.Fatal("directory symlink accepted")
 	}
 }
+
+func TestIsolatedClaudeSelectsLegacyWithoutMixingNamespaces(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		name := "home-state"
+		if nested {
+			name = "nested-state"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := filepath.Join(root, "xdg_config", "claude-code")
+			legacy := filepath.Join(root, "home", ".claude")
+			state := filepath.Join(root, "home", ".claude.json")
+			if nested {
+				state = filepath.Join(legacy, ".claude.json")
+				putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"stale-home"}}`)
+			}
+			putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"legacy"}}`)
+			putIsolatedTestFile(t, state, `{"oauthAccount":{"accountUuid":"legacy-id"}}`)
+			putIsolatedTestFile(t, filepath.Join(legacy, "settings.json"), `{"model":"legacy-model"}`)
+			// Policy and identity alone do not select XDG in the provider.
+			putIsolatedTestFile(t, filepath.Join(xdg, "settings.json"), `{"model":"xdg-model"}`)
+			putIsolatedTestFile(t, filepath.Join(xdg, ".claude.json"), `{"oauthAccount":{"accountUuid":"stale-xdg"}}`)
+			selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+			if err != nil || selected.configDir != legacy || len(captures) != 2 {
+				t.Fatalf("legacy source not selected: %v", err)
+			}
+			data := selected.data()
+			if string(data[".claude.json"]) != `{"oauthAccount":{"accountUuid":"legacy-id"}}` || string(data["settings.json"]) != `{"model":"legacy-model"}` {
+				t.Fatal("import mixed identity or settings from another namespace")
+			}
+			if selected.files[1].path != state {
+				t.Fatalf("wrong state provenance: %s", selected.files[1].path)
+			}
+			for _, capture := range captures {
+				if err := capture.unchanged(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeXDGPrimaryPresenceNeverFallsBack(t *testing.T) {
+	for _, name := range []string{".credentials.json", "auth.json"} {
+		for _, data := range []string{"", "{", "{}", `{"claudeAiOauth":{"accessToken":"expired","expiresAt":1}}`} {
+			t.Run(name+"/"+data, func(t *testing.T) {
+				root := t.TempDir()
+				xdg := filepath.Join(root, "xdg_config", "claude-code")
+				legacy := filepath.Join(root, "home", ".claude")
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`)
+				putIsolatedTestFile(t, filepath.Join(xdg, name), data)
+				selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+				if err != nil || selected.configDir != xdg || len(captures) != 1 {
+					t.Fatalf("incomplete XDG login fell back to legacy: %v", err)
+				}
+				if string(selected.data()[name]) != data {
+					t.Fatal("selector modified captured credential")
+				}
+			})
+		}
+	}
+}
+
+func TestIsolatedClaudeLayoutRejectsUnsafeSelectorsAndStateFallback(t *testing.T) {
+	for _, data := range []string{"{", "null", `{"apiKeyHelper":"do-not-execute"}`, `{"env":{"ANTHROPIC_API_KEY":"do-not-print"}}`} {
+		t.Run(data, func(t *testing.T) {
+			root := t.TempDir()
+			putIsolatedTestFile(t, filepath.Join(root, "home", ".claude", ".credentials.json"), `{}`)
+			putIsolatedTestFile(t, filepath.Join(root, "xdg_config", "claude-code", "settings.json"), data)
+			if _, _, err := selectIsolatedClaudeLayout(root, 4096, 4096); err == nil {
+				t.Fatal("unsafe XDG settings fell back to legacy")
+			}
+		})
+	}
+	root := t.TempDir()
+	putIsolatedTestFile(t, filepath.Join(root, "home", ".claude", ".credentials.json"), `{}`)
+	putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"home"}}`)
+	putIsolatedTestFile(t, filepath.Join(root, "home", ".claude", ".claude.json"), "{")
+	if _, _, err := selectIsolatedClaudeLayout(root, 4096, 4096); err == nil {
+		t.Fatal("malformed nested legacy state fell back to home state")
+	}
+}
+
+func TestIsolatedClaudeLayoutDetectsSelectionChanges(t *testing.T) {
+	for _, change := range []string{"xdg-parent", "xdg-directory", "xdg-token", "xdg-auth", "xdg-settings", "legacy-state", "legacy-token", "legacy-parent"} {
+		t.Run(change, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := filepath.Join(root, "xdg_config", "claude-code")
+			legacy := filepath.Join(root, "home", ".claude")
+			putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"generation":"one"}`)
+			putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"legacy"}}`)
+			if change != "xdg-parent" && change != "xdg-directory" {
+				if err := os.MkdirAll(xdg, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+			if err != nil || selected.configDir != legacy {
+				t.Fatalf("capture legacy: %v", err)
+			}
+			switch change {
+			case "xdg-parent":
+				err = os.Mkdir(filepath.Dir(xdg), 0700)
+			case "xdg-directory":
+				err = os.MkdirAll(xdg, 0700)
+			case "xdg-token":
+				putIsolatedTestFile(t, filepath.Join(xdg, ".credentials.json"), `{"generation":"new"}`)
+			case "xdg-auth":
+				putIsolatedTestFile(t, filepath.Join(xdg, "auth.json"), `{}`)
+			case "xdg-settings":
+				putIsolatedTestFile(t, filepath.Join(xdg, "settings.json"), `{"apiKeyHelper":"new-helper"}`)
+			case "legacy-state":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".claude.json"), `{"oauthAccount":{"accountUuid":"new"}}`)
+			case "legacy-token":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"generation":"two"}`)
+			case "legacy-parent":
+				err = os.Rename(filepath.Dir(legacy), filepath.Dir(legacy)+".moved")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			detected := false
+			for _, capture := range captures {
+				detected = capture.unchanged() != nil || detected
+			}
+			if !detected {
+				t.Fatal("changed source selection was not detected before publication")
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeLayoutRejectsLinksAndOversizedFiles(t *testing.T) {
+	for _, part := range []string{"xdg_config", "home", "home/.claude", "home/.claude.json", "home/.claude/.credentials.json"} {
+		t.Run(part, func(t *testing.T) {
+			root := t.TempDir()
+			putIsolatedTestFile(t, filepath.Join(root, "home", ".claude", ".credentials.json"), `{}`)
+			putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{}`)
+			path := filepath.Join(root, filepath.FromSlash(part))
+			target := path + ".original"
+			if _, err := os.Lstat(path); err == nil {
+				if err := os.Rename(path, target); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.MkdirAll(target, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			if _, _, err := selectIsolatedClaudeLayout(root, 4096, 4096); err == nil {
+				t.Fatal("linked source accepted")
+			}
+		})
+	}
+	root := t.TempDir()
+	path := filepath.Join(root, "home", ".claude", ".credentials.json")
+	putIsolatedTestFile(t, path, "12345")
+	if _, _, err := selectIsolatedClaudeLayout(root, 4, 4096); err == nil {
+		t.Fatal("oversized legacy credential accepted")
+	}
+}
+
+func TestOptionalIsolatedDirectoryPresenceIsGuarded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing")
+	dir, err := inspectOptionalIsolatedSourceDir(path)
+	if err != nil || dir.info != nil || dir.unchanged() != nil {
+		t.Fatalf("absent directory: %v", err)
+	}
+	if _, err := inspectIsolatedSourceDir(path); err == nil {
+		t.Fatal("required directory accepted absence")
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.unchanged(); err == nil {
+		t.Fatal("new directory was ignored")
+	}
+	present, err := inspectIsolatedSourceDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := present.unchanged(); err == nil {
+		t.Fatal("removed directory was ignored")
+	}
+}

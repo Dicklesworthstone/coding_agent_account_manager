@@ -97,8 +97,10 @@ func newProfileBackupCommand() *cobra.Command {
 
 Unlike 'caam backup' without --from-profile, this command reads the named
 isolated profile, not the currently active login. It captures .credentials.json,
-.claude.json, settings.json and auth.json from that profile's xdg_config/claude-code
-directory. It does not clear, replace, refresh or activate the live Claude login.
+.claude.json, settings.json and auth.json from its selected config directory.
+XDG authentication takes precedence; legacy-only home/.claude logins are also
+supported without migrating or mixing the two stores. It does not clear,
+replace, refresh or activate the live Claude login.
 
 Finish /login and exit the isolated session first. Other agents using the live
 login may keep running. Existing vault names are never overwritten; use --as to

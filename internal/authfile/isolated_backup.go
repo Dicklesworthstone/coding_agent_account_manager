@@ -14,7 +14,7 @@ import (
 // session first; two copies of an OAuth grant are not independent logins.
 //
 // Only the directory selected by caam exec's CLAUDE_CONFIG_DIR is authoritative.
-// Legacy home/.claude files are deliberately not mixed into a newer XDG login.
+// Legacy-only logins are supported, but never mixed into a newer XDG login.
 // Existing destinations (including empty directories) are never replaced.
 func (v *Vault) BackupIsolatedClaude(profileRoot, target string) error {
 	return v.backupIsolatedClaude(profileRoot, target, func(prepared *Vault, files AuthFileSet, name string) error {
@@ -111,6 +111,7 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 	metadata["source_type"] = "isolated-profile"
 	metadata["source_profile"] = filepath.Base(source.root)
 	metadata["source_profile_path"] = source.root
+	metadata["source_config_dir"] = source.configDir
 	if err := writeJSONFileAtomic(metadataPath, metadata, 0600); err != nil {
 		return fmt.Errorf("prepare source metadata: %w", err)
 	}
@@ -133,10 +134,12 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 }
 
 type isolatedClaudeSource struct {
-	root     string
-	dirs     []isolatedSourceDir
-	metadata *isolatedSourceFile
-	files    []*isolatedSourceFile
+	root      string
+	configDir string
+	dirs      []isolatedSourceDir
+	metadata  *isolatedSourceFile
+	files     []*isolatedSourceFile
+	layouts   []*isolatedClaudeLayout
 }
 
 func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
@@ -148,8 +151,7 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 		return nil, err
 	}
 	s := &isolatedClaudeSource{root: root}
-	configDir := filepath.Join(root, "xdg_config", "claude-code")
-	for _, path := range []string{filepath.Dir(root), root, filepath.Join(root, "xdg_config"), configDir} {
+	for _, path := range []string{filepath.Dir(root), root} {
 		dir, err := inspectIsolatedSourceDir(path)
 		if err != nil {
 			return nil, err
@@ -166,19 +168,18 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 	if err := validateIsolatedClaudeMetadata(s.metadata.data, root); err != nil {
 		return nil, err
 	}
+	selected, layouts, err := selectIsolatedClaudeLayout(root, MaxDiscoveryFileBytes, MaxSettingsDocumentBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: capture isolated Claude source: %w", ErrInvalidCredentials, err)
+	}
+	s.configDir, s.files, s.layouts = selected.configDir, selected.files, layouts
 	state := switchState{files: make(map[string][]byte)}
-	for _, name := range []string{claudeCredentialsFile, claudeSettingsFile, "auth.json", "settings.json"} {
-		limit := int64(MaxDiscoveryFileBytes)
-		if name == claudeSettingsFile || name == "settings.json" {
-			limit = MaxSettingsDocumentBytes
-		}
-		file, err := readIsolatedSourceFile(filepath.Join(configDir, name),
-			name == claudeCredentialsFile || name == claudeSettingsFile, limit)
-		if err != nil {
-			return nil, err
-		}
-		s.files = append(s.files, file)
+	for _, file := range s.files {
+		name := filepath.Base(file.path)
 		if file.info == nil {
+			if name == claudeCredentialsFile || name == claudeSettingsFile {
+				return nil, fmt.Errorf("%w: selected isolated Claude source is missing %s; finish /login first", ErrNoCredentials, name)
+			}
 			continue
 		}
 		var object map[string]json.RawMessage
@@ -186,9 +187,6 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 			return nil, fmt.Errorf("%w: isolated %s must contain a JSON object", ErrInvalidCredentials, name)
 		}
 		state.files[name] = file.data
-	}
-	if err := validateIsolatedClaudeOAuthSelection(state.files); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidCredentials, err)
 	}
 	state.identify(AuthFileSet{Tool: "claude"})
 	if state.identityConflict {
@@ -229,8 +227,8 @@ func (s *isolatedClaudeSource) unchanged() error {
 	if err := s.metadata.unchanged(); err != nil {
 		return err
 	}
-	for _, file := range s.files {
-		if err := file.unchanged(); err != nil {
+	for _, layout := range s.layouts {
+		if err := layout.unchanged(); err != nil {
 			return err
 		}
 	}

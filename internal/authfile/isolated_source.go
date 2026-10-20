@@ -93,7 +93,20 @@ type isolatedSourceDir struct {
 }
 
 func inspectIsolatedSourceDir(path string) (isolatedSourceDir, error) {
+	dir, err := inspectOptionalIsolatedSourceDir(path)
+	if err == nil && dir.info == nil {
+		err = fmt.Errorf("inspect isolated directory %s: %w", path, os.ErrNotExist)
+	}
+	return dir, err
+}
+
+// Absence participates in source selection too: creating an XDG directory
+// while a legacy snapshot is being prepared must invalidate that capture.
+func inspectOptionalIsolatedSourceDir(path string) (isolatedSourceDir, error) {
 	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return isolatedSourceDir{path: path}, nil
+	}
 	if err != nil {
 		return isolatedSourceDir{}, fmt.Errorf("inspect isolated directory %s: %w", path, err)
 	}
@@ -104,14 +117,138 @@ func inspectIsolatedSourceDir(path string) (isolatedSourceDir, error) {
 }
 
 func (s isolatedSourceDir) unchanged() error {
-	current, err := inspectIsolatedSourceDir(s.path)
+	current, err := inspectOptionalIsolatedSourceDir(s.path)
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(s.info, current.info) {
+	if s.info == nil && current.info == nil {
+		return nil
+	}
+	if s.info == nil || current.info == nil || !os.SameFile(s.info, current.info) {
 		return fmt.Errorf("isolated source directory changed; retry: %s", s.path)
 	}
 	return nil
+}
+
+// isolatedClaudeLayout is one complete source namespace. files are eligible
+// for export; guards only prove which source was selected. In particular, a
+// missing nested legacy state file must stay missing when home/.claude.json
+// supplies its identity. No identity or setting is borrowed from XDG.
+type isolatedClaudeLayout struct {
+	configDir string
+	dirs      []isolatedSourceDir
+	files     []*isolatedSourceFile
+	guards    []*isolatedSourceFile
+}
+
+func readIsolatedClaudeLayout(root string, legacy bool, credentialLimit, settingsLimit int64) (*isolatedClaudeLayout, error) {
+	parent := filepath.Join(root, "xdg_config")
+	dir := filepath.Join(parent, "claude-code")
+	if legacy {
+		parent = filepath.Join(root, "home")
+		dir = filepath.Join(parent, ".claude")
+	}
+	layout := &isolatedClaudeLayout{configDir: dir}
+	for _, path := range []string{parent, dir} {
+		captured, err := inspectOptionalIsolatedSourceDir(path)
+		if err != nil {
+			return nil, err
+		}
+		layout.dirs = append(layout.dirs, captured)
+	}
+	for _, name := range []string{".credentials.json", ".claude.json", "auth.json", "settings.json"} {
+		limit := credentialLimit
+		if name == ".claude.json" || name == "settings.json" {
+			limit = settingsLimit
+		}
+		file, err := readIsolatedSourceFile(filepath.Join(dir, name), false, limit)
+		if err != nil {
+			return nil, err
+		}
+		if legacy && name == ".claude.json" && file.info == nil {
+			// Match legacyClaudeStatePath: the nested state wins by presence,
+			// not validity. A malformed nested state cannot use the home copy.
+			layout.guards = append(layout.guards, file)
+			file, err = readIsolatedSourceFile(filepath.Join(parent, name), false, limit)
+			if err != nil {
+				return nil, err
+			}
+		}
+		layout.files = append(layout.files, file)
+	}
+	return layout, nil
+}
+
+func (s *isolatedClaudeLayout) data() map[string][]byte {
+	files := make(map[string][]byte)
+	for _, file := range s.files {
+		if file.info != nil {
+			files[filepath.Base(file.path)] = file.data
+		}
+	}
+	return files
+}
+
+func (s *isolatedClaudeLayout) hasPrimary() bool {
+	for _, file := range s.files {
+		name := filepath.Base(file.path)
+		if file.info != nil && (name == ".credentials.json" || name == "auth.json") {
+			return true
+		}
+	}
+	return false
+}
+
+// selectIsolatedClaudeLayout follows the provider's XDG-first selection for
+// file-backed OAuth profiles, without calling provider code that may follow
+// adoption links or update state. Malformed/alternate-auth settings fail closed;
+// an expired, empty, or incomplete XDG credential never falls back to legacy.
+// The caller must keep EVERY returned capture unchanged through publication.
+func selectIsolatedClaudeLayout(root string, credentialLimit, settingsLimit int64) (*isolatedClaudeLayout, []*isolatedClaudeLayout, error) {
+	xdg, err := readIsolatedClaudeLayout(root, false, credentialLimit, settingsLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateIsolatedClaudeOAuthSelection(xdg.data()); err != nil {
+		return nil, nil, err
+	}
+	if xdg.hasPrimary() {
+		return xdg, []*isolatedClaudeLayout{xdg}, nil
+	}
+	legacy, err := readIsolatedClaudeLayout(root, true, credentialLimit, settingsLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateIsolatedClaudeOAuthSelection(legacy.data()); err != nil {
+		return nil, nil, err
+	}
+	captures := []*isolatedClaudeLayout{xdg, legacy}
+	if legacy.hasPrimary() {
+		return legacy, captures, nil
+	}
+	return xdg, captures, nil // Neither store has a login; validation will fail.
+}
+
+func (s *isolatedClaudeLayout) unchanged() error {
+	checkDirs := func() error {
+		for _, dir := range s.dirs {
+			if err := dir.unchanged(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := checkDirs(); err != nil {
+		return err
+	}
+	for _, files := range [][]*isolatedSourceFile{s.files, s.guards} {
+		for _, file := range files {
+			if err := file.unchanged(); err != nil {
+				return err
+			}
+		}
+	}
+	return checkDirs()
 }
 
 // validateIsolatedClaudeMetadata checks the registered source before any
