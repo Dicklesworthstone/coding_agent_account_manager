@@ -199,6 +199,79 @@ func (s *isolatedClaudeLayout) hasPrimary() bool {
 	return false
 }
 
+// hasAuth mirrors the provider's presence check for conflict detection. An
+// identity-only .claude.json is not a login, but a credential cache (even an
+// invalid one), a helper or environment credential is. Malformed documents
+// participate too; they cannot hide a known conflicting account identity.
+func (s *isolatedClaudeLayout) hasAuth() bool {
+	if s.hasPrimary() {
+		return true
+	}
+	files := s.data()
+	for _, name := range []string{"settings.json", ".claude.json"} {
+		data, present := files[name]
+		if !present {
+			continue
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(data, &object) != nil || object == nil {
+			return true
+		}
+		keys := []string{"oauthToken", "sessionKey", "apiKey", "api_key", "primaryApiKey"}
+		if name == "settings.json" {
+			keys = []string{"apiKeyHelper", "apiKey", "api_key"}
+		}
+		for _, key := range keys {
+			value, err := isolatedSelectionString(object, key)
+			if err != nil || strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+		if name == "settings.json" {
+			if raw, present := object["env"]; present {
+				var env map[string]json.RawMessage
+				if json.Unmarshal(raw, &env) != nil || env == nil {
+					return true
+				}
+				for _, key := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} {
+					value, err := isolatedSelectionString(env, key)
+					if err != nil || strings.TrimSpace(value) != "" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// accountID is only conflict evidence, not credential validation or proof of
+// account equivalence. Prefer embedded accountId, then the layout's own paired
+// state, like the provider. Even an otherwise unusable cache must not conceal
+// an explicit conflicting ID. Never return token values in diagnostics.
+func (s *isolatedClaudeLayout) accountID() string {
+	files := s.data()
+	var credentials struct {
+		OAuth struct {
+			AccountID string `json:"accountId"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(files[".credentials.json"], &credentials) == nil {
+		if id := strings.TrimSpace(credentials.OAuth.AccountID); id != "" {
+			return id
+		}
+	}
+	var state struct {
+		Account struct {
+			ID string `json:"accountUuid"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(files[".claude.json"], &state) == nil {
+		return strings.TrimSpace(state.Account.ID)
+	}
+	return ""
+}
+
 // selectIsolatedClaudeLayout follows the provider's XDG-first selection for
 // file-backed OAuth profiles, without calling provider code that may follow
 // adoption links or update state. Malformed/alternate-auth settings fail closed;
@@ -212,17 +285,26 @@ func selectIsolatedClaudeLayout(root string, credentialLimit, settingsLimit int6
 	if err := validateIsolatedClaudeOAuthSelection(xdg.data()); err != nil {
 		return nil, nil, err
 	}
-	if xdg.hasPrimary() {
-		return xdg, []*isolatedClaudeLayout{xdg}, nil
-	}
 	legacy, err := readIsolatedClaudeLayout(root, true, credentialLimit, settingsLimit)
 	if err != nil {
 		return nil, nil, err
 	}
+	captures := []*isolatedClaudeLayout{xdg, legacy}
+	if xdg.hasPrimary() {
+		// caam exec rejects known conflicting accounts even when XDG would
+		// otherwise win. Capture legacy as a guard, not as exported material,
+		// and keep its absence/identity stable through final publication.
+		if legacy.hasAuth() {
+			xdgID, legacyID := xdg.accountID(), legacy.accountID()
+			if xdgID != "" && legacyID != "" && xdgID != legacyID {
+				return nil, nil, fmt.Errorf("isolated Claude profile contains conflicting accounts in legacy and XDG config directories; resolve the source accounts before backing up")
+			}
+		}
+		return xdg, captures, nil
+	}
 	if err := validateIsolatedClaudeOAuthSelection(legacy.data()); err != nil {
 		return nil, nil, err
 	}
-	captures := []*isolatedClaudeLayout{xdg, legacy}
 	if legacy.hasPrimary() {
 		return legacy, captures, nil
 	}

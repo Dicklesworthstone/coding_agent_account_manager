@@ -46,6 +46,15 @@ settings, a legacy-only login under `home/.claude/` can also be saved. No migrat
 or manual file copying is needed. An empty, malformed, expired, or incomplete
 XDG credential still selects XDG and cannot be rescued by a legacy login.
 
+XDG precedence does not resolve two different accounts. As with `caam exec`,
+if both layouts contain authentication and their known account IDs conflict,
+backup fails before vault preparation. A helper or environment credential can
+make the legacy layout participate in this check even without a token file.
+Identity-only legacy state is not a login and does not block a valid XDG account.
+Matching or unknown IDs never authorize copying legacy files into an XDG
+snapshot. Resolve a conflicting source explicitly; backup does not repair or
+overwrite either account, and its error does not print the IDs or credentials.
+
 The snapshot includes `.credentials.json`, `.claude.json`, and, when present,
 `settings.json` and `auth.json`, from that one source. For a legacy login,
 `home/.claude/.claude.json` takes precedence; only when it is absent does
@@ -118,6 +127,10 @@ lock again before publication. Legacy imports also guard the absent XDG
 credentials/directories and the absent nested legacy state that selected their
 source. An XDG login or nested state appearing during preparation aborts the
 import rather than publishing an account no longer selected for execution.
+XDG imports likewise capture the legacy layout as a read-only guard, including
+absent directories/files and the home-level state fallback. A legacy login,
+identity, helper, or directory change during preparation also aborts publication.
+Legacy guard files are never exported into the selected XDG vault snapshot.
 An observed login, token-refresh, or directory
 change causes an error with no new vault entry. Existing source credentials and
 vault entries are left intact. Native writers that bypass CAAM's locking still

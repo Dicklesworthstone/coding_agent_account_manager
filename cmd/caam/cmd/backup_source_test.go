@@ -482,3 +482,123 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 		}
 	}
 }
+
+func TestClaudeBackupRejectsLayoutConflictLikeExecution(t *testing.T) {
+	for _, command := range []string{"backup", "profile-backup"} {
+		for _, evidence := range []string{"credential", "home-state", "helper"} {
+			t.Run(command+"/"+evidence, func(t *testing.T) {
+				xdg, live := setupProfileBackupCommand(t)
+				root := filepath.Dir(filepath.Dir(xdg))
+				legacy := filepath.Join(root, "home", ".claude")
+				if err := os.MkdirAll(legacy, 0700); err != nil {
+					t.Fatal(err)
+				}
+				files := map[string]string{
+					filepath.Join(root, "home", ".claude.json"): `{"oauthAccount":{"accountUuid":"unprinted-other-account"}}`,
+				}
+				switch evidence {
+				case "credential":
+					files[filepath.Join(legacy, ".credentials.json")] = `{"claudeAiOauth":{"accessToken":"unprinted-access","refreshToken":"unprinted-refresh","accountId":"unprinted-other-account"}}`
+				case "home-state":
+					files[filepath.Join(legacy, "auth.json")] = `{"accessToken":"unprinted-access"}`
+				case "helper":
+					files[filepath.Join(legacy, "settings.json")] = `{"apiKeyHelper":"unprinted-never-executed-helper"}`
+				}
+				for path, data := range files {
+					if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				prof, err := profile.NewStore(profile.DefaultStorePath()).Load("claude", "isolated")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := claude.New().Env(context.Background(), prof); err == nil || !strings.Contains(err.Error(), "conflicting accounts") {
+					t.Fatalf("fixture must reproduce the provider's account conflict: %v", err)
+				}
+				sourceBefore, err := captureBackupTree(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				liveBefore, err := captureBackupTree(filepath.Dir(live))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var out, stderr string
+				if command == "backup" {
+					out, stderr, err = executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+				} else {
+					out, stderr, err = executeProfileBackupTest(t, "claude", "isolated", "--as", "saved", "--json")
+				}
+				var result profileBackupResult
+				if err == nil || json.Unmarshal([]byte(out), &result) != nil || result.Success || !strings.Contains(result.Error, "conflicting accounts") || stderr != "" {
+					t.Fatalf("conflicting profile was not rejected cleanly: %v; stdout=%s; stderr=%s", err, out, stderr)
+				}
+				if strings.Contains(out, "unprinted") {
+					t.Fatal("conflict diagnostic exposed account or credential data")
+				}
+				assertBackupTreeUnchanged(t, root, sourceBefore)
+				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+				if _, err := os.Lstat(authfile.DefaultVaultPath()); !os.IsNotExist(err) {
+					t.Fatalf("conflict reached vault preparation: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeBackupKeepsOnlyXDGWhenLegacyIsNotConflicting(t *testing.T) {
+	for _, sameAccount := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy-login=%v", sameAccount), func(t *testing.T) {
+			xdg, live := setupProfileBackupCommand(t)
+			root := filepath.Dir(filepath.Dir(xdg))
+			legacy := filepath.Join(root, "home", ".claude")
+			if err := os.MkdirAll(legacy, 0700); err != nil {
+				t.Fatal(err)
+			}
+			state := `{"oauthAccount":{"accountUuid":"stale-identity-without-login"}}`
+			if sameAccount {
+				state = `{"oauthAccount":{"accountUuid":"new-id"}}`
+				if err := os.WriteFile(filepath.Join(legacy, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"legacy-not-exported","refreshToken":"legacy-refresh"}}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(root, "home", ".claude.json"), []byte(state), 0600); err != nil {
+				t.Fatal(err)
+			}
+			prof, err := profile.NewStore(profile.DefaultStorePath()).Load("claude", "isolated")
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := claude.New().Env(context.Background(), prof)
+			if err != nil || env["CLAUDE_CONFIG_DIR"] != xdg {
+				t.Fatalf("expected provider to select XDG: %v", err)
+			}
+			sourceBefore, err := captureBackupTree(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := captureBackupTree(filepath.Dir(live))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, stderr, err := executeBackupSourceTest(t, "claude", "saved", "--from-profile", "isolated", "--json")
+			if err != nil || stderr != "" {
+				t.Fatalf("non-conflicting legacy guard rejected: %v; %s; %s", err, out, stderr)
+			}
+			v := authfile.NewVault(authfile.DefaultVaultPath())
+			for _, name := range []string{".credentials.json", ".claude.json", "settings.json"} {
+				want, err := os.ReadFile(filepath.Join(xdg, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(v.BackupPath("claude", "saved", name))
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("legacy guard leaked into %s: %v", name, err)
+				}
+			}
+			assertBackupTreeUnchanged(t, root, sourceBefore)
+			assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
+		})
+	}
+}

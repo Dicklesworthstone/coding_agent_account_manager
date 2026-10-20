@@ -1,9 +1,11 @@
 package authfile
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -182,7 +184,7 @@ func TestIsolatedClaudeXDGPrimaryPresenceNeverFallsBack(t *testing.T) {
 				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"legacy-access","refreshToken":"legacy-refresh"}}`)
 				putIsolatedTestFile(t, filepath.Join(xdg, name), data)
 				selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
-				if err != nil || selected.configDir != xdg || len(captures) != 1 {
+				if err != nil || selected.configDir != xdg || len(captures) != 2 {
 					t.Fatalf("incomplete XDG login fell back to legacy: %v", err)
 				}
 				if string(selected.data()[name]) != data {
@@ -317,5 +319,149 @@ func TestOptionalIsolatedDirectoryPresenceIsGuarded(t *testing.T) {
 	}
 	if err := present.unchanged(); err == nil {
 		t.Fatal("removed directory was ignored")
+	}
+}
+
+func TestIsolatedClaudeXDGRejectsConflictingLegacyAccount(t *testing.T) {
+	for _, source := range []string{"credential", "nested-state", "home-state", "secondary-auth", "helper"} {
+		t.Run(source, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := filepath.Join(root, "xdg_config", "claude-code")
+			legacy := filepath.Join(root, "home", ".claude")
+			putIsolatedTestFile(t, filepath.Join(xdg, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"selected-access","refreshToken":"selected-refresh","accountId":"selected-account"}}`)
+			putIsolatedTestFile(t, filepath.Join(xdg, ".claude.json"), `{"oauthAccount":{"accountUuid":"selected-account"}}`)
+			state := filepath.Join(legacy, ".claude.json")
+			switch source {
+			case "credential":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh","accountId":"other-account"}}`)
+			case "nested-state", "home-state":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh"}}`)
+				if source == "home-state" {
+					state = filepath.Join(root, "home", ".claude.json")
+				}
+			case "secondary-auth":
+				putIsolatedTestFile(t, filepath.Join(legacy, "auth.json"), `{"accessToken":"ignored-access"}`)
+			case "helper":
+				putIsolatedTestFile(t, filepath.Join(legacy, "settings.json"), `{"apiKeyHelper":"must-not-execute"}`)
+			}
+			putIsolatedTestFile(t, state, `{"oauthAccount":{"accountUuid":"other-account"}}`)
+			if _, _, err := selectIsolatedClaudeLayout(root, 4096, 4096); err == nil {
+				t.Fatal("export accepted accounts that the Claude provider refuses to launch")
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeXDGDoesNotExportLegacyGuard(t *testing.T) {
+	for _, scenario := range []string{"same-account", "identity-only", "unknown-account", "embedded-id", "nested-state"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := filepath.Join(root, "xdg_config", "claude-code")
+			legacy := filepath.Join(root, "home", ".claude")
+			selectedBytes := `{"claudeAiOauth":{"accessToken":"selected-access","refreshToken":"selected-refresh"}}`
+			putIsolatedTestFile(t, filepath.Join(xdg, ".credentials.json"), selectedBytes)
+			putIsolatedTestFile(t, filepath.Join(xdg, ".claude.json"), `{"oauthAccount":{"accountUuid":"same-id"}}`)
+			putIsolatedTestFile(t, filepath.Join(xdg, "settings.json"), `{"model":"selected-model"}`)
+			putIsolatedTestFile(t, filepath.Join(legacy, "settings.json"), `{"model":"ignored-model"}`)
+			state := `{"oauthAccount":{"accountUuid":"same-id"}}`
+			if scenario != "identity-only" {
+				credential := `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh"}}`
+				if scenario == "embedded-id" {
+					credential = `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh","accountId":" same-id "}}`
+					state = `{"oauthAccount":{"accountUuid":"stale-paired-id"}}`
+				}
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), credential)
+			}
+			if scenario == "identity-only" {
+				state = `{"oauthAccount":{"accountUuid":"stale-id-without-login"}}`
+			} else if scenario == "unknown-account" {
+				state = `{}`
+			}
+			putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), state)
+			if scenario == "nested-state" {
+				putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"ignored-home-id"}}`)
+				putIsolatedTestFile(t, filepath.Join(legacy, ".claude.json"), `{"oauthAccount":{"accountUuid":"same-id"}}`)
+			}
+			selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+			if err != nil || selected.configDir != xdg || len(captures) != 2 {
+				t.Fatalf("valid XDG source rejected: %v", err)
+			}
+			if !bytes.Equal(selected.data()[".credentials.json"], []byte(selectedBytes)) || strings.Contains(string(selected.data()["settings.json"]), "ignored") {
+				t.Fatal("legacy guard bytes were exported or changed the selected credential")
+			}
+			for _, capture := range captures {
+				if err := capture.unchanged(); err != nil {
+					t.Fatalf("read-only selection changed the source: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeXDGGuardsLegacyChanges(t *testing.T) {
+	for _, change := range []string{"new-login", "credential-id", "home-state", "nested-state", "helper", "directory"} {
+		t.Run(change, func(t *testing.T) {
+			root := t.TempDir()
+			xdg := filepath.Join(root, "xdg_config", "claude-code")
+			legacy := filepath.Join(root, "home", ".claude")
+			putIsolatedTestFile(t, filepath.Join(xdg, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"selected","accountId":"one"}}`)
+			putIsolatedTestFile(t, filepath.Join(xdg, ".claude.json"), `{"oauthAccount":{"accountUuid":"one"}}`)
+			if change != "new-login" {
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"ignored"}}`)
+				putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"one"}}`)
+			}
+			selected, captures, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+			if err != nil || selected.configDir != xdg {
+				t.Fatalf("capture XDG: %v", err)
+			}
+			switch change {
+			case "new-login", "credential-id":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"changed","accountId":"two"}}`)
+			case "home-state":
+				putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"two"}}`)
+			case "nested-state":
+				putIsolatedTestFile(t, filepath.Join(legacy, ".claude.json"), `{"oauthAccount":{"accountUuid":"two"}}`)
+			case "helper":
+				putIsolatedTestFile(t, filepath.Join(legacy, "settings.json"), `{"apiKeyHelper":"not-executed"}`)
+			case "directory":
+				if err := os.Rename(legacy, legacy+".moved"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The chosen XDG files never changed. Only the non-selected guard
+			// can prevent publication from an account now rejected by exec.
+			if err := selected.unchanged(); err != nil {
+				t.Fatalf("test unexpectedly modified XDG: %v", err)
+			}
+			detected := false
+			for _, capture := range captures {
+				detected = capture.unchanged() != nil || detected
+			}
+			if !detected {
+				t.Fatal("legacy change escaped the final publication guard")
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeLegacySettingsParticipateInConflicts(t *testing.T) {
+	for _, settings := range []string{
+		`{"env":{"ANTHROPIC_API_KEY":"unprinted-key"}}`,
+		`{"env":{"ANTHROPIC_AUTH_TOKEN":"unprinted-token"}}`,
+		`{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"unprinted-token"}}`,
+		`{"env":null}`, `{"env":{"ANTHROPIC_API_KEY":42}}`,
+		`{"apiKeyHelper":null}`, `null`, `{`,
+	} {
+		root := t.TempDir()
+		putIsolatedTestFile(t, filepath.Join(root, "xdg_config", "claude-code", ".credentials.json"), `{"claudeAiOauth":{"accountId":"one"}}`)
+		putIsolatedTestFile(t, filepath.Join(root, "home", ".claude", "settings.json"), settings)
+		putIsolatedTestFile(t, filepath.Join(root, "home", ".claude.json"), `{"oauthAccount":{"accountUuid":"two"}}`)
+		_, _, err := selectIsolatedClaudeLayout(root, 4096, 4096)
+		if err == nil || !strings.Contains(err.Error(), "conflicting accounts") {
+			t.Fatalf("legacy auth settings hid the conflict: %v", err)
+		}
+		if strings.Contains(err.Error(), "unprinted") || strings.Contains(err.Error(), "one") || strings.Contains(err.Error(), "two") {
+			t.Fatal("conflict diagnostic included source identity or credentials")
+		}
 	}
 }
