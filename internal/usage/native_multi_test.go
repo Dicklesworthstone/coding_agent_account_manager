@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -75,6 +76,112 @@ func TestNativeBatchUnavailableFetchersStayUnavailable(t *testing.T) {
 		}
 		if best := fetcher.GetBestProfile(context.Background(), provider, credentials); best != nil {
 			t.Errorf("%s selected a failed fetch: %+v", provider, best)
+		}
+	}
+}
+
+// Preserve all failures for diagnostics, but never offer one to a caller
+// asking which account should receive new work, regardless of provider.
+func TestBatchSelectionRejectsFailedFetchesForEveryProvider(t *testing.T) {
+	fetcher := &MultiProfileFetcher{}
+	for _, provider := range []string{"claude", "codex", "grok", "cursor"} {
+		t.Run(provider, func(t *testing.T) {
+			credentials := map[string]string{"one": "unused", "two": "unused"}
+			rows := fetcher.FetchAllProfiles(context.Background(), provider, credentials)
+			if len(rows) != 2 {
+				t.Fatal("diagnostic rows were dropped")
+			}
+			for _, row := range rows {
+				if row.Usage == nil || row.Usage.Error == "" {
+					t.Fatal("unavailable fetcher did not report a failure")
+				}
+			}
+			if best := fetcher.GetBestProfile(context.Background(), provider, credentials); best != nil {
+				t.Fatal("best-profile selection recommended a failed fetch")
+			}
+			if available := fetcher.GetProfilesAboveThreshold(context.Background(), provider, credentials, 0.8); len(available) != 0 {
+				t.Fatal("failed fetch was interpreted as spare capacity")
+			}
+		})
+	}
+}
+
+func TestProfilesBelowThresholdRetainsOnlyUsableCapacity(t *testing.T) {
+	for _, provider := range []string{"claude", "codex", "grok", "cursor"} {
+		t.Run(provider, func(t *testing.T) {
+			row := func(name string, used float64) ProfileUsage {
+				return ProfileUsage{Provider: provider, ProfileName: name, Usage: &UsageInfo{
+					Provider: provider, QuotaStatus: QuotaOK,
+					PrimaryWindow: &UsageWindow{Utilization: used, UsedPercent: int(used * 100)},
+				}}
+			}
+			failed := row("failed", 0)
+			failed.Usage.Error = "request failed"
+			degraded := row("degraded", 0)
+			degraded.Usage.QuotaStatus = QuotaDegraded
+			unknown := row("unknown", 0)
+			unknown.Usage.PrimaryWindow.Unmeasured = true
+			secondary := row("secondary-exhausted", 0)
+			secondary.Usage.SecondaryWindow = &UsageWindow{UsedPercent: 100}
+			tertiary := row("tertiary-exhausted", 0)
+			tertiary.Usage.TertiaryWindow = &UsageWindow{UsedPercent: 100}
+			scoped := row("scoped-exhausted", 0)
+			scoped.Usage.ModelWindows = map[string]*UsageWindow{"opus": {UsedPercent: 100}}
+			blocked := row("blocked", 0)
+			blocked.Usage.LimitStage = "HARD_BLOCK"
+			rows := []ProfileUsage{
+				failed, {Provider: provider, ProfileName: "nil"}, degraded, unknown, blocked,
+				row("zero", 0), row("some", 0.25), row("boundary", 0.8), row("primary-exhausted", 1),
+				secondary, tertiary, scoped,
+			}
+			before, err := json.Marshal(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range []struct {
+				threshold float64
+				want      []string
+			}{
+				{0.8, []string{"zero", "some"}},
+				{1, []string{"zero", "some", "boundary"}},
+				{0.25, []string{"zero"}},
+			} {
+				var names []string
+				for _, result := range profilesBelowThreshold(rows, tc.threshold) {
+					names = append(names, result.ProfileName)
+				}
+				if !reflect.DeepEqual(names, tc.want) {
+					t.Fatalf("threshold=%v got=%v want=%v", tc.threshold, names, tc.want)
+				}
+			}
+			after, err := json.Marshal(rows)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("selection changed diagnostic rows or their ordering")
+			}
+			if got := profilesBelowThreshold(rows[:5], 1); len(got) != 0 {
+				t.Fatal("all-failed pool supplied a candidate")
+			}
+			if got := profilesBelowThreshold(nil, 1); len(got) != 0 {
+				t.Fatal("empty pool supplied a candidate")
+			}
+		})
+	}
+}
+
+// Claude and Codex historically omit QuotaStatus. Do not require a new
+// wire format to fix error handling; keep their measured windows usable.
+func TestProfilesBelowThresholdPreservesLegacyQuotaStatus(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		usable := ProfileUsage{Provider: provider, ProfileName: "usable", Usage: &UsageInfo{
+			Provider: provider, PrimaryWindow: &UsageWindow{UsedPercent: 25},
+		}}
+		failed := ProfileUsage{Provider: provider, ProfileName: "failed", Usage: &UsageInfo{Provider: provider, Error: "request failed"}}
+		spent := ProfileUsage{Provider: provider, ProfileName: "spent", Usage: &UsageInfo{
+			Provider: provider, PrimaryWindow: &UsageWindow{UsedPercent: 100},
+		}}
+		got := profilesBelowThreshold([]ProfileUsage{failed, spent, usable}, 1)
+		if len(got) != 1 || got[0].ProfileName != "usable" {
+			t.Fatalf("%s selected failed/exhausted legacy quota or rejected valid quota", provider)
 		}
 	}
 }

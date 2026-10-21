@@ -255,17 +255,12 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 	return results
 }
 
-// GetBestProfile returns the profile with the highest availability score.
+// GetBestProfile returns the highest-scoring profile with usable quota below
+// its limits, or nil when every fetch failed or every account is exhausted.
 func (m *MultiProfileFetcher) GetBestProfile(ctx context.Context, provider string, profiles map[string]string) *ProfileUsage {
-	results := m.FetchAllProfiles(ctx, provider, profiles)
-	for i := range results {
-		if provider == "grok" || provider == "cursor" {
-			u := results[i].Usage
-			if !u.NumericQuotaKnown() || u.IsNearLimit(1) {
-				continue
-			}
-		}
-		return &results[i]
+	results := m.GetProfilesAboveThreshold(ctx, provider, profiles, 1)
+	if len(results) > 0 {
+		return &results[0]
 	}
 	return nil
 }
@@ -273,14 +268,19 @@ func (m *MultiProfileFetcher) GetBestProfile(ctx context.Context, provider strin
 // GetProfilesAboveThreshold returns profiles with usage below the threshold.
 // threshold is the maximum utilization (e.g., 0.8 for 80%).
 func (m *MultiProfileFetcher) GetProfilesAboveThreshold(ctx context.Context, provider string, profiles map[string]string, threshold float64) []ProfileUsage {
-	results := m.FetchAllProfiles(ctx, provider, profiles)
-	available := make([]ProfileUsage, 0)
+	return profilesBelowThreshold(m.FetchAllProfiles(ctx, provider, profiles), threshold)
+}
 
+// A failed fetch is not an unused account. Apply the existing quota-validity
+// contract to every provider, not only native quota sources. Preserve the
+// fetcher's ranked order and diagnostic rows; selection must not rewrite them.
+func profilesBelowThreshold(results []ProfileUsage, threshold float64) []ProfileUsage {
+	available := make([]ProfileUsage, 0, len(results))
 	for _, p := range results {
-		if (provider == "grok" || provider == "cursor") && !p.Usage.NumericQuotaKnown() {
+		if !p.Usage.NumericQuotaKnown() {
 			continue
 		}
-		if p.Usage != nil && !p.Usage.IsNearLimit(threshold) {
+		if !p.Usage.IsNearLimit(threshold) {
 			available = append(available, p)
 		}
 	}
