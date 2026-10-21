@@ -138,7 +138,7 @@ an exhausted profile to a freshly reset one. Synthetic CLI responses keep
 these tests independent of live provider accounts. Malformed usage and ACP
 errors remain ineligible for quota-based selection.
 
-Run these checks with the repository's pinned Go 1.26.8 toolchain:
+Run these checks with the repository's pinned Go 1.26.10 toolchain:
 
 ```sh
 go test ./internal/usage ./internal/rotation ./internal/monitor ./cmd/caam/cmd

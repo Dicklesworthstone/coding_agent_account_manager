@@ -395,3 +395,30 @@ uname() { printf 'Linux\n'; }
 		})
 	}
 }
+
+
+func TestPinnedGoToolchainStaysAligned(t *testing.T) {
+	root := filepath.Dir(repoInstallScript(t))
+	read := func(path string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, path))
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return string(data)
+	}
+
+	const want = "1.26.10"
+	checks := []struct {
+		path, needle string
+	}{
+		{"go.mod", "toolchain go" + want},
+		{filepath.Join(".github", "workflows", "ci.yml"), "go-version: '" + want + "'"},
+		{"install.sh", `local min_version="` + want + `"`},
+	}
+	for _, tc := range checks {
+		if !strings.Contains(read(tc.path), tc.needle) {
+			t.Errorf("%s is not pinned to Go %s (missing %q)", tc.path, want, tc.needle)
+		}
+	}
+}
