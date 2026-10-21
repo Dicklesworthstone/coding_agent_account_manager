@@ -234,7 +234,8 @@ func TestVerifyCodexToken(t *testing.T) {
 		{name: "200 accepted", statuses: []int{200}, wantAttempts: 1},
 		{name: "204 accepted", statuses: []int{204}, wantAttempts: 1},
 		{name: "401 rejected without retry", statuses: []int{401}, wantErr: true, wantStatus: 401, wantAttempts: 1, wantRejected: true},
-		{name: "403 rejected without retry", statuses: []int{403}, wantErr: true, wantStatus: 403, wantAttempts: 1, wantRejected: true},
+		{name: "403 is inconclusive without retry", statuses: []int{403}, wantErr: true, wantStatus: 403, wantAttempts: 1},
+		{name: "429 then 403 remains inconclusive", statuses: []int{429, 403}, wantErr: true, wantStatus: 403, wantAttempts: 2},
 		{name: "429 then 200 recovers", statuses: []int{429, 200}, wantAttempts: 2},
 		{name: "503 then 200 recovers", statuses: []int{503, 200}, wantAttempts: 2},
 		{name: "500 twice is transient", statuses: []int{500, 500}, wantErr: true, wantStatus: 500, wantAttempts: 2, wantTransit: true},
@@ -293,6 +294,46 @@ func TestVerifyCodexToken(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), fmt.Sprintf("status %d", tt.wantStatus)) {
 				t.Errorf("error text should name the status: %q", err.Error())
+			}
+		})
+	}
+}
+
+// Issue #127: a denied /v1/me request is not proof that the same credential
+// cannot run Codex. Keep the status, but never promote an edge HTML response,
+// a permission error, or an arbitrary error message into a token verdict.
+func TestVerifyCodexTokenForbiddenIsNotARejectedCredential(t *testing.T) {
+	for _, body := range []string{
+		"",
+		"<html>Access denied: response-must-not-be-logged</html>",
+		`{"error":{"code":"permission_denied","message":"response-must-not-be-logged"}}`,
+		`{"error":{"message":"invalid token: response-must-not-be-logged"}}`,
+	} {
+		t.Run(fmt.Sprintf("body-length=%d", len(body)), func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			oldURL := CodexVerifyURL
+			CodexVerifyURL = server.URL
+			defer func() { CodexVerifyURL = oldURL }()
+
+			err := VerifyCodexToken(context.Background(), "synthetic-probe-credential")
+			var denied *TokenVerifyError
+			if !errors.As(err, &denied) || denied.StatusCode != http.StatusForbidden || denied.Attempts != 1 {
+				t.Fatalf("lost denied-probe status: %v", err)
+			}
+			if denied.Rejected() || denied.Transient() || calls != 1 {
+				t.Fatalf("403 became a credential verdict or retry: rejected=%v transient=%v calls=%d", denied.Rejected(), denied.Transient(), calls)
+			}
+			for _, secret := range []string{"synthetic-probe-credential", "response-must-not-be-logged"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatal("probe error disclosed a credential or response body")
+				}
 			}
 		})
 	}

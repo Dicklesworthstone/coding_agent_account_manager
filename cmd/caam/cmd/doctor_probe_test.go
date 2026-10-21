@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +21,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
@@ -94,7 +97,8 @@ func TestDoctorValidatesIsolatedCursorCredentials(t *testing.T) {
 
 // Issue #78: doctor used to report every non-200 probe answer as "access token
 // rejected by API" with refresh-token-reuse guidance, sending users into an
-// unnecessary re-login on a 429 or 5xx. Only 401/403 may fail the check.
+// unnecessary re-login on a 429 or 5xx. Issue #127 extends this to 403:
+// permission or edge-proxy refusals are not proof of a rejected credential.
 func TestClassifyCodexProbeError(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -111,11 +115,18 @@ func TestClassifyCodexProbeError(t *testing.T) {
 			wantDetail:  "caam login codex work",
 		},
 		{
-			name:        "403 fails",
+			name:        "403 warns without diagnosing the credential",
 			err:         &refresh.TokenVerifyError{StatusCode: 403, Attempts: 1},
-			wantStatus:  "fail",
-			wantMessage: "access token rejected by API (HTTP 403)",
-			wantDetail:  "HTTP 403",
+			wantStatus:  "warn",
+			wantMessage: "could not verify token (unexpected HTTP 403)",
+			wantDetail:  "neither an acceptance",
+		},
+		{
+			name:        "wrapped 403 remains inconclusive",
+			err:         fmt.Errorf("probe: %w", &refresh.TokenVerifyError{StatusCode: 403, Attempts: 2}),
+			wantStatus:  "warn",
+			wantMessage: "could not verify token (unexpected HTTP 403)",
+			wantDetail:  "nor a credential rejection",
 		},
 		{
 			name:        "429 warns and keeps the status",
@@ -182,6 +193,93 @@ func TestClassifyCodexProbeError(t *testing.T) {
 			if got.Status != "fail" && strings.Contains(got.Details, "refresh_token_reused") {
 				t.Errorf("non-rejection must not diagnose refresh_token_reused: %q", got.Details)
 			}
+			if got.Status != "fail" && (strings.Contains(got.Details, "caam login") || strings.Contains(got.Details, "caam refresh")) {
+				t.Errorf("inconclusive probe recommended changing credentials: %q", got.Details)
+			}
+		})
+	}
+}
+
+// Exercise the real doctor probe, not only its error formatter. Unknown,
+// accepted, and rejected saved health must ALL survive an inconclusive 403.
+// The live and saved auth files may be in use by independent native processes.
+func TestProbeVaultTokenForbiddenPreservesCredentialsAndHealth(t *testing.T) {
+	for _, prior := range []string{"unknown", "accepted", "rejected"} {
+		t.Run(prior, func(t *testing.T) {
+			vaultDir, store := setupCodexVerificationVault(t)
+			data := writeCodexVaultAuth(t, vaultDir, "work", "synthetic-refresh-token", time.Now().Add(24*time.Hour))
+			liveRoot := t.TempDir()
+			t.Setenv("CODEX_HOME", liveRoot)
+			writeNativeTestCredential(t, filepath.Join(liveRoot, "auth.json"), string(data))
+			if prior != "unknown" {
+				verdict := health.ProviderVerification{
+					Accepted: prior == "accepted", At: time.Now().Add(-time.Hour),
+					Fingerprint: health.CodexCredentialFingerprint(data),
+				}
+				if prior == "rejected" {
+					verdict.Reason = "refresh_token_invalidated"
+				}
+				if err := store.RecordProviderVerification("codex", "work", verdict); err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeHealth, err := store.GetProfile("codex", "work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeJSON, err := json.Marshal(beforeHealth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := captureBackupTree(liveRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			vaultBefore, err := captureBackupTree(vaultDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requests, refreshes int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodGet || r.ContentLength > 0 {
+					t.Error("diagnostic attempted a write or token exchange")
+				}
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("<html>edge-proxy-response-must-not-be-logged</html>"))
+			}))
+			defer server.Close()
+			oldURL, oldRefresh := refresh.CodexVerifyURL, refresh.RefreshCodexToken
+			refresh.CodexVerifyURL = server.URL
+			refresh.RefreshCodexToken = func(context.Context, string) (*refresh.TokenResponse, error) {
+				refreshes++
+				return nil, errors.New("unexpected refresh")
+			}
+			defer func() { refresh.CodexVerifyURL, refresh.RefreshCodexToken = oldURL, oldRefresh }()
+
+			result := probeVaultToken("codex", "work")
+			if result == nil || result.Status != "warn" || !strings.Contains(result.Message, "403") || requests != 1 || refreshes != 0 {
+				t.Fatalf("403 was not a read-only warning: result=%+v requests=%d refreshes=%d", result, requests, refreshes)
+			}
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"caam login", "caam refresh", "refresh_token_reused", "edge-proxy-response-must-not-be-logged", "synthetic-refresh-token"} {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("unsafe doctor diagnostic contains %q", forbidden)
+				}
+			}
+			afterHealth, err := store.GetProfile("codex", "work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterJSON, err := json.Marshal(afterHealth)
+			if err != nil || string(beforeJSON) != string(afterJSON) {
+				t.Fatalf("inconclusive 403 changed provider verification: %v", err)
+			}
+			assertBackupTreeUnchanged(t, liveRoot, liveBefore)
+			assertBackupTreeUnchanged(t, vaultDir, vaultBefore)
 		})
 	}
 }

@@ -160,9 +160,9 @@ const (
 )
 
 // TokenVerifyError reports a non-2xx answer from the token verification
-// endpoint. The status code is preserved so callers can tell a definitive
-// rejection (401/403) apart from a transient failure (429/5xx) instead of
-// collapsing every non-200 answer into "token rejected".
+// endpoint. Preserve the distinction between an access-token rejection (401),
+// an inconclusive refusal of the request (403), and a retryable failure
+// (429/5xx). A failed probe is not necessarily a failed credential.
 type TokenVerifyError struct {
 	StatusCode int
 	// Attempts is how many requests were made before giving up (1 or 2).
@@ -176,13 +176,17 @@ func (e *TokenVerifyError) Error() string {
 	return fmt.Sprintf("token verification failed with status %d", e.StatusCode)
 }
 
-// Rejected reports whether the provider definitively refused the credential.
+// Rejected reports an authentication refusal by the verification endpoint.
+// A 403 can be a permission, policy, or edge-proxy denial for a working Codex
+// login (issue #127). It is neither proof of token rejection nor acceptance,
+// and must not trigger re-login advice or overwrite saved verification state.
+// Even a 401 only exercises the access token, never the refresh grant.
 func (e *TokenVerifyError) Rejected() bool {
-	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+	return e.StatusCode == http.StatusUnauthorized
 }
 
-// Transient reports whether the failure says nothing about the credential
-// itself: rate limiting or a server-side error.
+// Transient reports whether the probe may be retried: rate limiting or a
+// server-side error. An inconclusive 403 is deliberately not retryable.
 func (e *TokenVerifyError) Transient() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
