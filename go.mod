@@ -3,7 +3,7 @@ module github.com/Dicklesworthstone/coding_agent_account_manager
 // Keep this in sync with CI (see .github/workflows/ci.yml)
 go 1.26.0
 
-toolchain go1.26.8
+toolchain go1.26.10
 
 require (
 	aead.dev/minisign v0.3.0

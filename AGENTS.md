@@ -72,7 +72,7 @@ success** — one line, revert, next lever, no retraction narrative.
 We use **Go** with **Make** as the build system in this project.
 
 - **Go version:** 1.26+ (see `go.mod` for minimum)
-- **Toolchain:** `go1.26.8` (pinned in `go.mod`)
+- **Toolchain:** `go1.26.10` (pinned in `go.mod`)
 - **Build:** `make build` or `go build ./cmd/caam`
 - **Binary name:** `caam`
 - **Dependency versions:** Explicit in `go.mod` for stability

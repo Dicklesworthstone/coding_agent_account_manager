@@ -322,7 +322,7 @@ func TestSourceTarballRefHonorsRequestedVersion(t *testing.T) {
 func TestTryGoInstallRefusesRequestedTagCheckoutFailure(t *testing.T) {
 	tmp := t.TempDir()
 	setup := `
-ensure_go() { printf '1.26.8'; }
+ensure_go() { printf '1.26.10'; }
 make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
 git() {
     if [ "$1" = "clone" ]; then
@@ -345,7 +345,7 @@ func TestTryGoInstallTarballFallbackUsesRequestedTag(t *testing.T) {
 	tmp := t.TempDir()
 	capture := filepath.Join(t.TempDir(), "url")
 	setup := `
-ensure_go() { printf '1.26.8'; }
+ensure_go() { printf '1.26.10'; }
 make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
 git() { return 1; }
 download_file() {
@@ -374,8 +374,9 @@ func TestEnsureGoRequiresPinnedSourceBuildFloor(t *testing.T) {
 		version string
 		ok      bool
 	}{
-		{"1.26.7", false},
-		{"1.26.8", true},
+		{"1.26.8", false},
+		{"1.26.9", false},
+		{"1.26.10", true},
 		{"1.27.0", true},
 	} {
 		t.Run(tc.version, func(t *testing.T) {
@@ -388,7 +389,7 @@ uname() { printf 'Linux\n'; }
 			if (code == 0) != tc.ok {
 				t.Fatalf("ensure_go(go%s) exit=%d stdout=%q stderr=%q", tc.version, code, out, stderr)
 			}
-			if !tc.ok && !strings.Contains(stdout+stderr, "1.26.8") {
+			if !tc.ok && !strings.Contains(stdout+stderr, "1.26.10") {
 				t.Fatalf("old toolchain diagnostic did not name the required floor: stdout=%s stderr=%s", out, stderr)
 			}
 		})
