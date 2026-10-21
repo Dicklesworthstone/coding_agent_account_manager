@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -88,11 +90,22 @@ func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, e
 // the CLI for `_x.ai/billing`. The copy is removed before returning. Nothing
 // from the credential file is written to the error text.
 func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// This access-only copy cannot renew itself. Starting Grok with a stale
+	// cache can initiate browser login before the ACP handshake (issue #124).
+	if err := validateGrokBillingAuth(auth, time.Now()); err != nil {
+		return nil, err
+	}
 	stage, err := stageGrokHome(auth)
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(stage)
+	if err := prepareGrokBillingBrowserGuard(stage); err != nil {
+		return nil, err
+	}
 
 	bin := f.Bin
 	if bin == "" {
@@ -190,18 +203,32 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 		return nil, fmt.Errorf("grok closed before %s completed", method)
 	}
 
-	if _, err := call("initialize", map[string]any{
+	initialized, err := call("initialize", map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
 			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
 			"terminal": false,
 		},
 		"clientInfo": map[string]string{"name": "caam", "version": "0"},
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-	if _, err := call("authenticate", map[string]any{"methodId": "cached_token"}); err != nil {
+	if !grokBillingCachedTokenAvailable(initialized) {
+		return nil, fmt.Errorf("grok billing unavailable: compatible cached_token authentication was not advertised; interactive login was not attempted")
+	}
+	// Recheck after initialization too: a slow startup must not spend the
+	// freshness margin and then authenticate a cache the CLI wants to renew.
+	if err := validateGrokBillingAuth(auth, time.Now()); err != nil {
 		return nil, err
+	}
+	authTimer := time.AfterFunc(grokBillingAuthTimeout, cancel)
+	_, authErr := call("authenticate", map[string]any{"methodId": "cached_token"})
+	if !authTimer.Stop() || cctx.Err() != nil {
+		return nil, fmt.Errorf("grok cached-token authentication timed out or was cancelled; interactive login was not attempted")
+	}
+	if authErr != nil {
+		return nil, authErr
 	}
 	// session/new establishes the ACP session the extension is served on.
 	// It is not a model prompt; no session/prompt is sent.
@@ -209,6 +236,148 @@ func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMe
 		return nil, err
 	}
 	return call("_x.ai/billing", map[string]any{})
+}
+
+const (
+	// Leave room for the native CLI's early-renewal window and clock skew.
+	// A quota probe must not try to replace an unusable cache with a login.
+	grokBillingExpiryMargin = 15 * time.Minute
+	grokBillingAuthTimeout  = 5 * time.Second
+)
+
+// validateGrokBillingAuth checks the exact captured bytes, not a reread of a
+// live home. Unlike health reporting, the latest expiry in a multi-entry file
+// cannot authorize a launch: ANY expired/unknown entry might be selected by
+// Grok. Require every credential entry to carry its own usable access token
+// and absolute deadline. Relative expires_in alone is not a fresh lifetime.
+func validateGrokBillingAuth(auth []byte, now time.Time) error {
+	invalid := fmt.Errorf("grok billing requires a cached access token valid for more than 15 minutes; renew Grok in the home that owns this login before retrying")
+	var root map[string]json.RawMessage
+	if json.Unmarshal(auth, &root) != nil || root == nil {
+		return invalid
+	}
+	isEntry := func(entry map[string]json.RawMessage) bool {
+		for _, key := range []string{"key", "token", "access_token", "accessToken", "refresh_token", "refreshToken", "renewal_token", "auth_mode", "expires_at", "expiresAt", "expiry", "expires_in", "expiresIn"} {
+			if _, ok := entry[key]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	check := func(entry map[string]json.RawMessage) bool {
+		access := ""
+		for _, key := range []string{"key", "access_token", "accessToken", "token"} {
+			if raw, ok := entry[key]; ok {
+				var value string
+				if json.Unmarshal(raw, &value) != nil || value == "" || strings.TrimSpace(value) != value || (access != "" && access != value) {
+					return false
+				}
+				access = value
+			}
+		}
+		known := false
+		for _, key := range []string{"expires_at", "expiresAt", "expiry"} {
+			if raw, ok := entry[key]; ok {
+				deadline := grokBillingDeadline(raw)
+				if deadline.IsZero() || !deadline.After(now.Add(grokBillingExpiryMargin)) {
+					return false
+				}
+				known = true
+			}
+		}
+		return access != "" && known
+	}
+	found := false
+	if isEntry(root) {
+		if !check(root) {
+			return invalid
+		}
+		found = true
+	}
+	for key, raw := range root {
+		var entry map[string]json.RawMessage
+		parsed := json.Unmarshal(raw, &entry) == nil && entry != nil
+		if strings.Contains(key, "::") || (parsed && isEntry(entry)) {
+			if !parsed || !check(entry) {
+				return invalid
+			}
+			found = true
+		}
+	}
+	if !found {
+		return invalid
+	}
+	return nil
+}
+
+func grokBillingDeadline(raw json.RawMessage) time.Time {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if deadline := parseProviderTime(text); !deadline.IsZero() {
+			return deadline
+		}
+	} else {
+		text = string(raw)
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	var deadline time.Time
+	if n > 1e12 {
+		deadline = time.UnixMilli(n)
+	} else {
+		deadline = time.Unix(n, 0)
+	}
+	if deadline.Year() > 9999 {
+		return time.Time{}
+	}
+	return deadline
+}
+
+// Only the advertised ACP v1 cached-token flow is suitable for a quota read.
+// A terminal/browser method is not an acceptable fallback, even with that ID.
+func grokBillingCachedTokenAvailable(data json.RawMessage) bool {
+	var result struct {
+		Version int `json:"protocolVersion"`
+		Methods []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"authMethods"`
+	}
+	if json.Unmarshal(data, &result) != nil || result.Version != 1 {
+		return false
+	}
+	count := 0
+	for _, method := range result.Methods {
+		if method.ID == "cached_token" {
+			if method.Type != "" && method.Type != "agent" {
+				return false
+			}
+			count++
+		}
+	}
+	return count == 1
+}
+
+// Defense in depth for clients honoring BROWSER or PATH-based openers. This
+// is NOT an OS sandbox: an absolute system opener can bypass these stubs.
+func prepareGrokBillingBrowserGuard(home string) error {
+	dir := filepath.Join(home, ".caam-no-browser")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return fmt.Errorf("prepare grok browser guard: %w", err)
+	}
+	for _, name := range []string{"browser", "open", "xdg-open", "sensible-browser", "x-www-browser", "gio", "wslview"} {
+		body := "#!/bin/sh\nexit 1\n"
+		if runtime.GOOS == "windows" {
+			name += ".cmd"
+			body = "@exit /b 1\r\n"
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0700); err != nil {
+			return fmt.Errorf("prepare grok browser guard: %w", err)
+		}
+	}
+	return nil
 }
 
 func stageGrokHome(auth []byte) (string, error) {
@@ -272,6 +441,7 @@ func grokChildEnv(home string) []string {
 		"GROK_API_KEY": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {}, "XAI_API_TOKEN": {},
 		"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_CACHE_HOME": {},
 		"XDG_STATE_HOME": {}, "XDG_CONFIG_DIRS": {}, "XDG_DATA_DIRS": {},
+		"BROWSER": {}, "PATH": {},
 	}
 	out := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
@@ -279,11 +449,21 @@ func grokChildEnv(home string) []string {
 		if !ok {
 			continue
 		}
-		if _, skip := drop[key]; skip {
+		if _, skip := drop[strings.ToUpper(key)]; skip {
 			continue
 		}
 		out = append(out, kv)
 	}
+	guard := filepath.Join(home, ".caam-no-browser")
+	browser := filepath.Join(guard, "browser")
+	if runtime.GOOS == "windows" {
+		browser += ".cmd"
+	}
+	path := guard
+	if inherited := os.Getenv("PATH"); inherited != "" {
+		path += string(os.PathListSeparator) + inherited
+	}
+	out = append(out, "BROWSER="+browser, "PATH="+path)
 	out = append(out, "HOME="+home, "GROK_HOME="+home,
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),

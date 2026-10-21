@@ -433,7 +433,7 @@ func TestGrokDeadlineClosesInheritedProtocolPipes(t *testing.T) {
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC"}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "grok")
@@ -486,7 +486,7 @@ func TestGrokBillingOnlyUsesReadProtocolAndLeavesCredentialUnchanged(t *testing.
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	auth := `{"key":"SYNTHETIC","email":"test@example.com"}`
+	auth := `{"key":"SYNTHETIC","email":"test@example.com","expires_at":"2099-01-01T00:00:00Z"}`
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(auth), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +508,10 @@ while IFS= read -r line; do
       fi
       exit 0
       ;;
-    initialize|authenticate|session/new)
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}\n' "$id"
+      ;;
+    authenticate|session/new)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic"}}\n' "$id"
       ;;
     *) exit 1 ;;
@@ -580,7 +583,7 @@ func TestGrokAuthRejectionClassification(t *testing.T) {
 		t.Skip("shell process fixture")
 	}
 	home := t.TempDir()
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC"}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"key":"SYNTHETIC","expires_at":"2099-01-01T00:00:00Z"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	bin := filepath.Join(t.TempDir(), "grok")

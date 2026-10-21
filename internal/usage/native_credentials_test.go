@@ -83,6 +83,7 @@ func nativeLiveAuth(t *testing.T, provider, account, email, marker string) []byt
 		value = map[string]string{"accessToken": "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".SYNTHETIC"}
 	} else {
 		entry := map[string]string{"access_token": "SYNTHETIC-" + marker, "refresh_token": "SYNTHETIC-RENEWAL-" + marker}
+		entry["expires_at"] = "2099-01-01T00:00:00Z"
 		if account != "" {
 			entry["user_id"] = account
 		}
@@ -278,6 +279,7 @@ printf '{}' > "$GROK_HOME/auth.json"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
   case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}\n' "$id" ;;
     *'"_x.ai/billing"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"config":{"creditUsagePercent":12}}}\n' "$id"; exit 0 ;;
     *) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic"}}\n' "$id" ;;
   esac
