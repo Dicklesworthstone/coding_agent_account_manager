@@ -145,7 +145,19 @@ func updatedCodexAuth(data []byte, resp *TokenResponse) ([]byte, error) {
 
 // CodexVerifyURL is the authenticated endpoint VerifyCodexToken probes. It is
 // a variable (like CodexTokenURL) so tests can point it at a local server.
-var CodexVerifyURL = "https://api.openai.com/v1/me"
+//
+// The access token of a ChatGPT login (auth_mode "chatgpt", the only Codex
+// credential the probe sees: API-key logins are skipped) is accepted by the
+// ChatGPT backend that Codex itself talks to. This read-only usage endpoint,
+// which `caam limits codex` already reads, answers 200 for a working token and
+// 401 for an invalid one. The API platform's /v1/me, probed before,
+// refuses every ChatGPT-login token with 403 at its edge ("route
+// authentication policy does not accept this credential"), so it could
+// neither confirm nor reject such a login (issue #127).
+var CodexVerifyURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// codexVerifyHosts is the allowlist for CodexVerifyURL.
+var codexVerifyHosts = []string{"chatgpt.com"}
 
 const (
 	// codexVerifyAttempts bounds the probe to one retry: a second attempt is
@@ -191,7 +203,9 @@ func (e *TokenVerifyError) Transient() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
-// VerifyCodexToken probes whether an access token is accepted by the API.
+// VerifyCodexToken probes whether an access token is accepted by the ChatGPT
+// backend at CodexVerifyURL. It is a single read-only GET that never touches
+// the refresh token.
 //
 // A nil return means the token was accepted (2xx). Any other status is
 // returned as a *TokenVerifyError carrying that status; transient statuses
@@ -199,7 +213,7 @@ func (e *TokenVerifyError) Transient() bool {
 // reported. Transport failures and context cancellation are returned wrapped
 // as "request failed: ..." and carry no status.
 func VerifyCodexToken(ctx context.Context, token string) error {
-	if err := validateTokenEndpoint(CodexVerifyURL, []string{"api.openai.com"}); err != nil {
+	if err := validateTokenEndpoint(CodexVerifyURL, codexVerifyHosts); err != nil {
 		return err
 	}
 
@@ -233,6 +247,7 @@ func codexVerifyOnce(ctx context.Context, client *http.Client, token string) (in
 		return 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {

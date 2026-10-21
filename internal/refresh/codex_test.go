@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,6 +424,9 @@ func TestVerifyCodexToken(t *testing.T) {
 				if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 					t.Errorf("unexpected auth header: %q", got)
 				}
+				if got := r.Header.Get("Accept"); got != "application/json" {
+					t.Errorf("Accept = %q, want application/json", got)
+				}
 				idx := calls
 				if idx >= len(tt.statuses) {
 					idx = len(tt.statuses) - 1
@@ -469,7 +473,7 @@ func TestVerifyCodexToken(t *testing.T) {
 	}
 }
 
-// Issue #127: a denied /v1/me request is not proof that the same credential
+// Issue #127: a denied probe request is not proof that the same credential
 // cannot run Codex. Keep the status, but never promote an edge HTML response,
 // a permission error, or an arbitrary error message into a token verdict.
 func TestVerifyCodexTokenForbiddenIsNotARejectedCredential(t *testing.T) {
@@ -568,6 +572,28 @@ func TestVerifyCodexToken_RefusesNonAllowlistedHost(t *testing.T) {
 	err := VerifyCodexToken(context.Background(), "test-token")
 	if err == nil || !strings.Contains(err.Error(), "not allowlisted") {
 		t.Fatalf("expected allowlist refusal, got %v", err)
+	}
+}
+
+// Issue #127: the probe has to ask the service that accepts the access token
+// of a Codex ChatGPT login. The API platform's /v1/me refuses every such
+// token with 403 at its edge, so probing it could never confirm a working
+// login (and, while 403 counted as a rejection, it told users to log in
+// again). The default is the ChatGPT backend's read-only usage endpoint, it
+// must pass the probe's own allowlist, and the old endpoint must not.
+func TestCodexVerifyURLTargetsChatGPTBackend(t *testing.T) {
+	u, err := url.Parse(CodexVerifyURL)
+	if err != nil {
+		t.Fatalf("parse CodexVerifyURL: %v", err)
+	}
+	if u.Scheme != "https" || u.Hostname() != "chatgpt.com" || u.Path != "/backend-api/wham/usage" || u.RawQuery != "" {
+		t.Fatalf("CodexVerifyURL = %q, want https://chatgpt.com/backend-api/wham/usage", CodexVerifyURL)
+	}
+	if err := validateTokenEndpoint(CodexVerifyURL, codexVerifyHosts); err != nil {
+		t.Fatalf("default verify endpoint refused by its own allowlist: %v", err)
+	}
+	if err := validateTokenEndpoint("https://api.openai.com/v1/me", codexVerifyHosts); err == nil {
+		t.Fatal("the API platform endpoint, which refuses ChatGPT-login tokens, is still allowlisted for the probe")
 	}
 }
 

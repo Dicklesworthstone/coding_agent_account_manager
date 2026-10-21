@@ -49,7 +49,7 @@ type ProviderVerification struct {
 	// At is when the provider answered. Zero means now.
 	At time.Time
 	// AccessTokenOnly marks an acceptance that proves only that the access
-	// token works (the doctor /v1/me probe, a usage read), not the refresh
+	// token works (the doctor probe, a usage read), not the refresh
 	// token. It does not clear a refresh-token rejection of the same
 	// credential: after a revocation the access token keeps working until
 	// it expires, and then the account needs a new login.

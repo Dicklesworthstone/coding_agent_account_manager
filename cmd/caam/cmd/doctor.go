@@ -1206,7 +1206,7 @@ func checkDuplicateIdentities(tool string) []CheckResult {
 // where doctor reports "OK" based on JWT expiry alone, but the token is actually
 // unusable because the refresh token has been consumed (refresh_token_reused).
 //
-// Currently only supports Codex profiles (GET /v1/me).
+// Currently only supports Codex ChatGPT logins (GET refresh.CodexVerifyURL).
 // Returns nil if the probe succeeds or the tool is not supported for probing.
 func probeVaultToken(tool, profileName string) *CheckResult {
 	if tool != "codex" {
@@ -1301,8 +1301,9 @@ func recordProbeVerdict(tool, profileName string, accepted bool, reason, fingerp
 
 // classifyCodexProbeError maps a VerifyCodexToken failure onto a doctor check.
 //
-// Only a definitive rejection by the provider (HTTP 401/403) is a failure.
-// Rate limiting, server-side errors, and transport problems say nothing about
+// Only a definitive rejection by the provider (HTTP 401) is a failure. A 403
+// (a permission, policy or edge-proxy refusal of the request, issue #127),
+// rate limiting, server-side errors, and transport problems say nothing about
 // the stored credential, so they are reported as warnings that keep the HTTP
 // status for diagnosis instead of being misread as a consumed refresh token
 // (issue #78). Refresh-token reuse is never diagnosed here because the probe

@@ -1258,7 +1258,9 @@ looks the same as a working credential. Only the provider can tell them apart.
 
 caam therefore records what the provider says whenever it contacts the
 provider for a Codex profile: a caam refresh (`caam refresh`, the refresh
-daemon, activation), the live `/v1/me` probe in `caam doctor`, and a live
+daemon, activation), the live token probe in `caam doctor` (a read of the
+ChatGPT backend's usage endpoint, which accepts a ChatGPT login's access
+token), and a live
 `caam limits codex` read. A refusal (a refresh rejected as revoked, reused or
 expired, or a 401 for an unexpired access token) marks that credential
 `login_required: true` and `launch_usable: false`, and `caam ls` shows

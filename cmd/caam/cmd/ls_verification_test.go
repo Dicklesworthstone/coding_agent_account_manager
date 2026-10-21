@@ -561,7 +561,7 @@ func TestRecordCodexUsageVerdicts(t *testing.T) {
 	}
 }
 
-// doctor's live /v1/me probe records its verdict: a 401 marks the credential
+// doctor's live token probe records its verdict: a 401 marks the credential
 // rejected, a 200 later clears it, and a 5xx records nothing.
 func TestProbeVaultTokenRecordsVerdict(t *testing.T) {
 	vaultDir, store := setupCodexVerificationVault(t)
@@ -609,7 +609,7 @@ func TestProbeVaultTokenRecordsVerdict(t *testing.T) {
 }
 
 // A vault copy routinely holds a lapsed access token beside a working refresh
-// token. doctor's /v1/me probe answers 401 for it, and that must not mark the
+// token. doctor's token probe answers 401 for it, and that must not mark the
 // account "Login required" (review of c742360, GH #108): nothing clears such a
 // false rejection until a refresh or probe succeeds, and the refresh daemon
 // never refreshes an already-expired token.
