@@ -310,3 +310,87 @@ sudo() { echo "SUDO $*" >&2; return 0; }`
 		t.Fatalf("install_go_from_pkg did not install a pkg with the right checksum (exit %d); stdout=%s stderr=%s", code, stdout, stderr)
 	}
 }
+
+
+func TestSourceTarballRefHonorsRequestedVersion(t *testing.T) {
+	out, stderr, code := runInstallFunc(t, nil, "", `INSTALL_VERSION=v9.9.9; source_tarball_ref; INSTALL_VERSION=; source_tarball_ref`, "")
+	if code != 0 || out != "refs/tags/v9.9.9\nrefs/heads/main\n" {
+		t.Fatalf("source tarball refs = %q, exit %d; stderr=%s", out, code, stderr)
+	}
+}
+
+func TestTryGoInstallRefusesRequestedTagCheckoutFailure(t *testing.T) {
+	tmp := t.TempDir()
+	setup := `
+ensure_go() { printf '1.26.8'; }
+make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
+git() {
+    if [ "$1" = "clone" ]; then
+        mkdir -p "${@: -1}"
+        return 0
+    fi
+    return 1
+}
+`
+	stdout, stderr, code := runInstallFunc(t, []string{"TEST_TMP=" + tmp}, setup, `INSTALL_VERSION=v9.9.9; try_go_install`, "")
+	if code == 0 {
+		t.Fatalf("requested tag checkout failure built another revision; stdout=%s stderr=%s", stdout, stderr)
+	}
+	if !strings.Contains(stdout+stderr, "refusing to build a different source version") {
+		t.Fatalf("checkout failure did not explain fail-closed behavior; stdout=%s stderr=%s", stdout, stderr)
+	}
+}
+
+func TestTryGoInstallTarballFallbackUsesRequestedTag(t *testing.T) {
+	tmp := t.TempDir()
+	capture := filepath.Join(t.TempDir(), "url")
+	setup := `
+ensure_go() { printf '1.26.8'; }
+make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
+git() { return 1; }
+download_file() {
+    printf '%s\n' "$1" > "$CAPTURE"
+    return 1
+}
+`
+	_, _, code := runInstallFunc(t,
+		[]string{"TEST_TMP=" + tmp, "CAPTURE=" + capture, "CAAM_NO_CACHE_BUST=1"},
+		setup, `INSTALL_VERSION=v9.9.9; try_go_install`, "")
+	if code == 0 {
+		t.Fatal("stubbed tarball download unexpectedly succeeded")
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://codeload.github.com/Dicklesworthstone/coding_agent_account_manager/tar.gz/refs/tags/v9.9.9"
+	if strings.TrimSpace(string(data)) != want {
+		t.Fatalf("requested source fallback URL = %q, want %q", strings.TrimSpace(string(data)), want)
+	}
+}
+
+func TestEnsureGoRequiresPinnedSourceBuildFloor(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		ok      bool
+	}{
+		{"1.26.7", false},
+		{"1.26.8", true},
+		{"1.27.0", true},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			setup := `
+go() { printf 'go version go%s linux/amd64\n' "$FAKE_GO_VERSION"; }
+brew() { return 1; }
+uname() { printf 'Linux\n'; }
+`
+			out, stderr, code := runInstallFunc(t, []string{"FAKE_GO_VERSION=" + tc.version}, setup, `ensure_go`, "")
+			if (code == 0) != tc.ok {
+				t.Fatalf("ensure_go(go%s) exit=%d stdout=%q stderr=%q", tc.version, code, out, stderr)
+			}
+			if !tc.ok && !strings.Contains(stdout+stderr, "1.26.8") {
+				t.Fatalf("old toolchain diagnostic did not name the required floor: stdout=%s stderr=%s", out, stderr)
+			}
+		})
+	}
+}

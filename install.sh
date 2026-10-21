@@ -337,6 +337,16 @@ cache_bust_url() {
     fi
 }
 
+# A requested source build must come from exactly the requested tag. Only an
+# unversioned source install is allowed to follow main.
+source_tarball_ref() {
+    if [ -n "${INSTALL_VERSION:-}" ]; then
+        printf 'refs/tags/%s\n' "$INSTALL_VERSION"
+    else
+        printf 'refs/heads/main\n'
+    fi
+}
+
 # ==============================================================================
 # Version comparison and idempotency
 # ==============================================================================
@@ -1071,7 +1081,8 @@ is_tty() {
 }
 
 ensure_go() {
-    local min_version="1.21"
+    # Keep source builds aligned with go.mod's pinned release toolchain.
+    local min_version="1.26.8"
     local go_version=""
 
     if command -v go >/dev/null 2>&1; then
@@ -1305,7 +1316,7 @@ try_go_install() {
 
     local go_version
     if ! go_version=$(ensure_go); then
-        error "Go 1.21 or later is required for building from source."
+        error "Go 1.26.8 or later is required for building from source."
         error ""
         error "Install Go:"
         error "  macOS:         brew install go"
@@ -1332,7 +1343,9 @@ try_go_install() {
     fi
 
     if [ "$fetched" -ne 1 ]; then
-        tarball_url=$(cache_bust_url "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main")
+        local tarball_ref
+        tarball_ref=$(source_tarball_ref)
+        tarball_url=$(cache_bust_url "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/${tarball_ref}")
         tarball_path="$tmp_dir/source.tar.gz"
         if ! download_file "$tarball_url" "$tarball_path" "false"; then
             error "Failed to download source tarball from GitHub."
@@ -1358,7 +1371,8 @@ try_go_install() {
            git -C "$src_dir" checkout -q "tags/${INSTALL_VERSION}" >/dev/null 2>&1; then
             info "Building source at tag ${INSTALL_VERSION}"
         else
-            warn "Could not check out tag ${INSTALL_VERSION}; building default branch."
+            error "Could not check out requested tag ${INSTALL_VERSION}; refusing to build a different source version."
+            return 1
         fi
     fi
 
@@ -1383,7 +1397,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.21+ is installed: go version"
+            error "  1. Ensure Go 1.26.8+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
@@ -1393,7 +1407,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.21+ is installed: go version"
+            error "  1. Ensure Go 1.26.8+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
