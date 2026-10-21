@@ -6,6 +6,7 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -198,5 +199,101 @@ func TestNormalizeModelKey(t *testing.T) {
 	}
 	if modelKeysMatch(NormalizeModelKey("claude-opus-4"), NormalizeModelKey("")) {
 		t.Error("an empty key matched")
+	}
+}
+
+// An exact model ID and its family label can both be present. They are
+// simultaneous constraints, not alternative representations where the exact
+// key is allowed to hide a spent family allowance (or vice versa).
+func TestOverlappingScopedLimitsCannotHideExhaustion(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"family exhausted", `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"limits":[
+			{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Opus"}}},
+			{"kind":"weekly_scoped","percent":10,"scope":{"model":{"id":"claude-opus-4-1"}}}]}`},
+		{"specific model exhausted", `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"limits":[
+			{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Opus"}}},
+			{"kind":"weekly_scoped","percent":100,"scope":{"model":{"id":"claude-opus-4-1"}}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := fetchFixture(t, tc.body)
+			before, err := json.Marshal(info)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, model := range []string{"Opus", "claude-opus-4-1", "CLAUDE-OPUS-4-1-20250805"} {
+				// Repeated reads must not depend on Go's map iteration order.
+				for repeat := 0; repeat < 64; repeat++ {
+					if !info.IsNearLimitForModel(1, model) {
+						t.Fatalf("%s ignored an exhausted applicable allowance", model)
+					}
+					if w := info.WindowForModel(model); w == nil || w.UsedPercent != 100 {
+						t.Fatalf("%s displayed the less constrained model window: %+v", model, w)
+					}
+					if w := info.ScopedLimit(model); w == nil || w.UsedPercent != 100 {
+						t.Fatalf("%s selected the wrong scoped limit: %+v", model, w)
+					}
+					if score := info.AvailabilityScoreForModel(model); score != 85 {
+						t.Fatalf("%s scored %d instead of retaining the full scoped penalty", model, score)
+					}
+				}
+			}
+			if info.IsNearLimitForModel(0.8, "sonnet") || info.AvailabilityScoreForModel("sonnet") != 100 {
+				t.Fatal("an Opus-only limit constrained unrelated Sonnet work")
+			}
+			after, err := json.Marshal(info)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("model lookup rewrote the provider's measurements")
+			}
+		})
+	}
+}
+
+func TestScopedWindowSelectionUsesAllMatchingMeasurements(t *testing.T) {
+	exact := &UsageWindow{Label: "Opus", Utilization: 0.1, UsedPercent: 10}
+	family := &UsageWindow{Label: "Opus", UsedPercent: 95}
+	unknown := &UsageWindow{Label: "Opus", Unmeasured: true, Utilization: 1}
+	for _, tc := range []struct {
+		name    string
+		windows map[string]*UsageWindow
+		want    *UsageWindow
+	}{
+		{"exact plus family", map[string]*UsageWindow{"opus": exact, "claude-opus-4-1": family}, family},
+		{"label-only match", map[string]*UsageWindow{"opus": exact, "opaque-window-id": family}, family},
+		{"nil exact key", map[string]*UsageWindow{"opus": nil, "family": family}, family},
+		{"unmeasured exact key", map[string]*UsageWindow{"opus": unknown, "family": family}, family},
+		{"unmeasured family", map[string]*UsageWindow{"opus": family, "family": unknown}, family},
+		{"unknown only remains unknown", map[string]*UsageWindow{"family": unknown}, unknown},
+		{"all nil", map[string]*UsageWindow{"opus": nil, "family": nil}, nil},
+		{"no applicable scope", map[string]*UsageWindow{"sonnet": {Label: "Sonnet", UsedPercent: 100}}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &UsageInfo{ModelWindows: tc.windows}
+			for repeat := 0; repeat < 64; repeat++ {
+				if got := info.scopedWindowForModel("opus"); got != tc.want {
+					t.Fatalf("wrong governing scope: got=%+v want=%+v", got, tc.want)
+				}
+			}
+			if tc.want == family && !info.IsNearLimitForModel(0.9, "opus") {
+				t.Fatal("a matched measured limit was hidden by unknown data")
+			}
+		})
+	}
+	// Equal percentages have a stable diagnostic winner, not a map-order tie.
+	first := &UsageWindow{Label: "Opus", Utilization: 0.505, UsedPercent: 50}
+	second := &UsageWindow{Label: "Opus", Utilization: 0.505, UsedPercent: 50}
+	info := &UsageInfo{ModelWindows: map[string]*UsageWindow{"z": second, "a": first}}
+	for repeat := 0; repeat < 64; repeat++ {
+		if info.scopedWindowForModel("opus") != first {
+			t.Fatal("equal scopes changed diagnostics with map order")
+		}
+	}
+	second.Utilization = 0.509
+	if info.scopedWindowForModel("opus") != second {
+		t.Fatal("fractional utilization was rounded before selecting the tightest cap")
+	}
+	if (*UsageInfo)(nil).scopedWindowForModel("opus") != nil || info.scopedWindowForModel("") != nil {
+		t.Fatal("empty model or nil usage invented a scoped window")
 	}
 }

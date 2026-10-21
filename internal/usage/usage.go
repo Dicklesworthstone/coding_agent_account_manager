@@ -365,27 +365,35 @@ func (u *UsageInfo) ScopedLimit(model string) *UsageWindow {
 	return worst
 }
 
-// scopedWindowForModel returns the model-scoped window that applies to model,
-// or nil. Unlike WindowForModel it never falls back to the tertiary window.
+// scopedWindowForModel returns the tightest matching model allowance, or nil.
+// An exact identifier and a family/display-name match are simultaneous limits:
+// neither may shadow the other just because its map key is more specific.
+// Unlike WindowForModel this never falls back to the tertiary window.
 func (u *UsageInfo) scopedWindowForModel(model string) *UsageWindow {
 	if u == nil || len(u.ModelWindows) == 0 || model == "" {
 		return nil
 	}
-	if w, ok := u.ModelWindows[model]; ok {
-		return w
-	}
 	want := NormalizeModelKey(model)
+	var worst *UsageWindow
+	var worstKey string
 	for key, w := range u.ModelWindows {
-		if modelKeysMatch(want, NormalizeModelKey(key)) {
-			return w
+		if w == nil {
+			continue
 		}
-		// A scoped window also carries the provider's display name, which is
-		// what the API keys the limit on ("Fable", "Opus").
-		if w != nil && w.Label != "" && modelKeysMatch(want, NormalizeModelKey(w.Label)) {
-			return w
+		if key != model && !modelKeysMatch(want, NormalizeModelKey(key)) &&
+			!modelKeysMatch(want, NormalizeModelKey(w.Label)) {
+			continue
+		}
+		// A display-only window cannot suppress a measured cap. Retain an
+		// unmeasured match only when no matching measurement is available.
+		// Stable key ordering breaks ties without mutating the source map.
+		if worst == nil || (worst.Unmeasured && !w.Unmeasured) ||
+			(worst.Unmeasured == w.Unmeasured && (windowUtilization(w) > windowUtilization(worst) ||
+				(windowUtilization(w) == windowUtilization(worst) && key < worstKey))) {
+			worst, worstKey = w, key
 		}
 	}
-	return nil
+	return worst
 }
 
 // NormalizeModelKey reduces a model name to a comparable token: lower case,
