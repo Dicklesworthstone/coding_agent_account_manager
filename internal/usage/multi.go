@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 )
 
@@ -341,17 +342,22 @@ func ReadClaudeCredentials(path string) (accessToken string, accountID string, e
 	return "", "", fmt.Errorf("no access token found in credentials")
 }
 
-// ReadCodexCredentials reads the access token from Codex auth file.
+// ReadCodexCredentials reads the selected OAuth access token from Codex auth.
+// API-key logins cannot supply subscription quota, even if an older OAuth
+// cache remains in the file. Share the selector used by restore and health.
 func ReadCodexCredentials(path string) (accessToken string, accountID string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", "", err
 	}
 
-	var creds struct {
-		// Direct API key format
-		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	if _, selectedKey, err := authfile.CodexSelectedAPIKey(data); err != nil {
+		return "", "", fmt.Errorf("invalid Codex credential selection")
+	} else if selectedKey {
+		return "", "", fmt.Errorf("API key auth does not support usage fetch")
+	}
 
+	var creds struct {
 		// OAuth token format
 		Tokens *struct {
 			AccessToken string `json:"access_token"`
@@ -366,18 +372,13 @@ func ReadCodexCredentials(path string) (accessToken string, accountID string, er
 		return "", "", err
 	}
 
-	// Fall back to OAuth tokens
+	// Preserve the native OAuth formats and their nested-token precedence.
 	if creds.Tokens != nil && creds.Tokens.AccessToken != "" {
 		return creds.Tokens.AccessToken, creds.Tokens.AccountID, nil
 	}
 
 	if creds.AccessToken != "" {
 		return creds.AccessToken, creds.AccountID, nil
-	}
-
-	// API key auth does not support ChatGPT usage endpoints.
-	if creds.OpenAIAPIKey != "" {
-		return "", "", fmt.Errorf("API key auth does not support usage fetch")
 	}
 
 	return "", "", fmt.Errorf("no access token found in credentials")

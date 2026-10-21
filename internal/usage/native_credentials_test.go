@@ -336,3 +336,80 @@ func TestGrokStagingRemovesRenewalSecretsFromEveryEntry(t *testing.T) {
 		}
 	}
 }
+
+// A quota read must use the method selected in auth.json, not a leftover
+// subscription token that happens to survive an API-key login.
+func TestCodexUsageReaderHonorsSelectedAuthMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name, auth, token, account string
+		wantError                  string
+	}{
+		{"explicit key with nested OAuth", `{"auth_mode":"apikey","OPENAI_API_KEY":"SYNTHETIC-KEY","tokens":{"access_token":"SYNTHETIC-OLD","account_id":"old-seat"}}`, "", "", "API key auth"},
+		{"hyphenated key with root OAuth", `{"auth_mode":"api-key","OPENAI_API_KEY":"SYNTHETIC-KEY","access_token":"SYNTHETIC-OLD","account_id":"old-seat"}`, "", "", "API key auth"},
+		{"snake key alias", `{"auth_mode":"apikey","api_key":"SYNTHETIC-KEY","tokens":{"access_token":"SYNTHETIC-OLD"}}`, "", "", "API key auth"},
+		{"camel key alias", `{"auth_mode":"APIKEY","apiKey":"SYNTHETIC-KEY","access_token":"SYNTHETIC-OLD"}`, "", "", "API key auth"},
+		{"key ignores malformed unused tokens", `{"auth_mode":"apikey","OPENAI_API_KEY":"SYNTHETIC-KEY","tokens":17}`, "", "", "API key auth"},
+		{"key-only legacy", `{"OPENAI_API_KEY":"SYNTHETIC-KEY"}`, "", "", "API key auth"},
+		{"key mode without key", `{"auth_mode":"apikey","tokens":{"access_token":"SYNTHETIC-OLD"}}`, "", "", "invalid Codex credential selection"},
+		{"key aliases conflict", `{"auth_mode":"apikey","OPENAI_API_KEY":"SYNTHETIC-A","apiKey":"SYNTHETIC-B","tokens":{"access_token":"SYNTHETIC-OLD"}}`, "", "", "invalid Codex credential selection"},
+		{"malformed mode", `{"auth_mode":42,"tokens":{"access_token":"SYNTHETIC-OLD"}}`, "", "", "invalid Codex credential selection"},
+		{"malformed key", `{"OPENAI_API_KEY":42,"tokens":{"access_token":"SYNTHETIC-OLD"}}`, "", "", "invalid Codex credential selection"},
+		{"explicit OAuth with unused key", `{"auth_mode":"chatgpt","OPENAI_API_KEY":"SYNTHETIC-UNUSED","tokens":{"access_token":"SYNTHETIC-SELECTED","account_id":"selected-seat"}}`, "SYNTHETIC-SELECTED", "selected-seat", ""},
+		{"legacy nested OAuth", `{"tokens":{"access_token":"SYNTHETIC-SELECTED","account_id":"selected-seat"}}`, "SYNTHETIC-SELECTED", "selected-seat", ""},
+		{"legacy root OAuth", `{"access_token":"SYNTHETIC-SELECTED","account_id":"selected-seat"}`, "SYNTHETIC-SELECTED", "selected-seat", ""},
+		{"implicit mixed preserves native OAuth precedence", `{"OPENAI_API_KEY":"SYNTHETIC-UNUSED","tokens":{"access_token":"SYNTHETIC-SELECTED","account_id":"selected-seat"}}`, "SYNTHETIC-SELECTED", "selected-seat", ""},
+		{"nested OAuth precedes old root", `{"tokens":{"access_token":"SYNTHETIC-SELECTED","account_id":"selected-seat"},"access_token":"SYNTHETIC-OLD","account_id":"old-seat"}`, "SYNTHETIC-SELECTED", "selected-seat", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(path, []byte(tc.auth), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, account, err := ReadCodexCredentials(path)
+			if token != tc.token || account != tc.account {
+				t.Fatal("usage reader returned the wrong selected credential or account")
+			}
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("selected OAuth was rejected: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("wrong selection refusal: %v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), "SYNTHETIC") {
+				t.Fatal("selection diagnostic exposed credential material")
+			}
+			data, readErr := os.ReadFile(path)
+			after, statErr := os.Stat(path)
+			if readErr != nil || statErr != nil || string(data) != tc.auth || !os.SameFile(before, after) || before.Mode() != after.Mode() || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatal("quota selection changed the saved credential")
+			}
+		})
+	}
+}
+
+func TestCodexUsagePoolExcludesSelectedKeysWithLeftoverOAuth(t *testing.T) {
+	root := t.TempDir()
+	fixtures := map[string]string{
+		"key":     `{"auth_mode":"apikey","OPENAI_API_KEY":"SYNTHETIC-KEY","tokens":{"access_token":"SYNTHETIC-OLD"}}`,
+		"invalid": `{"auth_mode":"apikey","tokens":{"access_token":"SYNTHETIC-OLD"}}`,
+		"oauth":   `{"auth_mode":"chatgpt","OPENAI_API_KEY":"SYNTHETIC-UNUSED","tokens":{"access_token":"SYNTHETIC-SELECTED"}}`,
+	}
+	for name, data := range fixtures {
+		writeNativeLiveFixture(t, filepath.Join(root, "codex", name, "auth.json"), []byte(data))
+	}
+	credentials, err := LoadProfileCredentials(root, "codex")
+	if err != nil || len(credentials) != 1 || credentials["oauth"] != "SYNTHETIC-SELECTED" {
+		t.Fatalf("quota pool included an unselected account: count=%d, error=%v", len(credentials), err)
+	}
+	for name, want := range fixtures {
+		data, err := os.ReadFile(filepath.Join(root, "codex", name, "auth.json"))
+		if err != nil || string(data) != want {
+			t.Fatal("quota pool loading changed saved credentials")
+		}
+	}
+}
