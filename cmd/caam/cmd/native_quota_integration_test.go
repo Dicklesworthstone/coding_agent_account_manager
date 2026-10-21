@@ -44,8 +44,10 @@ func setupGrokResetProfiles(t *testing.T) (map[string]string, time.Time) {
 	for name, key := range map[string]string{
 		"fresh": "SYNTHETIC-FRESH", "spent": "SYNTHETIC-SPENT", "malformed": "SYNTHETIC-MALFORMED",
 	} {
+		// A current login: since #124 the billing probe refuses to launch
+		// Grok for a cache without a comfortably future absolute expiry.
 		writeNativeTestCredential(t, filepath.Join(vault.ProfilePath("grok", name), "auth.json"),
-			fmt.Sprintf(`{"key":%q,"email":%q}`, key, name+"@example.com"))
+			fmt.Sprintf(`{"key":%q,"email":%q,"expires_at":"2099-01-01T00:00:00Z"}`, key, name+"@example.com"))
 	}
 	now := time.Now().UTC()
 	reset := now.Add(7 * 24 * time.Hour)
@@ -70,7 +72,10 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$billing"
       exit 0
       ;;
-    initialize|authenticate|session/new)
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"authMethods":[{"id":"cached_token"}]}}\n' "$id"
+      ;;
+    authenticate|session/new)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"synthetic"}}\n' "$id"
       ;;
     *) exit 1 ;;
