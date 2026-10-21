@@ -50,7 +50,7 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newTokenHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codex refresh failed: %w", err)
@@ -203,7 +203,7 @@ func VerifyCodexToken(ctx context.Context, token string) error {
 		return err
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newTokenHTTPClient(10 * time.Second)
 	var last *TokenVerifyError
 	for attempt := 1; attempt <= codexVerifyAttempts; attempt++ {
 		status, retryAfter, err := codexVerifyOnce(ctx, client, token)

@@ -61,7 +61,7 @@ var RefreshGeminiToken = func(ctx context.Context, clientID, clientSecret, refre
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newTokenHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("gemini refresh failed: %w", err)
