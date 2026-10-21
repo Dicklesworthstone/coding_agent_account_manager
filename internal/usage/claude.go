@@ -52,6 +52,14 @@ type claudeWindow struct {
 	ResetsAt    string  `json:"resets_at"`   // ISO8601 timestamp
 }
 
+func (w *claudeWindow) UnmarshalJSON(data []byte) error {
+	if err := requireUsagePercent(data, "utilization"); err != nil {
+		return err
+	}
+	type plain claudeWindow
+	return json.Unmarshal(data, (*plain)(w))
+}
+
 // claudeLimit is one entry of the usage response's limits[] array.
 type claudeLimit struct {
 	Kind     string       `json:"kind"`     // "session" | "weekly_all" | "weekly_scoped"
@@ -61,6 +69,14 @@ type claudeLimit struct {
 	ResetsAt string       `json:"resets_at"`
 	Scope    *claudeScope `json:"scope"`
 	IsActive bool         `json:"is_active"`
+}
+
+func (l *claudeLimit) UnmarshalJSON(data []byte) error {
+	if err := requireUsagePercent(data, "percent"); err != nil {
+		return err
+	}
+	type plain claudeLimit
+	return json.Unmarshal(data, (*plain)(l))
 }
 
 type claudeScope struct {
@@ -210,8 +226,9 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 	}
 
 	var usage claudeUsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
-		info.Error = fmt.Sprintf("decode error: %v", err)
+	if err := decodeUsageResponse(resp.Body, &usage); err != nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error, info.QuotaNote = err.Error(), err.Error()
 		return info, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -253,6 +270,12 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 	// Per-model allowances, and the general windows for accounts that report
 	// them only here (issue #97).
 	applyLimits(info, usage.Limits)
+	if info.PrimaryWindow == nil && info.SecondaryWindow == nil {
+		info.QuotaStatus = QuotaDegraded
+		info.Error = "Claude response did not include a measured general quota"
+		info.QuotaNote = info.Error
+		return info, fmt.Errorf("%s", info.Error)
+	}
 
 	return info, nil
 }

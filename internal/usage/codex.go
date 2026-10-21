@@ -53,6 +53,14 @@ type codexWindow struct {
 	LimitWindowSeconds int `json:"limit_window_seconds"` // Window size in seconds
 }
 
+func (w *codexWindow) UnmarshalJSON(data []byte) error {
+	if err := requireUsagePercent(data, "used_percent"); err != nil {
+		return err
+	}
+	type plain codexWindow
+	return json.Unmarshal(data, (*plain)(w))
+}
+
 type codexCreditInfo struct {
 	HasCredits bool         `json:"has_credits"`
 	Unlimited  bool         `json:"unlimited"`
@@ -167,8 +175,9 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	}
 
 	var usage codexUsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
-		info.Error = fmt.Sprintf("decode error: %v", err)
+	if err := decodeUsageResponse(resp.Body, &usage); err != nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error, info.QuotaNote = err.Error(), err.Error()
 		return info, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -207,6 +216,12 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 		}
 	}
 
+	if info.PrimaryWindow == nil && info.SecondaryWindow == nil {
+		info.QuotaStatus = QuotaDegraded
+		info.Error = "Codex response did not include a measured general quota"
+		info.QuotaNote = info.Error
+		return info, fmt.Errorf("%s", info.Error)
+	}
 	return info, nil
 }
 
