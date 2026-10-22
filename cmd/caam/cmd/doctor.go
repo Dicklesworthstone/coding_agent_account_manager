@@ -1260,9 +1260,17 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 		// working refresh token, and that 401 says nothing about the
 		// account.
 		var verifyErr *refresh.TokenVerifyError
-		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized &&
-			codexAccessTokenLive(authPath) {
-			recordProbeVerdict(tool, profileName, false, fmt.Sprintf("access_token_rejected_http_%d", verifyErr.StatusCode), fingerprint)
+		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized {
+			if codexAccessTokenLive(authPath) {
+				recordProbeVerdict(tool, profileName, false, fmt.Sprintf("access_token_rejected_http_%d", verifyErr.StatusCode), fingerprint)
+			} else if expiresAt, lapsed := codexAccessTokenLapsed(authPath); lapsed {
+				// The same rule decides the check: this 401 is the expected
+				// answer for a lapsed token, not a rejected login. It is
+				// typically the active profile's snapshot, which goes stale
+				// while Codex rotates the live login in place; doctor judged
+				// that profile's expiry from the live file (issue #127).
+				return lapsedCodexSnapshotResult(tool, profileName, expiresAt)
+			}
 		}
 		return classifyCodexProbeError(tool, profileName, err)
 	}
@@ -1280,6 +1288,35 @@ func codexAccessTokenLive(authPath string) bool {
 		return false
 	}
 	return health.AccessTokenRejectionIsEvidence(info.ExpiresAt, time.Now())
+}
+
+// codexAccessTokenLapsed reports whether the Codex credential at authPath
+// claims an access token expiry that has passed or falls within the rejection
+// skew, and returns that expiry. An unknown expiry is not lapsed: a 401 for
+// such a token keeps its usual meaning.
+func codexAccessTokenLapsed(authPath string) (time.Time, bool) {
+	info, err := health.ParseCodexExpiry(authPath)
+	if err != nil || info == nil || info.ExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return info.ExpiresAt, !health.AccessTokenRejectionIsEvidence(info.ExpiresAt, time.Now())
+}
+
+// lapsedCodexSnapshotResult reports a probe that could not judge the login
+// because the saved access token had already lapsed by its own claim.
+func lapsedCodexSnapshotResult(tool, profileName string, expiresAt time.Time) *CheckResult {
+	return &CheckResult{
+		Name:    fmt.Sprintf("%s/%s token", tool, profileName),
+		Status:  "warn",
+		Message: "could not verify token (saved access token has lapsed)",
+		Details: fmt.Sprintf(
+			"The saved copy of %s/%s holds an access token whose own expiry (%s) has passed\n"+
+				"or is minutes away, so the provider's HTTP 401 for it says nothing about the login.\n"+
+				"While a profile is in use, its CLI keeps the newer login in the live auth file;\n"+
+				"caam saves a newer live login of the same account back to the profile when\n"+
+				"you switch away from it.",
+			tool, profileName, expiresAt.UTC().Format(time.RFC3339)),
+	}
 }
 
 // recordProbeVerdict stores a live probe's answer in health metadata so

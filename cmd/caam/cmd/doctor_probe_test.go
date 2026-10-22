@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -280,6 +281,91 @@ func TestProbeVaultTokenForbiddenPreservesCredentialsAndHealth(t *testing.T) {
 			}
 			assertBackupTreeUnchanged(t, liveRoot, liveBefore)
 			assertBackupTreeUnchanged(t, vaultDir, vaultBefore)
+		})
+	}
+}
+
+// Issue #127, after the probe moved to an endpoint that answers 401 for an
+// invalid token: Codex rotates the ACTIVE profile's login in place, so its
+// vault snapshot goes stale (caam writes the newer login back only when it
+// switches away, internal/authfile/switch.go) and the snapshot's access
+// token lapses while the live login is fresh. doctor judges
+// the active profile's expiry from the live file, then probes the snapshot's
+// lapsed access token and gets the expected 401. That 401 says nothing about
+// the login, so it must not fail the check or advise a re-login, while a 401
+// for an access token that is still live by its own claim still fails.
+func TestDoctorStaleActiveCodexSnapshotIsNotARejectedLogin(t *testing.T) {
+	jwt := func(exp time.Time) string {
+		claims, err := json.Marshal(map[string]any{"email": "work@example.com", "exp": exp.Unix()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".SYNTHETIC"
+	}
+	codexAuth := func(exp time.Time, refreshToken string) string {
+		return fmt.Sprintf(`{"auth_mode":"chatgpt","tokens":{"id_token":%q,"access_token":%q,"refresh_token":%q}}`,
+			jwt(exp), jwt(exp), refreshToken)
+	}
+	for _, tc := range []struct {
+		name       string
+		snapshot   time.Duration
+		wantStatus string
+	}{
+		{"lapsed snapshot", -2 * time.Hour, "warn"},
+		{"snapshot within clock skew", 2 * time.Minute, "warn"},
+		{"live snapshot", 9 * 24 * time.Hour, "fail"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vaultDir, store := setupCodexVerificationVault(t)
+			liveRoot := t.TempDir()
+			t.Setenv("CODEX_HOME", liveRoot)
+			tools["codex"] = authfile.CodexAuthFiles
+			snapshotExpiry := time.Now().Add(tc.snapshot)
+			writeNativeTestCredential(t, filepath.Join(vaultDir, "codex", "work", "auth.json"),
+				codexAuth(snapshotExpiry, "SYNTHETIC-SNAPSHOT-REFRESH"))
+			writeNativeTestCredential(t, filepath.Join(liveRoot, "auth.json"),
+				codexAuth(time.Now().Add(9*24*time.Hour), "SYNTHETIC-LIVE-REFRESH"))
+
+			var probed []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				probed = append(probed, r.Header.Get("Authorization"))
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer server.Close()
+			oldURL := refresh.CodexVerifyURL
+			refresh.CodexVerifyURL = server.URL
+			defer func() { refresh.CodexVerifyURL = oldURL }()
+
+			var check *CheckResult
+			for _, result := range checkAuthFiles() {
+				if result.Name == "codex" && !strings.Contains(result.Message, "profile: work") {
+					t.Fatalf("live login was not matched to the work profile: %+v", result)
+				}
+				if result.Name == "codex/work token" {
+					check = &result
+				}
+			}
+			if len(probed) != 1 || probed[0] != "Bearer "+jwt(snapshotExpiry) {
+				t.Fatalf("doctor did not probe the snapshot's access token once: %q", probed)
+			}
+			if check == nil || check.Status != tc.wantStatus {
+				t.Fatalf("doctor token check = %+v, want status %q", check, tc.wantStatus)
+			}
+			if tc.wantStatus == "fail" {
+				return
+			}
+			encoded, err := json.Marshal(check)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{"caam login", "caam refresh", "refresh_token_reused", "rejected"} {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("expected 401 for a lapsed snapshot diagnosed as a rejection (%q): %s", forbidden, encoded)
+				}
+			}
+			if h, _ := store.GetProfile("codex", "work"); h != nil && !h.ProviderRejectedAt.IsZero() {
+				t.Fatalf("lapsed snapshot's 401 was recorded as a provider rejection: %+v", h)
+			}
 		})
 	}
 }
