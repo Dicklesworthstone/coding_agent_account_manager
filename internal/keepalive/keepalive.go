@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -47,21 +48,29 @@ type Options struct {
 
 // Result deliberately excludes provider output, tokens, credential hashes, and
 // the child environment. Ref identifies the actual live owner for automation.
+//
+// When the native CLI exits unsuccessfully, the Native* fields describe why
+// without carrying provider text: the exit code, and for Claude the HTTP
+// status of a rejected API request and Claude's own terminal reason, both
+// read from its JSON result and validated against fixed formats.
 type Result struct {
-	Provider       string       `json:"provider"`
-	Profile        string       `json:"profile"`
-	Kind           string       `json:"kind"`
-	Ref            string       `json:"ref"`
-	AuthPath       string       `json:"auth_path"`
-	Status         string       `json:"status"`
-	Reason         string       `json:"reason,omitempty"`
-	Success        bool         `json:"success"`
-	Attempted      bool         `json:"attempted"`
-	ExpiresBefore  time.Time    `json:"expires_before,omitempty"`
-	ExpiresAfter   time.Time    `json:"expires_after,omitempty"`
-	NextEligibleAt time.Time    `json:"next_eligible_at,omitempty"`
-	SyncedProfiles []string     `json:"synced_profiles,omitempty"`
-	Sync           []SyncResult `json:"sync,omitempty"`
+	Provider             string       `json:"provider"`
+	Profile              string       `json:"profile"`
+	Kind                 string       `json:"kind"`
+	Ref                  string       `json:"ref"`
+	AuthPath             string       `json:"auth_path"`
+	Status               string       `json:"status"`
+	Reason               string       `json:"reason,omitempty"`
+	Success              bool         `json:"success"`
+	Attempted            bool         `json:"attempted"`
+	ExpiresBefore        time.Time    `json:"expires_before,omitempty"`
+	ExpiresAfter         time.Time    `json:"expires_after,omitempty"`
+	NextEligibleAt       time.Time    `json:"next_eligible_at,omitempty"`
+	NativeExitCode       *int         `json:"native_exit_code,omitempty"`
+	NativeAPIErrorStatus int          `json:"native_api_error_status,omitempty"`
+	NativeTerminalReason string       `json:"native_terminal_reason,omitempty"`
+	SyncedProfiles       []string     `json:"synced_profiles,omitempty"`
+	Sync                 []SyncResult `json:"sync,omitempty"`
 }
 
 var (
@@ -262,20 +271,39 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 	cmd := exec.CommandContext(cctx, bin, args...)
 	cmd.Dir = workDir
 	cmd.Env = nativeEnv(grant, os.Environ())
-	// Provider errors can contain opaque credentials. Discard both streams
-	// without copy pipes that a native wrapper's descendants could retain.
-	output, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	// Provider errors can contain opaque credentials. Discard stderr, and use
+	// files rather than copy pipes that a native wrapper's descendants could
+	// retain. Claude's JSON result goes to a private file outside the empty
+	// working directory; only validated, non-secret fields are read back.
+	discard, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		result.Status, result.Reason = "failed", "native_output_unavailable"
 		return result
 	}
-	defer output.Close()
-	cmd.Stdout, cmd.Stderr = output, output
+	defer discard.Close()
+	cmd.Stdout, cmd.Stderr = discard, discard
+	resultPath := ""
+	if grant.Provider == "claude" {
+		resultFile, err := os.CreateTemp("", "caam-keepalive-result-")
+		if err != nil {
+			result.Status, result.Reason = "failed", "native_output_unavailable"
+			return result
+		}
+		resultPath = resultFile.Name()
+		defer os.Remove(resultPath)
+		defer resultFile.Close()
+		cmd.Stdout = resultFile
+	}
 	result.Attempted = true
 	runErr := runNativeCommand(cctx, cmd)
 	if errors.Is(runErr, errNativeCleanup) {
 		result.Status, result.Reason = "failed", "native_cleanup_failed"
 		return result
+	}
+	if runErr != nil && cctx.Err() == nil {
+		// After a timeout or cancellation the exit status is keepalive's own
+		// kill (on Windows, the job's exit code 1), not the CLI's failure.
+		recordNativeFailure(&result, runErr, resultPath)
 	}
 	// Always inspect the file, including nonzero exit and timeout. Grok can
 	// delete a rejected auth.json yet return exit status zero.
@@ -383,6 +411,52 @@ func credentialReadReason(err error) string {
 	return "credential_invalid"
 }
 
+// Claude's terminal reasons are short snake_case identifiers such as
+// "api_error". Anything else could be free text and is not reported.
+var nativeTerminalReasonFormat = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+// recordNativeFailure explains an unsuccessful native exit without provider
+// text: the process exit code (absent when a signal ended it) and, for
+// Claude, two validated fields of its JSON result.
+func recordNativeFailure(result *Result, runErr error, resultPath string) {
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		if code := exitErr.ExitCode(); code >= 0 {
+			result.NativeExitCode = &code
+		}
+	}
+	if resultPath != "" {
+		result.NativeAPIErrorStatus, result.NativeTerminalReason = readClaudeFailure(resultPath)
+	}
+}
+
+// readClaudeFailure reads only api_error_status and terminal_reason from a
+// Claude --output-format json result. The result text and every other field
+// are ignored, and a missing, malformed, or out-of-range value is dropped.
+func readClaudeFailure(path string) (int, string) {
+	data, err := readRegular(path)
+	if err != nil {
+		return 0, ""
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
+		return 0, ""
+	}
+	var kind string
+	if json.Unmarshal(fields["type"], &kind) != nil || kind != "result" {
+		return 0, ""
+	}
+	var status int
+	if json.Unmarshal(fields["api_error_status"], &status) != nil || status < 100 || status > 599 {
+		status = 0
+	}
+	var reason string
+	if json.Unmarshal(fields["terminal_reason"], &reason) != nil || !nativeTerminalReasonFormat.MatchString(reason) {
+		reason = ""
+	}
+	return status, reason
+}
+
 func grantKey(grant Grant) string {
 	authPath := filepath.Clean(grant.AuthPath)
 	if grant.source != nil {
@@ -476,7 +550,9 @@ func nativeCommand(provider string, opts Options) (string, []string, error) {
 	switch provider {
 	case "claude":
 		bin = opts.ClaudeBin
-		args = []string{"-p", "ping", "--model", "haiku", "--effort", "low",
+		// JSON output reports an API rejection's HTTP status in a structured
+		// field, so a failure can be explained without echoing provider text.
+		args = []string{"-p", "ping", "--output-format", "json", "--model", "haiku", "--effort", "low",
 			"--safe-mode", "--max-turns", "1",
 			"--no-session-persistence", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`,
 			"--setting-sources", "project", "--settings", `{"disableAllHooks":true,"disableClaudeAiConnectors":true}`,

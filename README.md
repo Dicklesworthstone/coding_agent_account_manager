@@ -1055,7 +1055,15 @@ are scrubbed so each CLI uses the selected live credential.
 The command returns nonzero if any selected grant cannot be renewed.
 `--json` includes an overall `success`, per-grant `success` and `attempted`,
 before/after expiry, and reasons. Native output and credential secrets are
-excluded. A zero exit from Grok alone is insufficient: keepalive detects
+excluded. When the native CLI exits unsuccessfully, the result adds its
+`native_exit_code` (absent if it was killed, for example by `--timeout`). For
+Claude, which keepalive runs with `--output-format json`, it also adds
+`native_api_error_status`, the HTTP status of a rejected API request (`401`
+means the login was refused; `429` means the request was rate limited), and
+`native_terminal_reason`, Claude's own short reason such as `api_error`.
+Claude's message text is never copied.
+
+A zero exit from Grok alone is insufficient: keepalive detects
 the case where Grok removes rejected credentials while exiting successfully.
 It also rejects a backwards expiry or a missing refresh credential. Metadata
 or formatting changes alone do not count as renewal.

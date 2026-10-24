@@ -135,7 +135,7 @@ cp "$CAAM_KEEPALIVE_NEXT" "$GROK_HOME/auth.json"`
 			}
 			expectedArgs := []string{"models"}
 			if provider == "claude" {
-				expectedArgs = []string{"-p", "ping", "--model", "haiku", "--effort", "low",
+				expectedArgs = []string{"-p", "ping", "--output-format", "json", "--model", "haiku", "--effort", "low",
 					"--safe-mode", "--max-turns", "1",
 					"--no-session-persistence", "--strict-mcp-config", "--mcp-config", `{"mcpServers":{}}`,
 					"--setting-sources", "project", "--settings", `{"disableAllHooks":true,"disableClaudeAiConnectors":true}`,
@@ -473,7 +473,7 @@ func TestRunTimeoutIsBoundedAndDoesNotSync(t *testing.T) {
 	}
 	started := time.Now()
 	result := runEngine(t, grant, opts)
-	if result.Success || !result.Attempted || result.Reason != "native_cli_timeout" || called {
+	if result.Success || !result.Attempted || result.Reason != "native_cli_timeout" || called || result.NativeExitCode != nil {
 		t.Fatalf("unexpected timeout result: %+v, sync=%v", result, called)
 	}
 	if time.Since(started) > time.Second {
@@ -507,6 +507,88 @@ wait`))
 	time.Sleep(250 * time.Millisecond)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("native descendant survived cancellation (stat error %v)", err)
+	}
+}
+
+// A Claude request can fail inside the TTL window (for example on a usage
+// limit) while the login stays valid. The result must say why from Claude's
+// JSON result without carrying its message text, and leave no temp files.
+func TestRunReportsNativeFailureWithoutProviderText(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
+	script := `printf '%s' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: Request rejected (429) test-access-before test-refresh"}'
+printf 'stderr might echo test-access-before\n' >&2
+exit 1`
+	opts := engineOptions(t, "claude", engineCLI(t, script))
+	result := runEngine(t, grant, opts)
+	if result.Success || !result.Attempted || result.Status != "failed" || result.Reason != "native_cli_failed" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if result.NativeExitCode == nil || *result.NativeExitCode != 1 || result.NativeAPIErrorStatus != 429 || result.NativeTerminalReason != "api_error" {
+		t.Fatalf("native failure details missing: %+v", result)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"native_exit_code":1`, `"native_api_error_status":429`, `"native_terminal_reason":"api_error"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("JSON result lacks %s: %s", want, encoded)
+		}
+	}
+	for _, secret := range []string{"API Error", "Request rejected", "test-access-before", "test-refresh", "stderr might echo"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Errorf("result leaked provider text %q: %s", secret, encoded)
+		}
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Fatalf("native run left temporary files behind: %v, error %v", entries, err)
+	}
+}
+
+func TestRunDropsUnverifiableNativeFailureFields(t *testing.T) {
+	for _, tc := range []struct{ name, stdout string }{
+		{"no output", ``},
+		{"plain text", `API Error: 429 test-access-before`},
+		{"not a result object", `{"type":"assistant","api_error_status":429,"terminal_reason":"api_error"}`},
+		{"free text reason", `{"type":"result","api_error_status":600,"terminal_reason":"API Error test-access-before"}`},
+		{"uppercase reason", `{"type":"result","api_error_status":99,"terminal_reason":"Api_Error"}`},
+		{"overlong reason", `{"type":"result","api_error_status":"429","terminal_reason":"` + strings.Repeat("a", 65) + `"}`},
+		{"fractional status", `{"type":"result","api_error_status":429.5,"terminal_reason":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
+			stdout := filepath.Join(t.TempDir(), "stdout")
+			if err := os.WriteFile(stdout, []byte(tc.stdout), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CAAM_KEEPALIVE_STDOUT", stdout)
+			opts := engineOptions(t, "claude", engineCLI(t, `cat "$CAAM_KEEPALIVE_STDOUT"; exit 3`))
+			result := runEngine(t, grant, opts)
+			if result.Reason != "native_cli_failed" || result.NativeExitCode == nil || *result.NativeExitCode != 3 {
+				t.Fatalf("exit code not reported: %+v", result)
+			}
+			if result.NativeAPIErrorStatus != 0 || result.NativeTerminalReason != "" {
+				t.Fatalf("unverifiable native fields were reported: %+v", result)
+			}
+		})
+	}
+}
+
+func TestRunNativeFailureDetailsOnlyForUnsuccessfulExit(t *testing.T) {
+	grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
+	ok := engineCLI(t, `printf '%s' '{"type":"result","is_error":false,"terminal_reason":"completed","result":"pong"}'`)
+	if result := runEngine(t, grant, engineOptions(t, "claude", ok)); !result.Success || result.Status != "still_valid" ||
+		result.NativeExitCode != nil || result.NativeAPIErrorStatus != 0 || result.NativeTerminalReason != "" {
+		t.Fatalf("successful native run reported failure details: %+v", result)
+	}
+	grok := engineGrant(t, "grok", engineNow.Add(time.Hour))
+	failed := engineCLI(t, `printf '{"type":"result","api_error_status":401,"terminal_reason":"api_error"}'; exit 17`)
+	result := runEngine(t, grok, engineOptions(t, "grok", failed))
+	if result.Reason != "native_cli_failed" || result.NativeExitCode == nil || *result.NativeExitCode != 17 ||
+		result.NativeAPIErrorStatus != 0 || result.NativeTerminalReason != "" {
+		t.Fatalf("Grok failure should report only its exit code: %+v", result)
 	}
 }
 
