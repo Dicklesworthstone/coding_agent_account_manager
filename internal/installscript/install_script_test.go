@@ -311,7 +311,6 @@ sudo() { echo "SUDO $*" >&2; return 0; }`
 	}
 }
 
-
 func TestSourceTarballRefHonorsRequestedVersion(t *testing.T) {
 	out, stderr, code := runInstallFunc(t, nil, "", `INSTALL_VERSION=v9.9.9; source_tarball_ref; INSTALL_VERSION=; source_tarball_ref`, "")
 	if code != 0 || out != "refs/tags/v9.9.9\nrefs/heads/main\n" {
@@ -389,13 +388,12 @@ uname() { printf 'Linux\n'; }
 			if (code == 0) != tc.ok {
 				t.Fatalf("ensure_go(go%s) exit=%d stdout=%q stderr=%q", tc.version, code, out, stderr)
 			}
-			if !tc.ok && !strings.Contains(stdout+stderr, "1.26.10") {
+			if !tc.ok && !strings.Contains(out+stderr, "1.26.10") {
 				t.Fatalf("old toolchain diagnostic did not name the required floor: stdout=%s stderr=%s", out, stderr)
 			}
 		})
 	}
 }
-
 
 func TestPinnedGoToolchainStaysAligned(t *testing.T) {
 	root := filepath.Dir(repoInstallScript(t))
