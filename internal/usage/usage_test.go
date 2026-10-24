@@ -372,7 +372,10 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			payload := fmt.Sprintf(`{"plan_type":"pro","rate_limit":{},"credits":{"has_credits":true,"unlimited":false,"balance":%s}}`, tc.balance)
+			// A response without a measured general window is degraded and
+			// returns an error (see the quota-response tests), so carry one
+			// here to test balance parsing on a successful fetch.
+			payload := fmt.Sprintf(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"reset_at":1900000000,"limit_window_seconds":18000}},"credits":{"has_credits":true,"unlimited":false,"balance":%s}}`, tc.balance)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != CodexUsagePath {
 					t.Fatalf("unexpected path: %s", r.URL.Path)

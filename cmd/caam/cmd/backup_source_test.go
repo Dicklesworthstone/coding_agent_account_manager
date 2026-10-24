@@ -411,8 +411,10 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Track home-level native state separately from ~/.claude.
-				nativeState := filepath.Join(os.Getenv("HOME"), ".claude.json")
+				// Track home-level native state separately from ~/.claude. live is
+				// <test home>/.claude/.credentials.json, so derive the home from
+				// it rather than from the HOME variable.
+				nativeState := filepath.Join(filepath.Dir(filepath.Dir(live)), ".claude.json")
 				if err := os.WriteFile(nativeState, []byte(`{"running":"native-account"}`), 0600); err != nil {
 					t.Fatal(err)
 				}
