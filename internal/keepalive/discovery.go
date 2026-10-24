@@ -858,8 +858,13 @@ func resolveOwners(grants []Grant) {
 			refs = append(refs, grants[i].Ref())
 		}
 		sort.Strings(refs)
+		// A separate sign-in cannot clear this: distinct token values look the
+		// same as a copied credential that rotated afterwards, so the hint must
+		// not suggest that a second login for the same account is accepted.
 		for _, i := range group {
-			grants[i].BlockedReason = "ambiguous live grant owners: " + strings.Join(refs, ", ") + "; sign in independently or keep only one owner"
+			grants[i].BlockedReason = "ambiguous live grant owners: " + strings.Join(refs, ", ") +
+				"; keepalive renews one live home per account and cannot tell a separate sign-in from a copied credential," +
+				" so sign out of all but one of these homes; homes outside this group can still be selected by reference"
 		}
 	}
 }

@@ -1019,6 +1019,15 @@ live owners, unknown identities, malformed credentials, and unknown expiry
 are reported without running the CLI. File-based keepalive cannot verify a
 Claude login held in the macOS login keychain and reports it as blocked.
 
+Keepalive renews **one live home per account**. Apart from the
+shallow-over-host case above, when two homes hold the same account (for
+example the host home and an isolated profile), both are blocked, even if
+each was signed in separately: different token values cannot show whether a
+credential came from its own sign-in or is a copy that rotated later, and
+renewing a stale copy could replay a spent refresh token. Sign out of all
+but one of those homes. Homes for other accounts can still be selected by
+reference while the conflict remains.
+
 The default threshold is **2 hours** until expiry. While the access token
 remains valid, attempts are at least **25 minutes** apart; expired tokens
 bypass this interval. `--min-gap 0` disables the interval. Each native call

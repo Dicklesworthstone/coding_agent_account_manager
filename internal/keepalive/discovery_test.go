@@ -820,6 +820,45 @@ func TestDiscoverInvalidCredentialRetainsKnownOwnership(t *testing.T) {
 	}
 }
 
+// A second, separate sign-in to the same account has its own token values, but
+// discovery cannot tell it from a copy that rotated later. Both homes stay
+// blocked, and the hint must say so instead of suggesting a separate sign-in.
+func TestDiscoverSeparateSignInsToOneAccountStayAmbiguous(t *testing.T) {
+	opts := discoveryFixture(t)
+	opts.Provider = "claude"
+	writeDiscoveryClaude(t, opts.Home, "shared-account", "shared@example.test", "host-family")
+	for _, isolated := range []struct{ name, id, email, refresh string }{
+		{"main", "shared-account", "shared@example.test", "separate-login-family"},
+		{"other", "other-account", "other@example.test", "other-family"},
+	} {
+		prof := &profile.Profile{Provider: "claude", Name: isolated.name, AuthMode: "oauth", BasePath: filepath.Join(opts.ProfilesPath, "claude", isolated.name)}
+		data, err := json.Marshal(prof)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeDiscoveryFile(t, filepath.Join(prof.BasePath, "profile.json"), string(data))
+		writeDiscoveryClaude(t, prof.HomePath(), isolated.id, isolated.email, isolated.refresh)
+	}
+	grants, err := Discover(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{"host:claude", "isolated:claude/main"} {
+		grant := findDiscoveryGrant(t, grants, ref)
+		reason := grant.BlockedReason
+		if !strings.Contains(reason, "ambiguous live grant owners: host:claude, isolated:claude/main;") ||
+			!strings.Contains(reason, "one live home per account") || !strings.Contains(reason, "sign out of all but one") {
+			t.Fatalf("%s was not blocked with the one-home-per-account hint: %q", ref, reason)
+		}
+		if strings.Contains(reason, "sign in independently") {
+			t.Fatalf("%s hint still suggests a separate sign-in clears the block: %q", ref, reason)
+		}
+	}
+	if other := findDiscoveryGrant(t, grants, "isolated:claude/other"); other.BlockedReason != "" || other.Owner != "" {
+		t.Fatalf("a home outside the ambiguous group was blocked: %+v", other)
+	}
+}
+
 func TestDiscoverInvalidHostStillYieldsToUniqueShallowOwner(t *testing.T) {
 	opts := discoveryFixture(t)
 	opts.Provider = "claude"

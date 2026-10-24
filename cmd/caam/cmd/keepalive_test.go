@@ -257,6 +257,9 @@ func TestKeepaliveCLISelectionCannotConcealCompetingOwners(t *testing.T) {
 		if err == nil || out.Success || !strings.Contains(out.Error, "ambiguous live grant owners") || !strings.Contains(out.Error, "shallow:claude/other") {
 			t.Fatalf("%s concealed competing owner: %+v, error %v", selector, out, err)
 		}
+		if !strings.Contains(out.Error, "one live home per account") || strings.Contains(out.Error, "sign in independently") {
+			t.Fatalf("%s gave a hint that a separate sign-in cannot satisfy: %q", selector, out.Error)
+		}
 		for _, result := range out.Results {
 			if result.Success || result.Attempted {
 				t.Fatalf("competing owner was executed: %+v", result)
