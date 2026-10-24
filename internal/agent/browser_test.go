@@ -917,6 +917,12 @@ func fixtureBrowser(t *testing.T, fixture http.Handler) *Browser {
 	b.stepDelay = 200 * time.Millisecond
 	b.flowTimeout = 45 * time.Second
 	b.extraOpts = []chromedp.ExecAllocatorOption{
+		// These disposable fixture profiles run under an isolated HOME with
+		// no login keychain. Keep Chrome out of the host's credential stores
+		// so tests cannot open macOS keychain dialogs or touch real secrets.
+		// Production profiles retain Chrome's normal encryption settings.
+		chromedp.Flag("use-mock-keychain", true),
+		chromedp.Flag("password-store", "basic"),
 		chromedp.ProxyServer(tunnelProxy(t, fixture)),
 		chromedp.Flag("ignore-certificate-errors", true),
 		chromedp.NoSandbox,
