@@ -346,7 +346,13 @@ func TestRunCommand_Extended(t *testing.T) {
 				seen[call.Account] = true
 				require.Equal(t, input, call.Input, "every launch must receive the full piped input")
 				require.Equal(t, []string{"claude", "-p", "test prompt"}, call.Args)
-				require.Equal(t, root, call.WorkDir)
+				// The child reports its physical cwd; macOS temp dirs sit
+				// behind /var -> /private/var.
+				wantDir, err := filepath.EvalSymlinks(root)
+				require.NoError(t, err)
+				gotDir, err := filepath.EvalSymlinks(call.WorkDir)
+				require.NoError(t, err)
+				require.Equal(t, wantDir, gotDir)
 			}
 			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
 			require.NoError(t, err)

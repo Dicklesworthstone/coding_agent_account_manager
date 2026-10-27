@@ -879,6 +879,12 @@ func TestBackupScheduler_RetentionUsesPublicationOrder(t *testing.T) {
 			data := readBackupTestFile(t, source)
 			template := scheduler.GetState().OwnedBackups[0]
 			created := time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)
+			// Publish where CreateBackup does: into the resolved location
+			// (macOS temp dirs sit behind /var -> /private/var).
+			location, err := filepath.EvalSymlinks(scheduler.config.Location)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var publications []string
 			for _, id := range []byte{0xff, 0x01} {
 				// The older archive sorts later by random ID; publication order
@@ -886,7 +892,7 @@ func TestBackupScheduler_RetentionUsesPublicationOrder(t *testing.T) {
 				if backwards && len(publications) > 0 {
 					created = created.Add(-time.Hour)
 				}
-				path, err := publishScheduledBackup(source, scheduler.config.Location, created, bytes.NewReader(bytes.Repeat([]byte{id}, 16)))
+				path, err := publishScheduledBackup(source, location, created, bytes.NewReader(bytes.Repeat([]byte{id}, 16)))
 				if err != nil {
 					t.Fatal(err)
 				}

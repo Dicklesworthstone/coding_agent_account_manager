@@ -1814,7 +1814,7 @@ func TestTmuxCaptureJoinsWrappedOAuthURL(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
-	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX_TMPDIR", shortTmuxDir(t))
 	t.Setenv("TMUX", "")
 	url := "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG&code_challenge_method=S256&state=zyxwvutsrqponmlkjihgfedcba9876543210"
 	script := fmt.Sprintf("printf 'Browse to:\\n%%s\\nPaste code here if prompted > ' '%s'; sleep 30", url)
@@ -1981,7 +1981,7 @@ func TestTmuxDeliversLoginKeys(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
-	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX_TMPDIR", shortTmuxDir(t))
 	t.Setenv("TMUX", "")
 	want := "\x1b\x05\x15/login\r"
 	out := filepath.Join(t.TempDir(), "bytes")
@@ -2028,7 +2028,7 @@ func TestTmuxTypingPressesEnter(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
-	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX_TMPDIR", shortTmuxDir(t))
 	t.Setenv("TMUX", "")
 	out := filepath.Join(t.TempDir(), "bytes")
 	script := fmt.Sprintf("stty raw -echo; head -c 7 > '%s'; sleep 30", out)
@@ -2062,4 +2062,17 @@ func TestTmuxTypingPressesEnter(t *testing.T) {
 	if string(got) != "/login\r" {
 		t.Fatalf("raw-mode program received %q, want %q", got, "/login\r")
 	}
+}
+
+// shortTmuxDir returns a TMUX_TMPDIR short enough for tmux's socket path:
+// macOS limits unix socket paths to 104 bytes, and t.TempDir() under
+// /var/folders exceeds that once tmux appends tmux-<uid>/default.
+func shortTmuxDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "caam-tmux-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }

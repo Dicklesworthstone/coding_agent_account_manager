@@ -1131,7 +1131,7 @@ func TestRecoveryEndToEndInRealTmuxPane(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
-	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("TMUX_TMPDIR", shortTmuxDir(t))
 	t.Setenv("TMUX", "")
 	dir := t.TempDir()
 	script := filepath.Join(dir, "fake-claude.sh")
@@ -1342,4 +1342,17 @@ func countSent(sent []string, text string) int {
 		}
 	}
 	return n
+}
+
+// shortTmuxDir returns a TMUX_TMPDIR short enough for tmux's socket path:
+// macOS limits unix socket paths to 104 bytes, and t.TempDir() under
+// /var/folders exceeds that once tmux appends tmux-<uid>/default.
+func shortTmuxDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "caam-tmux-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
