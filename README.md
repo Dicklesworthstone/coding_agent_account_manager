@@ -1048,6 +1048,7 @@ are scrubbed so each CLI uses the selected live credential.
 |--------|---------|
 | `rotated` | The CLI left a renewable, unexpired credential for the same account with a strictly later expiry. |
 | `still_valid` | The credential remains usable; the native CLI may defer rotation until closer to expiry. |
+| `rate_limited` | Claude's request was refused with HTTP 429, so the login was accepted, and the credential passed every check. Counts as success. |
 | `skipped` | The token is outside the threshold, was attempted recently, or another reference owns the same grant. |
 | `dry_run` | This live grant would be attempted. |
 | `blocked` / `failed` | Ownership or credential checks failed, the CLI could not renew, or the resulting credential is expired, missing, or invalid. |

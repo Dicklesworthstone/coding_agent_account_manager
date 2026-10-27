@@ -510,14 +510,14 @@ wait`))
 	}
 }
 
-// A Claude request can fail inside the TTL window (for example on a usage
-// limit) while the login stays valid. The result must say why from Claude's
-// JSON result without carrying its message text, and leave no temp files.
+// A Claude request can fail inside the TTL window while the credential file
+// still looks valid. The result must say why from Claude's JSON result
+// without carrying its message text, and leave no temp files.
 func TestRunReportsNativeFailureWithoutProviderText(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 	grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
-	script := `printf '%s' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: Request rejected (429) test-access-before test-refresh"}'
+	script := `printf '%s' '{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"terminal_reason":"api_error","result":"API Error: Request rejected (401) test-access-before test-refresh"}'
 printf 'stderr might echo test-access-before\n' >&2
 exit 1`
 	opts := engineOptions(t, "claude", engineCLI(t, script))
@@ -525,14 +525,14 @@ exit 1`
 	if result.Success || !result.Attempted || result.Status != "failed" || result.Reason != "native_cli_failed" {
 		t.Fatalf("unexpected result: %+v", result)
 	}
-	if result.NativeExitCode == nil || *result.NativeExitCode != 1 || result.NativeAPIErrorStatus != 429 || result.NativeTerminalReason != "api_error" {
+	if result.NativeExitCode == nil || *result.NativeExitCode != 1 || result.NativeAPIErrorStatus != 401 || result.NativeTerminalReason != "api_error" {
 		t.Fatalf("native failure details missing: %+v", result)
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"native_exit_code":1`, `"native_api_error_status":429`, `"native_terminal_reason":"api_error"`} {
+	for _, want := range []string{`"native_exit_code":1`, `"native_api_error_status":401`, `"native_terminal_reason":"api_error"`} {
 		if !strings.Contains(string(encoded), want) {
 			t.Errorf("JSON result lacks %s: %s", want, encoded)
 		}
@@ -544,6 +544,33 @@ exit 1`
 	}
 	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
 		t.Fatalf("native run left temporary files behind: %v, error %v", entries, err)
+	}
+}
+
+// A 429 means the API accepted the login and refused only the request, so a
+// credential that passes every check is healthy: rate_limited, success, and
+// the usual vault sync (#129). A 429 never excuses a failed credential check.
+func TestRunTreatsRateLimitedRequestAsHealthy(t *testing.T) {
+	script := `printf '%s' '{"type":"result","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"API Error: Request rejected (429)"}'
+exit 1`
+	grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
+	opts := engineOptions(t, "claude", engineCLI(t, script))
+	synced := 0
+	opts.AfterRenew = func(context.Context, Grant, CredentialSnapshot) ([]SyncResult, error) {
+		synced++
+		return []SyncResult{{Profile: "max100", Status: "synced"}}, nil
+	}
+	result := runEngine(t, grant, opts)
+	if !result.Success || !result.Attempted || result.Status != "rate_limited" || result.Reason != "" || synced != 1 {
+		t.Fatalf("rate-limited request with a valid credential: %+v (synced %d)", result, synced)
+	}
+	if result.NativeExitCode == nil || *result.NativeExitCode != 1 || result.NativeAPIErrorStatus != 429 {
+		t.Fatalf("rate limit details missing: %+v", result)
+	}
+
+	expired := engineGrant(t, "claude", engineNow.Add(-time.Minute))
+	if result := runEngine(t, expired, engineOptions(t, "claude", engineCLI(t, script))); result.Success || result.Status != "failed" || result.Reason != "still_expired" {
+		t.Fatalf("a 429 excused an expired credential: %+v", result)
 	}
 }
 

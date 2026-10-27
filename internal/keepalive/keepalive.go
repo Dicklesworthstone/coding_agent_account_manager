@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -336,6 +337,13 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 	// Formatting, metadata, or token changes without an extended lifetime are
 	// not proof of renewal. The native CLI may legitimately defer renewal.
 	renewed := after.ExpiresAt.After(before.ExpiresAt)
+	if runErr != nil && !renewed && cctx.Err() == nil && result.NativeAPIErrorStatus == http.StatusTooManyRequests {
+		// The API accepted the login and refused only the request. The
+		// credential passed every check above, which is what keepalive
+		// verifies, so report the rate limit without failing (#129).
+		result.Status, result.Success = "rate_limited", true
+		return synchronizeResult(ctx, grant, after, opts, result)
+	}
 	if runErr != nil && !renewed {
 		result.Status, result.Reason = "failed", "native_cli_failed"
 		if cctx.Err() != nil {
