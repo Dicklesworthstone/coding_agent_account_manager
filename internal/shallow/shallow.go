@@ -1079,6 +1079,15 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 		}
 		src := filepath.Join(srcDir, name)
 		dst := filepath.Join(dstDir, name)
+		// An existing local directory or file belongs to the profile.
+		// Never replace it or follow it during a Library repair.
+		if dirName == "Library" && layout.provider == "claude" {
+			if _, err := os.Lstat(dst); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspect private Library entry %s: %w", dst, err)
+			}
+		}
 		if err := atomicSymlink(src, dst); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
 		}
