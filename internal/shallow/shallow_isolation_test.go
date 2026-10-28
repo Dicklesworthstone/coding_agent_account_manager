@@ -3,6 +3,7 @@ package shallow
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -200,5 +201,100 @@ func TestVaultUnreachableViaXDGRelocation(t *testing.T) {
 	other := filepath.Join(got, "xdgdata", "otherapp", "state")
 	if !resolvesUnderRealHome(t, other, home) {
 		t.Fatalf("carve-out over-withheld XDG sibling: %s should pass through", other)
+	}
+}
+
+
+// Issue #130: a macOS Claude shallow profile must never expose the real
+// login Keychain through the Library symlink farm.
+func TestClaudeLibraryKeychainBoundary(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	home := t.TempDir()
+	for _, p := range []string{"Library/Keychains/login.keychain-db", "Library/Application Support/app-state"} {
+		full := filepath.Join(home, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("host-secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{"empty", "vault"} {
+		t.Run(source, func(t *testing.T) {
+			opts := CreateOptions{Provider: "claude"}
+			if source == "vault" {
+				opts.CredentialSource = credSource(t, "vault-only")
+			}
+			path, err := mgr.Create(source, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolvesUnderRealHome(t, filepath.Join(path, "Library", "Keychains"), home) {
+				t.Fatal("host Keychain leaked into shallow Claude profile")
+			}
+			if _, err := os.ReadFile(filepath.Join(path, "Library", "Keychains", "login.keychain-db")); err == nil {
+				t.Fatal("host login credential readable through shallow HOME")
+			}
+			if !resolvesUnderRealHome(t, filepath.Join(path, "Library", "Application Support"), home) {
+				t.Fatal("noncredential Library resource no longer shared")
+			}
+			if err := mgr.RepairClaudeKeychainBoundary(source); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLegacyClaudeLibraryMigrationDoesNotTouchHostKeychain(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	home := t.TempDir()
+	hostKeys := filepath.Join(home, "Library", "Keychains")
+	if err := os.MkdirAll(hostKeys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(hostKeys, "login.keychain-db")
+	if err := os.WriteFile(original, []byte("immutable-host-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := mgr.Create("legacy", CreateOptions{Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lib := filepath.Join(path, "Library")
+	if err := os.Remove(lib); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(home, "Library"), lib); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RepairClaudeKeychainBoundary("legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(lib); err != nil || !info.IsDir() {
+		t.Fatalf("Library not a private directory: %v %v", info, err)
+	}
+	if _, err := os.Lstat(filepath.Join(lib, "Keychains")); !os.IsNotExist(err) {
+		t.Fatalf("Keychains entry should be absent: %v", err)
+	}
+	if secret, err := os.ReadFile(original); err != nil || string(secret) != "immutable-host-secret" {
+		t.Fatalf("host Keychain modified: %q %v", secret, err)
+	}
+	if err := os.Symlink(hostKeys, filepath.Join(lib, "Keychains")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RepairClaudeKeychainBoundary("legacy"); err == nil {
+		t.Fatal("must refuse profile with manually reintroduced Keychain link")
 	}
 }
