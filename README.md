@@ -186,9 +186,9 @@ Passthrough symlinks (and the Claude asset links) are refreshed on every `caam e
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
+A "shallow" `$HOME` per identity: provider authentication files stay private while development tools and shared resources are linked back to your real `~/`. On macOS, Claude profiles also keep `Library` private to exclude Keychains. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
 
-**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps only *its own* identity files real and private; everything else symlinks back to your real `~/`. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
+**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps its own identity files real and private, using the layouts below. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
@@ -219,6 +219,7 @@ Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-f
 | `.claude/settings.json` | **real file** | Workflow policy is refreshed from the canonical user settings; API-key helpers and credential environment remain private to this account. Existing links to the user's settings are converted to private files before launch. |
 | `.claude.json` | **real file** | Claude Code rewrites this on every run (it holds the login identity); a symlink would mutate the user's real settings under the shallow identity. Seeded from your real `~/.claude.json` minus the account-bound keys (`oauthAccount`, usage/entitlement caches), and the shared preference keys (theme, editor mode, notification channel, user/project `mcpServers`, project trust and `allowedTools`) are refreshed from the real file on every `shallow-spawn` — the main lane is the source of truth for configuration; pass `--no-sync-config` to keep a profile's own values. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
+| `Library/` (macOS only) | **real directory** | Shares non-Keychain children of `~/Library`; `Library/Keychains` is excluded so Claude Code's HOME-based lookup does not select the host login Keychain. |
 | `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
 
 Per-provider real (private) files — everything else under the provider's home is symlinked through, so non-auth state (sessions, history, caches) stays shared:
@@ -254,6 +255,34 @@ caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `
 ```
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
+
+#### macOS: upgrading existing Claude shallow profiles
+
+Claude shallow profiles use a private `Library` directory on macOS, with
+non-Keychain children linked from your real HOME and `Library/Keychains`
+excluded. Older caam builds linked the entire `Library` directory, allowing
+Claude Code to select the real login Keychain instead of the profile's
+credentials.
+
+Normal `shallow-spawn` repairs that old layout before starting a child,
+including with `--no-sync-config`. It stages the complete replacement before
+moving the old symlink to `.caam-legacy-Library`, without modifying the
+symlink's target. If a private `Library` already contains a `Keychains`
+entry or an existing symlink resolving into the host Keychain, launch stops
+and the entry is left untouched.
+
+`--print-env` remains read-only and does not repair existing profiles.
+After installing a build containing the fix for [issue #130](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/130),
+run this once for each existing macOS Claude profile before launching from
+its printed environment:
+
+```bash
+caam shallow-spawn <name> -- true
+```
+
+Use the same `--base` or `CAAM_SHALLOW_HOMES_DIR` override as your usual
+launcher, if you have one. Linux and other providers retain their existing
+layouts.
 
 **Worked example — 3-way Claude orchestration on a VPS:**
 
@@ -375,7 +404,7 @@ launch. `--print-env` stays read-only.
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
 - `~/Library/Application Support/Claude/config.json` — macOS: Claude Desktop's encrypted OAuth token cache (only its `oauth:tokenCache*` fields are tracked, so recent Claude Code builds can't reassert the previous account after a switch)
 
-**macOS login keychain:** on a Mac, Claude Code keeps the OAuth blob as a generic password in the login keychain (service `Claude Code-credentials`) and only falls back to `~/.claude/.credentials.json` when the keychain is unreachable. caam treats the keychain as authoritative and that file as its 0600 mirror: `backup` reads the item into the profile, `activate` writes the profile's token back into it, and `logout` removes it. A locked keychain, or a denied access prompt, fails `backup` and `activate` loudly rather than reporting a switch that did not happen. `caam doctor` reports the item's readability; `CAAM_KEYCHAIN=0` turns the bridge off and falls back to the file. Shallow profiles are unaffected — `security` derives the keychain from `HOME`, so a shallow lane has no login keychain and Claude Code uses that lane's own credentials file.
+**macOS login keychain:** on a Mac, Claude Code keeps the OAuth blob as a generic password in the login keychain (service `Claude Code-credentials`) and only falls back to `~/.claude/.credentials.json` when the keychain is unreachable. caam treats the keychain as authoritative and that file as its 0600 mirror: `backup` reads the item into the profile, `activate` writes the profile's token back into it, and `logout` removes it. A locked keychain, or a denied access prompt, fails `backup` and `activate` loudly rather than reporting a switch that did not happen. `caam doctor` reports the item's readability; `CAAM_KEYCHAIN=0` turns the bridge off and falls back to the file. On macOS, Claude shallow profiles use a private `Library` directory that excludes `Keychains`, keeping the real login Keychain out of Claude Code's HOME-based lookup. Normal `shallow-spawn` repairs older layouts; wrappers using `--print-env` need the [one-time normal spawn described above](#macos-upgrading-existing-claude-shallow-profiles).
 
 **Login Command:** Inside Claude Code, type `/login`
 

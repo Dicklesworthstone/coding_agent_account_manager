@@ -8,6 +8,17 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **Claude shallow profiles on macOS use a private `Library` directory (#130).** The layout shares non-Keychain children of `~/Library` but excludes `Library/Keychains`, so Claude Code does not inherit the real login Keychain through the profile's HOME. Normal `caam shallow-spawn` repairs the old whole-directory symlink before launching a child, including with `--no-sync-config`, and preserves it as `.caam-legacy-Library` without modifying its target. Migration stages the complete replacement before moving the old link. An existing `Library/Keychains` entry or an existing symlink inside the private `Library` that resolves into the host Keychain stops launch. Linux and other providers retain their existing layouts.
+- **Existing profiles used through `--print-env` need one normal spawn first.** `--print-env` remains read-only and does not repair old layouts. After installing a build containing this fix, run `caam shallow-spawn <name> -- true` once for each existing macOS Claude profile before launching commands from its printed environment. Use the same `--base` or `CAAM_SHALLOW_HOMES_DIR` override as the launcher.
+
+### Fixed
+
+- **`caam keepalive` treats an authenticated Claude rate limit as a healthy run (#129).** When Claude reports HTTP 429 without extending the credential, keepalive now reports `rate_limited` with `success: true` and performs the usual vault sync only if the credential still passes the existing account, expiry and renewability checks. Expired or invalid credentials still fail; timeouts, 401 responses and other failures keep their existing handling.
+
 ## [0.1.24] - 2026-10-24
 
 ### Changed
@@ -664,7 +675,7 @@ Everything on `main` since 0.1.18.
 ---
 
 <!-- Link definitions -->
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.24...HEAD
 [v0.1.10]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.5...v0.1.10
 [v0.1.5]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.1...v0.1.4
