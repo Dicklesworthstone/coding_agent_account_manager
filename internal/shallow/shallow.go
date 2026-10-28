@@ -1136,12 +1136,45 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 		if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("cannot safely stage legacy Library (backup exists or is unreadable)")
 		}
+		// Construct the replacement completely before changing the live
+		// Library entry. This prevents a failed mirror operation from leaving
+		// the profile half-migrated.
+		staging, err := os.MkdirTemp(home, ".caam-private-Library-")
+		if err != nil {
+			return fmt.Errorf("stage private Library: %w", err)
+		}
+		entries, err := os.ReadDir(filepath.Join(m.realHome, "Library"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(staging)
+			return fmt.Errorf("read host Library: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.Name() == "Keychains" {
+				continue
+			}
+			src := filepath.Join(m.realHome, "Library", entry.Name())
+			// Do not admit aliases to the host Keychain under other names.
+			resolved, resolveErr := filepath.EvalSymlinks(src)
+			if resolveErr != nil {
+				_ = os.RemoveAll(staging)
+				return fmt.Errorf("resolve host Library entry %q: %w", entry.Name(), resolveErr)
+			}
+			if isEqualOrAncestor(canonical(filepath.Join(m.realHome, "Library", "Keychains")), resolved) {
+				_ = os.RemoveAll(staging)
+				return fmt.Errorf("host Library entry %q aliases Keychains", entry.Name())
+			}
+			if err := os.Symlink(src, filepath.Join(staging, entry.Name())); err != nil {
+				_ = os.RemoveAll(staging)
+				return fmt.Errorf("stage Library entry %q: %w", entry.Name(), err)
+			}
+		}
 		if err := os.Rename(lib, backup); err != nil {
+			_ = os.RemoveAll(staging)
 			return fmt.Errorf("preserve legacy Library symlink: %w", err)
 		}
-		if err := os.Mkdir(lib, 0o700); err != nil {
+		if err := os.Rename(staging, lib); err != nil {
 			_ = os.Rename(backup, lib)
-			return fmt.Errorf("create private Library: %w", err)
+			return fmt.Errorf("install private Library: %w", err)
 		}
 	case !info.IsDir():
 		return fmt.Errorf("unsafe shallow Library: expected directory, found %s", info.Mode())
