@@ -1130,8 +1130,8 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	case err != nil:
 		return fmt.Errorf("inspect shallow Library: %w", err)
 	case info.Mode()&os.ModeSymlink != 0:
-		// There is no descendant traversal here; renaming a symlink moves
-		// the link, not its destination. A backup remains recoverable.
+		// A legacy symlink is moved, never followed. Preserve it as a
+		// recoverable backup and never touch anything under its target.
 		backup := filepath.Join(home, ".caam-legacy-Library")
 		if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("cannot safely stage legacy Library (backup exists or is unreadable)")
