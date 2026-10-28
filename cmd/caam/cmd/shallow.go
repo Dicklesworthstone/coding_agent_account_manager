@@ -944,6 +944,15 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		rest = []string{shallowSpawnHintBin(provider)}
 	}
 
+	// SECURITY (#130): upgrade legacy macOS Claude HOME layouts and fail
+	// closed on unsafe Keychain paths before any child process can start.
+	// This guard is mandatory even with --no-sync-config.
+	if shallow.NormalizeProvider(provider) == "claude" {
+		if err := mgr.RepairClaudeKeychainBoundary(name); err != nil {
+			return fmt.Errorf("prepare isolated Claude Keychain boundary for %q: %w", name, err)
+		}
+	}
+
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
 	// populated by jsm) are workflow content, not identity state, but they can
 	// drift out of a shallow profile — the real skills dir may postdate profile
