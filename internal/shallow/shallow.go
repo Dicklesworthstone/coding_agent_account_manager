@@ -1151,6 +1151,8 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect shallow Keychains: %w", err)
 	}
+	// A real Library directory containing a nested Keychains path is never
+	// modified or cleaned; merely detecting one is grounds to refuse spawn.
 	// Existing noncredential children might themselves be symlinks to the
 	// host Library/Keychains. Refuse rather than trust an inherited profile.
 	entries, err := os.ReadDir(lib)
