@@ -1142,6 +1142,22 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect shallow Keychains: %w", err)
 	}
+	// Existing noncredential children might themselves be symlinks to the
+	// host Library/Keychains. Refuse rather than trust an inherited profile.
+	entries, err := os.ReadDir(lib)
+	if err != nil {
+		return fmt.Errorf("read shallow Library: %w", err)
+	}
+	for _, entry := range entries {
+		child := filepath.Join(lib, entry.Name())
+		if entry.Type()&os.ModeSymlink != 0 {
+			resolved := canonical(child)
+			hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
+			if isEqualOrAncestor(hostKeychains, resolved) {
+				return fmt.Errorf("unsafe Library entry %q resolves into the real Keychain", entry.Name())
+			}
+		}
+	}
 	layout, _ := layoutFor("claude")
 	if err := m.populateInnerSymlinks(home, "Library", layout); err != nil {
 		return fmt.Errorf("populate noncredential Library resources: %w", err)
