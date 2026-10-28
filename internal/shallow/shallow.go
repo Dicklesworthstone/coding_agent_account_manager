@@ -1162,7 +1162,10 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	for _, entry := range entries {
 		child := filepath.Join(lib, entry.Name())
 		if entry.Type()&os.ModeSymlink != 0 {
-			resolved := canonical(child)
+			resolved, err := filepath.EvalSymlinks(child)
+			if err != nil {
+				return fmt.Errorf("cannot verify shallow Library link %q: %w", entry.Name(), err)
+			}
 			hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
 			if isEqualOrAncestor(hostKeychains, resolved) {
 				return fmt.Errorf("unsafe Library entry %q resolves into the real Keychain", entry.Name())
