@@ -1155,8 +1155,8 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	// modified or cleaned; merely detecting one is grounds to refuse spawn.
 	// Existing noncredential children might themselves be symlinks to the
 	// host Library/Keychains. Refuse rather than trust an inherited profile.
-	// The host Library itself may be replaced with a private directory only
-	// when it is a symlink; arbitrary real directories are preserved.
+	// The shallow Library can be replaced only when it is a symlink; any
+	// profile-local real directory is preserved.
 	entries, err := os.ReadDir(lib)
 	if err != nil {
 		return fmt.Errorf("read shallow Library: %w", err)
