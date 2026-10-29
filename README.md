@@ -269,7 +269,10 @@ including with `--no-sync-config`. It stages the complete replacement before
 moving the old symlink to `.caam-legacy-Library`, without modifying the
 symlink's target. If a private `Library` already contains a `Keychains`
 entry or an existing symlink resolving into the host Keychain, launch stops
-and the entry is left untouched.
+and the entry is left untouched. New host entries are also checked before
+they are linked into a profile: aliases into Keychains and links that cannot
+be resolved stop creation or spawn. Existing private files and directories
+keep their contents.
 
 `--print-env` remains read-only and does not repair existing profiles.
 After installing a build containing the fix for [issue #130](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/130),

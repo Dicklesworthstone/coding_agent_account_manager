@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -306,6 +307,191 @@ func TestShallowSpawnPrintEnv(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "SHALLOW_PROFILE=alice") {
 		t.Fatalf("expected SHALLOW_PROFILE in %q", stdout)
+	}
+}
+
+// These fixtures contain only synthetic bytes; none of the #130 command tests
+// opens the user's login Keychain or starts a provider CLI.
+func seedShallowHostLibrary(t *testing.T, realHome string) string {
+	t.Helper()
+	for _, dir := range []string{"Keychains", "Preferences"} {
+		if err := os.MkdirAll(filepath.Join(realHome, "Library", dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keychain := filepath.Join(realHome, "Library", "Keychains", "login.keychain-db")
+	if err := os.WriteFile(keychain, []byte("synthetic-host-keychain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return keychain
+}
+
+func makeLegacyShallowLibrary(t *testing.T, profileHome, realHome string) {
+	t.Helper()
+	library := filepath.Join(profileHome, "Library")
+	if err := os.Rename(library, filepath.Join(profileHome, ".test-original-Library")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(realHome, "Library"), library); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShallowSpawnRepairsClaudeLibraryBeforeExec(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	for _, noSync := range []bool{false, true} {
+		name := "normal"
+		if noSync {
+			name = "no-sync-config"
+		}
+		t.Run(name, func(t *testing.T) {
+			base, realHome := shallowEnv(t)
+			hostKeychain := seedShallowHostLibrary(t, realHome)
+			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacy"); err != nil {
+				t.Fatal(err)
+			}
+			profileHome := filepath.Join(base, "legacy")
+			makeLegacyShallowLibrary(t, profileHome, realHome)
+			library := filepath.Join(profileHome, "Library")
+			hostPreferences, err := filepath.EvalSymlinks(filepath.Join(realHome, "Library", "Preferences"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			calls := 0
+			originalExec := spawnExec
+			spawnExec = func(_ string, _ []string, env []string) error {
+				calls++
+				if !slices.Contains(env, "HOME="+profileHome) {
+					t.Fatal("child HOME does not select the repaired profile")
+				}
+				if info, err := os.Lstat(library); err != nil || !info.IsDir() {
+					t.Fatalf("child reached exec before Library became private: %v %v", info, err)
+				}
+				if _, err := os.Lstat(filepath.Join(library, "Keychains")); !os.IsNotExist(err) {
+					t.Fatalf("child reached exec with a Keychains entry: %v", err)
+				}
+				if got, err := filepath.EvalSymlinks(filepath.Join(library, "Preferences")); err != nil || got != hostPreferences {
+					t.Fatalf("benign Library passthrough changed: %q %v", got, err)
+				}
+				return nil
+			}
+			t.Cleanup(func() { spawnExec = originalExec })
+			args := []string{"shallow-spawn", "legacy"}
+			if noSync {
+				args = append(args, "--no-sync-config")
+			}
+			args = append(args, "--", "sh", "-c", "true")
+			for attempt := 0; attempt < 2; attempt++ {
+				if _, _, err := runCmdCaptured(t, args...); err != nil {
+					t.Fatalf("spawn %d: %v", attempt+1, err)
+				}
+				backup := filepath.Join(profileHome, ".caam-legacy-Library")
+				if got, err := os.Readlink(backup); err != nil || got != filepath.Join(realHome, "Library") {
+					t.Fatalf("legacy link was not preserved across repair: %q %v", got, err)
+				}
+			}
+			if calls != 2 {
+				t.Fatalf("exec calls = %d, want 2", calls)
+			}
+			if got, err := os.ReadFile(hostKeychain); err != nil || string(got) != "synthetic-host-keychain" {
+				t.Fatalf("repair changed the host Keychain fixture: %q %v", got, err)
+			}
+		})
+	}
+}
+
+func TestShallowSpawnRejectsUnsafeClaudeLibraryBeforeExec(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	for _, name := range []string{"private-keychains", "private-alias", "new-host-alias"} {
+		t.Run(name, func(t *testing.T) {
+			base, realHome := shallowEnv(t)
+			hostKeychain := seedShallowHostLibrary(t, realHome)
+			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice"); err != nil {
+				t.Fatal(err)
+			}
+			library := filepath.Join(base, "alice", "Library")
+			link := filepath.Join(library, "KeychainAlias")
+			if name == "private-keychains" {
+				link = filepath.Join(library, "Keychains")
+			} else if name == "new-host-alias" {
+				link = filepath.Join(realHome, "Library", "KeychainAlias")
+			}
+			hostKeys := filepath.Dir(hostKeychain)
+			if err := os.Symlink(hostKeys, link); err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			originalExec := spawnExec
+			spawnExec = func(_ string, _ []string, _ []string) error {
+				called = true
+				return nil
+			}
+			t.Cleanup(func() { spawnExec = originalExec })
+
+			_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--no-sync-config", "--", "sh", "-c", "true")
+			if err == nil || !strings.Contains(err.Error(), "prepare isolated Claude Keychain boundary") {
+				t.Fatalf("spawn did not fail at the Keychain guard: %v", err)
+			}
+			if called {
+				t.Fatal("unsafe profile reached child execution")
+			}
+			if got, err := os.Readlink(link); err != nil || got != hostKeys {
+				t.Fatalf("refusal modified the unsafe link: %q %v", got, err)
+			}
+			if name == "new-host-alias" {
+				if _, err := os.Lstat(filepath.Join(library, "KeychainAlias")); !os.IsNotExist(err) {
+					t.Fatalf("new host Keychain alias was installed before refusal: %v", err)
+				}
+			}
+			if got, err := os.ReadFile(hostKeychain); err != nil || string(got) != "synthetic-host-keychain" {
+				t.Fatalf("refusal changed the host Keychain fixture: %q %v", got, err)
+			}
+		})
+	}
+}
+
+func TestShallowSpawnPrintEnvLeavesLegacyClaudeLibraryUnchanged(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	base, realHome := shallowEnv(t)
+	seedShallowHostLibrary(t, realHome)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacy"); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(base, "legacy")
+	makeLegacyShallowLibrary(t, profileHome, realHome)
+	before, err := os.ReadDir(profileHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalExec := spawnExec
+	spawnExec = func(_ string, _ []string, _ []string) error {
+		t.Fatal("--print-env reached child execution")
+		return nil
+	}
+	t.Cleanup(func() { spawnExec = originalExec })
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "legacy", "--print-env")
+	if err != nil {
+		t.Fatalf("print-env: %v", err)
+	}
+	if !strings.Contains(stdout, "HOME="+profileHome) {
+		t.Fatalf("profile environment missing from %q", stdout)
+	}
+	if got, err := os.Readlink(filepath.Join(profileHome, "Library")); err != nil || got != filepath.Join(realHome, "Library") {
+		t.Fatalf("--print-env changed the legacy Library: %q %v", got, err)
+	}
+	after, err := os.ReadDir(profileHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.EqualFunc(before, after, func(a, b os.DirEntry) bool { return a.Name() == b.Name() && a.Type() == b.Type() }) {
+		t.Fatal("--print-env created or changed profile entries")
 	}
 }
 

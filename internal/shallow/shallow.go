@@ -1087,10 +1087,31 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("inspect private Library entry %s: %w", dst, err)
 			}
+			// Repair validates existing profile links before backfilling. A
+			// new host entry must pass the same boundary before this spawn
+			// can admit it, including when creating a profile from scratch.
+			if err := m.validateClaudeLibrarySource(src); err != nil {
+				return err
+			}
 		}
 		if err := atomicSymlink(src, dst); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
 		}
+	}
+	return nil
+}
+
+// validateClaudeLibrarySource applies the same admission policy to initial
+// creation, later backfill, and staged legacy migration. A link that cannot be
+// resolved must not enter the private Library as an unverified future alias.
+func (m *Manager) validateClaudeLibrarySource(src string) error {
+	resolved, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return fmt.Errorf("resolve host Library entry %q: %w", filepath.Base(src), err)
+	}
+	hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
+	if isEqualOrAncestor(hostKeychains, resolved) {
+		return fmt.Errorf("host Library entry %q aliases Keychains", filepath.Base(src))
 	}
 	return nil
 }
@@ -1154,14 +1175,9 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 			}
 			src := filepath.Join(m.realHome, "Library", entry.Name())
 			// Do not admit aliases to the host Keychain under other names.
-			resolved, resolveErr := filepath.EvalSymlinks(src)
-			if resolveErr != nil {
+			if err := m.validateClaudeLibrarySource(src); err != nil {
 				_ = os.RemoveAll(staging)
-				return fmt.Errorf("resolve host Library entry %q: %w", entry.Name(), resolveErr)
-			}
-			if isEqualOrAncestor(canonical(filepath.Join(m.realHome, "Library", "Keychains")), resolved) {
-				_ = os.RemoveAll(staging)
-				return fmt.Errorf("host Library entry %q aliases Keychains", entry.Name())
+				return err
 			}
 			if err := os.Symlink(src, filepath.Join(staging, entry.Name())); err != nil {
 				_ = os.RemoveAll(staging)

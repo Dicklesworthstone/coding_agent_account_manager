@@ -204,7 +204,6 @@ func TestVaultUnreachableViaXDGRelocation(t *testing.T) {
 	}
 }
 
-
 // Issue #130: a macOS Claude shallow profile must never expose the real
 // login Keychain through the Library symlink farm.
 func TestClaudeLibraryKeychainBoundary(t *testing.T) {
@@ -296,5 +295,202 @@ func TestLegacyClaudeLibraryMigrationDoesNotTouchHostKeychain(t *testing.T) {
 	}
 	if err := mgr.RepairClaudeKeychainBoundary("legacy"); err == nil {
 		t.Fatal("must refuse profile with manually reintroduced Keychain link")
+	}
+}
+
+func claudeLibrarySourceFixture(t *testing.T) (*Manager, string) {
+	t.Helper()
+	home := t.TempDir()
+	writeFile(t, filepath.Join(home, "Library", "Keychains", "login.keychain-db"), "host-secret")
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mgr, filepath.Join(mgr.BaseDir(), "p")
+}
+
+func TestLibraryLayoutIsScopedToMacOSClaude(t *testing.T) {
+	for _, provider := range SupportedProviders() {
+		t.Run(provider, func(t *testing.T) {
+			mgr, _ := claudeLibrarySourceFixture(t)
+			profile, err := mgr.Create("p", CreateOptions{Provider: provider})
+			if err != nil {
+				t.Fatal(err)
+			}
+			library := filepath.Join(profile, "Library")
+			info, err := os.Lstat(library)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS == "darwin" && provider == "claude" {
+				if !info.IsDir() {
+					t.Fatal("macOS Claude Library is not a private directory")
+				}
+				if _, err := os.Lstat(filepath.Join(library, "Keychains")); !os.IsNotExist(err) {
+					t.Fatalf("macOS Claude Library exposes Keychains: %v", err)
+				}
+				return
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Fatal("Library passthrough changed for another provider or platform")
+			}
+			if got := readFile(t, filepath.Join(library, "Keychains", "login.keychain-db")); got != "host-secret" {
+				t.Fatalf("Library passthrough no longer resolves to its existing source: %q", got)
+			}
+		})
+	}
+}
+
+// These tests exercise the explicit private-Library filesystem policy on any
+// OS supporting symlinks. They do not claim native macOS Keychain coverage.
+func TestClaudeLibraryMirroringRejectsNewKeychainAliases(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+		chain  bool
+	}{
+		{"directory", "Keychains", false},
+		{"descendant", "Keychains/login.keychain-db", false},
+		{"chain", "Bridge", true},
+		{"dangling", "missing", false},
+		{"cycle", "Alias", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, profile := claudeLibrarySourceFixture(t)
+			lib := filepath.Join(profile, "Library")
+			if err := os.MkdirAll(lib, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// Select a private Library explicitly instead of changing GOOS.
+			layout := &providerLayout{provider: "claude", realEntries: []string{"Library/Keychains"}}
+			if err := mgr.populateInnerSymlinks(profile, "Library", layout); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(mgr.RealHome(), "Library")
+			if tc.chain {
+				if err := os.Symlink("Keychains", filepath.Join(source, "Bridge")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.FromSlash(tc.target), filepath.Join(source, "Alias")); err != nil {
+				t.Fatal(err)
+			}
+			// Reject the first backfill after the source changes, before the
+			// new link can be admitted by a successful spawn preparation.
+			if err := mgr.populateInnerSymlinks(profile, "Library", layout); err == nil {
+				t.Error("accepted an unsafe new Library source")
+			}
+			if _, err := os.Lstat(filepath.Join(lib, "Alias")); !os.IsNotExist(err) {
+				t.Errorf("unsafe source was linked into the private Library: %v", err)
+			}
+			if got := readFile(t, filepath.Join(source, "Keychains", "login.keychain-db")); got != "host-secret" {
+				t.Fatalf("host Keychain changed: %q", got)
+			}
+		})
+	}
+}
+
+func TestClaudeLibraryMirroringPreservesResources(t *testing.T) {
+	t.Run("benign siblings", func(t *testing.T) {
+		mgr, profile := claudeLibrarySourceFixture(t)
+		for _, rel := range []string{"Preferences/app.plist", "KeychainsBackup/state"} {
+			writeFile(t, filepath.Join(mgr.RealHome(), "Library", filepath.FromSlash(rel)), "shared")
+		}
+		if err := os.MkdirAll(filepath.Join(profile, "Library"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		layout := &providerLayout{provider: "claude", realEntries: []string{"Library/Keychains"}}
+		if err := mgr.populateInnerSymlinks(profile, "Library", layout); err != nil {
+			t.Fatal(err)
+		}
+		for _, rel := range []string{"Preferences/app.plist", "KeychainsBackup/state"} {
+			if got := readFile(t, filepath.Join(profile, "Library", filepath.FromSlash(rel))); got != "shared" {
+				t.Fatalf("benign Library resource changed: %q", got)
+			}
+		}
+	})
+	for _, directory := range []bool{false, true} {
+		name := "local file"
+		if directory {
+			name = "local directory"
+		}
+		t.Run(name, func(t *testing.T) {
+			mgr, profile := claudeLibrarySourceFixture(t)
+			dest := filepath.Join(profile, "Library", "Alias")
+			local := dest
+			if directory {
+				local = filepath.Join(dest, "state")
+			}
+			writeFile(t, local, "private")
+			if err := os.Symlink("Keychains", filepath.Join(mgr.RealHome(), "Library", "Alias")); err != nil {
+				t.Fatal(err)
+			}
+			layout := &providerLayout{provider: "claude", realEntries: []string{"Library/Keychains"}}
+			if err := mgr.populateInnerSymlinks(profile, "Library", layout); err != nil {
+				t.Fatalf("host alias shadowed by a private entry should not be admitted or inspected: %v", err)
+			}
+			if info, err := os.Lstat(dest); err != nil || info.Mode()&os.ModeSymlink != 0 {
+				t.Fatalf("private entry replaced: %v %v", info, err)
+			}
+			if got := readFile(t, local); got != "private" {
+				t.Fatalf("private resource changed: %q", got)
+			}
+		})
+	}
+	t.Run("missing host Library", func(t *testing.T) {
+		mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile := filepath.Join(mgr.BaseDir(), "p")
+		local := filepath.Join(profile, "Library", "local-state")
+		writeFile(t, local, "private")
+		if err := mgr.populateInnerSymlinks(profile, "Library", &providerLayout{provider: "claude"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, local); got != "private" {
+			t.Fatalf("private resource changed: %q", got)
+		}
+	})
+}
+
+func TestClaudeLibraryCreateRejectsHostKeychainAlias(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	for _, force := range []bool{false, true} {
+		name := "new profile"
+		if force {
+			name = "forced replacement"
+		}
+		t.Run(name, func(t *testing.T) {
+			mgr, profile := claudeLibrarySourceFixture(t)
+			var originalMeta string
+			if force {
+				if _, err := mgr.Create("p", CreateOptions{Provider: "claude", CredentialSource: credSource(t, "original")}); err != nil {
+					t.Fatal(err)
+				}
+				originalMeta = readFile(t, filepath.Join(profile, ProfileMetaFilename))
+			}
+			if err := os.Symlink("Keychains", filepath.Join(mgr.RealHome(), "Library", "Alias")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := mgr.Create("p", CreateOptions{Provider: "claude", Force: force, CredentialSource: credSource(t, "replacement")}); err == nil {
+				t.Fatal("published a profile containing a host Keychain alias")
+			}
+			if force {
+				if got := readFile(t, filepath.Join(profile, ".claude", ".credentials.json")); got != "original" {
+					t.Fatalf("failed replacement changed the original credentials: %q", got)
+				}
+				if got := readFile(t, filepath.Join(profile, ProfileMetaFilename)); got != originalMeta {
+					t.Fatal("failed replacement changed the original metadata")
+				}
+			} else if _, err := os.Lstat(profile); !os.IsNotExist(err) {
+				t.Fatalf("failed creation published a profile: %v", err)
+			}
+			if got := readFile(t, filepath.Join(mgr.RealHome(), "Library", "Keychains", "login.keychain-db")); got != "host-secret" {
+				t.Fatalf("host Keychain changed: %q", got)
+			}
+		})
 	}
 }
