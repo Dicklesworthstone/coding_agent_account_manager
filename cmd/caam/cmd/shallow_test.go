@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -337,6 +338,46 @@ func makeLegacyShallowLibrary(t *testing.T, profileHome, realHome string) {
 	}
 }
 
+// snapshotShallowTestTree records temporary fixture entries without following
+// symlinks, so an environment preview must preserve bytes as well as layout.
+func snapshotShallowTestTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	state := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		state[rel] = info.Mode().String()
+		switch {
+		case entry.Type()&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			state[rel] += ":" + target
+		case !entry.IsDir():
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			state[rel] += ":" + string(body)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
 func TestShallowSpawnRepairsClaudeLibraryBeforeExec(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("native macOS shallow layout")
@@ -433,6 +474,23 @@ func TestShallowSpawnRejectsUnsafeClaudeLibraryBeforeExec(t *testing.T) {
 			}
 			t.Cleanup(func() { spawnExec = originalExec })
 
+			beforeProfile := snapshotShallowTestTree(t, filepath.Join(base, "alice"))
+			beforeHost := snapshotShallowTestTree(t, realHome)
+			stdout, _, printErr := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env")
+			if name == "new-host-alias" {
+				// Export does not backfill host resources: an alias that is not
+				// linked into this private Library cannot affect the preview.
+				if printErr != nil || !strings.Contains(stdout, "HOME="+filepath.Join(base, "alice")) {
+					t.Fatalf("safe existing profile was refused: stdout=%q err=%v", stdout, printErr)
+				}
+			} else if printErr == nil || !strings.Contains(printErr.Error(), "cannot use --print-env") || stdout != "" {
+				t.Fatalf("unsafe preview emitted an environment: stdout=%q err=%v", stdout, printErr)
+			}
+			if called || !maps.Equal(beforeProfile, snapshotShallowTestTree(t, filepath.Join(base, "alice"))) ||
+				!maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+				t.Fatal("--print-env executed a child or changed a fixture")
+			}
+
 			_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--no-sync-config", "--", "sh", "-c", "true")
 			if err == nil || !strings.Contains(err.Error(), "prepare isolated Claude Keychain boundary") {
 				t.Fatalf("spawn did not fail at the Keychain guard: %v", err)
@@ -455,7 +513,7 @@ func TestShallowSpawnRejectsUnsafeClaudeLibraryBeforeExec(t *testing.T) {
 	}
 }
 
-func TestShallowSpawnPrintEnvLeavesLegacyClaudeLibraryUnchanged(t *testing.T) {
+func TestShallowSpawnPrintEnvRejectsLegacyClaudeLibraryWithoutRepair(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("native macOS shallow layout")
 	}
@@ -466,32 +524,131 @@ func TestShallowSpawnPrintEnvLeavesLegacyClaudeLibraryUnchanged(t *testing.T) {
 	}
 	profileHome := filepath.Join(base, "legacy")
 	makeLegacyShallowLibrary(t, profileHome, realHome)
-	before, err := os.ReadDir(profileHome)
-	if err != nil {
+	beforeProfile := snapshotShallowTestTree(t, profileHome)
+	beforeHost := snapshotShallowTestTree(t, realHome)
+	calls := 0
+	originalExec := spawnExec
+	spawnExec = func(_ string, _ []string, _ []string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { spawnExec = originalExec })
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "legacy", "--print-env")
+	if err == nil || !strings.Contains(err.Error(), "caam shallow-spawn legacy -- true") ||
+		!strings.Contains(err.Error(), "--base") || stdout != "" {
+		t.Fatalf("legacy preview should refuse with a repair command: stdout=%q err=%v", stdout, err)
+	}
+	if calls != 0 || !maps.Equal(beforeProfile, snapshotShallowTestTree(t, profileHome)) ||
+		!maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+		t.Fatal("refused --print-env executed a child or changed a fixture")
+	}
+
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "legacy", "--no-sync-config", "--", "sh", "-c", "true"); err != nil {
+		t.Fatalf("normal repair spawn: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("normal repair spawn executed %d children, want 1", calls)
+	}
+	repairedProfile := snapshotShallowTestTree(t, profileHome)
+	stdout, _, err = runCmdCaptured(t, "shallow-spawn", "legacy", "--print-env")
+	if err != nil || !strings.Contains(stdout, "HOME="+profileHome) {
+		t.Fatalf("repaired preview: stdout=%q err=%v", stdout, err)
+	}
+	if calls != 1 || !maps.Equal(repairedProfile, snapshotShallowTestTree(t, profileHome)) ||
+		!maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+		t.Fatal("repaired --print-env executed a child or changed a fixture")
+	}
+}
+
+func TestShallowSpawnPrintEnvAcceptsMissingClaudeLibrary(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native macOS shallow layout")
+	}
+	base, realHome := shallowEnv(t)
+	seedShallowHostLibrary(t, realHome)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice"); err != nil {
 		t.Fatal(err)
 	}
+	profileHome := filepath.Join(base, "alice")
+	if err := os.Rename(filepath.Join(profileHome, "Library"), filepath.Join(profileHome, ".test-original-Library")); err != nil {
+		t.Fatal(err)
+	}
+	beforeProfile := snapshotShallowTestTree(t, profileHome)
+	beforeHost := snapshotShallowTestTree(t, realHome)
 	originalExec := spawnExec
 	spawnExec = func(_ string, _ []string, _ []string) error {
 		t.Fatal("--print-env reached child execution")
 		return nil
 	}
 	t.Cleanup(func() { spawnExec = originalExec })
-	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "legacy", "--print-env")
-	if err != nil {
-		t.Fatalf("print-env: %v", err)
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env")
+	if err != nil || !strings.Contains(stdout, "HOME="+profileHome) {
+		t.Fatalf("missing Library is safe: stdout=%q err=%v", stdout, err)
 	}
-	if !strings.Contains(stdout, "HOME="+profileHome) {
-		t.Fatalf("profile environment missing from %q", stdout)
+	if !maps.Equal(beforeProfile, snapshotShallowTestTree(t, profileHome)) ||
+		!maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+		t.Fatal("--print-env created Library or changed a fixture")
 	}
-	if got, err := os.Readlink(filepath.Join(profileHome, "Library")); err != nil || got != filepath.Join(realHome, "Library") {
-		t.Fatalf("--print-env changed the legacy Library: %q %v", got, err)
+}
+
+func TestShallowSpawnPrintEnvPreservesProviderLibraryPassthrough(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix symlink layout")
 	}
-	after, err := os.ReadDir(profileHome)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.EqualFunc(before, after, func(a, b os.DirEntry) bool { return a.Name() == b.Name() && a.Type() == b.Type() }) {
-		t.Fatal("--print-env created or changed profile entries")
+	for _, provider := range []string{"claude", "codex", "agy"} {
+		if runtime.GOOS == "darwin" && provider == "claude" {
+			continue // only macOS Claude requires a private Library
+		}
+		t.Run(provider, func(t *testing.T) {
+			base, realHome := shallowEnv(t)
+			seedShallowHostLibrary(t, realHome)
+			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--tool", provider); err != nil {
+				t.Fatal(err)
+			}
+			profileHome := filepath.Join(base, "alice")
+			if got, err := os.Readlink(filepath.Join(profileHome, "Library")); err != nil || got != filepath.Join(realHome, "Library") {
+				t.Fatalf("expected existing provider Library passthrough: %q %v", got, err)
+			}
+			originalExec := spawnExec
+			spawnExec = func(_ string, _ []string, _ []string) error {
+				t.Fatal("provider --print-env reached child execution")
+				return nil
+			}
+			t.Cleanup(func() { spawnExec = originalExec })
+			for _, inferred := range []bool{false, true} {
+				if inferred && provider == "claude" {
+					continue
+				}
+				if inferred {
+					// Legacy non-Claude profiles may have no metadata; their
+					// provider and home pin still come from the private layout.
+					meta := filepath.Join(profileHome, shallow.ProfileMetaFilename)
+					if err := os.Rename(meta, filepath.Join(profileHome, ".test-original-metadata")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				beforeProfile := snapshotShallowTestTree(t, profileHome)
+				beforeHost := snapshotShallowTestTree(t, realHome)
+				stdout, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env")
+				if err != nil || !strings.Contains(stdout, "HOME="+profileHome) {
+					t.Fatalf("provider preview changed (inferred=%v): stdout=%q err=%v", inferred, stdout, err)
+				}
+				pin := ""
+				switch provider {
+				case "codex":
+					pin = "CODEX_HOME=" + filepath.Join(profileHome, ".codex")
+				case "agy":
+					pin = "GEMINI_HOME=" + filepath.Join(profileHome, ".gemini")
+				}
+				if pin != "" && !strings.Contains(stdout, pin) {
+					t.Fatalf("provider home pin missing (inferred=%v): %q", inferred, stdout)
+				}
+				if !maps.Equal(beforeProfile, snapshotShallowTestTree(t, profileHome)) ||
+					!maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+					t.Fatal("provider preview changed a fixture")
+				}
+			}
+		})
 	}
 }
 

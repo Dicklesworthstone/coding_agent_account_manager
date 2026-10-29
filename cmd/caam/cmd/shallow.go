@@ -921,6 +921,15 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	set, scrub := shallow.SpawnEnv(provider, prof.Path, name, allowAgentView, disableAgentViewSet)
 
 	if printEnv {
+		// Exporting an unsafe HOME would let wrappers bypass normal spawn's
+		// repair guard. Inspect without modifying the profile or printing a
+		// partial environment; legacy layouts still require a normal spawn.
+		if shallow.NormalizeProvider(provider) == "claude" {
+			if err := mgr.ValidateClaudeKeychainBoundary(name); err != nil {
+				cmd.SilenceUsage = true
+				return fmt.Errorf("cannot use --print-env for %q: %w", name, err)
+			}
+		}
 		// Print the variables that WOULD be set, as clean KEY=VALUE lines, with
 		// HOME and SHALLOW_PROFILE first for stable output and the rest sorted.
 		fmt.Fprintf(cmd.OutOrStdout(), "HOME=%s\n", set["HOME"])

@@ -1116,30 +1116,96 @@ func (m *Manager) validateClaudeLibrarySource(src string) error {
 	return nil
 }
 
+// claudeKeychainHome returns the validated profile home, or an empty path when
+// the macOS Claude Keychain policy does not apply.
+func (m *Manager) claudeKeychainHome(name string) (string, error) {
+	if runtime.GOOS != "darwin" {
+		return "", nil
+	}
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return "", err
+	}
+	if err := m.assertSafeProfileHome(home); err != nil {
+		return "", err
+	}
+	if err := assertLooksLikeShallowProfile(home); err != nil {
+		return "", err
+	}
+	provider, err := m.ResolveProvider(name)
+	if err != nil {
+		return "", err
+	}
+	if NormalizeProvider(provider) != "claude" {
+		return "", nil
+	}
+	return home, nil
+}
+
+// ValidateClaudeKeychainBoundary checks an existing macOS Claude profile without
+// repairing it or adding links. Environment exporters must use this before
+// printing a HOME that another process could otherwise launch unsafely.
+func (m *Manager) ValidateClaudeKeychainBoundary(name string) error {
+	home, err := m.claudeKeychainHome(name)
+	if err != nil || home == "" {
+		return err
+	}
+	return m.validateClaudeLibrary(home)
+}
+
+// validateClaudeLibrary inspects only the current profile layout. A missing
+// Library is safe and stays absent; unlinked host resources cannot affect a
+// read-only environment export.
+func (m *Manager) validateClaudeLibrary(home string) error {
+	lib := filepath.Join(home, "Library")
+	info, err := os.Lstat(lib)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect shallow Library: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("unsafe shallow Library symlink; repair the legacy layout with `caam shallow-spawn %s -- true` using the same --base or CAAM_SHALLOW_HOMES_DIR override", filepath.Base(home))
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("unsafe shallow Library: expected directory, found %s", info.Mode())
+	}
+	if _, err := os.Lstat(filepath.Join(lib, "Keychains")); err == nil {
+		return fmt.Errorf("unsafe shallow Library/Keychains exists; refusing Claude spawn")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect shallow Keychains: %w", err)
+	}
+	// Existing links may expose the host Keychain under another name. Refuse
+	// unsafe or unresolvable links while leaving profile-local resources alone.
+	entries, err := os.ReadDir(lib)
+	if err != nil {
+		return fmt.Errorf("read shallow Library: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(filepath.Join(lib, entry.Name()))
+		if err != nil {
+			return fmt.Errorf("cannot verify shallow Library link %q: %w", entry.Name(), err)
+		}
+		hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
+		if isEqualOrAncestor(hostKeychains, resolved) {
+			return fmt.Errorf("unsafe Library entry %q resolves into the real Keychain", entry.Name())
+		}
+	}
+	return nil
+}
+
 // RepairClaudeKeychainBoundary migrates pre-fix macOS Claude profiles before
 // spawn. Never traverse a legacy Library symlink: prepare a private replacement
 // first, then rename the original symlink aside without resolving its target.
 // A suspicious existing Keychains entry fails closed rather than being deleted.
 func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
-	if runtime.GOOS != "darwin" {
-		return nil
-	}
-	home, err := m.HomeFor(name)
-	if err != nil {
+	home, err := m.claudeKeychainHome(name)
+	if err != nil || home == "" {
 		return err
-	}
-	if err := m.assertSafeProfileHome(home); err != nil {
-		return err
-	}
-	if err := assertLooksLikeShallowProfile(home); err != nil {
-		return err
-	}
-	provider, err := m.ResolveProvider(name)
-	if err != nil {
-		return err
-	}
-	if NormalizeProvider(provider) != "claude" {
-		return nil
 	}
 	lib := filepath.Join(home, "Library")
 	info, err := os.Lstat(lib)
@@ -1195,32 +1261,8 @@ func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
 	case !info.IsDir():
 		return fmt.Errorf("unsafe shallow Library: expected directory, found %s", info.Mode())
 	}
-	if _, err := os.Lstat(filepath.Join(lib, "Keychains")); err == nil {
-		return fmt.Errorf("unsafe shallow Library/Keychains exists; refusing Claude spawn")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect shallow Keychains: %w", err)
-	}
-	// A real Library directory containing a nested Keychains path is never
-	// modified or cleaned; merely detecting one is grounds to refuse spawn.
-	// Existing noncredential children might themselves be symlinks to the
-	// host Library/Keychains. Refuse rather than trust an inherited profile.
-	// Profile-local resources are left untouched.
-	entries, err := os.ReadDir(lib)
-	if err != nil {
-		return fmt.Errorf("read shallow Library: %w", err)
-	}
-	for _, entry := range entries {
-		child := filepath.Join(lib, entry.Name())
-		if entry.Type()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(child)
-			if err != nil {
-				return fmt.Errorf("cannot verify shallow Library link %q: %w", entry.Name(), err)
-			}
-			hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
-			if isEqualOrAncestor(hostKeychains, resolved) {
-				return fmt.Errorf("unsafe Library entry %q resolves into the real Keychain", entry.Name())
-			}
-		}
+	if err := m.validateClaudeLibrary(home); err != nil {
+		return err
 	}
 	layout, _ := layoutFor("claude")
 	if err := m.populateInnerSymlinks(home, "Library", layout); err != nil {

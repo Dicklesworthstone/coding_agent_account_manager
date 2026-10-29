@@ -274,7 +274,10 @@ they are linked into a profile: aliases into Keychains and links that cannot
 be resolved stop creation or spawn. Existing private files and directories
 keep their contents.
 
-`--print-env` remains read-only and does not repair existing profiles.
+`--print-env` remains read-only and does not repair existing profiles. It
+refuses an unsafe macOS Claude `Library` layout before printing any environment
+variables, so a wrapper cannot bypass the normal spawn guard. Safe profiles,
+including one with no `Library` directory, are left unchanged.
 After installing a build containing the fix for [issue #130](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/130),
 run this once for each existing macOS Claude profile before launching from
 its printed environment:

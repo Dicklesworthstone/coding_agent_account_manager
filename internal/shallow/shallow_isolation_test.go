@@ -1,6 +1,7 @@
 package shallow
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -490,6 +491,137 @@ func TestClaudeLibraryCreateRejectsHostKeychainAlias(t *testing.T) {
 			}
 			if got := readFile(t, filepath.Join(mgr.RealHome(), "Library", "Keychains", "login.keychain-db")); got != "host-secret" {
 				t.Fatalf("host Keychain changed: %q", got)
+			}
+		})
+	}
+}
+
+// Record entries without following links, including their modes, link targets,
+// and synthetic file contents, so both accepted and refused checks prove read-only.
+func snapshotClaudeLibraryTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snapshot := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		value := info.Mode().String()
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			value += ":" + target
+		} else if info.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			value += ":" + string(data)
+		}
+		snapshot[path] = value
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+// This is a portable filesystem check of the private-Library validator, not a
+// native macOS security(1) probe. The public platform/provider gate is separate.
+func TestValidateClaudeLibraryReadOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wantErr bool
+	}{
+		{"missing", false},
+		{"empty", false},
+		{"benign and private resources", false},
+		{"unmirrored host alias", false},
+		{"whole Library symlink", true},
+		{"dangling Library symlink", true},
+		{"Library file", true},
+		{"Keychains directory", true},
+		{"Keychains file", true},
+		{"dangling Keychains", true},
+		{"alias directory", true},
+		{"alias descendant", true},
+		{"alias chain", true},
+		{"unresolved alias", true},
+		{"cyclic alias", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, profile := claudeLibrarySourceFixture(t)
+			if err := os.MkdirAll(profile, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			lib := filepath.Join(profile, "Library")
+			hostLibrary := filepath.Join(mgr.RealHome(), "Library")
+			hostKeys := filepath.Join(hostLibrary, "Keychains")
+			mkdir := func(path string) {
+				t.Helper()
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link := func(target, path string) {
+				t.Helper()
+				mkdir(filepath.Dir(path))
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch tc.name {
+			case "missing":
+			case "empty":
+				mkdir(lib)
+			case "benign and private resources":
+				writeFile(t, filepath.Join(hostLibrary, "Preferences", "app.plist"), "shared")
+				link(filepath.Join(hostLibrary, "Preferences"), filepath.Join(lib, "Preferences"))
+				writeFile(t, filepath.Join(lib, "local-file"), "private-file")
+				writeFile(t, filepath.Join(lib, "local-dir", "state"), "private-directory")
+			case "unmirrored host alias":
+				mkdir(lib)
+				link(hostKeys, filepath.Join(hostLibrary, "Alias"))
+			case "whole Library symlink":
+				link(hostLibrary, lib)
+			case "dangling Library symlink":
+				link(filepath.Join(mgr.RealHome(), "missing"), lib)
+			case "Library file":
+				writeFile(t, lib, "private-file")
+			case "Keychains directory":
+				mkdir(filepath.Join(lib, "Keychains"))
+			case "Keychains file":
+				writeFile(t, filepath.Join(lib, "Keychains"), "private-keychain")
+			case "dangling Keychains":
+				link("missing", filepath.Join(lib, "Keychains"))
+			case "alias directory":
+				link(hostKeys, filepath.Join(lib, "Alias"))
+			case "alias descendant":
+				link(filepath.Join(hostKeys, "login.keychain-db"), filepath.Join(lib, "Alias"))
+			case "alias chain":
+				link(hostKeys, filepath.Join(lib, "Bridge"))
+				link("Bridge", filepath.Join(lib, "Alias"))
+			case "unresolved alias":
+				link("missing", filepath.Join(lib, "Alias"))
+			case "cyclic alias":
+				link("Alias", filepath.Join(lib, "Alias"))
+			}
+			beforeProfile := snapshotClaudeLibraryTree(t, profile)
+			beforeHost := snapshotClaudeLibraryTree(t, mgr.RealHome())
+			if err := mgr.validateClaudeLibrary(profile); (err != nil) != tc.wantErr {
+				t.Errorf("validation error = %v, want error %v", err, tc.wantErr)
+			}
+			if !maps.Equal(beforeProfile, snapshotClaudeLibraryTree(t, profile)) {
+				t.Error("validation modified the profile")
+			}
+			if !maps.Equal(beforeHost, snapshotClaudeLibraryTree(t, mgr.RealHome())) {
+				t.Error("validation modified the host Library")
 			}
 		})
 	}
