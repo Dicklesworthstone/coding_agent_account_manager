@@ -441,6 +441,17 @@ and explicit API-key modes keep their supported key inputs. Rate-limit
 handoff records the current account's cooldown before selecting a different
 eligible account, including when the usage database is unavailable.
 
+Shallow `--print-env` exports the complete policy as quoted unset/export
+commands or a JSON set/unset object. Export validates existing Claude settings
+and state without repairing or refreshing them, and skips startup migration
+and token-health checks. Invalid exports fail before emitting environment
+changes; shell-mode failures propagate through eval with a failing command.
+
+Profile onboarding also uses the same artifact limits as credential discovery:
+Claude settings and legacy state may be up to 256 MiB, while token files,
+executable helpers, and other providers retain their 16 MiB limit. Source and
+staged checks agree, and rejected imports never publish partial profiles.
+
 Synthetic regressions exercise in-flight source replacement, changed
 destinations, cancellation and cross-process refresh exclusion, invalid token
 responses, real child environments, Windows environment aliases, and every

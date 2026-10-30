@@ -217,7 +217,11 @@ func TestShallowTokenLaunchRejectsWrongScopeWithoutReading(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted token input outside a direct Claude launch")
 			}
-			if stdout != "" || strings.Contains(stderr+err.Error(), secret) {
+			wantOutput := ""
+			if strings.HasPrefix(tc.name, "print-env") {
+				wantOutput = "false  # caam: failed to resolve profile environment — see error on stderr above\n"
+			}
+			if stdout != wantOutput || strings.Contains(stdout+stderr+err.Error(), secret) {
 				t.Fatal("rejected token input printed an environment or secret")
 			}
 			buffer := make([]byte, len(secret)+1)

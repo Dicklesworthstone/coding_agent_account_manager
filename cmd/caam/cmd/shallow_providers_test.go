@@ -1,11 +1,20 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
 
 // stageVaultFile writes a file into the isolated CAAM vault for a given
@@ -521,5 +530,375 @@ func TestShallowSpawnUsesSelectedCredentialsDespiteAmbientKeys(t *testing.T) {
 				t.Fatal("spawn lost the selected home or unrelated workflow environment")
 			}
 		})
+	}
+}
+
+func TestShallowPrintEnvMatchesLaunchWithoutMutation(t *testing.T) {
+	for _, tool := range []string{"claude", "codex", "agy"} {
+		t.Run(tool, func(t *testing.T) {
+			base, realHome := shallowEnv(t)
+			if runtime.GOOS != "windows" {
+				// These characters must remain literal data through both the
+				// emitted shell program and the environment of its descendants.
+				base = filepath.Join(filepath.Dir(base), "profile homes ' \" $(touch caam-export-injected)\n;touch caam-export-injected; #")
+				t.Setenv("CAAM_SHALLOW_HOMES_DIR", base)
+			}
+			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "seat", "--tool", tool, "--json"); err != nil {
+				t.Fatal(err)
+			}
+			polluted := []string{"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_HOME", "XDG_DATA_HOME"}
+			switch tool {
+			case "claude":
+				polluted = append(polluted, "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_SESSION_ACCESS_TOKEN")
+			case "codex":
+				polluted = append(polluted, "OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL")
+			}
+			for _, key := range polluted {
+				t.Setenv(key, "synthetic-export-secret-"+key)
+			}
+			t.Setenv("CAAM_TEST_EXPORT_WORKFLOW", "preserved")
+			beforeEnv := shallowExportEnvironment(os.Environ())
+			roots := []string{base, realHome, os.Getenv("CAAM_HOME")}
+			before := make([]map[string]string, len(roots))
+			for i, path := range roots {
+				before[i] = snapshotShallowTestTree(t, path)
+			}
+
+			outputs := make(map[string]string)
+			for _, mode := range []string{"posix", "json"} {
+				args := []string{"shallow-spawn", "seat", "--print-env"}
+				if mode != "posix" {
+					args = append(args, "--"+mode)
+				}
+				stdout, stderr, err := runCmdCaptured(t, args...)
+				if err != nil {
+					t.Fatalf("%s export: %v", mode, err)
+				}
+				if strings.Contains(stdout+stderr, "synthetic-export-secret") {
+					t.Fatalf("%s export exposed an inherited credential", mode)
+				}
+				outputs[mode] = stdout
+			}
+			var changes provider.EnvironmentChanges
+			if err := json.Unmarshal([]byte(outputs["json"]), &changes); err != nil {
+				t.Fatalf("JSON export is not environment data: %v", err)
+			}
+			if changes.Set["HOME"] != filepath.Join(base, "seat") || changes.Set["SHALLOW_PROFILE"] != "seat" {
+				t.Fatal("export did not select the requested shallow HOME")
+			}
+			for _, key := range append(polluted, "CAAM_HOME") {
+				if !slices.Contains(changes.Unset, key) || !strings.Contains(outputs["posix"], "unset "+key) {
+					t.Errorf("export does not remove inherited %s in every format", key)
+				}
+			}
+			for i, path := range roots {
+				if !maps.Equal(before[i], snapshotShallowTestTree(t, path)) {
+					t.Fatalf("environment export changed fixture tree %d", i)
+				}
+			}
+			if !maps.Equal(beforeEnv, shallowExportEnvironment(os.Environ())) {
+				t.Fatal("environment export changed the caller's environment")
+			}
+
+			var launched map[string]string
+			oldExec, oldCheck := spawnExec, shallowCodexDaemonCheck
+			t.Cleanup(func() { spawnExec, shallowCodexDaemonCheck = oldExec, oldCheck })
+			spawnExec = func(_ string, _ []string, env []string) error {
+				launched = shallowExportEnvironment(env)
+				return nil
+			}
+			shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := runCmdCaptured(t, "shallow-spawn", "seat", "--no-sync-config", "--", binary); err != nil {
+				t.Fatal(err)
+			}
+			expected := maps.Clone(beforeEnv)
+			for _, key := range changes.Unset {
+				delete(expected, key)
+			}
+			for key, value := range changes.Set {
+				expected[key] = value
+			}
+			if !maps.Equal(launched, expected) {
+				t.Fatal("exported changes differ from the actual launch environment")
+			}
+			keys := append([]string{"CAAM_TEST_EXPORT_WORKFLOW"}, changes.Unset...)
+			for key := range changes.Set {
+				keys = append(keys, key)
+			}
+			assertShallowExportShell(t, outputs["posix"], launched, keys)
+		})
+	}
+}
+
+func shallowExportEnvironment(env []string) map[string]string {
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		if key, value, ok := strings.Cut(entry, "="); ok {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func assertShallowExportShell(t *testing.T, script string, expected map[string]string, keys []string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(keys)
+	keys = slices.Compact(keys)
+	var assertions strings.Builder
+	env := os.Environ()
+	for i, key := range keys {
+		if value, present := expected[key]; present {
+			want := fmt.Sprintf("CAAM_TEST_EXPORT_EXPECT_%d", i)
+			env = append(env, want+"="+value)
+			fmt.Fprintf(&assertions, "test \"${%s+x}\" = x && test \"$%s\" = \"$%s\" || exit 91\n", key, key, want)
+		} else {
+			fmt.Fprintf(&assertions, "test \"${%s+x}\" != x || exit 92\n", key)
+		}
+	}
+	// A second shell proves HOME and the other assignments were exported,
+	// rather than merely becoming variables in the evaluating shell.
+	child := exec.Command(shell, "-c", script+"\nexec \"$CAAM_TEST_EXPORT_SHELL\" -c \"$CAAM_TEST_EXPORT_ASSERTIONS\"")
+	child.Env = append(env, "CAAM_TEST_EXPORT_SHELL="+shell, "CAAM_TEST_EXPORT_ASSERTIONS="+assertions.String())
+	child.Dir = t.TempDir()
+	if output, err := child.CombinedOutput(); err != nil {
+		t.Fatalf("evaluating export in sh: %v: %s", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(child.Dir, "caam-export-injected")); !os.IsNotExist(err) {
+		t.Fatalf("a profile path executed shell code: %v", err)
+	}
+}
+
+func TestShallowPrintEnvFailuresAreReadOnlyAndFailClosed(t *testing.T) {
+	for _, problem := range []string{"missing", "invalid-state", "shared-settings"} {
+		t.Run(problem, func(t *testing.T) {
+			if problem == "shared-settings" && runtime.GOOS == "windows" {
+				t.Skip("fixture requires Unix symlinks")
+			}
+			base, realHome := shallowEnv(t)
+			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "seat", "--tool", "claude"); err != nil {
+				t.Fatal(err)
+			}
+			name := "seat"
+			switch problem {
+			case "missing":
+				name = "missing"
+			case "invalid-state":
+				if err := os.WriteFile(filepath.Join(base, name, ".claude.json"), []byte(`{"oauthToken":"synthetic-export-secret`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "shared-settings":
+				host := filepath.Join(realHome, ".claude", "settings.json")
+				if err := os.WriteFile(host, []byte(`{"apiKeyHelper":"echo synthetic-export-secret"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(base, name, ".claude", "settings.json")
+				if err := os.Rename(path, path+".before-test"); err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(host, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			beforeProfile, beforeHost := snapshotShallowTestTree(t, base), snapshotShallowTestTree(t, realHome)
+			for _, mode := range []string{"posix", "json"} {
+				args := []string{"shallow-spawn", name, "--print-env", "--create"}
+				if mode != "posix" {
+					args = append(args, "--"+mode)
+				}
+				stdout, stderr, err := runCmdCaptured(t, args...)
+				if err == nil {
+					t.Fatalf("%s accepted unsafe export", mode)
+				}
+				assertShallowExportFailure(t, mode, stdout)
+				if strings.Contains(stdout+stderr+err.Error(), "synthetic-export-secret") {
+					t.Fatal("export failure exposed credential contents")
+				}
+			}
+			if !maps.Equal(beforeProfile, snapshotShallowTestTree(t, base)) || !maps.Equal(beforeHost, snapshotShallowTestTree(t, realHome)) {
+				t.Fatal("failed environment export created or repaired a profile")
+			}
+		})
+	}
+}
+
+func assertShallowExportFailure(t *testing.T, mode, stdout string) {
+	t.Helper()
+	if mode == "json" {
+		if stdout != "" {
+			t.Fatal("failed JSON export emitted partial data or shell code")
+		}
+		return
+	}
+	if !strings.HasPrefix(stdout, "false ") || strings.Contains(stdout, "export ") {
+		t.Fatalf("failed %s export did not emit only a failing shell command: %q", mode, stdout)
+	}
+}
+
+func TestShallowPrintEnvRejectsInvalidModesBeforeLaunch(t *testing.T) {
+	base, _ := shallowEnv(t)
+	oldExec := spawnExec
+	t.Cleanup(func() { spawnExec = oldExec })
+	spawnExec = func(string, []string, []string) error { t.Fatal("invalid export mode launched a process"); return nil }
+	for _, flags := range [][]string{{"--json"}} {
+		args := append([]string{"shallow-spawn", "missing", "--create"}, flags...)
+		if stdout, _, err := runCmdCaptured(t, args...); err == nil || stdout != "" {
+			t.Fatalf("invalid export flags did not fail without output: %v, %q", err, stdout)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(base, "missing")); !os.IsNotExist(err) {
+		t.Fatalf("invalid export flags created a profile: %v", err)
+	}
+}
+
+func TestShallowPrintEnvReadonlyShellVariablesBlockLaunch(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires bash readonly variables")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "seat", "--tool", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", "synthetic-export-secret")
+	script, stderr, err := runCmdCaptured(t, "shallow-spawn", "seat", "--print-env")
+	if err != nil || strings.Contains(script+stderr, "synthetic-export-secret") {
+		t.Fatalf("export failed or disclosed a secret: %v", err)
+	}
+	for _, key := range []string{"ANTHROPIC_API_KEY", "HOME"} {
+		t.Run(key, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "provider-launched")
+			child := exec.Command(bash, "-c", "readonly "+key+"; eval \"$CAAM_TEST_EXPORT_SCRIPT\" && printf launched > \"$CAAM_TEST_EXPORT_MARKER\"")
+			child.Env = append(os.Environ(), "CAAM_TEST_EXPORT_SCRIPT="+script, "CAAM_TEST_EXPORT_MARKER="+marker)
+			output, err := child.CombinedOutput()
+			if err == nil {
+				t.Fatal("readonly identity variable did not make eval fail")
+			}
+			if strings.Contains(string(output), "synthetic-export-secret") {
+				t.Fatal("shell failure exposed an inherited credential")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("provider launched after an incomplete environment change: %v", err)
+			}
+		})
+	}
+}
+
+func preserveShallowExportRootGlobals(t *testing.T) {
+	t.Helper()
+	oldVault, oldStore, oldProject, oldHealth := vault, profileStore, projectStore, healthStore
+	oldConfig, oldRunner, oldRegistry := cfg, runner, registry
+	t.Cleanup(func() {
+		vault, profileStore, projectStore, healthStore = oldVault, oldStore, oldProject, oldHealth
+		cfg, runner, registry = oldConfig, oldRunner, oldRegistry
+	})
+}
+
+func TestShallowPrintEnvPreRunIsReadOnly(t *testing.T) {
+	preserveShallowExportRootGlobals(t)
+	base, realHome := shallowEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	legacyData := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", legacyData)
+	legacyPath := filepath.Join(legacyData, "caam", "migration-marker.txt")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, []byte("keep in legacy store"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "seat", "--tool", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	roots := []string{base, realHome, os.Getenv("CAAM_HOME"), legacyData}
+	before := make([]map[string]string, len(roots))
+	for i, path := range roots {
+		before[i] = snapshotShallowTestTree(t, path)
+	}
+	for _, mode := range []string{"posix", "json"} {
+		root := newShallowTestRoot()
+		root.PersistentPreRunE = rootCmd.PersistentPreRunE
+		var stdout, stderr bytes.Buffer
+		root.SetOut(&stdout)
+		root.SetErr(&stderr)
+		args := []string{"shallow-spawn", "seat", "--print-env"}
+		if mode != "posix" {
+			args = append(args, "--"+mode)
+		}
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil {
+			t.Fatalf("%s export with real pre-run: %v", mode, err)
+		}
+		cmd, _, err := root.Find([]string{"shallow-spawn"})
+		if err != nil || shouldShowWarnings(cmd) || stdout.Len() == 0 || stderr.Len() != 0 {
+			t.Fatalf("%s export did not bypass active credential warnings: %v", mode, err)
+		}
+	}
+	for i, path := range roots {
+		if !maps.Equal(before[i], snapshotShallowTestTree(t, path)) {
+			t.Fatalf("export pre-run migrated or mutated fixture tree %d", i)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(config.DefaultDataPath(), "migration-marker.txt")); !os.IsNotExist(err) {
+		t.Fatalf("export pre-run migrated legacy data: %v", err)
+	}
+}
+
+func TestShallowPrintEnvPreflightFailureOutput(t *testing.T) {
+	preserveShallowExportRootGlobals(t)
+	shallowEnv(t)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path := config.ConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"claude_settings":{"mode":"invalid"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []struct {
+		name      string
+		args      []string
+		wantError string
+	}{
+		{"arguments", []string{"--print-env"}, "requires at least 1 arg"},
+		{"config", []string{"seat", "--print-env"}, "load config"},
+		{"missing-flag-value", []string{"seat", "--print-env", "--base"}, "flag needs an argument"},
+		{"unknown-before-print-env", []string{"seat", "--unknown-export-flag", "--print-env"}, "unknown flag"},
+		{"unknown-after-print-env", []string{"seat", "--print-env", "--unknown-export-flag"}, "unknown flag"},
+	} {
+		for _, mode := range []string{"posix", "json"} {
+			t.Run(phase.name+"/"+mode, func(t *testing.T) {
+				root := newShallowTestRoot()
+				root.PersistentPreRunE = rootCmd.PersistentPreRunE
+				var stdout, stderr bytes.Buffer
+				root.SetOut(&stdout)
+				root.SetErr(&stderr)
+				args := []string{"shallow-spawn"}
+				// JSON must be parsed before the failing flag: Cobra stops
+				// at that flag and cannot know the output mode that follows.
+				if mode != "posix" {
+					args = append(args, "--"+mode)
+				}
+				args = append(args, phase.args...)
+				root.SetArgs(args)
+				if err := root.Execute(); err == nil || !strings.Contains(err.Error(), phase.wantError) {
+					t.Fatalf("unexpected preflight failure: %v", err)
+				}
+				assertShallowExportFailure(t, mode, stdout.String())
+			})
+		}
 	}
 }

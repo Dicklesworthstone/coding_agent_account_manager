@@ -116,8 +116,10 @@ func newShallowTestRoot() *cobra.Command {
 		Args: shallowSpawnCmd.Args,
 		RunE: shallowSpawnCmd.RunE,
 	}
+	spawn.SetFlagErrorFunc(shallowSpawnCmd.FlagErrorFunc())
 	spawn.Flags().String("base", "", "")
 	spawn.Flags().Bool("print-env", false, "")
+	spawn.Flags().Bool("json", false, "")
 	spawn.Flags().Bool("reload-daemon", false, "")
 	spawn.Flags().Bool("allow-agent-view", false, "")
 	spawn.Flags().String("effort", "", "")
@@ -484,7 +486,7 @@ func TestShallowSpawnRejectsUnsafeClaudeLibraryBeforeExec(t *testing.T) {
 				if printErr != nil || !strings.Contains(stdout, "HOME="+filepath.Join(base, "alice")) {
 					t.Fatalf("safe existing profile was refused: stdout=%q err=%v", stdout, printErr)
 				}
-			} else if printErr == nil || !strings.Contains(printErr.Error(), "cannot use --print-env") || stdout != "" {
+			} else if printErr == nil || !strings.Contains(printErr.Error(), "cannot use --print-env") || !strings.HasPrefix(stdout, "false  # caam:") {
 				t.Fatalf("unsafe preview emitted an environment: stdout=%q err=%v", stdout, printErr)
 			}
 			if called || !maps.Equal(beforeProfile, snapshotShallowTestTree(t, filepath.Join(base, "alice"))) ||
@@ -536,7 +538,7 @@ func TestShallowSpawnPrintEnvRejectsLegacyClaudeLibraryWithoutRepair(t *testing.
 	t.Cleanup(func() { spawnExec = originalExec })
 	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "legacy", "--print-env")
 	if err == nil || !strings.Contains(err.Error(), "caam shallow-spawn legacy -- true") ||
-		!strings.Contains(err.Error(), "--base") || stdout != "" {
+		!strings.Contains(err.Error(), "--base") || !strings.HasPrefix(stdout, "false  # caam:") {
 		t.Fatalf("legacy preview should refuse with a repair command: stdout=%q err=%v", stdout, err)
 	}
 	if calls != 0 || !maps.Equal(beforeProfile, snapshotShallowTestTree(t, profileHome)) ||

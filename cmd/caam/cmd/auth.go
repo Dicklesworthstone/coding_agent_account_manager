@@ -493,8 +493,9 @@ func importAuthProfile(ctx context.Context, prov provider.Provider, name, source
 		if err != nil {
 			return result, fmt.Errorf("inspect source credential: %w", err)
 		}
-		if !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
-			return result, fmt.Errorf("source credential must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+		limit := authfile.CredentialFileSizeLimit(prov.ID(), sourcePath)
+		if !info.Mode().IsRegular() || info.Size() > limit {
+			return result, fmt.Errorf("source credential must be a regular file of at most %d bytes", limit)
 		}
 	}
 	var relativeFiles []string
@@ -682,9 +683,10 @@ func validateImportedFiles(tool, basePath string, files []string) ([]string, err
 		if err != nil || !filepath.IsLocal(inside) {
 			return nil, fmt.Errorf("imported file points outside the profile")
 		}
+		limit := authfile.CredentialFileSizeLimit(tool, path)
 		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > authfile.MaxDiscoveryFileBytes {
-			return nil, fmt.Errorf("imported file must be a regular file of at most %d bytes", authfile.MaxDiscoveryFileBytes)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > limit {
+			return nil, fmt.Errorf("imported file must be a regular file of at most %d bytes", limit)
 		}
 		// These adapters retain permissive passive validators for historical
 		// formats. Apply the native discovery credential checks before intake.
@@ -693,7 +695,7 @@ func validateImportedFiles(tool, basePath string, files []string) ([]string, err
 			if err != nil {
 				return nil, fmt.Errorf("read imported credential: %w", err)
 			}
-			data, readErr := io.ReadAll(io.LimitReader(f, authfile.MaxDiscoveryFileBytes+1))
+			data, readErr := io.ReadAll(io.LimitReader(f, limit+1))
 			closeErr := f.Close()
 			if readErr != nil || closeErr != nil {
 				return nil, fmt.Errorf("cannot read imported credential")

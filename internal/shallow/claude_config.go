@@ -125,6 +125,57 @@ func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 	return claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy})
 }
 
+// ValidateClaudeConfigBoundary checks the files an exported Claude HOME will
+// use without repairing links, refreshing policy, or creating missing files.
+// Environment exporters must refuse layouts that need normal spawn preparation
+// rather than hand a wrapper access to shared account settings or state.
+func (m *Manager) ValidateClaudeConfigBoundary(name string) error {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return err
+	}
+	provider, err := m.ResolveProvider(name)
+	if err != nil || NormalizeProvider(provider) != "claude" {
+		return err
+	}
+	refuse := func(err error) error {
+		return fmt.Errorf("Claude configuration is unsafe for environment export: %w; run `caam shallow-spawn %s -- true` with the same base override and resolve any configuration errors before exporting", err, name)
+	}
+	if err := m.assertSafeProfileHome(home); err != nil {
+		return refuse(err)
+	}
+	// Check both parents before reading either document. A missing .claude
+	// directory is safe, but neither the profile HOME nor .claude may alias
+	// another home. This also catches unsafe parents when both files are absent.
+	for _, dir := range []string{home, filepath.Join(home, ".claude")} {
+		info, err := os.Lstat(dir)
+		if errors.Is(err, os.ErrNotExist) && dir != home {
+			continue
+		}
+		if err != nil {
+			return refuse(err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return refuse(fmt.Errorf("Claude configuration directory must be private: %s", dir))
+		}
+	}
+	sharedSettings, sharedLegacy := claudesettings.SharedPaths(m.realHome)
+	for _, document := range []struct {
+		path, shared, defaultShared string
+	}{
+		{filepath.Join(home, ".claude", "settings.json"), sharedSettings, filepath.Join(m.realHome, ".claude", "settings.json")},
+		{filepath.Join(home, ".claude.json"), sharedLegacy, filepath.Join(m.realHome, ".claude.json")},
+	} {
+		// Reuse the same private-file and JSON validation as --no-sync-config.
+		// PreparePrivate reads only this document, not shared policy contents;
+		// deliberately never apply the returned update on an export path.
+		if _, err := claudesettings.PreparePrivate(document.path, document.shared, document.defaultShared); err != nil {
+			return refuse(err)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) writeClaudeSettings(home string, opts CreateOptions) error {
 	policy, err := claudesettings.LoadPolicy()
 	if err != nil {

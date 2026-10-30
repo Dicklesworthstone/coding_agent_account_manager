@@ -554,8 +554,14 @@ Examples:
   caam shallow-spawn codex-bob --reload-daemon -- codex
   caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
-Use 'caam shallow-spawn <name> --print-env' to print the environment that
-WOULD be applied without executing anything (useful for shell wrappers).
+Use 'caam shallow-spawn <name> --print-env' to print POSIX shell unset/export
+commands for the complete launch environment, including credential removals.
+Use --json for a data-only object with set/unset fields.
+Exporting never executes a child, repairs a profile, or refreshes shared policy.
+Unsafe Claude configuration must be repaired by a normal spawn before export.
+On shell-mode errors, stdout contains a failing command ('false') so eval cannot
+silently succeed with the parent identity. Check the command's exit status:
+  env_script=$(caam shallow-spawn alice --print-env) && eval "$env_script"
 
 --reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
 auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
@@ -583,13 +589,23 @@ or a path whose basename is claude). Shell/env wrappers, other providers, and
 --print-env are rejected. Native Windows handles are not Unix descriptors;
 this option is unsupported there (use CAAM inside WSL). Ambient OAuth tokens
 remain filtered, including from nested shallow launches for other providers.`,
-	Args: cobra.MinimumNArgs(1),
+	Args: func(cmd *cobra.Command, args []string) error {
+		if err := cobra.MinimumNArgs(1)(cmd, args); err != nil {
+			if isEnvironmentExport(cmd) {
+				emitEvalFailure(cmd)
+			}
+			return err
+		}
+		return nil
+	},
 	RunE: runShallowSpawn,
 }
 
 func init() {
+	shallowSpawnCmd.SetFlagErrorFunc(environmentFlagError)
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
-	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
+	shallowSpawnCmd.Flags().Bool("print-env", false, "print safely quoted shell unset/export commands without changing the profile or executing a child")
+	shallowSpawnCmd.Flags().Bool("json", false, "with --print-env: print data-only environment changes with set and unset fields")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
 	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "skip shared Claude/Codex policy refresh before exec; Claude settings must still be valid and private")
@@ -871,10 +887,22 @@ func createShallowForSpawn(cmd *cobra.Command, mgr *shallow.Manager, name, tool 
 // unlike the host-wide activate/next path.
 var shallowCodexDaemonCheck = checkCodexDaemonScoped
 
-func runShallowSpawn(cmd *cobra.Command, args []string) error {
+func runShallowSpawn(cmd *cobra.Command, args []string) (runErr error) {
 	name := args[0]
 	rest := args[1:]
 	printEnv, _ := cmd.Flags().GetBool("print-env")
+	defer func() {
+		if printEnv && runErr != nil {
+			emitEvalFailure(cmd)
+		}
+	}()
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	if jsonOutput {
+		cmd.SilenceUsage = true
+		if !printEnv {
+			return fmt.Errorf("--json requires --print-env")
+		}
+	}
 	explicitToken := cmd.Flags().Changed("claude-oauth-token-fd")
 	tokenFD := -1
 	if explicitToken {
@@ -967,6 +995,11 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	allowAgentView, _ := cmd.Flags().GetBool("allow-agent-view")
 	_, disableAgentViewSet := os.LookupEnv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
 	set, scrub := shallow.SpawnEnv(provider, prof.Path, name, allowAgentView, disableAgentViewSet)
+	// Apply one credential policy to both direct launches and shell exports.
+	// Inherited credentials and home/vault overrides cannot substitute the
+	// parent account for the selected shallow profile.
+	changes := providerapi.CredentialEnvironment(shallow.NormalizeProvider(provider), providerapi.AuthModeOAuth, set)
+	changes.Unset = append(changes.Unset, scrub...)
 
 	if printEnv {
 		// Exporting an unsafe HOME would let wrappers bypass normal spawn's
@@ -977,23 +1010,14 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 				cmd.SilenceUsage = true
 				return fmt.Errorf("cannot use --print-env for %q: %w", name, err)
 			}
-		}
-		// Print the variables that WOULD be set, as clean KEY=VALUE lines, with
-		// HOME and SHALLOW_PROFILE first for stable output and the rest sorted.
-		fmt.Fprintf(cmd.OutOrStdout(), "HOME=%s\n", set["HOME"])
-		fmt.Fprintf(cmd.OutOrStdout(), "SHALLOW_PROFILE=%s\n", set["SHALLOW_PROFILE"])
-		extra := make([]string, 0, len(set))
-		for k := range set {
-			if k == "HOME" || k == "SHALLOW_PROFILE" {
-				continue
+			if err := mgr.ValidateClaudeConfigBoundary(name); err != nil {
+				return fmt.Errorf("cannot use --print-env for %q: %w", name, err)
 			}
-			extra = append(extra, k)
 		}
-		sort.Strings(extra)
-		for _, k := range extra {
-			fmt.Fprintf(cmd.OutOrStdout(), "%s=%s\n", k, set[k])
+		if jsonOutput {
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(changes)
 		}
-		return nil
+		return writeEnvironmentChanges(cmd.OutOrStdout(), changes, "export", false)
 	}
 
 	// Short form: no '-- <cmd>' means "open this profile's own provider CLI".
@@ -1096,11 +1120,6 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("lookup %q: %w", rest[0], err)
 	}
 
-	// A shallow profile selects credentials from its own files. Inherited
-	// keys and tokens must not silently substitute the parent shell's account.
-	// Preserve the shallow-specific home/vault scrub before pinning its paths.
-	changes := providerapi.CredentialEnvironment(shallow.NormalizeProvider(provider), providerapi.AuthModeOAuth, set)
-	changes.Unset = append(changes.Unset, scrub...)
 	var explicit map[string]string
 	if explicitToken {
 		// Read only after profile/command validation and preparation succeed.

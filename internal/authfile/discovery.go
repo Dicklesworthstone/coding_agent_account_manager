@@ -27,15 +27,22 @@ const MaxDiscoveryFileBytes int64 = 16 << 20
 // ones in backup, add and run (#120). Credential artifacts keep the 16 MiB cap.
 const MaxSettingsDocumentBytes int64 = 256 << 20
 
+// CredentialFileSizeLimit returns the native artifact limit used by discovery
+// and profile import. Only Claude's mixed settings/state documents receive the
+// larger allowance; token files and other providers retain the credential cap.
+// Executable helpers always use MaxDiscoveryFileBytes, regardless of name.
+func CredentialFileSizeLimit(tool, filename string) int64 {
+	if isClaudeSettingsDocument(tool, filename) {
+		return MaxSettingsDocumentBytes
+	}
+	return MaxDiscoveryFileBytes
+}
+
 // ValidateCredentialData checks the credential material in one native auth
 // artifact without reading or modifying its source. Callers that import a
 // complete bundle must also validate the provider's selected runtime layout.
 func ValidateCredentialData(tool, filename string, data []byte) error {
-	limit := MaxDiscoveryFileBytes
-	if isClaudeSettingsDocument(tool, filename) {
-		limit = MaxSettingsDocumentBytes // per-project state grows with use (#120)
-	}
-	if int64(len(data)) > limit {
+	if int64(len(data)) > CredentialFileSizeLimit(tool, filename) {
 		return fmt.Errorf("%w: credential file exceeds size limit", ErrInvalidCredentials)
 	}
 	material, err := discoveryMaterial(tool, filepath.Base(filename), data)

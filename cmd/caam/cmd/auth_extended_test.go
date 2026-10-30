@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -334,6 +336,258 @@ func setupAuthImportStore(t *testing.T) *profile.Store {
 	profileStore = profile.NewStore(filepath.Join(t.TempDir(), "profiles"))
 	t.Cleanup(func() { profileStore = original })
 	return profileStore
+}
+
+func TestClaudeImportAcceptsLargeNativeSettings(t *testing.T) {
+	for _, filename := range []string{"settings.json", ".claude.json"} {
+		for _, flow := range []string{"auth import", "init"} {
+			t.Run(filename+"/"+flow, func(t *testing.T) {
+				fixtureRoot := setupInitImport(t)
+				home := filepath.Join(fixtureRoot, "home")
+				t.Setenv("USERPROFILE", home)
+				t.Setenv("CLAUDE_CONFIG_DIR", "")
+				t.Setenv("CAAM_KEYCHAIN", "0")
+				registry = provider.NewRegistry()
+				p := claude.New()
+				registry.Register(p)
+
+				// Use native paths so shared policy is preserved in the staged
+				// import, exercising both source and destination admission. Keep
+				// only a digest while native validation processes the large file.
+				paddingLength := authfile.MaxDiscoveryFileBytes + 64
+				const credential = "synthetic-large-document-credential"
+				source := filepath.Join(home, ".claude", filename)
+				if filename == ".claude.json" {
+					source = filepath.Join(home, filename)
+				}
+				require.NoError(t, os.MkdirAll(filepath.Dir(source), 0700))
+				originalDigest := writeLargeClaudeImportFixture(t, source, credential, paddingLength)
+				before, err := os.Stat(source)
+				require.NoError(t, err)
+				require.Greater(t, before.Size(), authfile.MaxDiscoveryFileBytes)
+
+				name := "large"
+				if flow == "init" {
+					name = "default"
+					detections := detectProviderAuth()
+					require.Len(t, detections, 1)
+					require.NoError(t, detections[0].Error)
+					require.True(t, detections[0].Detection.Found)
+					require.NotNil(t, detections[0].Detection.Primary)
+					require.Equal(t, source, detections[0].Detection.Primary.Path)
+					output, err := captureStdout(t, func() error {
+						count, err := importDetectedAuth(context.Background(), detections, true)
+						assert.Equal(t, 1, count)
+						return err
+					})
+					require.NoError(t, err)
+					assert.NotContains(t, output, credential)
+				} else {
+					cmd := &cobra.Command{}
+					cmd.SetContext(context.Background())
+					cmd.Flags().String("name", name, "")
+					cmd.Flags().String("source", "", "")
+					cmd.Flags().String("description", "", "")
+					cmd.Flags().Bool("force", false, "")
+					cmd.Flags().Bool("json", true, "")
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					require.NoError(t, runAuthImport(cmd, []string{"claude"}))
+					var result AuthImportResult
+					require.NoError(t, json.Unmarshal(output.Bytes(), &result))
+					require.True(t, result.Success)
+					require.Equal(t, source, result.SourceFile)
+					assert.NotContains(t, output.String(), credential)
+				}
+				prof, err := profileStore.Load("claude", name)
+				require.NoError(t, err)
+				validation, err := p.ValidateToken(context.Background(), prof, true)
+				require.NoError(t, err)
+				require.True(t, validation.Valid, validation.Error)
+				env, err := p.Env(context.Background(), prof)
+				require.NoError(t, err)
+				assertLargeClaudeImportContent(t, filepath.Join(env["CLAUDE_CONFIG_DIR"], filename), credential, paddingLength)
+				after, err := os.Stat(source)
+				require.NoError(t, err)
+				require.True(t, os.SameFile(before, after))
+				assert.Equal(t, before.ModTime(), after.ModTime())
+				unchanged, err := os.Open(source)
+				require.NoError(t, err)
+				digest := sha256.New()
+				_, readErr := io.Copy(digest, unchanged)
+				closeErr := unchanged.Close()
+				require.NoError(t, readErr)
+				require.NoError(t, closeErr)
+				assert.Equal(t, originalDigest[:], digest.Sum(nil))
+			})
+		}
+	}
+}
+
+func writeLargeClaudeImportFixture(t *testing.T, path, credential string, paddingLength int64) [sha256.Size]byte {
+	t.Helper()
+	prefix, suffix := `{"apiKey":%s,"permissions":{"allow":["`, `"]}}`
+	if filepath.Base(path) == ".claude.json" {
+		prefix, suffix = `{"oauthToken":%s,"projects":{"/synthetic/work":{"history":"`, `"}}}`
+	}
+	encodedCredential, err := json.Marshal(credential)
+	require.NoError(t, err)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	require.NoError(t, err)
+	defer f.Close()
+	digest := sha256.New()
+	out := io.MultiWriter(f, digest)
+	_, err = fmt.Fprintf(out, prefix, encodedCredential)
+	require.NoError(t, err)
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	for remaining := paddingLength; remaining > 0; {
+		n := min(remaining, int64(len(chunk)))
+		_, err = out.Write(chunk[:int(n)])
+		require.NoError(t, err)
+		remaining -= n
+	}
+	_, err = io.WriteString(out, suffix)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	var sum [sha256.Size]byte
+	copy(sum[:], digest.Sum(nil))
+	return sum
+}
+
+func assertLargeClaudeImportContent(t *testing.T, path, credential string, paddingLength int64) {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	reader := io.LimitReader(f, authfile.MaxSettingsDocumentBytes+1)
+	needle := []byte(credential)
+	const chunkSize = 32 << 10
+	buffer := make([]byte, chunkSize+len(needle)-1)
+	var total, run, longest int64
+	var foundCredential bool
+	carry := 0
+	for {
+		n, err := reader.Read(buffer[carry : carry+chunkSize])
+		end := carry + n
+		total += int64(n)
+		for _, b := range buffer[carry:end] {
+			if b == 'x' {
+				run++
+				longest = max(longest, run)
+			} else {
+				run = 0
+			}
+		}
+		foundCredential = foundCredential || bytes.Contains(buffer[:end], needle)
+		// Retain only the overlap needed to recognize a credential split
+		// across reads; the large contiguous payload is counted separately.
+		carry = min(len(needle)-1, end)
+		copy(buffer[:carry], buffer[end-carry:end])
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.Greater(t, total, authfile.MaxDiscoveryFileBytes)
+	require.LessOrEqual(t, total, authfile.MaxSettingsDocumentBytes)
+	require.True(t, foundCredential, "import lost the selected credential")
+	require.Equal(t, paddingLength, longest, "import lost or changed the complete contiguous document payload")
+}
+
+func TestValidateImportedFilesEnforcesArtifactSizeBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		tool, filename string
+		limit          int64
+	}{
+		{"claude", "settings.json", authfile.MaxSettingsDocumentBytes},
+		{"claude", ".claude.json", authfile.MaxSettingsDocumentBytes},
+		{"claude", ".credentials.json", authfile.MaxDiscoveryFileBytes},
+		{"claude", "auth.json", authfile.MaxDiscoveryFileBytes},
+		{"claude", "imported-api-key-helper-settings.json", authfile.MaxDiscoveryFileBytes},
+		{"codex", "settings.json", authfile.MaxDiscoveryFileBytes},
+		{"gemini", "settings.json", authfile.MaxDiscoveryFileBytes},
+	} {
+		t.Run(tc.tool+"/"+tc.filename, func(t *testing.T) {
+			base := t.TempDir()
+			path := filepath.Join(base, tc.filename)
+			file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = file.Close() })
+			// Sparse files exercise stat-based admission without allocating
+			// hundreds of MiB. Native credential validity is checked later by
+			// the provider and separately by the real-provider test above.
+			require.NoError(t, file.Truncate(tc.limit))
+			files, err := validateImportedFiles(tc.tool, base, []string{path})
+			require.NoError(t, err)
+			assert.Equal(t, []string{tc.filename}, files)
+			require.NoError(t, file.Truncate(tc.limit+1))
+			files, err = validateImportedFiles(tc.tool, base, []string{path})
+			require.ErrorContains(t, err, "at most")
+			assert.Nil(t, files)
+		})
+	}
+}
+
+func TestAuthImportOversizedArtifactsNeverPublish(t *testing.T) {
+	for _, tc := range []struct {
+		tool, filename string
+		limit          int64
+	}{
+		{"claude", "settings.json", authfile.MaxSettingsDocumentBytes},
+		{"claude", ".claude.json", authfile.MaxSettingsDocumentBytes},
+		{"claude", ".credentials.json", authfile.MaxDiscoveryFileBytes},
+		{"codex", "settings.json", authfile.MaxDiscoveryFileBytes},
+	} {
+		for _, phase := range []string{"source", "staged"} {
+			for _, replace := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/%s/replace=%t", tc.tool, tc.filename, phase, replace), func(t *testing.T) {
+					store := setupAuthImportStore(t)
+					var oldMetadata []byte
+					if replace {
+						old, err := store.Create(tc.tool, "work", "oauth")
+						require.NoError(t, err)
+						old.Description = "retain the working account"
+						require.NoError(t, old.Save())
+						oldMetadata, err = os.ReadFile(old.MetaPath())
+						require.NoError(t, err)
+						require.NoError(t, os.WriteFile(filepath.Join(old.BasePath, "auth.json"), []byte("synthetic-old-credential"), 0600))
+					}
+					source := filepath.Join(t.TempDir(), tc.filename)
+					require.NoError(t, os.WriteFile(source, []byte("synthetic-source"), 0600))
+					mock := &MockProvider{id: tc.tool, mockImportFiles: []string{tc.filename}}
+					if phase == "source" {
+						require.NoError(t, os.Truncate(source, tc.limit+1))
+					} else {
+						mock.importHook = func(prof *profile.Profile) error {
+							return os.Truncate(filepath.Join(prof.BasePath, tc.filename), tc.limit+1)
+						}
+					}
+					result, err := importAuthProfile(context.Background(), mock, "work", source, "replacement", replace)
+					require.ErrorContains(t, err, "at most")
+					assert.Equal(t, phase == "staged", mock.calledImport)
+					assert.False(t, result.Success)
+					assert.Empty(t, result.ProfilePath)
+					assert.Empty(t, result.BackupPath)
+					assert.Empty(t, result.CopiedFiles)
+					profiles, err := store.List(tc.tool)
+					require.NoError(t, err)
+					if replace {
+						require.Len(t, profiles, 1)
+						metadata, err := os.ReadFile(profiles[0].MetaPath())
+						require.NoError(t, err)
+						assert.Equal(t, oldMetadata, metadata)
+						credential, err := os.ReadFile(filepath.Join(profiles[0].BasePath, "auth.json"))
+						require.NoError(t, err)
+						assert.Equal(t, "synthetic-old-credential", string(credential))
+						assert.False(t, profiles[0].IsLocked())
+					} else {
+						assert.Empty(t, profiles)
+						assert.False(t, store.Exists(tc.tool, "work"))
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestClaudeNativeImportPreservesSourceAuthority(t *testing.T) {

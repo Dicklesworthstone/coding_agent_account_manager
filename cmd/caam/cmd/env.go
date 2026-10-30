@@ -4,6 +4,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -100,22 +101,8 @@ Use --export-prefix to change the export syntax (default: "export").`,
 			return json.NewEncoder(out).Encode(changes)
 		}
 
-		// Clear inherited authentication before setting the selected paths.
-		for _, k := range changes.Unset {
-			if fishMode {
-				fmt.Fprintf(out, "set -e %s\n", k)
-			} else {
-				fmt.Fprintf(out, "unset %s\n", k)
-			}
-		}
-		if !unset {
-			for _, k := range keys {
-				if fishMode {
-					fmt.Fprintf(out, "set -gx %s %s\n", k, fishQuote(envVars[k]))
-				} else {
-					fmt.Fprintf(out, "%s %s=%s\n", exportPrefix, k, shellQuote(envVars[k]))
-				}
-			}
+		if err := writeEnvironmentChanges(out, changes, exportPrefix, fishMode); err != nil {
+			return err
 		}
 
 		// Add a helpful comment
@@ -128,6 +115,62 @@ Use --export-prefix to change the export syntax (default: "export").`,
 
 		return nil
 	},
+}
+
+// writeEnvironmentChanges renders the complete isolation policy, including
+// removals. Assignment-only output would leave ambient credentials active in
+// shell wrappers even though MergeEnvironment removes them for direct launches.
+func writeEnvironmentChanges(out io.Writer, changes provider.EnvironmentChanges, exportPrefix string, fishMode bool) error {
+	var commands []string
+	unsets := append([]string(nil), changes.Unset...)
+	sort.Strings(unsets)
+	for i, k := range unsets {
+		if i > 0 && unsets[i-1] == k {
+			continue
+		}
+		if fishMode {
+			commands = append(commands, fmt.Sprintf("set -e %s", k))
+		} else {
+			commands = append(commands, fmt.Sprintf("unset %s", k))
+		}
+	}
+	keys := make([]string, 0, len(changes.Set))
+	for k := range changes.Set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if fishMode {
+			commands = append(commands, fmt.Sprintf("set -gx %s %s", k, fishQuote(changes.Set[k])))
+		} else {
+			commands = append(commands, fmt.Sprintf("%s %s=%s", exportPrefix, k, shellQuote(changes.Set[k])))
+		}
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	separator := "\n"
+	if !fishMode {
+		// A readonly ambient credential or HOME must make eval fail rather
+		// than let a later successful assignment hide the isolation failure.
+		separator = " &&\n"
+	}
+	script := strings.Join(commands, separator) + "\n"
+	n, err := io.WriteString(out, script)
+	if err == nil && n != len(script) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+// isEnvironmentExport also covers shallow exports so root initialization cannot
+// migrate stores or mirror host credentials during a read-only inspection.
+func isEnvironmentExport(cmd *cobra.Command) bool {
+	if cmd.Name() == "env" {
+		return true
+	}
+	printEnv, _ := cmd.Flags().GetBool("print-env")
+	return cmd.Name() == "shallow-spawn" && printEnv
 }
 
 // emitEvalFailure prints a shell command that makes `eval "$(caam env ...)"`
@@ -145,11 +188,19 @@ func emitEvalFailure(cmd *cobra.Command) {
 	if jsonOutput, _ := cmd.Flags().GetBool("json"); jsonOutput {
 		return
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), "false  # caam env: failed to resolve profile environment — see error on stderr above")
+	fmt.Fprintln(cmd.OutOrStdout(), "false  # caam: failed to resolve profile environment — see error on stderr above")
+}
+
+// Flag parsing happens before Args and RunE. A parse error must also make eval
+// fail, even when an invalid flag prevented a later --print-env from parsing.
+func environmentFlagError(cmd *cobra.Command, err error) error {
+	emitEvalFailure(cmd)
+	return err
 }
 
 func init() {
 	rootCmd.AddCommand(envCmd)
+	envCmd.SetFlagErrorFunc(environmentFlagError)
 	envCmd.Flags().Bool("unset", false, "print unset commands instead of export")
 	envCmd.Flags().String("export-prefix", "export", "export syntax prefix (default: export)")
 	envCmd.Flags().Bool("fish", false, "use fish shell syntax")

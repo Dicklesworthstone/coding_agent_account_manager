@@ -247,7 +247,8 @@ caam shallow-spawn <name>                     # open the profile's own provider 
 caam shallow-spawn <name> --create            # first run of a NEW identity: provision an empty profile, then start it
 caam shallow-spawn <name> --create --tool codex   # ...with a codex layout instead of claude
 caam shallow-spawn <name> -- <cmd> [args...]  # or run any other command under the profile
-caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
+caam shallow-spawn <name> --print-env         # shell unset/export commands, including credential removals
+caam shallow-spawn <name> --print-env --json  # data-only set/unset object for wrappers
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
 caam shallow-spawn <name> --no-sync-config    # don't refresh shared config from your real HOME before starting
 caam shallow-profile sync-config <name>       # ...or reconcile it on demand (--all for every profile)
@@ -255,6 +256,36 @@ caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `
 ```
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
+
+#### Exporting a shallow environment
+
+`--print-env` emits safely quoted POSIX `unset` and `export` commands. It removes
+the same conflicting ambient credentials and home/vault overrides as a direct
+shallow launch before setting the selected profile's paths. Wrappers that parsed
+the old assignment-only output should use `--print-env --json` and apply **both**
+the `unset` list and the `set` map. Shell output targets POSIX shells; wrappers
+for other shells should use JSON.
+
+To keep a shell export scoped to one session, evaluate it inside a subshell and
+check success before launching the provider:
+
+```bash
+(
+  env_script=$(caam shallow-spawn alice --print-env) &&
+    eval "$env_script" &&
+    claude
+)
+```
+
+Export is read-only: it does not create or repair profiles, refresh shared
+policy, migrate CAAM stores, run token-health checks, or start a child.
+Claude settings and state must already be valid private files; unsafe links
+or malformed documents are refused before any environment is printed. Run
+`caam shallow-spawn alice -- true` with the same base override to perform normal
+preparation, resolving any reported configuration errors before exporting.
+Missing private settings remain absent. On errors, shell output contains a
+failing `false` command; JSON mode leaves stdout empty and returns an error.
+Explicit setup-token input cannot be combined with environment export.
 
 #### One-launch Claude setup tokens
 

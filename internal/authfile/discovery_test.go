@@ -845,3 +845,26 @@ func TestCaptureDiscoveryBoundsNativeCredentialReads(t *testing.T) {
 		t.Fatal("oversized credential published a profile")
 	}
 }
+
+func TestCredentialFileSizeLimitScopesClaudeDocuments(t *testing.T) {
+	for _, tc := range []struct {
+		tool, filename string
+		want           int64
+	}{
+		{"claude", "settings.json", MaxSettingsDocumentBytes},
+		{"claude", filepath.Join("config", ".claude.json"), MaxSettingsDocumentBytes},
+		{"claude", ".credentials.json", MaxDiscoveryFileBytes},
+		{"claude", "auth.json", MaxDiscoveryFileBytes},
+		{"claude", "imported-api-key-helper-settings.json", MaxDiscoveryFileBytes},
+		{"claude", "settings.json.backup", MaxDiscoveryFileBytes},
+		{"codex", "settings.json", MaxDiscoveryFileBytes},
+		{"gemini", "settings.json", MaxDiscoveryFileBytes},
+		{"grok", ".claude.json", MaxDiscoveryFileBytes},
+	} {
+		t.Run(tc.tool+"/"+tc.filename, func(t *testing.T) {
+			if got := CredentialFileSizeLimit(tc.tool, tc.filename); got != tc.want {
+				t.Fatalf("file size limit = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

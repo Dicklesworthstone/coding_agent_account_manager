@@ -148,7 +148,7 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Environment exports are read-only, including when CAAM_HOME points
 		// at a new store that would otherwise trigger a legacy data migration.
-		if cmd.Name() != "env" {
+		if !isEnvironmentExport(cmd) {
 			if _, err := config.MigrateDataToCAAMHome(); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: data migration skipped: %v\n", err)
 			}
@@ -183,7 +183,7 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		var err error
 		cfg, err = config.Load()
 		if err != nil {
-			if cmd.Name() == "env" {
+			if isEnvironmentExport(cmd) {
 				emitEvalFailure(cmd)
 			}
 			return fmt.Errorf("load config: %w", err)
@@ -229,9 +229,11 @@ func ExitCode(err error) int {
 // - Already doing validation (validate, doctor)
 // - JSON output mode (warnings would corrupt output)
 func shouldShowWarnings(cmd *cobra.Command) bool {
+	if isEnvironmentExport(cmd) {
+		return false
+	}
 	// Skip for commands that don't benefit from warnings
 	skipCommands := map[string]bool{
-		"env":        true, // Read-only exports must not mirror keychain credentials.
 		"version":    true, // Quick info command
 		"paths":      true, // Quick info command
 		"validate":   true, // Already doing token validation

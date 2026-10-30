@@ -386,7 +386,9 @@ func TestEnvCmdClearsInheritedCredentialOverrides(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, key := range tc.keys {
-					unsetLine := "unset " + key + "\n"
+					// POSIX operations form one chain so a failed removal cannot
+					// be hidden by a later successful profile-path assignment.
+					unsetLine := "unset " + key + " &&\n"
 					if fish {
 						unsetLine = "set -e " + key + "\n"
 					}
