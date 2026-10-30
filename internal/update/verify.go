@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -34,10 +35,44 @@ const MinisignPublicKey = "RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1X
 // keyless (GitHub Actions OIDC) and keep the legacy verification path.
 const MinisignRequiredFromVersion = "0.1.18"
 
+var releaseVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
+
+// normalizedReleaseVersion accepts the versioned release names used by both
+// the release API and archive names. Unknown names cannot select an older
+// signing policy or become a path in a release request.
+func normalizedReleaseVersion(version string) (string, error) {
+	version = strings.TrimPrefix(version, "v")
+	if !releaseVersionPattern.MatchString(version) {
+		return "", fmt.Errorf("release version must be MAJOR.MINOR.PATCH with an optional prerelease or build suffix")
+	}
+	return version, nil
+}
+
 // MinisignRequired reports whether a release at the given version must carry
-// a SHA256SUMS.minisig signature verifiable with MinisignPublicKey.
+// a SHA256SUMS.minisig signature verifiable with MinisignPublicKey. Only a
+// recognized version before the signing transition may use the legacy key.
+// Prereleases of the transition version also require minisign.
 func MinisignRequired(version string) bool {
-	return compareVersions(version, MinisignRequiredFromVersion) >= 0
+	version, err := normalizedReleaseVersion(version)
+	if err != nil {
+		return true
+	}
+	if suffix := strings.IndexAny(version, "-+"); suffix >= 0 {
+		version = version[:suffix]
+	}
+	parts := strings.Split(version, ".")
+	threshold := strings.Split(MinisignRequiredFromVersion, ".")
+	for i, part := range parts {
+		// Compare validated decimal strings without integer overflow. Leading
+		// zeroes have already been rejected by normalizedReleaseVersion.
+		if len(part) != len(threshold[i]) {
+			return len(part) > len(threshold[i])
+		}
+		if part != threshold[i] {
+			return part > threshold[i]
+		}
+	}
+	return true
 }
 
 // VerifyMinisign verifies the minisign signature on the checksums file using
@@ -86,9 +121,7 @@ func verifyMinisignBytes(publicKey string, message, signature []byte) error {
 func VerifySignature(ctx context.Context, checksumsPath, signaturePath, tag, owner, repo string) error {
 	// Check if cosign is available
 	if _, err := exec.LookPath("cosign"); err != nil {
-		// If cosign is not installed, skip signature verification with a warning
-		// This allows updates to work even without cosign, but logs the skip
-		return nil // Consider logging: "cosign not found, skipping signature verification"
+		return fmt.Errorf("cosign is required to verify legacy release signatures; install cosign or select a release >= %s: %w", MinisignRequiredFromVersion, err)
 	}
 
 	// Build the expected identity for the OIDC certificate
@@ -131,17 +164,15 @@ func VerifyChecksum(filePath, checksumsPath, assetName string) error {
 	return nil
 }
 
-// readExpectedChecksum reads the expected checksum for an asset from SHA256SUMS.
-// The asset name may contain wildcards like "caam_*_linux_amd64.tar.gz".
-func readExpectedChecksum(checksumsPath, assetPattern string) (string, error) {
+// readExpectedChecksum reads the checksum for the exact selected release asset.
+// Matching a different version's entry would allow a valid older signature to
+// authenticate an archive presented as the requested release.
+func readExpectedChecksum(checksumsPath, assetName string) (string, error) {
 	f, err := os.Open(checksumsPath)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-
-	// Convert pattern to match format (handle wildcards)
-	patternParts := strings.Split(assetPattern, "*")
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -152,10 +183,9 @@ func readExpectedChecksum(checksumsPath, assetPattern string) (string, error) {
 			continue
 		}
 		hash := parts[0]
-		filename := parts[len(parts)-1]
+		filename := strings.TrimPrefix(parts[len(parts)-1], "*")
 
-		// Check if filename matches pattern
-		if matchPattern(filename, patternParts) {
+		if filename == assetName {
 			return hash, nil
 		}
 	}
@@ -164,29 +194,7 @@ func readExpectedChecksum(checksumsPath, assetPattern string) (string, error) {
 		return "", err
 	}
 
-	return "", fmt.Errorf("asset not found in checksums: %s", assetPattern)
-}
-
-// matchPattern checks if a filename matches a pattern with wildcards.
-func matchPattern(filename string, patternParts []string) bool {
-	if len(patternParts) == 1 {
-		return filename == patternParts[0]
-	}
-
-	// For pattern like "caam_*_linux_amd64.tar.gz":
-	// patternParts = ["caam_", "_linux_amd64.tar.gz"]
-	// Check if filename starts with first part and ends with last part
-	if len(patternParts) >= 2 {
-		if !strings.HasPrefix(filename, patternParts[0]) {
-			return false
-		}
-		if !strings.HasSuffix(filename, patternParts[len(patternParts)-1]) {
-			return false
-		}
-		return true
-	}
-
-	return false
+	return "", fmt.Errorf("asset not found in checksums: %s", assetName)
 }
 
 // calculateSHA256 calculates the SHA256 hash of a file.

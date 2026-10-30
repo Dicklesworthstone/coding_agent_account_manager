@@ -5,6 +5,12 @@
 package installscript
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -417,6 +423,291 @@ func TestPinnedGoToolchainStaysAligned(t *testing.T) {
 	for _, tc := range checks {
 		if !strings.Contains(read(tc.path), tc.needle) {
 			t.Errorf("%s is not pinned to Go %s (missing %q)", tc.path, want, tc.needle)
+		}
+	}
+}
+
+func TestReleaseSignatureKind(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		kind    string
+	}{
+		{"0.0.999999999999999999999999999999", "cosign"},
+		{"v0.1.0", "cosign"},
+		{"0.1.17", "cosign"},
+		{"v0.1.17-beta.2+build.4", "cosign"},
+		{"0.1.18", "minisign"},
+		{"v0.1.18-rc.1", "minisign"},
+		{"0.1.24+host.1", "minisign"},
+		{"0.2.0", "minisign"},
+		{"1.0.0", "minisign"},
+		{"18446744073709551616.0.0", "minisign"},
+		{"0.18446744073709551616.0", "minisign"},
+		{"0.1.18446744073709551616", "minisign"},
+		{"", ""},
+		{"dev", ""},
+		{"v0.1", ""},
+		{"0.1.17.9", ""},
+		{"01.1.17", ""},
+		{"0.1.17\n2.3.4", ""},
+		{"0.1.$(printf injected)", ""},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			stdout, stderr, code := runInstallFunc(t, []string{"RELEASE_VERSION=" + tc.version}, "",
+				`release_signature_kind "$RELEASE_VERSION"`, "")
+			if tc.kind == "" {
+				if code == 0 || stdout != "" || !strings.Contains(stderr, "major.minor.patch") {
+					t.Fatalf("ambiguous release version was not refused: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+				}
+				return
+			}
+			if code != 0 || stdout != tc.kind+"\n" {
+				t.Fatalf("signature kind: exit=%d stdout=%q stderr=%q; want %s", code, stdout, stderr, tc.kind)
+			}
+		})
+	}
+}
+
+// These tests run the real installer through metadata selection, verification,
+// extraction, replacement and its optional executable check. Network reads and
+// external signature tools are synthetic; real hash checks and filesystem
+// changes are confined to test directories. The Go updater separately tests
+// the pinned key against an actual maintainer-signed minisign fixture.
+func TestInstallerReleaseVerification(t *testing.T) {
+	for _, name := range []string{"tar", "find", "chmod", "mv", "cp", "awk", "sed", "grep", "head", "date"} {
+		if _, err := exec.LookPath(name); err != nil {
+			t.Skipf("installer test requires %s", name)
+		}
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		if _, err := exec.LookPath("shasum"); err != nil {
+			t.Skip("installer test requires sha256sum or shasum")
+		}
+	}
+	for backend, backendSetup := range backends(t) {
+		for _, tc := range []struct {
+			name             string
+			version          string
+			requested        string
+			archiveVersion   string
+			signatures       string
+			missingVerifier  string
+			mode             string
+			checksums        string
+			badSignature     bool
+			skipVerification bool
+			wantOK           bool
+			wantError        string
+			wantVerifier     string
+		}{
+			{name: "current signed release", requested: "0.1.24", signatures: "minisign", wantOK: true, wantVerifier: "minisign"},
+			{name: "legacy signed release", version: "v0.1.17", signatures: "cosign", wantOK: true, wantVerifier: "cosign"},
+			{name: "legacy release with minisign", version: "v0.1.17", signatures: "minisign", wantOK: true, wantVerifier: "minisign"},
+			{name: "missing minisign interactive", signatures: "minisign", missingVerifier: "minisign", wantError: "minisign is required"},
+			{name: "missing minisign CI", signatures: "minisign", missingVerifier: "minisign", mode: "CI=true", wantError: "minisign is required"},
+			{name: "missing minisign noninteractive", signatures: "minisign", missingVerifier: "minisign", mode: "NONINTERACTIVE=1", wantError: "minisign is required"},
+			{name: "missing cosign interactive", version: "v0.1.17", signatures: "cosign", missingVerifier: "cosign", wantError: "cosign is required"},
+			{name: "missing cosign CI", version: "v0.1.17", signatures: "cosign", missingVerifier: "cosign", mode: "CI=true", wantError: "cosign is required"},
+			{name: "missing cosign noninteractive", version: "v0.1.17", signatures: "cosign", missingVerifier: "cosign", mode: "NONINTERACTIVE=1", wantError: "cosign is required"},
+			{name: "current cannot downgrade to cosign", signatures: "cosign", wantError: "required for releases >= v0.1.18"},
+			{name: "boundary prerelease cannot downgrade", version: "v0.1.18-rc.1", signatures: "cosign", wantError: "required for releases >= v0.1.18"},
+			{name: "invalid release tag", version: "dev", signatures: "minisign", wantError: "major.minor.patch"},
+			{name: "requested version mismatch", requested: "v0.1.25", signatures: "minisign", wantError: "does not match the requested version"},
+			{name: "older signed archive under newer metadata", archiveVersion: "0.1.17", signatures: "minisign", wantError: "archive name does not match its release version"},
+			{name: "checksum prefix is not the archive", signatures: "minisign", checksums: "prefix", wantError: "exactly one valid entry", wantVerifier: "minisign"},
+			{name: "duplicate checksum entry", signatures: "minisign", checksums: "duplicate", wantError: "exactly one valid entry", wantVerifier: "minisign"},
+			{name: "malformed checksum entry", signatures: "minisign", checksums: "malformed", wantError: "exactly one valid entry", wantVerifier: "minisign"},
+			{name: "wrong archive checksum", signatures: "minisign", checksums: "wrong", wantError: "Checksum verification failed", wantVerifier: "minisign"},
+			{name: "binary marker checksum", signatures: "minisign", checksums: "binary", wantOK: true, wantVerifier: "minisign"},
+			{name: "invalid minisign signature", signatures: "minisign", badSignature: true, wantError: "Signature verification failed", wantVerifier: "minisign"},
+			{name: "invalid minisign cannot fall back to cosign", signatures: "both", badSignature: true, wantError: "Signature verification failed", wantVerifier: "minisign"},
+			{name: "invalid cosign signature", version: "v0.1.17", signatures: "cosign", badSignature: true, wantError: "Signature verification failed", wantVerifier: "cosign"},
+			{name: "missing signature assets", wantError: "required for releases >= v0.1.18"},
+			{name: "explicit verification opt out", missingVerifier: "both", mode: "CI=true", skipVerification: true, wantOK: true},
+			{name: "opt out preserves requested version", requested: "v0.1.25", skipVerification: true, wantError: "does not match the requested version"},
+			{name: "opt out preserves archive version", archiveVersion: "0.1.17", skipVerification: true, wantError: "archive name does not match its release version"},
+		} {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				version := tc.version
+				if version == "" {
+					version = "v0.1.24"
+				}
+				archiveVersion := tc.archiveVersion
+				if archiveVersion == "" {
+					archiveVersion = strings.TrimPrefix(version, "v")
+				}
+				assetName := "caam_" + archiveVersion + "_linux_amd64.tar.gz"
+				assetURL := "https://example.test/" + assetName
+				assets := []map[string]string{
+					{"name": assetName, "browser_download_url": assetURL},
+					{"name": "SHA256SUMS", "browser_download_url": "https://example.test/SHA256SUMS"},
+				}
+				if tc.signatures == "minisign" || tc.signatures == "both" {
+					assets = append(assets, map[string]string{"name": "SHA256SUMS.minisig", "browser_download_url": "https://example.test/SHA256SUMS.minisig"})
+				}
+				if tc.signatures == "cosign" || tc.signatures == "both" {
+					assets = append(assets, map[string]string{"name": "SHA256SUMS.sig", "browser_download_url": "https://example.test/SHA256SUMS.sig"})
+				}
+				release, err := json.Marshal(map[string]any{"tag_name": version, "assets": assets})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				dir := t.TempDir()
+				installed := filepath.Join(dir, "installed")
+				if err := os.Mkdir(installed, 0700); err != nil {
+					t.Fatal(err)
+				}
+				oldBinary := []byte("previous installed binary must survive verification failure\n")
+				if err := os.WriteFile(filepath.Join(installed, "caam"), oldBinary, 0600); err != nil {
+					t.Fatal(err)
+				}
+				program := []byte("#!/bin/sh\nprintf 'candidate-ran\\n' >> \"$RUN_MARKER\"\nprintf 'caam %s\\n' \"$TEST_RELEASE_VERSION\"\n")
+				var archive bytes.Buffer
+				gzipWriter := gzip.NewWriter(&archive)
+				tarWriter := tar.NewWriter(gzipWriter)
+				if err := tarWriter.WriteHeader(&tar.Header{Name: "caam", Mode: 0755, Size: int64(len(program))}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tarWriter.Write(program); err != nil {
+					t.Fatal(err)
+				}
+				if err := tarWriter.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := gzipWriter.Close(); err != nil {
+					t.Fatal(err)
+				}
+				archivePath := filepath.Join(dir, "fixture.tar.gz")
+				if err := os.WriteFile(archivePath, archive.Bytes(), 0600); err != nil {
+					t.Fatal(err)
+				}
+				sum := sha256.Sum256(archive.Bytes())
+				runMarker := filepath.Join(dir, "candidate-ran")
+				fallbackMarker := filepath.Join(dir, "source-fallback")
+				verifierTrace := filepath.Join(dir, "verifier-trace")
+				env := []string{
+					"INSTALL_DIR=" + installed, "RELEASE_JSON=" + string(release),
+					"FIXTURE_ARCHIVE=" + archivePath, "FIXTURE_SUM=" + hex.EncodeToString(sum[:]),
+					"FIXTURE_ASSET=" + assetName, "ASSET_URL=" + assetURL,
+					"TEST_RELEASE_VERSION=" + version, "REQUESTED_VERSION=" + tc.requested,
+					"RUN_MARKER=" + runMarker, "FALLBACK_MARKER=" + fallbackMarker,
+					"VERIFIER_TRACE=" + verifierTrace, "MISSING_VERIFIER=" + tc.missingVerifier,
+					"CHECKSUM_KIND=" + tc.checksums,
+				}
+				if tc.mode != "" {
+					env = append(env, tc.mode)
+				}
+				if tc.badSignature {
+					env = append(env, "BAD_SIGNATURE=1")
+				}
+				if tc.skipVerification {
+					env = append(env, "CAAM_SKIP_VERIFY=1")
+				}
+				setup := backendSetup + `
+INSTALL_VERSION="$REQUESTED_VERSION"
+VERIFY_AFTER_INSTALL=true
+detect_terminal_features() { USE_COLOR=false; HAS_GUM=false; IS_TTY=false; }
+detect_platform() { printf 'linux_amd64\n'; }
+get_release() { printf '%s' "$RELEASE_JSON"; }
+get_installed_version() { :; }
+try_go_install() { printf 'source-fallback\n' > "$FALLBACK_MARKER"; return 0; }
+command() {
+    if [ "$1" = '-v' ]; then
+        case "${2:-}" in
+            minisign|cosign)
+                if [ "$MISSING_VERIFIER" = "$2" ] || [ "$MISSING_VERIFIER" = both ]; then return 1; fi ;;
+        esac
+    fi
+    builtin command "$@"
+}
+download_file() {
+    case "$1" in
+        "$ASSET_URL") cp "$FIXTURE_ARCHIVE" "$2" ;;
+        */SHA256SUMS)
+            case "$CHECKSUM_KIND" in
+                prefix) printf '%s  %s.extra\n' "$FIXTURE_SUM" "$FIXTURE_ASSET" > "$2" ;;
+                duplicate) printf '%s  %s\n%s  %s\n' "$FIXTURE_SUM" "$FIXTURE_ASSET" "$FIXTURE_SUM" "$FIXTURE_ASSET" > "$2" ;;
+                malformed) printf 'not-a-sha256  %s\n' "$FIXTURE_ASSET" > "$2" ;;
+                wrong) printf '%064d  %s\n' 0 "$FIXTURE_ASSET" > "$2" ;;
+                binary) printf '%s *%s\n' "$FIXTURE_SUM" "$FIXTURE_ASSET" > "$2" ;;
+                *) printf '%s  %s\n' "$FIXTURE_SUM" "$FIXTURE_ASSET" > "$2" ;;
+            esac ;;
+        */SHA256SUMS.minisig) printf 'synthetic minisign signature\n' > "$2" ;;
+        */SHA256SUMS.sig) printf 'synthetic cosign signature\n' > "$2" ;;
+        *) return 1 ;;
+    esac
+}
+minisign() {
+    printf 'minisign\n' >> "$VERIFIER_TRACE"
+    [ "$#" -eq 7 ] && [ "$1" = '-V' ] && [ "$2" = '-p' ] && [ "$4" = '-m' ] && [ "$6" = '-x' ] || return 1
+    grep -Fx 'RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70' "$3" >/dev/null || return 1
+    [ -f "$5" ] && [ "$(cat "$7")" = 'synthetic minisign signature' ] || return 1
+    [ "${BAD_SIGNATURE:-}" != 1 ]
+}
+cosign() {
+    printf 'cosign\n' >> "$VERIFIER_TRACE"
+    [ "$#" -eq 8 ] && [ "$1" = verify-blob ] && [ "$2" = '--bundle' ] || return 1
+    [ "$4" = '--certificate-oidc-issuer' ] && [ "$5" = 'https://token.actions.githubusercontent.com' ] || return 1
+    [ "$6" = '--certificate-identity' ] && [ "$7" = "https://github.com/Dicklesworthstone/coding_agent_account_manager/.github/workflows/release.yml@refs/tags/$TEST_RELEASE_VERSION" ] || return 1
+    [ -f "$8" ] && [ "$(cat "$3")" = 'synthetic cosign signature' ] || return 1
+    [ "${BAD_SIGNATURE:-}" != 1 ]
+}
+`
+				stdout, stderr, code := runInstallFunc(t, env, setup, `main`, "")
+				wantCode := 3
+				if tc.wantOK {
+					wantCode = 0
+				}
+				if code != wantCode {
+					t.Fatalf("installer exit=%d, want %d; stdout=%s stderr=%s", code, wantCode, stdout, stderr)
+				}
+				if tc.wantError != "" && !strings.Contains(stdout+stderr, tc.wantError) {
+					t.Errorf("missing error %q; stdout=%s stderr=%s", tc.wantError, stdout, stderr)
+				}
+				if (!tc.wantOK || tc.skipVerification) && strings.Contains(stdout+stderr, "Verified release signature and checksum") {
+					t.Errorf("installer falsely claimed verification: stdout=%s stderr=%s", stdout, stderr)
+				}
+				if tc.skipVerification && tc.wantOK && !strings.Contains(stderr, "Skipping release verification (CAAM_SKIP_VERIFY set)") {
+					t.Errorf("explicit opt-out was not reported: stderr=%s", stderr)
+				}
+				gotBinary, err := os.ReadFile(filepath.Join(installed, "caam"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.wantOK {
+					if !bytes.Equal(gotBinary, program) {
+						t.Error("successful install did not publish the verified candidate")
+					}
+					if ran, err := os.ReadFile(runMarker); err != nil || string(ran) != "candidate-ran\n" {
+						t.Errorf("successful install did not execute the candidate exactly once: marker=%q err=%v", ran, err)
+					}
+				} else {
+					if !bytes.Equal(gotBinary, oldBinary) {
+						t.Error("verification failure changed the previous installation")
+					}
+					if _, err := os.Stat(runMarker); !os.IsNotExist(err) {
+						t.Errorf("unverified candidate executed or marker lookup failed: %v", err)
+					}
+				}
+				if _, err := os.Stat(fallbackMarker); !os.IsNotExist(err) {
+					t.Errorf("verification path attempted an unsigned source fallback: %v", err)
+				}
+				trace, err := os.ReadFile(verifierTrace)
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatal(err)
+				}
+				if tc.wantVerifier == "" {
+					if len(trace) != 0 {
+						t.Errorf("unexpected verifier invocation: %q", trace)
+					}
+				} else if !strings.Contains(string(trace), tc.wantVerifier+"\n") {
+					t.Errorf("expected %s invocation, got %q", tc.wantVerifier, trace)
+				}
+				if tc.wantVerifier == "minisign" && strings.Contains(string(trace), "cosign\n") {
+					t.Errorf("minisign verification fell back to cosign: %q", trace)
+				}
+			})
 		}
 	}
 }

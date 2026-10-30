@@ -46,26 +46,18 @@ func TestCompareVersions(t *testing.T) {
 
 func TestBinaryAssetName(t *testing.T) {
 	u := New(DefaultConfig())
-	name := u.binaryAssetName()
-
-	// Should contain OS and arch
-	if name == "" {
-		t.Error("binaryAssetName() returned empty string")
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
 	}
-	// Should be a pattern with wildcard
-	if name[0:5] != "caam_" {
-		t.Errorf("expected name to start with 'caam_', got %q", name)
+	want := fmt.Sprintf("caam_0.1.24_%s_%s.%s", runtime.GOOS, runtime.GOARCH, ext)
+	if name := u.binaryAssetName("0.1.24"); name != want {
+		t.Errorf("binaryAssetName() = %q, want %q", name, want)
 	}
 }
 
-// TestBinaryAssetSelection pins issue #75: binaryAssetName() returns a PATTERN,
-// and the release scan in Update() must resolve it with matchPattern(). It
-// previously compared with ==, so no asset could ever match and `caam update`
-// reported "binary asset not found" on every platform while the asset was
-// plainly present in the release.
-//
-// The old TestBinaryAssetName only asserted the pattern was non-empty and began
-// with "caam_", which stayed green throughout. This asserts selection instead.
+// A published archive must match both the selected release and this platform.
+// Matching any version would allow an older signed archive to stand in for it.
 func TestBinaryAssetSelection(t *testing.T) {
 	u := New(DefaultConfig())
 
@@ -87,17 +79,15 @@ func TestBinaryAssetSelection(t *testing.T) {
 		{Name: "SHA256SUMS.sig"},
 	}
 
-	got := selectBinaryAsset(assets, u.binaryAssetName())
+	got := selectBinaryAsset(assets, u.binaryAssetName("0.1.17"))
 	if got == nil {
-		t.Fatalf("selectBinaryAsset returned nil for pattern %q; this is issue #75", u.binaryAssetName())
+		t.Fatalf("selectBinaryAsset returned nil for published archive %q", want)
 	}
 	if got.Name != want {
 		t.Errorf("selected %q, want %q", got.Name, want)
 	}
 }
 
-// TestBinaryAssetSelectionAcrossVersions guards the version-independence that
-// the wildcard exists for.
 func TestBinaryAssetSelectionAcrossVersions(t *testing.T) {
 	u := New(DefaultConfig())
 
@@ -107,13 +97,17 @@ func TestBinaryAssetSelectionAcrossVersions(t *testing.T) {
 	}
 	for _, v := range []string{"0.1.17", "0.1.18", "1.0.0", "1.2.3-rc.1"} {
 		name := fmt.Sprintf("caam_%s_%s_%s.%s", v, runtime.GOOS, runtime.GOARCH, ext)
-		got := selectBinaryAsset([]Asset{{Name: name}}, u.binaryAssetName())
-		if got == nil {
+		older := fmt.Sprintf("caam_0.0.1_%s_%s.%s", runtime.GOOS, runtime.GOARCH, ext)
+		got := selectBinaryAsset([]Asset{{Name: older}, {Name: name}}, u.binaryAssetName(v))
+		if got == nil || got.Name != name {
 			t.Errorf("selectBinaryAsset failed to match published asset %q", name)
+		}
+		if got := selectBinaryAsset([]Asset{{Name: older}}, u.binaryAssetName(v)); got != nil {
+			t.Errorf("selected older archive %q for release %s", got.Name, v)
 		}
 	}
 	// SHA256SUMS must never be selected as the binary.
-	if got := selectBinaryAsset([]Asset{{Name: "SHA256SUMS"}}, u.binaryAssetName()); got != nil {
+	if got := selectBinaryAsset([]Asset{{Name: "SHA256SUMS"}}, u.binaryAssetName("0.1.24")); got != nil {
 		t.Errorf("selectBinaryAsset wrongly selected %q", got.Name)
 	}
 }
@@ -179,18 +173,17 @@ func TestFetchLatestRelease(t *testing.T) {
 		Repo:       "test",
 		Channel:    ChannelStable,
 		HTTPClient: server.Client(),
+		APIBase:    server.URL,
 	}
-	// Override the API base URL by setting it on the server path
 	u := New(cfg)
 
 	ctx := context.Background()
 	release, err := u.fetchLatestRelease(ctx)
-	// This will fail because we're not replacing GitHubAPIBase
-	// but it tests the structure
-	if err == nil {
-		if release.TagName != "v1.0.0" {
-			t.Errorf("TagName = %q, want %q", release.TagName, "v1.0.0")
-		}
+	if err != nil {
+		t.Fatalf("fetchLatestRelease: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("TagName = %q, want %q", release.TagName, "v1.0.0")
 	}
 }
 
@@ -206,14 +199,13 @@ func TestFetchLatestRelease_FiltersDrafts(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Verify draft filtering logic exists
-	for _, r := range releases {
-		if !r.Draft && !r.Prerelease {
-			if r.TagName != "v1.0.0" {
-				t.Errorf("First non-draft release should be v1.0.0, got %s", r.TagName)
-			}
-			break
-		}
+	u := New(Config{Owner: "test", Repo: "test", Channel: ChannelStable, HTTPClient: server.Client(), APIBase: server.URL})
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("selected draft release: %s", release.TagName)
 	}
 }
 
@@ -223,65 +215,58 @@ func TestFetchLatestRelease_FiltersPrereleases(t *testing.T) {
 		{TagName: "v1.0.0", Prerelease: false},
 	}
 
-	// For stable channel, prereleases should be skipped
-	cfg := Config{Channel: ChannelStable}
-
-	// Verify prerelease filtering logic
-	for _, r := range releases {
-		if !r.Draft && (cfg.Channel != ChannelStable || !r.Prerelease) {
-			if r.TagName != "v1.0.0" {
-				t.Errorf("First stable release should be v1.0.0, got %s", r.TagName)
-			}
-			break
-		}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(releases)
+	}))
+	defer server.Close()
+	u := New(Config{Owner: "test", Repo: "test", Channel: ChannelStable, HTTPClient: server.Client(), APIBase: server.URL})
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("selected prerelease for stable channel: %s", release.TagName)
 	}
 }
 
-func TestMatchPattern(t *testing.T) {
+func TestNormalizedReleaseVersion(t *testing.T) {
 	tests := []struct {
-		name         string
-		filename     string
-		patternParts []string
-		want         bool
+		input string
+		want  string
 	}{
-		{
-			name:         "exact match",
-			filename:     "caam_1.0.0_linux_amd64.tar.gz",
-			patternParts: []string{"caam_1.0.0_linux_amd64.tar.gz"},
-			want:         true,
-		},
-		{
-			name:         "wildcard match",
-			filename:     "caam_1.0.0_linux_amd64.tar.gz",
-			patternParts: []string{"caam_", "_linux_amd64.tar.gz"},
-			want:         true,
-		},
-		{
-			name:         "wildcard no match prefix",
-			filename:     "other_1.0.0_linux_amd64.tar.gz",
-			patternParts: []string{"caam_", "_linux_amd64.tar.gz"},
-			want:         false,
-		},
-		{
-			name:         "wildcard no match suffix",
-			filename:     "caam_1.0.0_darwin_arm64.tar.gz",
-			patternParts: []string{"caam_", "_linux_amd64.tar.gz"},
-			want:         false,
-		},
-		{
-			name:         "exact no match",
-			filename:     "different.tar.gz",
-			patternParts: []string{"caam.tar.gz"},
-			want:         false,
-		},
+		{"0.1.24", "0.1.24"},
+		{"v0.1.24", "0.1.24"},
+		{"v1.2.3-rc.1+build.7", "1.2.3-rc.1+build.7"},
+		{"18446744073709551616.0.0", "18446744073709551616.0.0"},
+		{"", ""},
+		{"dev", ""},
+		{"latest", ""},
+		{"vv0.1.24", ""},
+		{"v0.1", ""},
+		{"v0.1.24.1", ""},
+		{"v0.01.24", ""},
+		{"v0.1.not-a-number", ""},
+		{"v0.1.24-", ""},
+		{"v0.1.24+", ""},
+		{"v0.1.24-rc..1", ""},
+		{"v0.1.24/../../v0.1.17", ""},
+		{"v0.1.24?tag=v0.1.17", ""},
+		{" v0.1.24", ""},
+		{"v0.1.24\n", ""},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := matchPattern(tt.filename, tt.patternParts)
-			if got != tt.want {
-				t.Errorf("matchPattern(%q, %v) = %v, want %v",
-					tt.filename, tt.patternParts, got, tt.want)
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := normalizedReleaseVersion(tt.input)
+			if tt.want == "" {
+				if err == nil {
+					t.Errorf("accepted malformed release version %q", tt.input)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Errorf("normalizedReleaseVersion(%q) = %q, %v; want %q", tt.input, got, err, tt.want)
 			}
 		})
 	}
@@ -351,7 +336,8 @@ func TestReadExpectedChecksum(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create checksums file
-	checksumsContent := `abc123  caam_1.0.0_linux_amd64.tar.gz
+	checksumsContent := `older  caam_0.9.0_linux_amd64.tar.gz
+abc123  caam_1.0.0_linux_amd64.tar.gz
 def456  caam_1.0.0_darwin_arm64.tar.gz
 ghi789  SHA256SUMS.sig
 `
@@ -372,9 +358,14 @@ ghi789  SHA256SUMS.sig
 			wantHash:  "abc123",
 		},
 		{
-			name:      "wildcard match",
+			name:      "wildcard is not an archive name",
 			assetName: "caam_*_linux_amd64.tar.gz",
-			wantHash:  "abc123",
+			wantErr:   true,
+		},
+		{
+			name:      "another version cannot supply the checksum",
+			assetName: "caam_1.0.1_linux_amd64.tar.gz",
+			wantErr:   true,
 		},
 		{
 			name:      "not found",

@@ -725,6 +725,29 @@ version_ge() {
     return 0
 }
 
+# The signing policy depends on the release version, never on which signature
+# assets happen to be present. Do not feed release metadata into version_ge:
+# its arithmetic is meant for the bounded numeric Go toolchain versions above.
+release_signature_kind() {
+    local version="$1"
+    local pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+    if ! [[ "$version" =~ $pattern ]]; then
+        print_error "Release tag must contain a valid major.minor.patch version for signature verification."
+        return 1
+    fi
+
+    local major="${BASH_REMATCH[1]}"
+    local minor="${BASH_REMATCH[2]}"
+    local patch="${BASH_REMATCH[3]}"
+    # String-only checks also handle very large numeric components safely.
+    # Prereleases of 0.1.18 already require the maintainer signing key.
+    if [[ "$major" == 0 && ( "$minor" == 0 || ( "$minor" == 1 && "$patch" =~ ^([0-9]|1[0-7])$ ) ) ]]; then
+        printf 'cosign\n'
+    else
+        printf 'minisign\n'
+    fi
+}
+
 # select_release_asset reads one release object on stdin and prints three
 # lines: tag name, download URL, asset name. Fails when no asset matches.
 select_release_asset() {
@@ -883,6 +906,17 @@ verify_release_assets() {
     local archive_path="$4"
     local tmp_dir="$5"
 
+    local signature_kind
+    signature_kind=$(release_signature_kind "$version") || return 1
+    if [ -n "$INSTALL_VERSION" ] && ! versions_equal "$INSTALL_VERSION" "$version"; then
+        print_error "Release metadata does not match the requested version."
+        return 1
+    fi
+    if [[ "$asset_name" != "${BIN_NAME}_${version#v}_"* ]]; then
+        print_error "Release archive name does not match its release version."
+        return 1
+    fi
+
     if [ -n "${CAAM_SKIP_VERIFY:-}" ]; then
         print_warn "Skipping release verification (CAAM_SKIP_VERIFY set)."
         return 0
@@ -895,6 +929,10 @@ verify_release_assets() {
 
     if [ -z "$checksums_url" ]; then
         print_error "Release is missing the SHA256SUMS asset."
+        return 1
+    fi
+    if [ "$signature_kind" = "minisign" ] && [ -z "$minisig_url" ]; then
+        print_error "Release is missing SHA256SUMS.minisig (required for releases >= v0.1.18)."
         return 1
     fi
     if [ -z "$minisig_url" ] && [ -z "$signature_url" ]; then
@@ -921,22 +959,13 @@ verify_release_assets() {
             return 1
         fi
         if ! command -v minisign >/dev/null 2>&1; then
-            if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
-                print_warn "minisign not found — skipping signature verification (CI/non-interactive mode)."
-                print_warn "Install minisign for signature verification in production."
-                # Fall through to checksum-only verification below
-            else
-                error "minisign is required to verify release signatures."
-                error ""
-                error "Install minisign:"
-                error "  macOS:         brew install minisign"
-                error "  Ubuntu/Debian: sudo apt install minisign"
-                error "  Other:         https://jedisct1.github.io/minisign/"
-                error ""
-                error "Or bypass verification (not recommended for security):"
-                error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
-                return 1
-            fi
+            error "minisign is required to verify release signatures, including in CI/non-interactive mode."
+            error ""
+            error "Install minisign:"
+            error "  macOS:         brew install minisign"
+            error "  Ubuntu/Debian: sudo apt install minisign"
+            error "  Other:         https://jedisct1.github.io/minisign/"
+            return 1
         else
             local minisign_pub="$tmp_dir/caam-release-minisign.pub"
             cat > "$minisign_pub" <<'CAAM_MINISIGN_PUB'
@@ -955,22 +984,13 @@ CAAM_MINISIGN_PUB
             fi
         fi
     elif ! command -v cosign >/dev/null 2>&1; then
-        if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
-            print_warn "cosign not found — skipping signature verification (CI/non-interactive mode)."
-            print_warn "Install cosign for signature verification in production."
-            # Fall through to checksum-only verification below
-        else
-            error "cosign is required to verify release signatures."
-            error ""
-            error "Install cosign:"
-            error "  macOS:        brew install cosign"
-            error "  Ubuntu/Debian: sudo apt install cosign"
-            error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
-            error ""
-            error "Or bypass verification (not recommended for security):"
-            error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
-            return 1
-        fi
+        error "cosign is required to verify legacy release signatures, including in CI/non-interactive mode."
+        error ""
+        error "Install cosign:"
+        error "  macOS:        brew install cosign"
+        error "  Ubuntu/Debian: sudo apt install cosign"
+        error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
+        return 1
     else
         if ! download_file "$signature_url" "$signature_path"; then
             print_error "Failed to download SHA256SUMS.sig."
@@ -1047,16 +1067,25 @@ CAAM_COSIGN_PUB
         fi
     fi
 
-    if [ -z "$asset_name" ]; then
-        asset_name=$(basename "$archive_path")
-    fi
-
     local expected actual
-    expected=$(grep -F " $asset_name" "$checksums_path" | awk '{print $1}' | head -1)
-    if [ -z "$expected" ]; then
-        print_error "Checksum entry not found for $asset_name."
+    expected=$(awk -v name="$asset_name" '
+        {
+            filename = $2
+            sub(/^\*/, "", filename)
+            if (filename == name) {
+                matches++
+                if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) invalid = 1
+                hash = tolower($1)
+            }
+        }
+        END {
+            if (matches != 1 || invalid) exit 1
+            print hash
+        }
+    ' "$checksums_path") || {
+        print_error "Signed checksums must contain exactly one valid entry for the selected archive."
         return 1
-    fi
+    }
 
     if command -v sha256sum >/dev/null 2>&1; then
         actual=$(sha256sum "$archive_path" | awk '{print $1}')
@@ -1198,6 +1227,10 @@ try_binary_install() {
         version="unknown"
     fi
 
+    if [ -n "$INSTALL_VERSION" ] && ! versions_equal "$INSTALL_VERSION" "$version"; then
+        die "Release metadata does not match the requested version." $EXIT_VERIFY_FAILED
+    fi
+
     # Check for idempotency (skip if same version already installed)
     local installed_version
     installed_version=$(get_installed_version)
@@ -1253,7 +1286,7 @@ try_binary_install() {
         error "unsigned code (supply-chain safety). See issue #59."
         error ""
         error "If you understand and accept the risk, re-run with:"
-        error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
+        error "  curl -fsSL ... | CAAM_SKIP_VERIFY=1 bash"
         # Fail CLOSED: exit the whole installer rather than returning non-zero,
         # which the caller would treat as "no prebuilt binary" and fall through
         # to try_go_install (an unsigned build of main HEAD).

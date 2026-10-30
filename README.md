@@ -1967,9 +1967,19 @@ binary on your `PATH`:
 For example, on Linux x86_64:
 
 ```bash
-ver=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
-curl -fsSL -o caam.tar.gz "https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam_${ver}_linux_amd64.tar.gz"
-tar -xzf caam.tar.gz && sudo install caam /usr/local/bin/
+(
+  set -euo pipefail
+  ver=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+  asset="caam_${ver}_linux_amd64.tar.gz"
+  base="https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/download/v${ver}"
+  curl -fsSL -o "$asset" "$base/$asset"
+  curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
+  curl -fsSL -o SHA256SUMS.minisig "$base/SHA256SUMS.minisig"
+  minisign -Vm SHA256SUMS -P RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+  awk -v asset="$asset" '$2 == asset { print }' SHA256SUMS | sha256sum -c -
+  tar -xzf "$asset"
+  sudo install caam /usr/local/bin/
+)
 ```
 
 If you don't want to pick an asset by hand, the install script above downloads,
@@ -2001,7 +2011,20 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 The same public key is embedded in the `caam` binary itself, so `caam update`
 performs this verification in pure Go — fail-closed, with no external tools
-required.
+required for releases v0.1.18 and later. The shell installer requires the
+`minisign` command for these releases, including in CI and noninteractive
+sessions. Install it with `brew install minisign` on macOS or
+`sudo apt install minisign` on Debian/Ubuntu. Missing verification tools stop
+installation; setting `CI` or `NONINTERACTIVE` never disables verification.
+
+The installer and updater bind the selected archive and its signed checksum
+entry to the release version. An explicit `--version` also requires matching
+release metadata. A missing modern signature cannot fall back to the legacy
+signing policy, and invalid release names are rejected. Verification failures
+leave the installed binary untouched; the installer does not turn them into
+a source-build fallback. The installer's explicit `CAAM_SKIP_VERIFY` escape
+hatch still warns that verification was skipped and never reports it as
+verified.
 
 **Trust model.** Releases up to v0.1.17 were built by GitHub Actions and
 signed keylessly with cosign, pinned to the release workflow's OIDC identity
@@ -2012,8 +2035,9 @@ release could ever verify (see issue #77). From v0.1.18, releases are built on
 maintainer-controlled hosts and signed with the maintainer-held minisign key
 above; what you trust is that key (and this README/binary pinning it) rather
 than GitHub's CI identity chain. Verification is strictly fail-closed in both
-the updater and the install script. For old releases (≤ v0.1.17) the legacy
-cosign verification still applies:
+the updater and the install script by default. For old releases (≤ v0.1.17)
+the legacy cosign verification still applies and requires `cosign` to be
+installed:
 
 ```bash
 cosign verify-blob \

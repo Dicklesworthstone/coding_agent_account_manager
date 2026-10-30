@@ -149,7 +149,10 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 	}
 
 	currentVersion := version.Short()
-	latestVersion := strings.TrimPrefix(release.TagName, "v")
+	latestVersion, err := normalizedReleaseVersion(release.TagName)
+	if err != nil {
+		return nil, fmt.Errorf("invalid release tag: %w", err)
+	}
 	updateAvailable := compareVersions(currentVersion, latestVersion) < 0
 
 	return &CheckResult{
@@ -187,24 +190,19 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 			return nil, fmt.Errorf("fetch target release: %w", err)
 		}
 		result.ToVersion = strings.TrimPrefix(release.TagName, "v")
+		result.ReleaseURL = release.HTMLURL
 	}
 
 	// Find the appropriate binary asset
-	assetName := u.binaryAssetName()
+	assetName := u.binaryAssetName(result.ToVersion)
 	var binaryAsset *Asset
 	var checksumsAsset *Asset
 	var signatureAsset *Asset
 	var minisigAsset *Asset
 
-	// binaryAssetName() deliberately returns a PATTERN, not a literal: it does
-	// not know the version, so it emits caam_*_<os>_<arch>.<ext>. Comparing that
-	// with == can never match a real asset name, which made `caam update` fail
-	// with "binary asset not found" on every platform even though the asset was
-	// present (issue #75).
-	//
-	// verify.go already resolves the checksum entry with matchPattern(); the
-	// asset scan simply never used it. Reuse the same helper so both paths
-	// agree on what "matches" means.
+	// Bind both selection and checksum verification to this release's exact
+	// archive name. A valid signed older archive must not install while the
+	// updater reports the requested newer version.
 	binaryAsset = selectBinaryAsset(release.Assets, assetName)
 
 	for i := range release.Assets {
@@ -292,7 +290,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	result.DownloadSize = binaryAsset.Size
 
 	// Verify checksum
-	if err := VerifyChecksum(archivePath, checksumsPath, assetName); err != nil {
+	if err := VerifyChecksum(archivePath, checksumsPath, binaryAsset.Name); err != nil {
 		return nil, fmt.Errorf("verify checksum: %w", err)
 	}
 
@@ -370,9 +368,11 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*Release, error) {
 
 // fetchRelease fetches a specific release by tag.
 func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error) {
-	if !strings.HasPrefix(tag, "v") {
-		tag = "v" + tag
+	wantVersion, err := normalizedReleaseVersion(tag)
+	if err != nil {
+		return nil, fmt.Errorf("invalid requested release version: %w", err)
 	}
+	tag = "v" + wantVersion
 	url := fmt.Sprintf("%s/repos/%s/%s/releases/tags/%s", u.config.APIBase, u.config.Owner, u.config.Repo, tag)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -398,12 +398,17 @@ func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return nil, fmt.Errorf("decode release: %w", err)
 	}
+	actualVersion, err := normalizedReleaseVersion(release.TagName)
+	if err != nil || actualVersion != wantVersion {
+		return nil, fmt.Errorf("release metadata does not match requested version %s", tag)
+	}
 
 	return &release, nil
 }
 
-// binaryAssetName returns the expected asset name for the current platform.
-func (u *Updater) binaryAssetName() string {
+// binaryAssetName returns the archive for the validated release version and
+// current platform, using the same names as the signed checksum manifest.
+func (u *Updater) binaryAssetName(releaseVersion string) string {
 	osName := runtime.GOOS
 	archName := runtime.GOARCH
 
@@ -412,27 +417,17 @@ func (u *Updater) binaryAssetName() string {
 		ext = "zip"
 	}
 
-	// Match goreleaser naming: caam_VERSION_OS_ARCH.ext
-	// Since we fetch the release, we'll use a pattern that doesn't include version
-	return fmt.Sprintf("caam_*_%s_%s.%s", osName, archName, ext)
+	return fmt.Sprintf("caam_%s_%s_%s.%s", releaseVersion, osName, archName, ext)
 }
 
-// selectBinaryAsset picks the release asset matching pattern, which may contain
-// a '*' wildcard because binaryAssetName() does not know the release version.
-//
-// This must NOT be an equality comparison: the pattern contains a literal '*',
-// so == can never match a published asset name. That was issue #75 -- every
-// platform reported "binary asset not found" while the asset was present.
-// verify.go already resolved its checksum entry with matchPattern(); this makes
-// the asset scan agree.
-func selectBinaryAsset(assets []Asset, pattern string) *Asset {
-	patternParts := strings.Split(pattern, "*")
+// selectBinaryAsset picks only the archive named for the selected release.
+func selectBinaryAsset(assets []Asset, name string) *Asset {
 	for i := range assets {
 		asset := &assets[i]
 		if asset.Name == "SHA256SUMS" || asset.Name == "SHA256SUMS.sig" || asset.Name == "SHA256SUMS.minisig" {
 			continue
 		}
-		if matchPattern(asset.Name, patternParts) {
+		if asset.Name == name {
 			return asset
 		}
 	}
