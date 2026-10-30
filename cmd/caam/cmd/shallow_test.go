@@ -124,6 +124,7 @@ func newShallowTestRoot() *cobra.Command {
 	spawn.Flags().Bool("no-sync-config", false, "")
 	spawn.Flags().Bool("create", false, "")
 	spawn.Flags().String("tool", "", "")
+	spawn.Flags().String("claude-oauth-token-fd", "", "")
 
 	sync := &cobra.Command{
 		Use:  "sync-config [name]",

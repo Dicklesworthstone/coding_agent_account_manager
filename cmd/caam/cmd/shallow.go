@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -566,7 +567,22 @@ codex command. Codex has no '--effort' CLI flag (that spelling is a Claude-ism);
 its knob is the config key 'model_reasoning_effort', so caam translates
 '--effort xhigh' into '-c model_reasoning_effort=xhigh' injected right after
 the codex binary (issue #63). Like --reload-daemon it is a shallow-spawn flag:
-place it BEFORE '--'; it errors when the spawned command is not codex.`,
+place it BEFORE '--'; it errors when the spawned command is not codex.
+
+--claude-oauth-token-fd N explicitly authorizes a setup token for this launch
+only. On Unix, pass a dedicated inherited read descriptor numbered 3 or higher
+(for example, an anonymous pipe from your secret manager). CAAM consumes and
+closes it before executing Claude, preserving stdin for the session. The input
+must be one nonempty token of at most 16 KiB, optionally ending in LF or CRLF;
+the producer must close its write end. Pipe reads time out after five seconds.
+The token is placed only in this child's CLAUDE_CODE_OAUTH_TOKEN environment;
+CAAM never saves it, prints it, or adds it to command-line arguments.
+
+This flag requires a Claude profile and a direct claude command (the default
+or a path whose basename is claude). Shell/env wrappers, other providers, and
+--print-env are rejected. Native Windows handles are not Unix descriptors;
+this option is unsupported there (use CAAM inside WSL). Ambient OAuth tokens
+remain filtered, including from nested shallow launches for other providers.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runShallowSpawn,
 }
@@ -580,6 +596,9 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("create", false, "create the shallow profile (with EMPTY credentials) if it does not exist yet, then start the session; without this a name that does not exist is an error, so a typo cannot silently become a new identity")
 	shallowSpawnCmd.Flags().String("tool", "", "provider layout to use with --create: claude (default), codex, or agy. On an existing profile of a different provider it is an error, not a no-op.")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
+	// Parse the descriptor ourselves: pflag's integer errors quote the supplied
+	// value, which could expose a token accidentally pasted in place of an FD.
+	shallowSpawnCmd.Flags().String("claude-oauth-token-fd", "", "for a direct Claude launch on Unix: consume a setup token from inherited read descriptor N (>=3), without storing or printing it")
 }
 
 // shallowProfileSyncConfigCmd reconciles a shallow profile's shared
@@ -856,6 +875,29 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	rest := args[1:]
 	printEnv, _ := cmd.Flags().GetBool("print-env")
+	explicitToken := cmd.Flags().Changed("claude-oauth-token-fd")
+	tokenFD := -1
+	if explicitToken {
+		cmd.SilenceUsage = true
+		if printEnv {
+			return fmt.Errorf("--claude-oauth-token-fd cannot be combined with --print-env")
+		}
+		if !shallowTokenFDSupported {
+			return fmt.Errorf("--claude-oauth-token-fd requires Unix file descriptors; on Windows, run CAAM inside WSL")
+		}
+		rawFD, _ := cmd.Flags().GetString("claude-oauth-token-fd")
+		var err error
+		tokenFD, err = parseShallowTokenFD(rawFD)
+		if err != nil {
+			return err
+		}
+		// Authorize only the direct Claude invocation, never a generic shell or
+		// another provider running under a Claude HOME. Do this before --create
+		// can provision anything or a descriptor can be consumed.
+		if len(rest) > 0 && filepath.Base(rest[0]) != "claude" {
+			return fmt.Errorf("--claude-oauth-token-fd requires a direct claude command; shell wrappers and other commands are not supported")
+		}
+	}
 
 	mgr, err := resolveShallowManager(cmd)
 	if err != nil {
@@ -864,6 +906,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 
 	wantTool := strings.ToLower(strings.TrimSpace(mustString(cmd, "tool")))
 	createMissing, _ := cmd.Flags().GetBool("create")
+	if explicitToken && wantTool != "" && shallow.NormalizeProvider(wantTool) != "claude" {
+		return fmt.Errorf("--claude-oauth-token-fd requires a Claude shallow profile")
+	}
 
 	prof, err := mgr.Get(name)
 	if err != nil {
@@ -904,6 +949,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	provider, err := mgr.ResolveProvider(name)
 	if err != nil {
 		return err
+	}
+	if explicitToken && shallow.NormalizeProvider(provider) != "claude" {
+		return fmt.Errorf("--claude-oauth-token-fd requires a Claude shallow profile")
 	}
 	// --tool names the layout to create; on a profile that already exists it
 	// can only ever be a mistake, so say so rather than silently ignoring it
@@ -1053,11 +1101,44 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// Preserve the shallow-specific home/vault scrub before pinning its paths.
 	changes := providerapi.CredentialEnvironment(shallow.NormalizeProvider(provider), providerapi.AuthModeOAuth, set)
 	changes.Unset = append(changes.Unset, scrub...)
-	envSlice := providerapi.MergeEnvironment(os.Environ(), changes, nil)
+	var explicit map[string]string
+	if explicitToken {
+		// Read only after profile/command validation and preparation succeed.
+		// The reader closes the descriptor on every path BEFORE syscall.Exec:
+		// deferred cleanup alone cannot run when exec replaces this process.
+		token, err := readShallowClaudeOAuthToken(cmd.Context(), tokenFD)
+		if err != nil {
+			return err
+		}
+		explicit = map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": token}
+	}
+	envSlice := providerapi.MergeEnvironment(os.Environ(), changes, explicit)
 
 	// On Unix, exec the target so signals/exit propagate naturally and we
 	// don't add a stray caam process to the tree.
 	return spawnExec(binPath, rest, envSlice)
+}
+
+// parseShallowTokenFD deliberately never quotes input in errors. The flag
+// contains a descriptor number, not a credential, but a mistaken token paste
+// must not be repeated into diagnostics or logs.
+func parseShallowTokenFD(raw string) (int, error) {
+	invalid := func() (int, error) {
+		return -1, fmt.Errorf("--claude-oauth-token-fd requires a decimal file descriptor between 3 and 2147483647; pass the token through that descriptor, not as a flag value")
+	}
+	if raw == "" {
+		return invalid()
+	}
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return invalid()
+		}
+	}
+	fd, err := strconv.ParseUint(raw, 10, 31)
+	if err != nil || fd < 3 {
+		return invalid()
+	}
+	return int(fd), nil
 }
 
 // injectCodexEffort translates shallow-spawn's --effort flag into the config

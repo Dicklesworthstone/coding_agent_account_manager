@@ -261,6 +261,11 @@ func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet b
 	// caam resolves its vault under the shallow HOME, where the caam data subtree
 	// is deliberately withheld, so the spawned process sees no other identities.
 	scrub = []string{"CAAM_HOME", "XDG_DATA_HOME"}
+	// A setup token explicitly supplied to an outer Claude launch is ambient
+	// in any nested shallow launch. Drop it for EVERY provider, so a Codex/agy
+	// session cannot carry that launch's Claude identity into unrelated tools.
+	// Only the CLI's validated per-launch input may reintroduce an OAuth token.
+	scrub = append(scrub, "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
 	// Every provider-home override is scrubbed for EVERY provider (issue #106).
 	// A shallow session is itself a parent shell for whatever it spawns: a
 	// claude shallow spawn launched from inside a codex shallow session would
