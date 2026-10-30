@@ -446,6 +446,24 @@ destinations, cancellation and cross-process refresh exclusion, invalid token
 responses, real child environments, Windows environment aliases, and every
 rotation algorithm and policy used for rate-limit handoff.
 
+#### 5.4 Explicit setup tokens for a single shallow launch
+
+For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately
+supplied Claude setup token from a dedicated inherited Unix descriptor. The
+CLI requires both a Claude profile and a direct Claude executable, rejects
+environment export, bounds input size and pipe read time, and closes the
+descriptor before replacing the process. The existing explicit environment
+merge supplies the token only to that launch; no token is written to a
+profile, settings, or the vault. Native Windows is refused rather than
+interpreting descriptor numbers as handles.
+
+Ambient OAuth tokens remain rejected. All shallow providers now remove an
+outer Claude launch's OAuth token and descriptor variable, so the exception
+cannot silently flow into a nested Codex or agy session. Synthetic tests
+exercise actual process replacement, exact token delivery, stdin and exit
+status preservation, subsequent-launch isolation, unchanged stored profiles,
+invalid inputs, cancellation, descriptor lifetime, and secret-free errors.
+
 ---
 
 ## Dependency Graph

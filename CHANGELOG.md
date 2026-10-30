@@ -18,6 +18,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ### Fixed
 
+- **Claude setup-token seats have an explicit per-launch input again (#131).** On Unix, `caam shallow-spawn <name> --claude-oauth-token-fd N -- claude` reads a setup token from a dedicated inherited descriptor numbered 3 or higher and closes it before execution. Both the selected profile and direct command must be Claude; other commands, providers, and `--print-env` are refused. Tokens stay out of CAAM's arguments, output, and persistent storage. Input is limited to one token of at most 16 KiB and pipe reads time out after five seconds. Ambient tokens remain rejected, including when entering a nested Codex or agy shallow session. Native Windows rejects the descriptor option; the Linux build inside WSL supports it. See [One-launch Claude setup tokens](README.md#one-launch-claude-setup-tokens) for the pipe-based migration from ambient-token wrappers.
 - **`caam keepalive` treats an authenticated Claude rate limit as a healthy run (#129).** When Claude reports HTTP 429 without extending the credential, keepalive now reports `rate_limited` with `success: true` and performs the usual vault sync only if the credential still passes the existing account, expiry and renewability checks. Expired or invalid credentials still fail; timeouts, 401 responses and other failures keep their existing handling.
 
 ## [0.1.24] - 2026-10-24

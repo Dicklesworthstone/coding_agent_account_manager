@@ -256,6 +256,63 @@ caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
 
+#### One-launch Claude setup tokens
+
+Shallow launches remove inherited `CLAUDE_CODE_OAUTH_TOKEN` and
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` values. An ambient credential must
+never silently replace the selected profile's identity. To deliberately use a
+`claude setup-token` credential for one launch, pass it through a dedicated
+inherited read descriptor with `--claude-oauth-token-fd N` (issue #131).
+
+For example, in **Bash**, replace `read-claude-setup-token` below with your
+existing secret-manager command. That command must write only the raw token
+to stdout, optionally followed by one newline, and then close stdout:
+
+```bash
+caam shallow-profile create seat-01 --tool claude   # once, if it does not exist
+caam shallow-spawn seat-01 --claude-oauth-token-fd 3 -- claude \
+  3< <(read-claude-setup-token)
+```
+
+The process substitution supplies an anonymous pipe; stdin remains available
+to Claude. The flag takes a **descriptor number, never the token itself**.
+Place it before `--`. A launcher written in Go can pass a pipe as
+`exec.Cmd.ExtraFiles[0]` and select descriptor `3`; a Python launcher can use
+`subprocess`'s `pass_fds` with its read descriptor. Do not concurrently read
+from or reuse that descriptor. CAAM temporarily makes a pipe nonblocking,
+restores its original status flags, and closes its copy before executing the
+child. The producer must finish within five seconds of the read starting.
+
+CAAM accepts one nonempty token of at most 16 KiB, with an optional terminal
+LF or CRLF. It rejects whitespace, control characters, additional lines,
+closed or unreadable descriptors, devices, directories, and descriptors
+`0`, `1`, and `2`. Errors never include token contents. Passing a descriptor
+to an existing regular file is supported, but the pipe example avoids
+creating a credential file.
+
+The override requires **both a Claude shallow profile and a direct `claude`
+command**, including an absolute path whose basename is `claude`. Omitting
+the command uses the profile's default Claude executable. Shell wrappers,
+`env` wrappers, other providers, and `--print-env` with this flag are refused
+before reading the credential. An explicitly authorized token is placed in
+that child's `CLAUDE_CODE_OAUTH_TOKEN`; CAAM never stores it in profile
+metadata, settings, or the vault, and never adds it to arguments or prints
+it. The next launch again uses the profile's stored identity unless it
+receives its own explicit descriptor. Every nested shallow launch, including
+Codex and agy, removes the outer launch's Claude OAuth token and descriptor
+variable.
+
+The token is still a credential in Claude's process environment and is
+available to its descendants in the normal way. This feature controls
+CAAM's credential selection; it does not sandbox the selected executable or
+prevent that executable from using or recording a credential it receives.
+
+This input is supported on **Unix systems, including Linux and macOS**.
+Native Windows uses handles rather than inherited Unix descriptor numbers,
+so CAAM rejects the flag there. Use the Linux build inside WSL for this
+workflow. There is no fallback to ambient credentials or a persistent token
+store.
+
 #### macOS: upgrading existing Claude shallow profiles
 
 Claude shallow profiles use a private `Library` directory on macOS, with
