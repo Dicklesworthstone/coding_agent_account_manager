@@ -1,12 +1,13 @@
 package authfile
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // All vault callers (CLI, robot, API, TUI, wrap, workspace and smart runner)
@@ -130,6 +131,10 @@ func resolveLiveParent(path string) string {
 // recoverable batch as mixed settings and Desktop caches. Source generations,
 // including the identity used by the existing freshness guard, stay captured.
 func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[string]claudeSettingsRestore, error) {
+	return prepareClaudeSettingsRestoreIdentity(fileSet, profileDir, nil, nil)
+}
+
+func prepareClaudeSettingsRestoreIdentity(fileSet AuthFileSet, profileDir string, selected, live *switchState) (map[string]claudeSettingsRestore, error) {
 	if fileSet.Tool != "claude" {
 		return nil, nil
 	}
@@ -153,11 +158,8 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 		}
 		identitySources[path] = data
 	}
-	var liveObject map[string]interface{}
-	_ = json.Unmarshal(identitySources[liveState], &liveObject)
-	liveKeys := claudeIdentityKeys(liveObject)
-	// The existing freshness helper takes an explicit profileDir; this view
-	// uses that same vault root and does not create or modify any directory.
+	// The cached-proof freshness check is read-only; this view never creates
+	// or modifies any vault directory.
 	identityVault := NewVault(filepath.Dir(filepath.Dir(profileDir)))
 	var result map[string]claudeSettingsRestore
 	for _, spec := range fileSet.Files {
@@ -171,7 +173,13 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			if filename == ".claude.json" {
 				prepare = claudesettings.PrepareLegacyRestore
 			}
-			update, err := prepare(snapshotPath, livePath, policy)
+			var update *claudesettings.Update
+			var err error
+			if filename == claudeSettingsFile && selected != nil && selected.credentialName == claudeCredentialsFile {
+				update, err = claudesettings.PrepareLegacyRestoreAccount(snapshotPath, livePath, policy, claudeOAuthAccount(selected.claudeIdentity))
+			} else {
+				update, err = prepare(snapshotPath, livePath, policy)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude settings restore: %w", err)
 			}
@@ -193,12 +201,19 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 			var keepLive func() bool
 			if filename == claudeCredentialsFile {
 				keepLive = func() bool {
-					return identityVault.claudeLiveIsNewer(liveKeys, profileDir, livePath, snapshotPath)
+					if selected != nil && live != nil {
+						return live.sameAccount(*selected) && live.complete &&
+							!selected.freshness.IsZero() && live.freshness.After(selected.freshness)
+					}
+					return identityVault.claudeLiveIsNewer(livePath, snapshotPath)
 				}
 			}
 			replacement, err := prepareClaudeCredentialRestore(snapshotPath, livePath, identitySources, mirror, keepLive)
 			if err != nil {
 				return nil, fmt.Errorf("prepare Claude credential replacement: %w", err)
+			}
+			if selected != nil && filename == selected.credentialName && !bytes.Equal(replacement.target, selected.credential) {
+				return nil, fmt.Errorf("claude snapshot changed after identity verification")
 			}
 			hasAuth, err := claudeCredentialMaterial(replacement.target, filename)
 			if err != nil {
@@ -281,6 +296,15 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 		return nil, err
 	}
 	batch := &claudeRestoreBatch{authority: authority}
+	if selected != nil && selected.claudeIdentity != nil {
+		credential := resolveLiveParent(claudeFileSetPath(fileSet, claudeCredentialsFile))
+		cachePath := filepath.Join(filepath.Dir(credential), identity.ClaudeIdentityCacheFile)
+		update, err := claudesettings.PrepareIdentityCache(filepath.Join(profileDir, claudeCredentialsFile), credential, cachePath, selected.claudeIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("prepare Claude identity cache: %w", err)
+		}
+		batch.updates = append(batch.updates, update)
+	}
 	for _, spec := range fileSet.Files {
 		plan, ok := result[spec.Path]
 		if !ok {
@@ -298,6 +322,24 @@ func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[s
 		}
 		plan.update = batch
 		result[spec.Path] = plan
+	}
+	if selected != nil && selected.claudeIdentity != nil {
+		// Persist a first-time verification with the saved generation so the
+		// next activation and post-restart matching can remain offline. These
+		// updates follow native publication preparation; all source documents
+		// are still guarded until the same recoverable batch installs them.
+		credential := filepath.Join(profileDir, claudeCredentialsFile)
+		metadata, err := claudesettings.PrepareIdentityCache(credential, credential, filepath.Join(profileDir, "meta.json"), selected.claudeIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("prepare saved Claude identity: %w", err)
+		}
+		batch.updates = append(batch.updates, metadata)
+		snapshotState := filepath.Join(profileDir, claudeSettingsFile)
+		stateUpdate, err := claudesettings.PrepareLegacyRestoreAccount(snapshotState, snapshotState, policy, claudeOAuthAccount(selected.claudeIdentity))
+		if err != nil {
+			return nil, fmt.Errorf("prepare saved Claude account state: %w", err)
+		}
+		batch.updates = append(batch.updates, stateUpdate)
 	}
 	return result, nil
 }

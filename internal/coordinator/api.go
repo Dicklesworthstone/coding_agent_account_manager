@@ -192,9 +192,11 @@ type PaneStatusResponse struct {
 	// LimitedAccount hit its usage limit in this pane (LimitReset is the
 	// banner's reset); HoldUntil, when set, is when a login may start
 	// again after the agent found no account free.
-	LimitedAccount string     `json:"limited_account,omitempty"`
-	LimitReset     string     `json:"limit_reset,omitempty"`
-	HoldUntil      *time.Time `json:"hold_until,omitempty"`
+	LimitedAccount        string     `json:"limited_account,omitempty"`
+	LimitedAccountID      string     `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string     `json:"limited_organization_id,omitempty"`
+	LimitReset            string     `json:"limit_reset,omitempty"`
+	HoldUntil             *time.Time `json:"hold_until,omitempty"`
 }
 
 func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -205,15 +207,17 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, t := range trackers {
 		t.mu.RLock()
 		status := PaneStatusResponse{
-			PaneID:         t.PaneID,
-			State:          t.State.String(),
-			StateEntered:   t.StateEntered,
-			RequestID:      t.RequestID,
-			Account:        t.UsedAccount,
-			Error:          t.ErrorMessage,
-			Retries:        t.RetryCount,
-			LimitedAccount: t.LimitedAccount,
-			LimitReset:     t.LimitReset,
+			PaneID:                t.PaneID,
+			State:                 t.State.String(),
+			StateEntered:          t.StateEntered,
+			RequestID:             t.RequestID,
+			Account:               t.UsedAccount,
+			Error:                 t.ErrorMessage,
+			Retries:               t.RetryCount,
+			LimitedAccount:        t.LimitedAccount,
+			LimitedAccountID:      t.LimitedAccountID,
+			LimitedOrganizationID: t.LimitedOrganizationID,
+			LimitReset:            t.LimitReset,
 		}
 		if t.HoldUntil.After(time.Now()) {
 			hold := t.HoldUntil

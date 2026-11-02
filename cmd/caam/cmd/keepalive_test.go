@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keepalive"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/spf13/cobra"
@@ -218,6 +219,20 @@ func TestKeepaliveCLIRefusalsIdentifyActualShallowOwner(t *testing.T) {
 	writeKeepaliveCLIFile(t, filepath.Join(f.base, "work", ".claude", ".credentials.json"), credential)
 	writeKeepaliveCLIFile(t, filepath.Join(f.base, "work", shallow.ProfileMetaFilename), `{"provider":"claude","name":"work"}`)
 	writeKeepaliveCLIFile(t, filepath.Join(f.vault.ProfilePath("claude", "saved-work"), ".credentials.json"), credential)
+	binding := claudeCLIIdentityBinding(t, []byte(credential), "org-work", "Work")
+	binding.Identity.AccountID = "account-a"
+	binding.Identity.Email = "alice@example.invalid"
+	metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(f.home, ".claude", identity.ClaudeIdentityCacheFile),
+		filepath.Join(f.base, "work", ".claude", identity.ClaudeIdentityCacheFile),
+		filepath.Join(f.vault.ProfilePath("claude", "saved-work"), "meta.json"),
+	} {
+		writeKeepaliveCLIFile(t, path, string(metadata))
+	}
 	for _, selector := range []string{"host:claude", "vault:claude/saved-work", "saved-work"} {
 		data, err := executeKeepaliveCLI(t, selector)
 		out := decodeKeepaliveCLI(t, data)

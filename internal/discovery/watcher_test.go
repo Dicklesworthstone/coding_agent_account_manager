@@ -25,6 +25,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// addWatcherClaudeIdentity supplies an explicit provider identity for exact
+// synthetic token pairs. Local credential fields and .claude.json labels are
+// never consulted. Configure this oracle before starting asynchronous watchers.
+func addWatcherClaudeIdentity(t *testing.T, vault *authfile.Vault, ident identity.Identity, tokenPairs ...[2]string) {
+	t.Helper()
+	require.NotEmpty(t, ident.AccountID)
+	require.NotEmpty(t, ident.OrganizationID)
+	ident.Provider, ident.Verified = "claude", true
+	bindings := make(map[string]*identity.ClaudeIdentityBinding, len(tokenPairs))
+	for _, pair := range tokenPairs {
+		credentials, err := json.Marshal(map[string]interface{}{
+			"claudeAiOauth": map[string]string{"accessToken": pair[0], "refreshToken": pair[1]},
+		})
+		require.NoError(t, err)
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		require.NoError(t, err)
+		bindings[fingerprint] = &identity.ClaudeIdentityBinding{
+			Identity: ident, CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}
+	}
+	previous := vault.ClaudeIdentityVerifier
+	vault.ClaudeIdentityVerifier = func(ctx context.Context, credentials []byte) (*identity.ClaudeIdentityBinding, error) {
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			return nil, err
+		}
+		if binding := bindings[fingerprint]; binding != nil {
+			copy := *binding
+			return &copy, nil
+		}
+		if previous != nil {
+			return previous(ctx, credentials)
+		}
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+}
+
 func TestWatchOnce(t *testing.T) {
 	// Create temp directories
 	tmpDir := t.TempDir()
@@ -35,6 +72,9 @@ func TestWatchOnce(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 
 	vault := authfile.NewVault(vaultDir)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_123", OrganizationID: "personal-org", Email: "test@example.com"},
+		[2]string{"test-access-token", ""})
 
 	// Create mock Claude credentials
 	creds := map[string]interface{}{
@@ -82,6 +122,9 @@ func TestWatcher_Discovery(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 
 	vault := authfile.NewVault(vaultDir)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_456", OrganizationID: "personal-org", Email: "newuser@example.com"},
+		[2]string{"new-user-access-token", ""})
 
 	// Override HOME for test
 	origHome := os.Getenv("HOME")
@@ -200,6 +243,9 @@ func TestWatcher_UpdateExisting(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 
 	vault := authfile.NewVault(vaultDir)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_789", OrganizationID: "personal-org", Email: "existing@example.com"},
+		[2]string{"initial-access-token", "synthetic-refresh-token"}, [2]string{"rotated-access-token", "synthetic-refresh-token"})
 
 	// Override HOME for test
 	origHome := os.Getenv("HOME")
@@ -564,6 +610,12 @@ func TestE2E_AccountSwitchDetection(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 
 	vault := authfile.NewVault(vaultDir)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_001", OrganizationID: "org-one", Email: "account1@example.com"},
+		[2]string{"token-account1", "refresh-account1"})
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_002", OrganizationID: "org-two", Email: "account2@example.com"},
+		[2]string{"token-account2", "refresh-account2"})
 
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", homeDir)
@@ -789,6 +841,9 @@ func TestE2E_TokenRefreshNoNewProfile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(homeDir, ".claude"), 0700))
 
 	vault := authfile.NewVault(vaultDir)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "acct_refresh", OrganizationID: "personal-org", Email: "refresh@example.com"},
+		[2]string{"initial-token", "refresh-token"}, [2]string{"refreshed-token", "refresh-token"})
 
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", homeDir)
@@ -880,8 +935,8 @@ func grokWatcherCredential(generation string) string {
 }
 
 func claudeWatcherCredential(generation string) string {
-	// An opaque token can prove continuity through an unchanged refresh token.
-	// A strictly later expiry proves this is a new generation worth saving.
+	// The provider oracle must verify each new opaque token pair separately.
+	// A strictly later expiry determines which verified generation to save.
 	return fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":"synthetic-stable-claude-refresh","expiresAt":%d}}`, "access-"+generation, watcherGenerationTime(generation).UnixMilli())
 }
 
@@ -899,6 +954,9 @@ func watcherGenerationTime(generation string) time.Time {
 
 func TestWatcherClaudeExplicitDirectoryOwnsCredentialsAndIdentity(t *testing.T) {
 	vault, home := watcherFixture(t)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "selected", OrganizationID: "selected-org", Email: "selected@example.test"},
+		[2]string{"synthetic-selected-access", "synthetic-selected-refresh"})
 	configured := filepath.Join(home, "custom-claude")
 	t.Setenv("CLAUDE_CONFIG_DIR", configured)
 	writeWatcherFile(t, filepath.Join(home, ".claude", ".credentials.json"), claudeWatcherCredential("ignored"))
@@ -978,6 +1036,9 @@ func TestWatcherCapturesGeminiSelectorOnlyChanges(t *testing.T) {
 
 func TestWatcherRoutesSharedBasenamesToTheirExactProviders(t *testing.T) {
 	vault, home := watcherFixture(t)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "claude-account", OrganizationID: "claude-org", Email: "claude@example.test"},
+		[2]string{"synthetic-claude-access", "synthetic-claude-refresh"})
 	providers := []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"}
 	for _, provider := range providers {
 		fileSet, _ := authfile.GetAuthFileSet(provider)
@@ -1043,6 +1104,9 @@ func TestWatchOnceSavesModernClaudeRotationWithoutDuplicatingAliases(t *testing.
 	for _, profile := range []string{"claude@example.test", "work"} {
 		t.Run(profile, func(t *testing.T) {
 			vault, home := watcherFixture(t)
+			addWatcherClaudeIdentity(t, vault,
+				identity.Identity{AccountID: "claude-account", OrganizationID: "claude-org", Email: "claude@example.test"},
+				[2]string{"access-old", "synthetic-stable-claude-refresh"}, [2]string{"access-rotated", "synthetic-stable-claude-refresh"})
 			auth := filepath.Join(home, ".claude", ".credentials.json")
 			writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"}}`)
 			writeWatcherFile(t, auth, claudeWatcherCredential("old"))
@@ -1051,11 +1115,14 @@ func TestWatchOnceSavesModernClaudeRotationWithoutDuplicatingAliases(t *testing.
 			writeWatcherFile(t, auth, claudeWatcherCredential("rotated"))
 			active, err := vault.ActiveProfile(fileSet)
 			require.NoError(t, err)
-			require.Equal(t, profile, active, "the account must match despite changed token bytes")
+			require.Empty(t, active, "an unverified token generation cannot borrow the previous account's labels")
 			discovered, err := WatchOnce(vault, []string{"claude"}, nil)
 			require.NoError(t, err)
 			require.Equal(t, []string{"claude/" + profile}, discovered)
 			require.Equal(t, claudeWatcherCredential("rotated"), readWatcherFile(t, vault.BackupPath("claude", profile, ".credentials.json")))
+			active, err = vault.ActiveProfile(fileSet)
+			require.NoError(t, err)
+			require.Equal(t, profile, active, "the saved exact-token proof must identify the verified rotation offline")
 			profiles, err := vault.List("claude")
 			require.NoError(t, err)
 			require.Equal(t, []string{profile}, profiles)
@@ -1106,6 +1173,9 @@ func TestWatchOnceKeepsNamedClaudeSnapshotWhenOpaqueRotationIsUnproven(t *testin
 
 func TestWatcherRotatesClaudeAndIgnoresOptionalConfigChurn(t *testing.T) {
 	vault, home := watcherFixture(t)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "claude-account", OrganizationID: "claude-org", Email: "claude@example.test"},
+		[2]string{"access-old", "synthetic-stable-claude-refresh"}, [2]string{"access-rotated", "synthetic-stable-claude-refresh"})
 	auth := filepath.Join(home, ".claude", ".credentials.json")
 	writeWatcherFile(t, filepath.Join(home, ".claude.json"), `{"oauthAccount":{"accountUuid":"claude-account","emailAddress":"claude@example.test"}}`)
 	writeWatcherFile(t, auth, claudeWatcherCredential("old"))
@@ -1659,6 +1729,9 @@ func TestWatcherRuntime_ConcurrentStopWaitsForCallback(t *testing.T) {
 
 func TestWatcherRuntime_SettingsChurnDoesNotDelayCredentialCapture(t *testing.T) {
 	home, vault := runtimeWatcherHome(t)
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "churn", OrganizationID: "churn-org", Email: "churn@example.com"},
+		[2]string{"synthetic-churn", "synthetic-refresh"})
 	discoveries := make(chan runtimeDiscovery, 8)
 	var changes atomic.Int64
 	watcher, err := NewWatcher(vault, WatcherConfig{
@@ -1729,6 +1802,12 @@ func TestWatcherRuntime_OptionalSettingsAreOptIn(t *testing.T) {
 
 func TestWatcherRuntime_KeychainRotationWithoutFileEvents(t *testing.T) {
 	home, vault := runtimeWatcherHome(t)
+	for generation := 1; generation <= 2; generation++ {
+		email := fmt.Sprintf("keychain-%d@example.com", generation)
+		addWatcherClaudeIdentity(t, vault,
+			identity.Identity{AccountID: fmt.Sprintf("keychain-account-%d", generation), OrganizationID: "keychain-org", Email: email},
+			[2]string{fmt.Sprintf("synthetic-keychain-%d", generation), "synthetic-refresh"})
+	}
 	items := testutil.FakeKeychain(t)
 	discoveries := make(chan runtimeDiscovery, 4)
 	watcher, err := NewWatcher(vault, WatcherConfig{

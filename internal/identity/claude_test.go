@@ -832,3 +832,50 @@ func TestExtractClaudeBindingOverridesStaleSettingsAndSurvivesRestart(t *testing
 		})
 	}
 }
+
+func TestSavedClaudeBindingCannotBeReplacedByCopiedNativeCache(t *testing.T) {
+	dir := t.TempDir()
+	credentialsPath := filepath.Join(dir, ".credentials.json")
+	oldCredentials := []byte(`{"claudeAiOauth":{"accessToken":"personal-access","refreshToken":"personal-refresh"}}`)
+	newCredentials := []byte(`{"claudeAiOauth":{"accessToken":"team-access","refreshToken":"team-refresh","accountId":"user","organizationUuid":"personal","email":"same@example.com"}}`)
+	if err := os.WriteFile(credentialsPath, newCredentials, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, dir, map[string]interface{}{"accountUuid": "user", "organizationUuid": "personal", "emailAddress": "same@example.com"})
+	writeProof := func(name string, credentials []byte, organization string) {
+		t.Helper()
+		fingerprint, err := ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding := &ClaudeIdentityBinding{
+			Identity:              Identity{Provider: "claude", AccountID: "user", OrganizationID: organization, Email: "same@example.com"},
+			CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}
+		data, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeProof("meta.json", oldCredentials, "personal")
+	writeProof(ClaudeIdentityCacheFile, newCredentials, "team")
+	if binding, err := ReadClaudeIdentityBindingForCredentials(credentialsPath, newCredentials); err != nil || binding != nil {
+		t.Fatalf("copied cache bypassed the saved profile's expected owner: binding=%v, err=%v", binding != nil, err)
+	}
+	id, err := ExtractFromClaudeCredentials(credentialsPath)
+	if err != nil || id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "" {
+		t.Fatalf("changed saved credentials inherited an account label: %+v, %v", id, err)
+	}
+	// A native directory can contain unrelated metadata without a saved
+	// account expectation; in that case the exact-token native cache applies.
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(`{"unrelated":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, err = ExtractFromClaudeCredentials(credentialsPath)
+	if err != nil || !id.Verified || id.OrganizationID != "team" {
+		t.Fatalf("unrelated metadata shadowed the valid native cache: %+v, %v", id, err)
+	}
+}

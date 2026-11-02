@@ -2,13 +2,17 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
@@ -162,5 +166,147 @@ func TestExecAndLoginReportVaultProfile(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "is a vault profile") {
 			t.Errorf("%s error = %v, want the vault-profile explanation", c.Name(), err)
 		}
+	}
+}
+
+func claudeCLIIdentityBinding(t *testing.T, credential []byte, orgID, organization string) *identity.ClaudeIdentityBinding {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{
+			Provider: "claude", AccountID: "shared-account-id", Email: "shared@example.test",
+			OrganizationID: orgID, Organization: organization,
+		},
+		CredentialFingerprint: fingerprint,
+		VerifiedAt:            time.Now().UTC(),
+	}
+}
+
+func setupClaudeOrganizationProfiles(t *testing.T) (authfile.AuthFileSet, map[string][]byte) {
+	t.Helper()
+	origVault, origTools, origStore, origHealth := vault, tools, profileStore, healthStore
+	t.Cleanup(func() { vault, tools, profileStore, healthStore = origVault, origTools, origStore, origHealth })
+	root := t.TempDir()
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	profileStore, healthStore = nil, nil
+	vault = authfile.NewVault(filepath.Join(root, "vault"))
+	liveDir := filepath.Join(root, "native")
+	fileSet := authfile.AuthFileSet{
+		Tool: "claude",
+		Files: []authfile.AuthFileSpec{
+			{Tool: "claude", Path: filepath.Join(liveDir, ".credentials.json"), Required: true},
+			{Tool: "claude", Path: filepath.Join(liveDir, ".claude.json")},
+		},
+	}
+	tools = map[string]func() authfile.AuthFileSet{
+		"claude": func() authfile.AuthFileSet { return fileSet },
+	}
+	credentials := make(map[string][]byte)
+	for _, name := range []string{"personal", "team"} {
+		plan := "max"
+		if name == "team" {
+			plan = "team"
+		}
+		data := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d,"subscriptionType":%q}}`,
+			"SYNTHETIC-"+name+"-access", "SYNTHETIC-"+name+"-refresh", time.Now().Add(3*time.Hour).UnixMilli(), plan))
+		credentials[name] = data
+		profileDir := vault.ProfilePath("claude", name)
+		writeNativeTestCredential(t, filepath.Join(profileDir, ".credentials.json"), string(data))
+		// Deliberately reuse the display name. The stable organization UUID
+		// must distinguish these rows even though both email and label match.
+		binding := claudeCLIIdentityBinding(t, data, "org-"+name, "Shared display name")
+		metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeNativeTestCredential(t, filepath.Join(profileDir, "meta.json"), string(metadata))
+		// Simulate a stale .claude.json saved from another organization.
+		writeNativeTestCredential(t, filepath.Join(profileDir, ".claude.json"), `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-stale","organizationName":"Stale label"}}`)
+	}
+	return fileSet, credentials
+}
+
+func TestLsClaudeOrganizationsUseBoundIdentityAndPersistAcrossRestart(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	for _, active := range []string{"personal", "team", "unknown"} {
+		t.Run(active, func(t *testing.T) {
+			live := credentials[active]
+			if active == "unknown" {
+				live = []byte(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-unsaved-access","refreshToken":"SYNTHETIC-unsaved-refresh"}}`)
+			}
+			writeNativeTestCredential(t, fileSet.Files[0].Path, string(live))
+			// Another running session rewrites metadata independently of the
+			// selected token. Listing must use credentials to mark the row.
+			writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal","organizationName":"Stale personal label"}}`)
+			for restart := 0; restart < 2; restart++ {
+				vault = authfile.NewVault(vault.BasePath())
+				verificationCalls := 0
+				vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+					verificationCalls++
+					return nil, fmt.Errorf("identity verification unavailable")
+				}
+				for _, args := range [][]string{{"claude"}, nil} {
+					out := runLsJSON(t, args)
+					if out["count"] != float64(2) {
+						t.Fatalf("unexpected listing count: %v", out["count"])
+					}
+					for _, value := range out["profiles"].([]any) {
+						row := value.(map[string]any)
+						name := row["name"].(string)
+						id := row["identity"].(map[string]any)
+						if id["email"] != "shared@example.test" || id["organization_id"] != "org-"+name || id["organization"] != "Shared display name" || id["identity_verified"] != true {
+							t.Fatalf("listing used stale labels for %s: %v", name, id)
+						}
+						if row["active"] != (name == active) {
+							t.Fatalf("active=%s: wrong active marker for %s", active, name)
+						}
+					}
+					command := &cobra.Command{}
+					command.Flags().Bool("json", false, "")
+					command.Flags().Bool("no-color", true, "")
+					command.Flags().String("tag", "", "")
+					text, err := captureStdout(t, func() error { return runLs(command, args) })
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, expected := range []string{"ORGANIZATION", "Shared display name (org-personal)", "Shared display name (org-team)"} {
+						if !strings.Contains(text, expected) {
+							t.Fatalf("organization missing from listing: %q", expected)
+						}
+					}
+					if strings.Contains(text, "Stale") || strings.Contains(text, "SYNTHETIC-") || strings.Contains(text, "[unverified]") {
+						t.Fatal("listing exposed credentials or used unverified stale metadata")
+					}
+				}
+				if verificationCalls != 0 {
+					t.Fatal("listing attempted online identity verification")
+				}
+			}
+		})
+	}
+}
+
+func TestFormatOrganizationDisplay(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   *identity.Identity
+		want string
+	}{
+		{"missing", nil, "unknown"},
+		{"unknown", &identity.Identity{Provider: "claude"}, "unknown"},
+		{"verified", &identity.Identity{Organization: "Team", OrganizationID: "org-team", Verified: true}, "Team (org-team)"},
+		{"unnamed", &identity.Identity{OrganizationID: "org-team", Verified: true}, "org-team"},
+		{"unverified", &identity.Identity{Organization: "Team", OrganizationID: "org-team"}, "Team (org-team) [unverified]"},
+		{"legacy", &identity.Identity{Organization: "Team"}, "Team (ID unknown) [unverified]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatOrganizationDisplay(tc.id); got != tc.want {
+				t.Fatalf("organization = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

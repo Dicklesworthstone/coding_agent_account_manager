@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -270,8 +272,10 @@ type AuthRequest struct {
 	// LimitedAccount is the account Claude Code was signed in with when the
 	// pane hit its limit, and LimitReset the banner's reset ("3pm
 	// (America/New_York)"); the agent passes over that account until then.
-	LimitedAccount string `json:"limited_account,omitempty"`
-	LimitReset     string `json:"limit_reset,omitempty"`
+	LimitedAccount        string `json:"limited_account,omitempty"`
+	LimitReset            string `json:"limit_reset,omitempty"`
+	LimitedAccountID      string `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string `json:"limited_organization_id,omitempty"`
 
 	// response is the first valid response accepted for this request.
 	response *AuthResponse
@@ -306,7 +310,7 @@ type Coordinator struct {
 
 	// signedInAccount reports the account Claude Code is signed in with on
 	// this host, so a request can tell the agent which account hit its limit.
-	signedInAccount func() string
+	signedInAccount func() *identity.Identity
 
 	// Callbacks
 	OnAuthRequest  func(req *AuthRequest)
@@ -368,8 +372,26 @@ func New(config Config) *Coordinator {
 		doneCh:     make(chan struct{}),
 		runID:      runID,
 
-		signedInAccount: identity.ClaudeSignedInEmail,
+		signedInAccount: func() *identity.Identity { return signedInClaudeIdentity(runtime.GOOS) },
 	}
+}
+
+func signedInClaudeIdentity(goos string) *identity.Identity {
+	if goos == "darwin" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil
+		}
+		// A verified file mirror is not evidence that the native keychain
+		// still contains the same grant. Do not prompt for keychain access
+		// during pane polling or infer its identity from a stale mirror.
+		for _, name := range []string{"login.keychain-db", "login.keychain"} {
+			if _, err := os.Stat(filepath.Join(home, "Library", "Keychains", name)); !errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+		}
+	}
+	return identity.ClaudeSignedInIdentity()
 }
 
 // RunID returns the correlation ID for this coordinator run.
@@ -684,10 +706,12 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 		// Tell the agent which account hit its limit, so it is not the one
 		// signed in again.
 		limited := c.signedInAccount()
-		tracker.SetLimit(limited, metadata["reset_text"])
+		tracker.SetIdentityLimit(limited, metadata["reset_text"])
+		accountID, organizationID := tracker.GetLimitIdentity()
 		c.logger.Info("usage limit",
 			"pane_id", tracker.PaneID,
-			"account", limited,
+			"account_id", accountID,
+			"organization_id", organizationID,
 			"resets", metadata["reset_text"])
 
 		// Check login cooldown before injecting
@@ -974,14 +998,17 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 	if oauthURL != "" && tracker.GetRequestID() == "" {
 		// Create auth request for local agent
 		limited, reset := tracker.GetLimit()
+		accountID, organizationID := tracker.GetLimitIdentity()
 		req := &AuthRequest{
-			ID:             uuid.New().String(),
-			PaneID:         tracker.PaneID,
-			URL:            oauthURL,
-			CreatedAt:      time.Now(),
-			Status:         RequestPending,
-			LimitedAccount: limited,
-			LimitReset:     reset,
+			ID:                    uuid.New().String(),
+			PaneID:                tracker.PaneID,
+			URL:                   oauthURL,
+			CreatedAt:             time.Now(),
+			Status:                RequestPending,
+			LimitedAccount:        limited,
+			LimitReset:            reset,
+			LimitedAccountID:      accountID,
+			LimitedOrganizationID: organizationID,
 		}
 
 		c.mu.Lock()

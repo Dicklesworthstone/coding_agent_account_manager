@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // TestCooldownBasics tests basic cooldown functionality.
@@ -1943,7 +1945,9 @@ func TestAuthRequestNamesTheLimitedAccount(t *testing.T) {
 	cfg.PaneClient = client
 	cfg.LoginCooldown = time.Millisecond
 	coord := New(cfg)
-	coord.signedInAccount = func() string { return "limited@example.com" }
+	coord.signedInAccount = func() *identity.Identity {
+		return &identity.Identity{Provider: "claude", Email: "limited@example.com", AccountID: "limited-account", OrganizationID: "limited-org", Verified: true}
+	}
 	ctx := context.Background()
 
 	coord.pollPanes(ctx)
@@ -1960,7 +1964,8 @@ func TestAuthRequestNamesTheLimitedAccount(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("pending = %d requests, want 1", len(pending))
 	}
-	if got := pending[0]; got.LimitedAccount != "limited@example.com" || got.LimitReset != "3pm (America/New_York)" {
+	if got := pending[0]; got.LimitedAccount != "limited@example.com" || got.LimitReset != "3pm (America/New_York)" ||
+		got.LimitedAccountID != "limited-account" || got.LimitedOrganizationID != "limited-org" {
 		t.Fatalf("request limit = %q / %q", got.LimitedAccount, got.LimitReset)
 	}
 	data, err := json.Marshal(pending[0])
@@ -1969,6 +1974,74 @@ func TestAuthRequestNamesTheLimitedAccount(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"limited_account":"limited@example.com"`) || !strings.Contains(string(data), `"limit_reset":"3pm (America/New_York)"`) {
 		t.Fatalf("pending JSON lacks the limit: %s", data)
+	}
+}
+
+func TestLimitIdentityRequiresVerifiedAccountAndOrganization(t *testing.T) {
+	tracker := NewPaneTracker(1)
+	personal := &identity.Identity{Provider: "claude", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com", Verified: true}
+	team := *personal
+	team.OrganizationID = "team"
+	tracker.SetIdentityLimit(personal, "in 1h")
+	accountID, orgID := tracker.GetLimitIdentity()
+	if accountID != "same-account" || orgID != "personal" {
+		t.Fatal("personal organization identity was lost")
+	}
+	tracker.SetIdentityLimit(&team, "in 2h")
+	tracker.Reset()
+	accountID, orgID = tracker.GetLimitIdentity()
+	if accountID != "same-account" || orgID != "team" {
+		t.Fatal("same-email Team organization did not survive a retry")
+	}
+	for _, uncertain := range []*identity.Identity{nil, {Provider: "claude", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com"}, {Provider: "claude", AccountID: "same-account", Email: "shared@example.com", Verified: true}} {
+		tracker.SetIdentityLimit(uncertain, "in 1h")
+		accountID, orgID = tracker.GetLimitIdentity()
+		email, _ := tracker.GetLimit()
+		if accountID != "" || orgID != "" || email != "" {
+			t.Fatal("unverified shared state became an account-selection key")
+		}
+	}
+}
+
+func TestCoordinatorDoesNotAttributeKeychainIdentityToFileMirror(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CAAM_KEYCHAIN", "0") // This disables CAAM's bridge, not Claude's lookup.
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}}`)
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), credentials, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := json.Marshal(map[string]any{"claude_identity": identity.ClaudeIdentityBinding{
+		Identity:              identity.Identity{Provider: "claude", AccountID: "file-account", OrganizationID: "file-org"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, identity.ClaudeIdentityCacheFile), meta, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := signedInClaudeIdentity("darwin"); got == nil || !got.Verified || got.OrganizationID != "file-org" {
+		t.Fatalf("private file-backed HOME lost its verified identity: %+v", got)
+	}
+	keychainPath := filepath.Join(home, "Library", "Keychains", "login.keychain-db")
+	if err := os.MkdirAll(filepath.Dir(keychainPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keychainPath, []byte("synthetic-native-keychain"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := signedInClaudeIdentity("darwin"); got != nil {
+		t.Fatal("native keychain identity was inferred from a file mirror")
 	}
 }
 

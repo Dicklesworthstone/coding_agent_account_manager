@@ -224,6 +224,59 @@ func PrepareLegacyRestore(snapshotPath, livePath string, p Policy) (*Update, err
 	return prepare(snapshotPath, livePath, livePath, p, MergeLegacy)
 }
 
+// WithOAuthAccount replaces independently mutable native identity metadata
+// with the account verified for the selected credential. Nil explicitly drops
+// an unverified label. All unrelated fields retain their original JSON values.
+func WithOAuthAccount(data []byte, account json.RawMessage) ([]byte, error) {
+	obj, err := object(data)
+	if err != nil {
+		return nil, err
+	}
+	if account == nil {
+		if _, exists := obj["oauthAccount"]; !exists {
+			return data, nil
+		}
+		delete(obj, "oauthAccount")
+	} else {
+		var validated map[string]json.RawMessage
+		if json.Unmarshal(account, &validated) != nil || validated == nil {
+			return nil, fmt.Errorf("verified OAuth account must be an object")
+		}
+		obj["oauthAccount"] = account
+	}
+	return json.MarshalIndent(obj, "", "  ")
+}
+
+// PrepareOAuthAccount normalizes only the account label in a captured state
+// document. Keeping a live credential must preserve every unrelated setting
+// and session field, without merging an older saved document over it.
+func PrepareOAuthAccount(path string, before []byte, account json.RawMessage, verify func() error) (*Update, error) {
+	if verify == nil {
+		return nil, fmt.Errorf("claude account metadata requires a source guard")
+	}
+	after, err := WithOAuthAccount(before, account)
+	if err != nil {
+		return nil, err
+	}
+	update, err := prepareIdentityOnlyUpdate(path, before, after, verify)
+	if err != nil {
+		return nil, err
+	}
+	return update, update.checkUnchanged()
+}
+
+// PrepareLegacyRestoreAccount uses the ordinary guarded settings transaction,
+// including source rechecks, with identity supplied by credential verification.
+func PrepareLegacyRestoreAccount(snapshotPath, livePath string, p Policy, account json.RawMessage) (*Update, error) {
+	return prepare(snapshotPath, livePath, livePath, p, func(shared, snapshot []byte, p Policy) ([]byte, error) {
+		selected, err := WithOAuthAccount(snapshot, account)
+		if err != nil {
+			return nil, err
+		}
+		return MergeLegacy(shared, selected, p)
+	})
+}
+
 func PrepareLegacyRefresh(sharedPath, profilePath string, p Policy) (*Update, error) {
 	update, err := PrepareLegacyImport(sharedPath, profilePath, profilePath, p)
 	if err != nil {

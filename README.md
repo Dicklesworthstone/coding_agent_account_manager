@@ -502,6 +502,66 @@ launch. `--print-env` stays read-only.
 
 **Login Command:** Inside Claude Code, type `/login`
 
+#### Account and organization identity
+
+A personal subscription and a Team subscription can share an email address.
+CAAM distinguishes them using **both the account UUID and organization UUID**;
+emails and organization names are display labels. Give the profiles distinct
+names, for example `personal-max` and `work-team`:
+
+```bash
+caam backup claude personal-max       # after signing in to the personal org
+caam backup claude work-team          # after signing in to the Team org
+caam ls claude                        # includes ORGANIZATION name and UUID
+caam activate claude work-team
+```
+
+For an unrecognized OAuth credential, backup, activation, or keepalive can
+make a bounded request to `/api/oauth/profile` to identify the access token.
+CAAM binds that result to a fingerprint of the complete access/refresh token
+pair. Saved profiles retain the binding in `meta.json`; native credentials
+can have a private `.caam-identity.json` cache alongside them. These records
+contain identity and a fingerprint, not another copy of the tokens.
+
+An unchanged, previously verified token pair can be recognized and activated
+offline, including after restarting CAAM or after the access token expires.
+When activation keeps a newer verified live credential, it still persists
+identity bindings for both the saved and live credential generations, allowing
+offline identification after restart without replacing either token pair.
+Rotation or replacement invalidates that cached proof for the new pair.
+Verification proves recorded ownership; it does not guarantee that a token
+is currently usable or independently validate the refresh token. Listing
+profiles does not call the identity endpoint. `caam ls --json` includes
+`identity.organization_id` and, for a verified binding,
+`identity.identity_verified: true`.
+
+If verification is unavailable or the access token has expired, CAAM can
+preserve an unverified grant or explicitly activate a legacy snapshot, but
+omits its unverified `oauthAccount` label and reports a warning. Existing
+legacy labels appear as `[unverified]` in the organization column. Exact
+credential matches remain usable; email alone cannot authorize a match
+after token rotation or an overwrite of a named profile. Replaced tokens in
+an already bound profile are rejected unless verification confirms the same
+account and organization. Automatic backups and keepalive synchronization
+follow the same ownership checks.
+
+The first-use `_original` snapshot and automatic recovery snapshots preserve
+the captured credential bytes. Correcting or omitting unsupported account
+labels does not replace those credentials or assert that an expired grant is
+currently usable.
+
+Participating CAAM commands use a private per-vault process lock to serialize
+managed mutations. Captured source generations are rechecked after lock waits
+and during publication, using the existing recoverable file publication path.
+Claude processes do not acquire CAAM's lock: running sessions can retain
+credentials in memory or write shared state after a switch, and CAAM does not
+retarget those processes. Use isolated or shallow profiles for
+simultaneous accounts. Distributed browser recovery currently declines
+organization-specific requests because its email-based browser configuration
+cannot reliably select a Claude organization; activate a verified profile
+explicitly instead. See [issue #132](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/132)
+and the [identity inventory](docs/CLAUDE_AUTH_INVENTORY.md#claude-001-identity-extraction-from-credentials).
+
 #### Shared workflow settings and private account settings
 
 CAAM applies the same `claude_settings` policy to vault activation, isolated
@@ -573,7 +633,7 @@ clears those path overrides; it cannot restore earlier environment values.
 **Notes:** Claude Max has a 5-hour rolling usage window. When you hit it, you'll see rate limit messages. Switch accounts to continue.
 
 **Limitations:**
-- **Email/Identity Detection:** Claude's current auth format does not expose email or account ID. Profile names default to timestamp-based auto-names (`auto-YYYYMMDD-HHMMSS`) unless you specify a name when backing up.
+- **Identity without verification:** Claude OAuth tokens are opaque, and `.claude.json` can describe a different login. Account and organization matching requires a token-bound provider result or an exact credential match; unverified local labels are not ownership proof. See [account and organization identity](#account-and-organization-identity).
 - **Automatic Token Refresh:** Claude Code manages token refresh internally. CAAM cannot refresh Claude tokens—use `/login` in Claude Code if tokens expire.
 - **Usage API:** Claude's usage API is undocumented and may not be reliable.
 
@@ -1773,6 +1833,11 @@ and hit their limit, caam can log them back in without you touching them: a
 publishes the OAuth URL; the **auth agent** on your local machine completes
 the login in its own Chrome profile and sends the code back over SSH; the
 coordinator pastes it and resumes the session.
+
+Organization-specific Claude recovery is refused when the browser agent has
+only email-based account configuration. It cannot choose between Personal and
+Team organizations sharing an email; use a verified vault profile as described
+under [account and organization identity](#account-and-organization-identity).
 
 ```bash
 # One time, on the machine with the browser:

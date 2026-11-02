@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -70,21 +71,23 @@ type PaneTracker struct {
 	UsedAccount  string // Account used for auth
 	ErrorMessage string
 	RetryCount   int
-	ContinueSent bool                 // Enter sent to dismiss the post-login screen this cycle
-	SelectSends  int                  // login-method selections sent this cycle
-	GaveUp       bool                 // retries spent this rate-limit episode; left to a human (survives Reset)
+	ContinueSent bool // Enter sent to dismiss the post-login screen this cycle
+	SelectSends  int  // login-method selections sent this cycle
+	GaveUp       bool // retries spent this rate-limit episode; left to a human (survives Reset)
 	// LimitedAccount and LimitReset describe this episode's limit: the
 	// account Claude Code was signed in with and the banner's reset. They
 	// survive Reset, so retried logins still report them.
-	LimitedAccount string
-	LimitReset     string
+	LimitedAccount        string
+	LimitReset            string
+	LimitedAccountID      string
+	LimitedOrganizationID string
 	// HoldUntil is when the agent will have an account again after it
 	// declined because all were at their limit; no login is started in the
 	// pane before then. It survives Reset.
-	HoldUntil time.Time
-	LastOutput   string               // Cached output for duplicate detection
-	Cooldowns    map[string]time.Time // action -> cooldown expiry
-	mu           sync.RWMutex
+	HoldUntil  time.Time
+	LastOutput string               // Cached output for duplicate detection
+	Cooldowns  map[string]time.Time // action -> cooldown expiry
+	mu         sync.RWMutex
 }
 
 // NewPaneTracker creates a tracker for a pane.
@@ -152,6 +155,29 @@ func (t *PaneTracker) SetLimit(account, reset string) {
 	defer t.mu.Unlock()
 	t.LimitedAccount = account
 	t.LimitReset = reset
+	t.LimitedAccountID = ""
+	t.LimitedOrganizationID = ""
+}
+
+// SetIdentityLimit captures only a provider-verified, token-bound Claude
+// identity. A shared .claude.json is descriptive metadata and cannot tell us
+// which organization's credentials were being used.
+func (t *PaneTracker) SetIdentityLimit(account *identity.Identity, reset string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.LimitedAccount, t.LimitedAccountID, t.LimitedOrganizationID = "", "", ""
+	t.LimitReset = reset
+	if account != nil && account.Verified && account.AccountID != "" && account.OrganizationID != "" {
+		t.LimitedAccount = account.Email
+		t.LimitedAccountID = account.AccountID
+		t.LimitedOrganizationID = account.OrganizationID
+	}
+}
+
+func (t *PaneTracker) GetLimitIdentity() (accountID, organizationID string) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.LimitedAccountID, t.LimitedOrganizationID
 }
 
 // GetLimit returns the account that hit the limit and when it resets.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -31,8 +32,10 @@ func setupProfileBackupCommand(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	for name, data := range map[string]string{
-		".credentials.json": `{"claudeAiOauth":{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":4102444800000}}`,
-		".claude.json":      `{"oauthAccount":{"accountUuid":"new-id","emailAddress":"new@example.test"}}`,
+		// An expired opaque token is still preservable offline. Its local
+		// account label is deliberately unverified and must not be asserted.
+		".credentials.json": `{"claudeAiOauth":{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":1600000000000}}`,
+		".claude.json":      `{"numStartups":3,"projects":{"/example":{"allowedTools":["Read"]}},"oauthAccount":{"accountUuid":"new-id","emailAddress":"new@example.test"}}`,
 		"settings.json":     `{"model":"opus"}`,
 	} {
 		if err := os.WriteFile(filepath.Join(config, name), []byte(data), 0600); err != nil {
@@ -47,6 +50,27 @@ func setupProfileBackupCommand(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 	return config, live
+}
+
+func requireOfflineClaudeSnapshot(t *testing.T, name string, source, saved []byte) {
+	t.Helper()
+	if name != ".claude.json" {
+		if !bytes.Equal(source, saved) {
+			t.Fatalf("snapshot changed %s", name)
+		}
+		return
+	}
+	var want, got map[string]any
+	if err := json.Unmarshal(source, &want); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(saved, &got); err != nil {
+		t.Fatal(err)
+	}
+	delete(want, "oauthAccount")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("offline snapshot must omit the unverified account label and preserve all other state")
+	}
 }
 
 func executeProfileBackupTest(t *testing.T, args ...string) (string, string, error) {
@@ -110,9 +134,10 @@ func TestProfileBackupCommandNonDisruptiveJSON(t *testing.T) {
 			t.Fatal(err)
 		}
 		saved, err := os.ReadFile(filepath.Join(result.Path, name))
-		if err != nil || !bytes.Equal(source, saved) {
+		if err != nil {
 			t.Fatalf("missing snapshot artifact %s: %v", name, err)
 		}
+		requireOfflineClaudeSnapshot(t, name, source, saved)
 	}
 }
 

@@ -438,8 +438,20 @@ type pendingRequest struct {
 	CreatedAt time.Time `json:"created_at"`
 	// LimitedAccount hit its usage limit in the pane, which LimitReset
 	// lifts ("3pm (America/New_York)"); both are empty when unknown.
-	LimitedAccount string `json:"limited_account,omitempty"`
-	LimitReset     string `json:"limit_reset,omitempty"`
+	LimitedAccount        string `json:"limited_account,omitempty"`
+	LimitReset            string `json:"limit_reset,omitempty"`
+	LimitedAccountID      string `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string `json:"limited_organization_id,omitempty"`
+}
+
+// Browser account configuration contains emails, not Claude organization
+// identities. Decline an organization-specific handoff instead of treating
+// every organization of that email as one account or selecting one by chance.
+func organizationSelectionError(p pendingRequest) error {
+	if p.LimitedAccountID != "" || p.LimitedOrganizationID != "" {
+		return fmt.Errorf("automatic browser login cannot select a verified Claude organization; activate a verified account-and-organization profile")
+	}
+	return nil
 }
 
 // fetchPending lists a coordinator's pending auth requests.
@@ -672,6 +684,13 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if err := organizationSelectionError(p); err != nil {
+			if deliveryErr := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+				failureCompletion(p.ID, err), a.delivery, a.logger); deliveryErr != nil {
+				a.logger.Warn("could not deliver organization selection refusal", "request_id", p.ID, "error", deliveryErr)
+			}
+			continue
+		}
 		a.noteLimit(p)
 		a.processAuthRequest(ctx, p.ID, p.URL)
 	}
@@ -679,7 +698,7 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 
 // noteLimit holds the account a request reports at its usage limit.
 func (a *Agent) noteLimit(p pendingRequest) {
-	if p.LimitedAccount == "" {
+	if p.LimitedAccount == "" || organizationSelectionError(p) != nil {
 		return
 	}
 	until := limitResetTime(p.LimitReset, time.Now())

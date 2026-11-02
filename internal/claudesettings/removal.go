@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // PrepareCredentialReplacement stages an exact, already validated credential
@@ -71,6 +73,118 @@ func PrepareCredentialReplacement(snapshot, path string, before, after []byte, s
 	if err := update.checkUnchanged(); err != nil {
 		return nil, err
 	}
+	return update, nil
+}
+
+// PrepareIdentityCache publishes a verified token binding as part of the same
+// recoverable batch as its credential. The cache cannot alias the credential,
+// and proof is checked against captured snapshot bytes before any writes.
+func PrepareIdentityCache(snapshot, credential, path string, binding *identity.ClaudeIdentityBinding) (*Update, error) {
+	if binding == nil {
+		return nil, fmt.Errorf("claude identity cache requires verified ownership")
+	}
+	var err error
+	snapshot, err = filepath.Abs(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, source := range []string{snapshot, credential} {
+		if err := CheckPrivate(path, source); err != nil {
+			return nil, err
+		}
+	}
+	captured, err := Read(snapshot)
+	if err != nil || !binding.MatchesCredentials(captured) {
+		return nil, fmt.Errorf("claude identity proof does not match the selected credential")
+	}
+	before, err := Read(path)
+	if err != nil {
+		return nil, err
+	}
+	metadata := make(map[string]interface{})
+	if before != nil {
+		if json.Unmarshal(before, &metadata) != nil || metadata == nil {
+			return nil, fmt.Errorf("claude identity metadata must contain a JSON object")
+		}
+	}
+	metadata["claude_identity"] = binding
+	metadata["identity"] = binding.Identity.Email
+	metadata["identity_keys"] = []string{"uuid:" + binding.Identity.AccountID, "org:" + binding.Identity.OrganizationID}
+	after, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	update, err := preparedUpdate(path, before, after)
+	if err != nil {
+		return nil, err
+	}
+	update.inputs = settingsInputs{snapshot: bytes.Clone(captured)}
+	update.privateSources = []string{snapshot, credential}
+	return update, update.checkUnchanged()
+}
+
+// PrepareIdentityMetadata updates only CAAM's identity fields for an already
+// captured credential. The credential can come from a keychain without a file
+// mirror. A nil binding removes unverified labels; verify must guard that
+// captured source before publication and again in the batch finalizer.
+func PrepareIdentityMetadata(path, credential string, before, captured []byte, binding *identity.ClaudeIdentityBinding, verify func() error) (*Update, error) {
+	if verify == nil {
+		return nil, fmt.Errorf("claude identity metadata requires a source guard")
+	}
+	if binding != nil && !binding.MatchesCredentials(captured) {
+		return nil, fmt.Errorf("claude identity proof does not match the captured credential")
+	}
+	if err := CheckPrivate(path, credential); err != nil {
+		return nil, err
+	}
+	metadata, err := object(before)
+	if err != nil {
+		return nil, fmt.Errorf("claude identity metadata must contain a JSON object")
+	}
+	delete(metadata, "identity")
+	delete(metadata, "identity_keys")
+	delete(metadata, "claude_identity")
+	if binding != nil {
+		confirmed := *binding
+		confirmed.Identity.Verified = true
+		metadata["claude_identity"], err = json.Marshal(&confirmed)
+		if err != nil {
+			return nil, err
+		}
+		metadata["identity"], _ = json.Marshal(binding.Identity.Email)
+		metadata["identity_keys"], _ = json.Marshal([]string{"uuid:" + binding.Identity.AccountID, "org:" + binding.Identity.OrganizationID})
+	}
+	after, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	update, err := prepareIdentityOnlyUpdate(path, before, after, verify)
+	if err != nil {
+		return nil, err
+	}
+	update.privateSources = []string{credential}
+	return update, update.checkUnchanged()
+}
+
+// Identity-only publication must leave canonical documents and their inode
+// untouched on repeated activation. ChangedKeys compares JSON losslessly.
+func prepareIdentityOnlyUpdate(path string, before, after []byte, verify func() error) (*Update, error) {
+	update, err := preparedUpdate(path, bytes.Clone(before), bytes.Clone(after))
+	if err != nil {
+		return nil, err
+	}
+	changed, err := update.ChangedKeys()
+	if err != nil {
+		return nil, err
+	}
+	if len(changed) == 0 {
+		update.after = update.before
+	}
+	update.verify = verify
 	return update, nil
 }
 

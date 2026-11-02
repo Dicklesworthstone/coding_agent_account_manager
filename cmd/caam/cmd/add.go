@@ -113,6 +113,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("backup current auth: %w", err)
 		}
 		fmt.Printf("  Backed up to %s/%s\n", tool, backupName)
+		if tool == "claude" {
+			for _, warning := range claudeBackupIdentityWarnings(vault.ProfilePath(tool, backupName)) {
+				fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+			}
+		}
 	}
 
 	// Step 2: Clear auth files
@@ -206,6 +211,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("save profile: %w", err)
 	}
 	fmt.Printf("  Saved %s/%s\n", tool, profileName)
+	if tool == "claude" {
+		for _, warning := range claudeBackupIdentityWarnings(vault.ProfilePath(tool, profileName)) {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+		}
+	}
 
 	description, _ := cmd.Flags().GetString("description")
 	tags, _ := cmd.Flags().GetStringSlice("tag")

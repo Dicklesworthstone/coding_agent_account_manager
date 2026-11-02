@@ -6,10 +6,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func TestAllTools(t *testing.T) {
@@ -531,7 +533,7 @@ func TestWatchOnce_ReportsVaultWriteFailure(t *testing.T) {
 	}
 }
 
-func TestWatchOnce_UsesExplicitClaudeConfigAndItsPairedIdentity(t *testing.T) {
+func TestWatchOnce_UsesExplicitClaudeConfigAndVerifiedIdentity(t *testing.T) {
 	home := t.TempDir()
 	configured := filepath.Join(home, "isolated-claude")
 	t.Setenv("HOME", home)
@@ -556,7 +558,7 @@ func TestWatchOnce_UsesExplicitClaudeConfigAndItsPairedIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 		paired, err := json.Marshal(map[string]interface{}{
-			"oauthAccount": map[string]string{"accountUuid": account, "emailAddress": account + "@example.com"},
+			"oauthAccount": map[string]string{"accountUuid": account, "organizationUuid": account + "-org", "emailAddress": account + "@example.com"},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -570,6 +572,9 @@ func TestWatchOnce_UsesExplicitClaudeConfigAndItsPairedIdentity(t *testing.T) {
 		}
 	}
 	vault := authfile.NewVault(filepath.Join(t.TempDir(), "vault"))
+	addWatcherClaudeIdentity(t, vault,
+		identity.Identity{AccountID: "configured", OrganizationID: "configured-org", Email: "configured@example.com"},
+		[2]string{"synthetic-access-configured", "synthetic-refresh-configured"})
 	discovered, err := WatchOnce(vault, []string{"CLAUDE", "claude"}, nil)
 	if err != nil || len(discovered) != 1 || discovered[0] != "claude/configured@example.com" {
 		t.Fatalf("explicit config did not select its own credential and identity: %v, %v", discovered, err)
@@ -580,7 +585,15 @@ func TestWatchOnce_UsesExplicitClaudeConfigAndItsPairedIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 		saved, err := os.ReadFile(vault.BackupPath("claude", "configured@example.com", name))
-		if err != nil || string(live) != string(saved) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == ".claude.json" {
+			var liveSettings, savedSettings map[string]interface{}
+			if json.Unmarshal(live, &liveSettings) != nil || json.Unmarshal(saved, &savedSettings) != nil || !reflect.DeepEqual(liveSettings, savedSettings) {
+				t.Fatal("configured account state changed beyond verified identity serialization")
+			}
+		} else if string(live) != string(saved) {
 			t.Fatalf("configured %s not captured intact: %v", name, err)
 		}
 	}

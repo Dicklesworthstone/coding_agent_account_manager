@@ -674,6 +674,31 @@ func formatIdentityDisplay(id *identity.Identity) (string, string) {
 	return email, plan
 }
 
+// formatOrganizationDisplay includes Claude's stable organization ID because
+// one account can belong to multiple organizations, including organizations
+// that share a display name. Neither the email nor the name identifies a grant.
+func formatOrganizationDisplay(id *identity.Identity) string {
+	if id == nil {
+		return "unknown"
+	}
+	name := strings.TrimSpace(id.Organization)
+	orgID := strings.TrimSpace(id.OrganizationID)
+	verification := ""
+	if !id.Verified {
+		verification = " [unverified]"
+	}
+	if name != "" && orgID != "" {
+		return fmt.Sprintf("%s (%s)%s", name, orgID, verification)
+	}
+	if orgID != "" {
+		return orgID + verification
+	}
+	if name != "" {
+		return name + " (ID unknown)" + verification
+	}
+	return "unknown"
+}
+
 // getCooldownString returns a formatted string showing cooldown remaining time.
 // Returns empty string if no active cooldown or if db is unavailable.
 func getCooldownString(provider, profile string, opts health.FormatOptions) string {
@@ -848,11 +873,32 @@ var versionCmd = &cobra.Command{
 
 // backupOutput is the JSON output structure for backup command.
 type backupOutput struct {
-	Success bool   `json:"success"`
-	Tool    string `json:"tool"`
-	Profile string `json:"profile"`
-	Path    string `json:"path"`
-	Error   string `json:"error,omitempty"`
+	Success  bool     `json:"success"`
+	Tool     string   `json:"tool"`
+	Profile  string   `json:"profile"`
+	Path     string   `json:"path"`
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+const claudeBackupIdentityWarning = "Claude account and organization could not be verified; unverified account labels were omitted."
+
+// Reporting a backup never initiates verification. An opaque OAuth grant can
+// be preserved offline, but its unverified labels must not look authoritative.
+func claudeBackupIdentityWarnings(profileDir string) []string {
+	path := filepath.Join(profileDir, ".credentials.json")
+	credential, err := os.ReadFile(path)
+	if err != nil {
+		return nil // API-key/helper profiles need no OAuth identity endpoint.
+	}
+	if _, err := identity.ClaudeCredentialFingerprint(credential); err != nil {
+		return nil
+	}
+	binding, err := identity.ReadClaudeIdentityBindingForCredentials(path, credential)
+	if err == nil && binding != nil {
+		return nil
+	}
+	return []string{claudeBackupIdentityWarning}
 }
 
 // backupCmd saves current auth files to the vault.
@@ -928,6 +974,9 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 	output.Success = true
 	output.Path = vault.ProfilePath(tool, profileName)
+	if tool == "claude" {
+		output.Warnings = claudeBackupIdentityWarnings(output.Path)
+	}
 
 	if jsonOutput {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -937,6 +986,9 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Backed up %s auth to profile '%s'\n", tool, profileName)
 	fmt.Printf("  Vault: %s\n", output.Path)
+	for _, warning := range output.Warnings {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+	}
 	return nil
 }
 
@@ -1296,6 +1348,11 @@ same name also exists, so 'caam exec' works for it too. Isolated profiles with
 no vault counterpart are listed after the table; 'caam profile ls' shows them
 in detail.
 
+Claude profiles also show the organization name and stable organization ID,
+so personal and Team subscriptions sharing an email remain distinguishable.
+An [unverified] label comes from local metadata that has not been checked
+against the saved credential; listing profiles does not contact the provider.
+
 Examples:
   caam ls              # List all profiles
   caam ls claude       # List just Claude profiles
@@ -1381,7 +1438,11 @@ func runLs(cmd *cobra.Command, args []string) error {
 		}
 
 		if !jsonOutput {
-			fmt.Printf("%-22s  %-9s  %-24s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", "PLAN", "STATUS")
+			organizationColumn := ""
+			if tool == "claude" {
+				organizationColumn = fmt.Sprintf("  %-30s", "ORGANIZATION")
+			}
+			fmt.Printf("%-22s  %-9s  %-24s%s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", organizationColumn, "PLAN", "STATUS")
 		}
 
 		// Check which is active
@@ -1431,7 +1492,11 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("%s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
+				organizationColumn := ""
+				if tool == "claude" {
+					organizationColumn = fmt.Sprintf("  %-30s", formatOrganizationDisplay(id))
+				}
+				fmt.Printf("%s%-20s  %-9s  %-24s%s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, organizationColumn, plan, healthStr)
 				if line := lsLabelLine(description, tags); line != "" {
 					fmt.Printf("    %s\n", line)
 				}
@@ -1494,7 +1559,11 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		if !jsonOutput {
 			fmt.Printf("%s:\n", tool)
-			fmt.Printf("  %-22s  %-9s  %-24s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", "PLAN", "STATUS")
+			organizationColumn := ""
+			if tool == "claude" {
+				organizationColumn = fmt.Sprintf("  %-30s", "ORGANIZATION")
+			}
+			fmt.Printf("  %-22s  %-9s  %-24s%s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", organizationColumn, "PLAN", "STATUS")
 		}
 
 		for _, p := range profiles {
@@ -1540,7 +1609,11 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("  %s%-20s  %-9s  %-24s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, plan, healthStr)
+				organizationColumn := ""
+				if tool == "claude" {
+					organizationColumn = fmt.Sprintf("  %-30s", formatOrganizationDisplay(id))
+				}
+				fmt.Printf("  %s%-20s  %-9s  %-24s%s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, organizationColumn, plan, healthStr)
 				if line := lsLabelLine(description, tags); line != "" {
 					fmt.Printf("      %s\n", line)
 				}

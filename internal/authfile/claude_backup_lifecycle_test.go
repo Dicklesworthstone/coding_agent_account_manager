@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
@@ -144,9 +145,14 @@ func TestClaudeBackupProjectsCapturedDesktopCaches(t *testing.T) {
 			t.Setenv("CAAM_KEYCHAIN", "0")
 			files := ClaudeAuthFiles()
 			vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+			account := identity.Identity{AccountID: "desktop-test-account", OrganizationID: "desktop-test-org"}
+			setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+				keychainCreds("old-generation"): account,
+				keychainCreds("new-generation"): account,
+			})
 			credentials := claudeFileSetPath(files, ".credentials.json")
 			desktop := claudeDesktopConfigPath(home)
-			authSourceTestWrite(t, credentials, keychainCreds("old-account"))
+			authSourceTestWrite(t, credentials, keychainCreds("old-generation"))
 			authSourceTestWrite(t, desktop, `{"theme":"old-policy","oauth:tokenCacheV2":"synthetic-old-cache"}`)
 			if err := vault.Backup(files, "work"); err != nil {
 				t.Fatal(err)
@@ -160,7 +166,7 @@ func TestClaudeBackupProjectsCapturedDesktopCaches(t *testing.T) {
 			for _, name := range []string{".credentials.json", "config.json", "meta.json"} {
 				previous[name] = readFixtureFile(t, filepath.Join(profileDir, name))
 			}
-			authSourceTestWrite(t, credentials, keychainCreds("new-account"))
+			authSourceTestWrite(t, credentials, keychainCreds("new-generation"))
 			authSourceTestWrite(t, desktop, tc.document)
 			err = vault.Backup(files, "work")
 			if tc.invalid {
@@ -200,7 +206,7 @@ func TestClaudeBackupProjectsCapturedDesktopCaches(t *testing.T) {
 			if got := readFixtureFile(t, desktop); got != tc.document {
 				t.Fatal("backup changed live Desktop preferences or credentials")
 			}
-			if got := readFixtureFile(t, credentials); got != keychainCreds("new-account") {
+			if got := readFixtureFile(t, credentials); got != keychainCreds("new-generation") {
 				t.Fatal("backup changed the live Code credential")
 			}
 		})
@@ -209,6 +215,11 @@ func TestClaudeBackupProjectsCapturedDesktopCaches(t *testing.T) {
 
 func TestClaudeBackupCapturesKeychainBeforeClassifyingMissingSources(t *testing.T) {
 	f := newKeychainFixture(t)
+	account := identity.Identity{AccountID: "keychain-test-account", OrganizationID: "keychain-test-org"}
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("first"):   account,
+		keychainCreds("rotated"): account,
+	})
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	settings := filepath.Join(filepath.Dir(f.credPath), "settings.json")

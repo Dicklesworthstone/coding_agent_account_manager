@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/spf13/cobra"
 )
 
@@ -360,4 +362,245 @@ func TestActivateSwitchBackupPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func requireClaudeSavedOrganization(t *testing.T, profile, accountID, organizationID, email string, credential []byte) {
+	t.Helper()
+	credentialPath := vault.BackupPath("claude", profile, ".credentials.json")
+	requireSwitchCredential(t, credentialPath, string(credential))
+	binding, err := identity.ReadClaudeIdentityBinding(credentialPath)
+	if err != nil || binding == nil || binding.Identity.AccountID != accountID || binding.Identity.OrganizationID != organizationID || binding.Identity.Email != email || !binding.MatchesCredentials(credential) {
+		t.Fatalf("saved profile %s lost verified token ownership: %v", profile, err)
+	}
+	settings, err := os.ReadFile(vault.BackupPath("claude", profile, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Account struct {
+			AccountID      string `json:"accountUuid"`
+			OrganizationID string `json:"organizationUuid"`
+			Email          string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(settings, &doc); err != nil || doc.Account.AccountID != accountID || doc.Account.OrganizationID != organizationID || doc.Account.Email != email {
+		t.Fatalf("saved profile %s retained mismatched OAuth metadata: %v", profile, err)
+	}
+}
+
+func TestBackupClaudeCorrectsStaleOrganizationWithoutChangingNativeFiles(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"numStartups":12,"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal","organizationName":"Personal"}}`)
+	before, err := captureBackupTree(filepath.Dir(fileSet.Files[0].Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		if !bytes.Equal(data, credentials["team"]) {
+			return nil, fmt.Errorf("unexpected credential generation")
+		}
+		return claudeCLIIdentityBinding(t, data, "org-team", "Team"), nil
+	}
+	command := &cobra.Command{}
+	command.Flags().Bool("json", true, "")
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	if err := runBackup(command, []string{"claude", "team-snapshot"}); err != nil {
+		t.Fatalf("backup failed: %v", err)
+	}
+	var output backupOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || !output.Success {
+		t.Fatalf("backup did not report success: %v", err)
+	}
+	if strings.Contains(stdout.String(), "SYNTHETIC-") {
+		t.Fatal("backup exposed token material")
+	}
+	requireClaudeSavedOrganization(t, "team-snapshot", "shared-account-id", "org-team", "shared@example.test", credentials["team"])
+	assertBackupTreeUnchanged(t, filepath.Dir(fileSet.Files[0].Path), before)
+}
+
+func TestBackupClaudeRejectsReplacingNamedProfileWithDifferentOrganization(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal"}}`)
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		return claudeCLIIdentityBinding(t, data, "org-team", "Team"), nil
+	}
+	// An initialized vault retains its private process lock between commands.
+	// Include it in the baseline so the refusal must leave the entire tree intact.
+	if err := os.WriteFile(filepath.Join(vault.BasePath(), ".caam-mutation.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := captureBackupTree(vault.BasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := &cobra.Command{}
+	command.Flags().Bool("json", true, "")
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	err = runBackup(command, []string{"claude", "personal"})
+	var output backupOutput
+	if err == nil || json.Unmarshal(stdout.Bytes(), &output) != nil || output.Success || output.Error == "" {
+		t.Fatalf("backup replaced an existing different organization: %v", err)
+	}
+	if strings.Contains(stdout.String(), "SYNTHETIC-") {
+		t.Fatal("failed backup exposed token material")
+	}
+	assertBackupTreeUnchanged(t, vault.BasePath(), before)
+}
+
+func TestBackupClaudeUnavailableIdentityIsPreservedWithExplicitWarning(t *testing.T) {
+	for _, verificationError := range []error{identity.ErrClaudeIdentityUnavailable, identity.ErrClaudeTokenExpired} {
+		t.Run(verificationError.Error(), func(t *testing.T) {
+			fileSet, _ := setupClaudeOrganizationProfiles(t)
+			credential := `{"claudeAiOauth":{"accessToken":"SYNTHETIC-offline-access","refreshToken":"SYNTHETIC-offline-refresh","expiresAt":1600000000000}}`
+			settings := `{"numStartups":4,"oauthAccount":{"accountUuid":"stale-account","emailAddress":"stale@example.test","organizationUuid":"stale-org"}}`
+			writeNativeTestCredential(t, fileSet.Files[0].Path, credential)
+			writeNativeTestCredential(t, fileSet.Files[1].Path, settings)
+			vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+				return nil, verificationError
+			}
+			command := &cobra.Command{}
+			command.Flags().Bool("json", true, "")
+			var stdout bytes.Buffer
+			command.SetOut(&stdout)
+			if err := runBackup(command, []string{"claude", "offline"}); err != nil {
+				t.Fatalf("offline preservation failed: %v", err)
+			}
+			var output backupOutput
+			if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || !output.Success || len(output.Warnings) != 1 || output.Warnings[0] != claudeBackupIdentityWarning {
+				t.Fatalf("backup did not explain unverified identity: %v", err)
+			}
+			requireSwitchCredential(t, vault.BackupPath("claude", "offline", ".credentials.json"), credential)
+			saved, err := os.ReadFile(vault.BackupPath("claude", "offline", ".claude.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireOfflineClaudeSnapshot(t, ".claude.json", []byte(settings), saved)
+			requireSwitchCredential(t, fileSet.Files[0].Path, credential)
+			requireSwitchCredential(t, fileSet.Files[1].Path, settings)
+			if strings.Contains(stdout.String(), "SYNTHETIC-") {
+				t.Fatal("offline backup exposed token material")
+			}
+		})
+	}
+}
+
+func TestActivateClaudeAutoBackupKeepsTokenAndOrganizationTogether(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	// A different login arrived while an older Claude session left its
+	// account metadata behind. It must not overwrite either named profile.
+	unsaved := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-other-access","refreshToken":"SYNTHETIC-other-refresh","expiresAt":%d,"subscriptionType":"team"}}`, time.Now().Add(4*time.Hour).UnixMilli()))
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(unsaved))
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal","organizationName":"Personal"}}`)
+	writeNativeTestCredential(t, vault.BackupPath("claude", "_original", ".credentials.json"), string(credentials["personal"]))
+	writeNativeTestCredential(t, filepath.Join(os.Getenv("CAAM_HOME"), "config.yaml"), "version: 1\nanalytics:\n  enabled: false\nsafety:\n  auto_backup_before_switch: smart\n  max_auto_backups: 5\n")
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		if bytes.Equal(data, unsaved) {
+			binding := claudeCLIIdentityBinding(t, data, "org-other", "Other Team")
+			binding.Identity.AccountID = "other-account-id"
+			binding.Identity.Email = "other@example.test"
+			return binding, nil
+		}
+		for name, credential := range credentials {
+			if bytes.Equal(data, credential) {
+				return claudeCLIIdentityBinding(t, data, "org-"+name, "Shared display name"), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected credential generation")
+	}
+	output, err := runActivateJSONCommand(t, "claude", "personal")
+	if err != nil || !output.Success || !strings.HasPrefix(output.AutoBackup, "_backup_") || output.PreviousProfile != "" || output.ResnapshottedProfile != "" {
+		t.Fatalf("switch did not safely preserve the unsaved account: %+v, %v", output, err)
+	}
+	requireSwitchCredential(t, fileSet.Files[0].Path, string(credentials["personal"]))
+	for name, credential := range credentials {
+		requireSwitchCredential(t, vault.BackupPath("claude", name, ".credentials.json"), string(credential))
+	}
+	requireClaudeSavedOrganization(t, output.AutoBackup, "other-account-id", "org-other", "other@example.test", unsaved)
+	// Restarted reporting must still recover the backup's actual token owner.
+	vault = authfile.NewVault(vault.BasePath())
+	id := getVaultIdentity("claude", output.AutoBackup)
+	if id == nil || !id.Verified || id.AccountID != "other-account-id" || id.OrganizationID != "org-other" || id.Email != "other@example.test" {
+		t.Fatal("restart lost the automatic backup's identity binding")
+	}
+	var liveSettings struct {
+		Account struct {
+			OrganizationID string `json:"organizationUuid"`
+		} `json:"oauthAccount"`
+	}
+	live, err := os.ReadFile(fileSet.Files[1].Path)
+	if err != nil || json.Unmarshal(live, &liveSettings) != nil || liveSettings.Account.OrganizationID != "org-personal" {
+		t.Fatalf("activation did not publish target organization metadata: %v", err)
+	}
+}
+
+func TestActivateClaudeSameEmailDifferentOrganizationDoesNotKeepWrongLiveGrant(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	rotatedPersonal := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-personal-rotated-access","refreshToken":"SYNTHETIC-personal-rotated-refresh","expiresAt":%d,"subscriptionType":"max"}}`, time.Now().Add(8*time.Hour).UnixMilli()))
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(rotatedPersonal))
+	// A longer-lived Personal grant plus stale Team metadata must not make
+	// activating Team a false same-account no-op.
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-team","organizationName":"Team"}}`)
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		if bytes.Equal(data, rotatedPersonal) {
+			return claudeCLIIdentityBinding(t, data, "org-personal", "Personal"), nil
+		}
+		for name, credential := range credentials {
+			if bytes.Equal(data, credential) {
+				return claudeCLIIdentityBinding(t, data, "org-"+name, "Shared display name"), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected credential generation")
+	}
+	output, err := runActivateJSONCommand(t, "claude", "team")
+	if err != nil || !output.Success || output.KeptLive || output.PreviousProfile != "personal" || output.ResnapshottedProfile != "personal" {
+		t.Fatalf("same email confused organization activation: %+v, %v", output, err)
+	}
+	requireSwitchCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+	requireSwitchCredential(t, vault.BackupPath("claude", "personal", ".credentials.json"), string(rotatedPersonal))
+	bound, err := identity.ReadClaudeIdentityBinding(vault.BackupPath("claude", "personal", ".credentials.json"))
+	if err != nil || bound == nil || bound.Identity.OrganizationID != "org-personal" || !bound.MatchesCredentials(rotatedPersonal) {
+		t.Fatalf("preserved refresh lost its personal organization binding: %v", err)
+	}
+}
+
+func TestActivateClaudeRejectsMismatchedAccessTokenBeforeChangingLive(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-team"}}`)
+	var tampered map[string]any
+	if err := json.Unmarshal(credentials["personal"], &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered["claudeAiOauth"].(map[string]any)["accessToken"] = "SYNTHETIC-replaced-access"
+	changed, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeNativeTestCredential(t, vault.BackupPath("claude", "personal", ".credentials.json"), string(changed))
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		return claudeCLIIdentityBinding(t, data, "org-team", "Team"), nil
+	}
+	// Retain the normal inert lock in the baseline; no credential, metadata,
+	// or other vault-tree change is permitted when activation is refused.
+	if err := os.WriteFile(filepath.Join(vault.BasePath(), ".caam-mutation.lock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	liveBefore, err := captureBackupTree(filepath.Dir(fileSet.Files[0].Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultBefore, err := captureBackupTree(vault.BasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runActivateJSONCommand(t, "claude", "personal")
+	if err == nil || output.Success || output.Error == "" {
+		t.Fatalf("mismatched saved access token was activated: %+v, %v", output, err)
+	}
+	assertBackupTreeUnchanged(t, filepath.Dir(fileSet.Files[0].Path), liveBefore)
+	assertBackupTreeUnchanged(t, vault.BasePath(), vaultBefore)
 }

@@ -2,6 +2,7 @@ package authfile
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func discoveryFixture(t *testing.T, tool string, files map[string]string) (*Vault, AuthFileSet, string) {
@@ -237,6 +240,11 @@ func TestCaptureDiscoveryRecognizesCompleteNativeSources(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			v, set, live := discoveryFixture(t, test.tool, map[string]string{test.primary: test.credential})
+			if test.name == "Claude OAuth" {
+				setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+					test.credential: {AccountID: "claude-user", OrganizationID: "claude-org", Email: "claude@example.com"},
+				})
+			}
 			result, err := v.CaptureDiscovery(set)
 			if err != nil || result == nil || !result.Created || result.Updated || result.Unchanged {
 				t.Fatalf("capture = %+v, %v", result, err)
@@ -470,19 +478,21 @@ func TestCaptureDiscoveryKeepsNewerSavedGrant(t *testing.T) {
 	}
 }
 
-func TestCaptureDiscoveryPreservesOpaqueRotationAndNewLogin(t *testing.T) {
+func TestCaptureDiscoveryPreservesVerifiedClaudeRotationAndNewLogin(t *testing.T) {
 	initial := claudeRotationCreds("synthetic-access-one", "synthetic-stable-refresh", 1000)
 	rotated := claudeRotationCreds("synthetic-access-two", "synthetic-stable-refresh", 2000)
 	unproven := claudeRotationCreds("synthetic-other-access", "synthetic-other-refresh", 3000)
 	v, set, live := discoveryFixture(t, "claude", map[string]string{claudeCredentialsFile: initial})
+	account := identity.Identity{AccountID: "account-a", OrganizationID: "org-a"}
+	setClaudeFixtureIdentities(t, v, map[string]identity.Identity{initial: account, rotated: account})
 	first, err := v.CaptureDiscovery(set)
-	if err != nil || !first.Created || !strings.HasPrefix(first.Profile, "auto-") {
-		t.Fatalf("anonymous capture = %+v, %v", first, err)
+	if err != nil || !first.Created || first.Profile != "account-a" || first.Identity == nil || !first.Identity.Verified {
+		t.Fatalf("verified capture = %+v, %v", first, err)
 	}
 	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), rotated)
 	second, err := v.CaptureDiscovery(set)
 	if err != nil || !second.Updated || second.Profile != first.Profile {
-		t.Fatalf("opaque refresh continuity = %+v, %v", second, err)
+		t.Fatalf("verified account-and-organization continuity = %+v, %v", second, err)
 	}
 	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), unproven)
 	third, err := v.CaptureDiscovery(set)
@@ -491,6 +501,146 @@ func TestCaptureDiscoveryPreservesOpaqueRotationAndNewLogin(t *testing.T) {
 	}
 	if got := readFixtureFile(t, v.BackupPath("claude", first.Profile, claudeCredentialsFile)); got != rotated {
 		t.Fatal("new anonymous login replaced the previous account")
+	}
+	// An unchanged refresh token cannot authorize substituting an access
+	// token from another login, even when the file advertises a newer expiry.
+	mismatched := claudeRotationCreds("synthetic-unverified-access", "synthetic-stable-refresh", 4000)
+	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), mismatched)
+	fourth, err := v.CaptureDiscovery(set)
+	if err != nil || !fourth.Created || fourth.Profile == first.Profile || fourth.Identity.Verified {
+		t.Fatalf("unverified access substitution reused an account: %+v, %v", fourth, err)
+	}
+	if got := readFixtureFile(t, v.BackupPath("claude", first.Profile, claudeCredentialsFile)); got != rotated {
+		t.Fatal("shared refresh token allowed an unverified access token to overwrite the saved account")
+	}
+}
+
+func TestCaptureDiscoveryUnverifiedClaudeGrantsStaySeparateAndRepeatOffline(t *testing.T) {
+	initial := claudeRotationCreds("unknown-access-one", "shared-refresh", 1000)
+	replacement := claudeRotationCreds("unknown-access-two", "shared-refresh", 2000)
+	v, set, live := discoveryFixture(t, "claude", map[string]string{claudeCredentialsFile: initial, claudeSettingsFile: aliceSettings(1)})
+	setClaudeFixtureIdentities(t, v, nil)
+	verify := v.ClaudeIdentityVerifier
+	calls := 0
+	v.ClaudeIdentityVerifier = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		calls++
+		return verify(ctx, data)
+	}
+	first, err := v.CaptureDiscovery(set)
+	if err != nil || !first.Created || !strings.HasPrefix(first.Profile, "auto-") || first.Identity.Email != "" {
+		t.Fatalf("unverified initial capture: %+v, %v", first, err)
+	}
+	if readJSONMap(t, v.BackupPath("claude", first.Profile, claudeSettingsFile))["oauthAccount"] != nil {
+		t.Fatal("unverified metadata mislabeled an automatic snapshot")
+	}
+	writeFixtureFile(t, filepath.Join(live, claudeSettingsFile), bobSettings(2))
+	again, err := v.CaptureDiscovery(set)
+	if err != nil || !again.Unchanged || again.Profile != first.Profile || calls != 1 {
+		t.Fatalf("metadata churn retried verification or changed owner: %+v, %v, calls=%d", again, err, calls)
+	}
+	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), replacement)
+	second, err := v.CaptureDiscovery(set)
+	if err != nil || !second.Created || second.Profile == first.Profile || calls != 2 {
+		t.Fatalf("unverified shared-refresh substitution overwrote a grant: %+v, %v", second, err)
+	}
+	if got := readFixtureFile(t, v.BackupPath("claude", first.Profile, claudeCredentialsFile)); got != initial {
+		t.Fatal("unverified snapshot's original credentials were overwritten")
+	}
+}
+
+func TestCaptureDiscoverySeparatesClaudeOrganizationsAndPersistsProofs(t *testing.T) {
+	personal := claudeRotationCreds("same-user-personal-access", "personal-refresh", 1000)
+	team := claudeRotationCreds("same-user-team-access", "team-refresh", 2000)
+	v, set, live := discoveryFixture(t, "claude", map[string]string{
+		claudeCredentialsFile: personal,
+		claudeSettingsFile:    aliceSettings(1),
+	})
+	setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+		personal: {AccountID: "same-user", OrganizationID: "personal-org", Organization: "Personal", Email: "shared@example.com"},
+		team:     {AccountID: "same-user", OrganizationID: "team-org", Organization: "Team", Email: "shared@example.com"},
+	})
+	first, err := v.CaptureDiscovery(set)
+	if err != nil || !first.Created || first.Identity.OrganizationID != "personal-org" {
+		t.Fatalf("personal discovery: %+v, %v", first, err)
+	}
+	// A second session selects Team but leaves the personal account block.
+	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), team)
+	second, err := v.CaptureDiscovery(set)
+	if err != nil || !second.Created || second.Profile == first.Profile || second.Identity.OrganizationID != "team-org" {
+		t.Fatalf("Team discovery collapsed the shared email: %+v, %v", second, err)
+	}
+	for _, entry := range []struct {
+		result       *DiscoveryResult
+		credentials  string
+		organization string
+	}{{first, personal, "personal-org"}, {second, team, "team-org"}} {
+		path := v.BackupPath("claude", entry.result.Profile, claudeCredentialsFile)
+		if got := readFixtureFile(t, path); got != entry.credentials {
+			t.Fatal("discovered organization contains another organization's credentials")
+		}
+		binding, err := identity.ReadClaudeIdentityBinding(path)
+		if err != nil || binding == nil || binding.Identity.OrganizationID != entry.organization {
+			t.Fatalf("discovery did not persist the matching organization proof: %v", err)
+		}
+		settings := readJSONMap(t, v.BackupPath("claude", entry.result.Profile, claudeSettingsFile))
+		if settings["oauthAccount"].(map[string]interface{})["organizationUuid"] != entry.organization {
+			t.Fatal("saved account block disagrees with the verified token identity")
+		}
+	}
+	// New process state must identify a repeated grant from the persisted
+	// proof even when verification is unavailable and the token has expired.
+	restarted := NewVault(v.basePath)
+	restarted.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+		t.Fatal("repeated discovery contacted the identity endpoint")
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+	again, err := restarted.CaptureDiscovery(set)
+	if err != nil || !again.Unchanged || again.Profile != second.Profile || !again.Identity.Verified || again.Identity.OrganizationID != "team-org" {
+		t.Fatalf("restart lost exact-token organization identity: %+v, %v", again, err)
+	}
+}
+
+func TestCaptureDiscoveryChecksConcurrentClaudeWriterAfterVerification(t *testing.T) {
+	for _, replaceCredential := range []bool{false, true} {
+		name := "stale-label-only"
+		if replaceCredential {
+			name = "new-token-generation"
+		}
+		t.Run(name, func(t *testing.T) {
+			original := claudeRotationCreds("captured-access", "captured-refresh", 1000)
+			replacement := claudeRotationCreds("concurrent-access", "concurrent-refresh", 2000)
+			v, set, live := discoveryFixture(t, "claude", map[string]string{claudeCredentialsFile: original, claudeSettingsFile: aliceSettings(1)})
+			setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+				original: {AccountID: "captured-account", OrganizationID: "captured-org", Email: "captured@example.com"},
+			})
+			verify := v.ClaudeIdentityVerifier
+			v.ClaudeIdentityVerifier = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				binding, err := verify(ctx, data)
+				// Model an independently running Claude session writing during
+				// the provider round trip. It does not share CAAM's vault lock.
+				writeFixtureFile(t, filepath.Join(live, claudeSettingsFile), bobSettings(2))
+				if replaceCredential {
+					writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), replacement)
+				}
+				return binding, err
+			}
+			result, err := v.CaptureDiscovery(set)
+			if replaceCredential {
+				profiles, listErr := v.List("claude")
+				if err == nil || result != nil || listErr != nil || len(profiles) != 0 {
+					t.Fatalf("concurrent token replacement published an inconsistent snapshot: %+v, %v; profiles=%v, %v", result, err, profiles, listErr)
+				}
+				return
+			}
+			if err != nil || !result.Created || !result.Identity.Verified || result.Identity.OrganizationID != "captured-org" {
+				t.Fatalf("stale concurrent label overrode the captured token identity: %+v, %v", result, err)
+			}
+			settings := readJSONMap(t, v.BackupPath("claude", result.Profile, claudeSettingsFile))
+			account := settings["oauthAccount"].(map[string]interface{})
+			if account["accountUuid"] != "captured-account" || account["organizationUuid"] != "captured-org" {
+				t.Fatal("concurrent metadata mislabelled the saved credentials")
+			}
+		})
 	}
 }
 
@@ -515,21 +665,24 @@ func TestCaptureDiscoverySecondaryCredentialIsNeverLostToStalePrimary(t *testing
 	}
 }
 
-func TestCaptureDiscoveryRejectsConflictingClaudePair(t *testing.T) {
+func TestCaptureDiscoveryRepairsStaleClaudeMetadataFromProviderProof(t *testing.T) {
 	credential := `{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","accountId":"new-account","email":"new@example.com","expiresAt":2000}}`
 	settings := `{"oauthAccount":{"accountUuid":"old-account","emailAddress":"old@example.com"}}`
 	v, set, live := discoveryFixture(t, "claude", map[string]string{claudeCredentialsFile: credential, claudeSettingsFile: settings})
-	if _, err := v.CaptureDiscovery(set); !errors.Is(err, ErrInvalidCredentials) {
-		t.Fatalf("conflicting pair = %v", err)
-	}
-	profiles, _ := v.List("claude")
-	if len(profiles) != 0 {
-		t.Fatal("discovery published an unusable conflicting snapshot")
-	}
-	writeFixtureFile(t, filepath.Join(live, claudeSettingsFile), `{"oauthAccount":{"accountUuid":"new-account","emailAddress":"new@example.com"}}`)
+	setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+		credential: {AccountID: "new-account", OrganizationID: "new-org", Email: "new@example.com"},
+	})
 	result, err := v.CaptureDiscovery(set)
 	if err != nil || !result.Created || result.Profile != "new@example.com" {
-		t.Fatalf("completed pair = %+v, %v", result, err)
+		t.Fatalf("provider-confirmed capture = %+v, %v", result, err)
+	}
+	saved := readJSONMap(t, v.BackupPath("claude", result.Profile, claudeSettingsFile))
+	account, _ := saved["oauthAccount"].(map[string]interface{})
+	if account["accountUuid"] != "new-account" || account["organizationUuid"] != "new-org" || account["emailAddress"] != "new@example.com" {
+		t.Fatal("saved account metadata does not describe the verified tokens")
+	}
+	if readFixtureFile(t, filepath.Join(live, claudeSettingsFile)) != settings {
+		t.Fatal("discovery modified shared native metadata")
 	}
 }
 
@@ -595,6 +748,9 @@ func TestCaptureDiscoveryExplicitClaudeConfigRemainsIsolatedAndRestorable(t *tes
 			t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 			set := ClaudeAuthFiles()
 			credential := `{"claudeAiOauth":{"accessToken":"synthetic-selected-access","refreshToken":"synthetic-selected-refresh","accountId":"selected-account","email":"selected@example.com","expiresAt":2000}}`
+			setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+				credential: {AccountID: "selected-account", OrganizationID: "selected-org", Email: "selected@example.com"},
+			})
 			session := `{"oauthAccount":{"accountUuid":"selected-account","emailAddress":"selected@example.com"},"projects":{"/synthetic-repo":{"history":["selected-history"],"lastSessionId":"selected-session","allowedTools":["Read"]}}}`
 			settings := `{"apiKeyHelper":"selected-helper","env":{"PRIVATE_GATEWAY":"selected-gateway"},"model":"old-shared-model"}`
 			for name, data := range map[string]string{claudeCredentialsFile: credential, claudeSettingsFile: session, "settings.json": settings} {

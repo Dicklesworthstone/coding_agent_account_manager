@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 const (
@@ -39,6 +40,9 @@ type Options struct {
 	Now           func() time.Time
 	ClaudeBin     string
 	GrokBin       string
+	// IdentityClient may supply a transport for the fixed Claude profile
+	// endpoint. It never changes the endpoint or redirect policy.
+	IdentityClient *http.Client
 
 	// AfterRenew runs under the keepalive lock after a live credential is
 	// verified, including valid grants skipped by TTL or minimum gap. It may
@@ -154,7 +158,7 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	result.ExpiresBefore = before.ExpiresAt
-	if !SameAccount(grant.Identity, before.Identity) {
+	if !sameDiscoveredAccount(grant, before) {
 		result.Status, result.Reason = "blocked", "account_changed_since_discovery"
 		return result
 	}
@@ -224,7 +228,7 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	result.ExpiresBefore = before.ExpiresAt
-	if !SameAccount(grant.Identity, before.Identity) {
+	if !sameDiscoveredAccount(grant, before) {
 		result.Status, result.Reason = "blocked", "account_changed_since_discovery"
 		return result
 	}
@@ -314,6 +318,19 @@ func runGrant(ctx context.Context, grant Grant, opts Options) Result {
 		return result
 	}
 	result.ExpiresAfter = after.ExpiresAt
+	if grant.Provider == "claude" && before.claudeIdentity != nil && after.claudeIdentity == nil {
+		binding, verifyErr := identity.VerifyClaudeCredentials(ctx, after.data, opts.IdentityClient)
+		if verifyErr != nil {
+			result.Status, result.Reason = "failed", "renewed_identity_unverified"
+			return result
+		}
+		after.claudeIdentity = binding
+		after.Identity = accountIdentityFromClaude(binding.Identity)
+		if err := cacheClaudeIdentity(grant, after); err != nil {
+			result.Status, result.Reason = "failed", "credential_changed_after_renewal"
+			return result
+		}
+	}
 	if !SameAccount(before.Identity, after.Identity) {
 		result.Status, result.Reason = "failed", "account_changed"
 		return result
@@ -372,6 +389,19 @@ func synchronizeResult(ctx context.Context, grant Grant, current CredentialSnaps
 		syncCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 		defer cancel()
 		var err error
+		if grant.Provider == "claude" && current.claudeIdentity == nil {
+			binding, verifyErr := identity.VerifyClaudeCredentials(syncCtx, current.data, opts.IdentityClient)
+			if verifyErr != nil {
+				result.Sync = syncSkipped("source_identity_unverified", "Claude token identity could not be verified; saved credentials were left unchanged")
+				return result
+			}
+			current.claudeIdentity = binding
+			current.Identity = accountIdentityFromClaude(binding.Identity)
+			if err := cacheClaudeIdentity(grant, current); err != nil {
+				result.Sync = syncSkipped("source_changed", "Claude credentials changed during identity verification; saved credentials were left unchanged")
+				return result
+			}
+		}
 		result.Sync, err = opts.AfterRenew(syncCtx, grant, current)
 		for _, syncResult := range result.Sync {
 			if syncResult.Status == "synced" {
@@ -387,6 +417,19 @@ func synchronizeResult(ctx context.Context, grant Grant, current CredentialSnaps
 		}
 	}
 	return result
+}
+
+func sameDiscoveredAccount(grant Grant, current CredentialSnapshot) bool {
+	if grant.Provider != "claude" {
+		return SameAccount(grant.Identity, current.Identity)
+	}
+	// A stale .claude.json cannot authorize a different token generation.
+	// Exact captured bytes remain usable offline, including an expired grant
+	// that the native CLI must renew. A changed generation needs bound IDs.
+	if grant.CredentialFingerprint != "" && grant.CredentialFingerprint == current.Fingerprint {
+		return true
+	}
+	return grant.Identity.Verified && current.Identity.Verified && SameAccount(grant.Identity, current.Identity)
 }
 
 func applyMinGap(result *Result, snapshot CredentialSnapshot, statePath string, opts Options) bool {
@@ -523,6 +566,9 @@ func accountStateKey(identity AccountIdentity) string {
 	key := "id:" + identity.AccountID
 	if identity.AccountID == "" {
 		key = "email:" + strings.ToLower(identity.Email)
+	}
+	if identity.OrganizationID != "" {
+		key += "\x00organization:" + identity.OrganizationID
 	}
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])

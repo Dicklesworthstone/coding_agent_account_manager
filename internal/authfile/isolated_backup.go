@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // BackupIsolatedClaude saves a registered isolated OAuth login to a NEW vault
-// name. It never reads the native login, calls a provider, changes environment
+// name. It never reads the native login, changes environment
 // variables, refreshes tokens, or modifies the isolated profile. Stop the source
 // session first; two copies of an OAuth grant are not independent logins.
 //
@@ -96,6 +98,16 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 		}
 	}
 	prepared := NewVault(filepath.Join(work, "vault"))
+	prepared.ClaudeIdentityVerifier = v.ClaudeIdentityVerifier
+	if source.binding != nil {
+		data, err := json.Marshal(map[string]interface{}{"claude_identity": source.binding})
+		if err != nil {
+			return err
+		}
+		if err := writeSwitchFile(filepath.Join(captureDir, identity.ClaudeIdentityCacheFile), data, true); err != nil {
+			return fmt.Errorf("capture isolated identity proof: %w", err)
+		}
+	}
 	if err := prepare(prepared, files, target); err != nil {
 		return fmt.Errorf("prepare isolated vault snapshot: %w", err)
 	}
@@ -125,6 +137,11 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 	// absent optional file, directory identity and the isolated session lock.
 	switchMu.Lock()
 	defer switchMu.Unlock()
+	release, err := v.lockMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return publishIsolatedBackupDurably(stage, destination, ancestor, func() error {
 		// Flushing may block long enough for a native source writer to finish.
 		// Recheck AFTER flushing, immediately before the no-replace rename.
@@ -142,12 +159,14 @@ func (v *Vault) backupIsolatedClaude(profileRoot, target string, prepare func(*V
 }
 
 type isolatedClaudeSource struct {
-	root      string
-	configDir string
-	dirs      []isolatedSourceDir
-	metadata  *isolatedSourceFile
-	files     []*isolatedSourceFile
-	layouts   []*isolatedClaudeLayout
+	root          string
+	configDir     string
+	dirs          []isolatedSourceDir
+	metadata      *isolatedSourceFile
+	files         []*isolatedSourceFile
+	layouts       []*isolatedClaudeLayout
+	identityCache *isolatedSourceFile
+	binding       *identity.ClaudeIdentityBinding
 }
 
 func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
@@ -197,6 +216,16 @@ func captureIsolatedClaude(profileRoot string) (*isolatedClaudeSource, error) {
 		state.files[name] = file.data
 	}
 	state.identify(AuthFileSet{Tool: "claude"})
+	s.identityCache, err = readIsolatedSourceFile(filepath.Join(s.configDir, identity.ClaudeIdentityCacheFile), false, MaxDiscoveryFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	if s.identityCache.info != nil {
+		s.binding, err = identity.DecodeClaudeIdentityBinding(s.identityCache.data, state.credential)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if state.identityConflict {
 		return nil, fmt.Errorf("%w: isolated credentials and account identity conflict", ErrInvalidCredentials)
 	}
@@ -234,6 +263,11 @@ func (s *isolatedClaudeSource) unchanged() error {
 	}
 	if err := s.metadata.unchanged(); err != nil {
 		return err
+	}
+	if s.identityCache != nil {
+		if err := s.identityCache.unchanged(); err != nil {
+			return err
+		}
 	}
 	for _, layout := range s.layouts {
 		if err := layout.unchanged(); err != nil {

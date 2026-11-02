@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	claudeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	grokprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/grok"
@@ -30,13 +31,21 @@ import (
 // AccountIdentity comes from the live credential or its own Claude account
 // state, never from a profile name or vault metadata.
 type AccountIdentity struct {
-	AccountID string `json:"account_id,omitempty"`
-	Email     string `json:"email,omitempty"`
+	AccountID      string `json:"account_id,omitempty"`
+	OrganizationID string `json:"organization_id,omitempty"`
+	Email          string `json:"email,omitempty"`
+	Verified       bool   `json:"verified,omitempty"`
 }
 
 // SameAccount uses a known account ID as authority. Email is a fallback only
 // when at least one side lacks an ID. Unknown identities never compare equal.
 func SameAccount(a, b AccountIdentity) bool {
+	// An organization belongs to the identity, not its display label. Never
+	// bridge a known organization to a different or unknown one by email.
+	if a.OrganizationID != "" || b.OrganizationID != "" {
+		return a.AccountID != "" && a.AccountID == b.AccountID &&
+			a.OrganizationID != "" && a.OrganizationID == b.OrganizationID
+	}
 	if a.AccountID != "" && b.AccountID != "" {
 		return a.AccountID == b.AccountID
 	}
@@ -46,21 +55,22 @@ func SameAccount(a, b AccountIdentity) bool {
 // Grant identifies one native live credential owner. A grant with a
 // BlockedReason is diagnostic only and must never launch a native command.
 type Grant struct {
-	Provider              string            `json:"provider"`
-	Name                  string            `json:"name,omitempty"`
-	Kind                  string            `json:"kind"`
-	Home                  string            `json:"home"`
-	AuthPath              string            `json:"auth_path,omitempty"`
-	IdentityPath          string            `json:"identity_path,omitempty"`
-	Env                   map[string]string `json:"-"`
-	Scrub                 []string          `json:"-"`
-	Identity              AccountIdentity   `json:"identity"`
-	ExpiresAt             time.Time         `json:"expires_at,omitempty"`
-	CredentialFingerprint string            `json:"-"`
-	RefreshFingerprint    string            `json:"-"`
-	BlockedReason         string            `json:"blocked_reason,omitempty"`
-	Owner                 string            `json:"owner,omitempty"`
-	source                *grantSource
+	Provider               string            `json:"provider"`
+	Name                   string            `json:"name,omitempty"`
+	Kind                   string            `json:"kind"`
+	Home                   string            `json:"home"`
+	AuthPath               string            `json:"auth_path,omitempty"`
+	IdentityPath           string            `json:"identity_path,omitempty"`
+	Env                    map[string]string `json:"-"`
+	Scrub                  []string          `json:"-"`
+	Identity               AccountIdentity   `json:"identity"`
+	ExpiresAt              time.Time         `json:"expires_at,omitempty"`
+	CredentialFingerprint  string            `json:"-"`
+	RefreshFingerprint     string            `json:"-"`
+	BlockedReason          string            `json:"blocked_reason,omitempty"`
+	Owner                  string            `json:"owner,omitempty"`
+	claudeTokenFingerprint string
+	source                 *grantSource
 }
 
 // Ref is the unambiguous selector used by keepalive's human and JSON output.
@@ -86,14 +96,16 @@ type grantSource struct {
 // CredentialSnapshot is a read of one exact native file. Secret material is
 // private to this package so results and diagnostics cannot serialize it.
 type CredentialSnapshot struct {
-	Identity            AccountIdentity `json:"identity"`
-	ExpiresAt           time.Time       `json:"expires_at,omitempty"`
-	HasRefreshToken     bool            `json:"has_refresh_token"`
-	Fingerprint         string          `json:"-"`
-	RefreshFingerprint  string          `json:"-"`
-	IdentityFingerprint string          `json:"-"`
-	data                []byte
-	identityData        []byte
+	Identity               AccountIdentity `json:"identity"`
+	ExpiresAt              time.Time       `json:"expires_at,omitempty"`
+	HasRefreshToken        bool            `json:"has_refresh_token"`
+	Fingerprint            string          `json:"-"`
+	RefreshFingerprint     string          `json:"-"`
+	IdentityFingerprint    string          `json:"-"`
+	data                   []byte
+	identityData           []byte
+	claudeIdentity         *identity.ClaudeIdentityBinding
+	claudeTokenFingerprint string
 }
 
 // DiscoverOptions locates CAAM's existing live homes. Empty paths use the same
@@ -342,6 +354,7 @@ func inspectGrant(g Grant, vaultPaths []string) Grant {
 	// Its unusable copy must still participate in duplicate-owner checks.
 	g.Identity, g.ExpiresAt = snapshot.Identity, snapshot.ExpiresAt
 	g.CredentialFingerprint, g.RefreshFingerprint = snapshot.Fingerprint, snapshot.RefreshFingerprint
+	g.claudeTokenFingerprint = snapshot.claudeTokenFingerprint
 	if err != nil {
 		if g.BlockedReason == "" {
 			g.BlockedReason = err.Error()
@@ -404,7 +417,10 @@ func recheckGrantOwnership(ctx context.Context, grant Grant) error {
 			return fmt.Errorf("live account ownership is no longer unambiguous; run caam keepalive --dry-run to inspect owners")
 		}
 		if current.Home != grant.Home || current.AuthPath != grant.AuthPath || current.IdentityPath != grant.IdentityPath ||
-			!maps.Equal(current.Env, grant.Env) || !slices.Equal(current.Scrub, grant.Scrub) || !SameAccount(current.Identity, grant.Identity) {
+			!maps.Equal(current.Env, grant.Env) || !slices.Equal(current.Scrub, grant.Scrub) ||
+			(grant.Provider == "claude" && current.CredentialFingerprint != grant.CredentialFingerprint &&
+				(!current.Identity.Verified || !grant.Identity.Verified || !SameAccount(current.Identity, grant.Identity))) ||
+			(grant.Provider != "claude" && !SameAccount(current.Identity, grant.Identity)) {
 			return fmt.Errorf("live credential source or account changed since discovery")
 		}
 		return nil
@@ -525,6 +541,14 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 		if err != nil {
 			return CredentialSnapshot{}, err
 		}
+		snapshot.Identity.OrganizationID, err = credentialString(oauth, "organizationId", "organizationUuid")
+		if err != nil || strings.ContainsAny(snapshot.Identity.OrganizationID, "\r\n\x00") {
+			return CredentialSnapshot{}, fmt.Errorf("claude organization identity is malformed")
+		}
+		binding, bindingErr := identity.ReadClaudeIdentityBindingForCredentials(authPath, data)
+		if bindingErr == nil && binding != nil {
+			snapshot.claudeIdentity = binding
+		}
 		if identityPath != "" {
 			identityData, readErr := readRegular(identityPath)
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
@@ -541,7 +565,11 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 				if err != nil {
 					return CredentialSnapshot{}, err
 				}
-				if knownIdentity(snapshot.Identity) && knownIdentity(paired) && !SameAccount(snapshot.Identity, paired) {
+				paired.OrganizationID, err = credentialString(state.OAuthAccount, "organizationUuid")
+				if err != nil || strings.ContainsAny(paired.OrganizationID, "\r\n\x00") {
+					return CredentialSnapshot{}, fmt.Errorf("claude organization identity is malformed")
+				}
+				if snapshot.claudeIdentity == nil && claudeIdentityConflict(snapshot.Identity, paired) {
 					return CredentialSnapshot{}, fmt.Errorf("Claude credential and paired account state disagree")
 				}
 				if snapshot.Identity.AccountID == "" {
@@ -550,9 +578,17 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 				if snapshot.Identity.Email == "" {
 					snapshot.Identity.Email = paired.Email
 				}
+				if snapshot.Identity.OrganizationID == "" {
+					snapshot.Identity.OrganizationID = paired.OrganizationID
+				}
 				snapshot.identityData = identityData
 				snapshot.IdentityFingerprint = fingerprint(identityData)
 			}
+		}
+		// The sidecar may be stale even when it is internally consistent. A
+		// provider identity bound to these exact token bytes takes precedence.
+		if snapshot.claudeIdentity != nil {
+			snapshot.Identity = accountIdentityFromClaude(snapshot.claudeIdentity.Identity)
 		}
 		access, err := credentialString(oauth, "accessToken")
 		if err != nil || access == "" {
@@ -565,6 +601,10 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 		snapshot.HasRefreshToken = refresh != ""
 		if refresh != "" {
 			snapshot.RefreshFingerprint = fingerprint([]byte(refresh))
+			snapshot.claudeTokenFingerprint, err = identity.ClaudeCredentialFingerprint(data)
+			if err != nil {
+				return snapshot, err
+			}
 		}
 		snapshot.ExpiresAt, err = credentialExpiry(oauth, "expiresAt")
 		if err != nil {
@@ -609,6 +649,17 @@ func readCredentialFiles(providerID, authPath, identityPath string) (CredentialS
 		return CredentialSnapshot{}, fmt.Errorf("unsupported keepalive provider")
 	}
 	return snapshot, nil
+}
+
+func accountIdentityFromClaude(id identity.Identity) AccountIdentity {
+	return AccountIdentity{AccountID: id.AccountID, OrganizationID: id.OrganizationID,
+		Email: id.Email, Verified: true}
+}
+
+func claudeIdentityConflict(a, b AccountIdentity) bool {
+	return (a.AccountID != "" && b.AccountID != "" && a.AccountID != b.AccountID) ||
+		(a.OrganizationID != "" && b.OrganizationID != "" && a.OrganizationID != b.OrganizationID) ||
+		(a.AccountID == "" && b.AccountID == "" && a.Email != "" && b.Email != "" && !strings.EqualFold(a.Email, b.Email))
 }
 
 func credentialString(fields map[string]json.RawMessage, names ...string) (string, error) {
@@ -770,6 +821,21 @@ func samePhysicalFile(a, b string) bool {
 	return ae == nil && be == nil && os.SameFile(ai, bi)
 }
 
+func sameClaudeGrantOwner(a, b Grant) bool {
+	if a.Provider != "claude" || b.Provider != "claude" {
+		return false
+	}
+	if a.Identity.Verified && b.Identity.Verified {
+		// Contradictory verified identities are uncertainty even if two local
+		// cache files claim to describe the same credential generation.
+		return a.Identity.OrganizationID != "" && b.Identity.OrganizationID != "" && SameAccount(a.Identity, b.Identity)
+	}
+	// A full opaque token pair proves that these are copies of one grant
+	// without contacting the provider. A refresh token or settings label alone
+	// cannot prove which account and organization owns the access token.
+	return a.claudeTokenFingerprint != "" && a.claudeTokenFingerprint == b.claudeTokenFingerprint
+}
+
 func resolveOwners(grants []Grant) {
 	// An unidentified credential could be a rotated copy of any known
 	// account. Distinct token strings cannot establish independent families.
@@ -832,7 +898,11 @@ func resolveOwners(grants []Grant) {
 			// Directory aliases share the exact credential and its sibling
 			// lock across native atomic replacement. File hard links do not.
 			allSameFile = allSameFile && canonicalPath(grants[owner].AuthPath) == canonicalPath(grants[i].AuthPath)
-			if knownIdentity(grants[owner].Identity) && knownIdentity(grants[i].Identity) && !SameAccount(grants[owner].Identity, grants[i].Identity) {
+			conflicting := knownIdentity(grants[owner].Identity) && knownIdentity(grants[i].Identity) && !SameAccount(grants[owner].Identity, grants[i].Identity)
+			if grants[owner].Provider == "claude" {
+				conflicting = conflicting && grants[owner].Identity.Verified && grants[i].Identity.Verified
+			}
+			if conflicting {
 				allSameFile = false
 			}
 		}
@@ -847,7 +917,7 @@ func resolveOwners(grants []Grant) {
 			continue
 		}
 		if len(group) == 2 && grants[owner].Provider == "claude" && grants[owner].Kind == "shallow" &&
-			grants[group[1]].Kind == "host" && SameAccount(grants[owner].Identity, grants[group[1]].Identity) && grants[owner].BlockedReason == "" {
+			grants[group[1]].Kind == "host" && sameClaudeGrantOwner(grants[owner], grants[group[1]]) && grants[owner].BlockedReason == "" {
 			host := group[1]
 			grants[host].BlockedReason = "the shallow live home owns this Claude account; the host copy must not replay its grant"
 			grants[host].Owner = grants[owner].Ref()

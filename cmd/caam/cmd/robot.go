@@ -1108,6 +1108,9 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 
 		result.Success = true
 		result.Message = fmt.Sprintf("backed up to %s/%s", provider, profile)
+		if provider == "claude" {
+			result.Warnings = claudeBackupIdentityWarnings(vault.ProfilePath(provider, profile))
+		}
 
 	default:
 		return robotError(cmd, "act", "INVALID_ACTION",

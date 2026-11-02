@@ -2,6 +2,7 @@ package authfile
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func isolatedClaudeFixture(t *testing.T) (string, *Vault, map[string]string) {
@@ -23,7 +26,7 @@ func isolatedClaudeFixture(t *testing.T) (string, *Vault, map[string]string) {
 	}
 	putIsolatedTestFile(t, filepath.Join(root, "profile.json"), string(metadata))
 	files := map[string]string{
-		".credentials.json": `{"claudeAiOauth":{"accessToken":"isolated-access","refreshToken":"isolated-refresh","expiresAt":4102444800000,"accountId":"new-id","email":"new@example.test","scopes":["user:inference"]}}`,
+		".credentials.json": `{"claudeAiOauth":{"accessToken":"isolated-access","refreshToken":"isolated-refresh","expiresAt":1600000000000,"scopes":["user:inference"]}}`,
 		".claude.json":      `{"oauthAccount":{"accountUuid":"new-id","emailAddress":"new@example.test"},"hasCompletedOnboarding":true,"numStartups":7}`,
 		"settings.json":     `{"model":"opus","permissions":{"allow":["Read"]}}`,
 		"auth.json":         `{"accessToken":"isolated-secondary","refreshToken":"isolated-secondary-refresh"}`,
@@ -44,6 +47,77 @@ func assertIsolatedUnchanged(t *testing.T, root string, files map[string]string)
 	}
 }
 
+func assertIsolatedSnapshot(t *testing.T, vault *Vault, profile string, files map[string]string, account *identity.Identity) {
+	t.Helper()
+	for name, source := range files {
+		path := vault.BackupPath("claude", profile, name)
+		saved, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("missing snapshot %s: %v", name, err)
+		}
+		if name == ".claude.json" {
+			var want, got map[string]interface{}
+			if err := json.Unmarshal([]byte(source), &want); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(saved, &got); err != nil {
+				t.Fatal(err)
+			}
+			delete(want, "oauthAccount")
+			if account != nil {
+				want["oauthAccount"] = map[string]interface{}{
+					"accountUuid": account.AccountID, "organizationUuid": account.OrganizationID,
+					"emailAddress": account.Email, "organizationName": account.Organization,
+				}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatal("snapshot must use verified account labels and preserve all other Claude settings")
+			}
+		} else if string(saved) != source {
+			t.Fatalf("incomplete snapshot %s", name)
+		}
+		info, err := os.Stat(path)
+		if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
+			t.Fatalf("insecure snapshot mode for %s: %v", name, err)
+		}
+	}
+}
+
+func isolatedClaudeTeamBinding(t *testing.T, credentials string) *identity.ClaudeIdentityBinding {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(credentials))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{
+			Provider: "claude", AccountID: "new-id", OrganizationID: "org-team",
+			Email: "new@example.test", Organization: "Team",
+		},
+		CredentialFingerprint: fingerprint,
+		VerifiedAt:            time.Now().UTC().Add(-24 * time.Hour),
+	}
+}
+
+func assertIsolatedSavedBinding(t *testing.T, vault *Vault, profile string, expected *identity.ClaudeIdentityBinding) {
+	t.Helper()
+	// Reopen the vault so the assertions cannot depend on in-memory proof.
+	reopened := NewVault(vault.BasePath())
+	path := reopened.BackupPath("claude", profile, ".credentials.json")
+	got, err := identity.ReadClaudeIdentityBinding(path)
+	if err != nil || got == nil {
+		t.Fatalf("saved proof missing after restart: %v", err)
+	}
+	if !identity.ClaudeSameAccount(&got.Identity, &expected.Identity) ||
+		got.CredentialFingerprint != expected.CredentialFingerprint || !got.VerifiedAt.Equal(expected.VerifiedAt) {
+		t.Fatal("saved proof does not belong to the captured account, organization, and credential generation")
+	}
+	account, err := identity.ExtractFromClaudeCredentials(path)
+	if err != nil || account == nil || !account.Verified || account.OrganizationID != expected.Identity.OrganizationID {
+		t.Fatalf("reopened snapshot lost verified organization identity: %v", err)
+	}
+}
+
 func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 	root, vault, files := isolatedClaudeFixture(t)
 	home := t.TempDir()
@@ -54,7 +128,7 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 	liveCredential := filepath.Join(home, ".claude", ".credentials.json")
 	liveSettings := filepath.Join(home, ".claude.json")
 	livePolicy := filepath.Join(home, ".claude", "settings.json")
-	putIsolatedTestFile(t, liveCredential, `{"claudeAiOauth":{"accessToken":"live-access","refreshToken":"live-refresh","expiresAt":4102444800000,"accountId":"live-id","email":"live@example.test"}}`)
+	putIsolatedTestFile(t, liveCredential, `{"claudeAiOauth":{"accessToken":"live-access","refreshToken":"live-refresh","expiresAt":1600000000000,"accountId":"live-id","email":"live@example.test"}}`)
 	putIsolatedTestFile(t, liveSettings, `{"oauthAccount":{"accountUuid":"live-id","emailAddress":"live@example.test"},"numStartups":99}`)
 	putIsolatedTestFile(t, livePolicy, `{"model":"sonnet"}`)
 
@@ -100,17 +174,7 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 		}
 	}
 	assertIsolatedUnchanged(t, root, files)
-	for name, want := range files {
-		path := vault.BackupPath("claude", "saved", name)
-		got, err := os.ReadFile(path)
-		if err != nil || string(got) != want {
-			t.Fatalf("incomplete snapshot %s: %v", name, err)
-		}
-		info, err := os.Stat(path)
-		if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
-			t.Fatalf("insecure snapshot mode for %s: %v", name, err)
-		}
-	}
+	assertIsolatedSnapshot(t, vault, "saved", files, nil)
 	names, err := vault.List("claude")
 	if err != nil || !reflect.DeepEqual(names, []string{"saved"}) {
 		t.Fatalf("vault listing: %v, %v", names, err)
@@ -129,9 +193,9 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(metadata.Identity, "new@example.test") || len(metadata.IdentityKeys) == 0 ||
+	if metadata.Identity != "" || len(metadata.IdentityKeys) != 0 ||
 		metadata.SourceType != "isolated-profile" || metadata.SourceProfile != "new-account" || len(metadata.OriginalPaths) != len(files) {
-		t.Fatalf("missing source-derived metadata: %+v", metadata)
+		t.Fatalf("wrong source metadata or unverified account labels: %+v", metadata)
 	}
 	for _, path := range metadata.OriginalPaths {
 		if filepath.Dir(path) != filepath.Join(root, "xdg_config", "claude-code") {
@@ -140,7 +204,8 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 	}
 
 	// Activation uses the ordinary native destination fileset, not recorded
-	// original_paths. It must select the new identity and preserve the source.
+	// original_paths. It must select the captured credential, omit unverified
+	// labels, and preserve the source.
 	if _, err := vault.Switch(ClaudeAuthFiles(), "saved", SwitchOptions{BackupMode: "always"}); err != nil {
 		t.Fatal(err)
 	}
@@ -149,14 +214,106 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 		t.Fatalf("saved login was not activated: %v", err)
 	}
 	got, err = os.ReadFile(liveSettings)
-	if err != nil || !bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("live@example.test")) {
-		t.Fatalf("wrong activated identity: %v", err)
+	if err != nil || bytes.Contains(got, []byte("oauthAccount")) || bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("live@example.test")) {
+		t.Fatalf("activation published an unverified identity: %v", err)
 	}
 	assertIsolatedUnchanged(t, root, files)
 }
 
+func TestBackupIsolatedClaudeOmitsConflictingUnverifiedLabels(t *testing.T) {
+	root, vault, files := isolatedClaudeFixture(t)
+	files[".claude.json"] = `{"oauthAccount":{"accountUuid":"other-id","organizationUuid":"other-org","emailAddress":"other@example.test"},"hasCompletedOnboarding":true,"numStartups":7}`
+	putIsolatedTestFile(t, filepath.Join(root, "xdg_config", "claude-code", ".claude.json"), files[".claude.json"])
+	if err := vault.BackupIsolatedClaude(root, "saved"); err != nil {
+		t.Fatalf("an unverifiable label must not prevent preserving a complete credential: %v", err)
+	}
+	assertIsolatedSnapshot(t, vault, "saved", files, nil)
+	assertIsolatedUnchanged(t, root, files)
+	metadata, err := os.ReadFile(vault.BackupPath("claude", "saved", "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(metadata, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"identity", "identity_keys", "claude_identity"} {
+		if _, exists := decoded[name]; exists {
+			t.Fatalf("unverified source label persisted as trusted %s", name)
+		}
+	}
+}
+
+func TestBackupIsolatedClaudeCachedExpiredIdentityStaysOffline(t *testing.T) {
+	root, vault, files := isolatedClaudeFixture(t)
+	configDir := filepath.Join(root, "xdg_config", "claude-code")
+	// The same email belongs to Personal and Team organizations. The captured
+	// token has expired, but its exact-generation proof still identifies Team.
+	files[".claude.json"] = `{"oauthAccount":{"accountUuid":"new-id","organizationUuid":"org-personal","organizationName":"Personal","emailAddress":"new@example.test"},"hasCompletedOnboarding":true,"numStartups":7}`
+	putIsolatedTestFile(t, filepath.Join(configDir, ".claude.json"), files[".claude.json"])
+	binding := isolatedClaudeTeamBinding(t, files[".credentials.json"])
+	cache, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachePath := filepath.Join(configDir, identity.ClaudeIdentityCacheFile)
+	putIsolatedTestFile(t, cachePath, string(cache))
+	cacheBefore, err := readIsolatedSourceFile(cachePath, true, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verificationCalls := 0
+	vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+		verificationCalls++
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+	if err := vault.BackupIsolatedClaude(root, "saved"); err != nil {
+		t.Fatal(err)
+	}
+	if verificationCalls != 0 {
+		t.Fatalf("cached expired credential triggered %d online verification attempts", verificationCalls)
+	}
+	assertIsolatedSavedBinding(t, vault, "saved", binding)
+	assertIsolatedSnapshot(t, vault, "saved", files, &binding.Identity)
+	assertIsolatedUnchanged(t, root, files)
+	if err := cacheBefore.unchanged(); err != nil {
+		t.Fatalf("source identity cache was modified: %v", err)
+	}
+}
+
+func TestBackupIsolatedClaudeUsesCallerVerifierForFreshSource(t *testing.T) {
+	root, vault, files := isolatedClaudeFixture(t)
+	configDir := filepath.Join(root, "xdg_config", "claude-code")
+	files[".credentials.json"] = fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"fresh-isolated-access","refreshToken":"fresh-isolated-refresh","expiresAt":%d,"scopes":["user:inference","user:profile"]}}`, time.Now().Add(time.Hour).UnixMilli())
+	files[".claude.json"] = `{"oauthAccount":{"accountUuid":"new-id","organizationUuid":"org-personal","organizationName":"Personal","emailAddress":"new@example.test"},"hasCompletedOnboarding":true,"numStartups":7}`
+	for _, name := range []string{".credentials.json", ".claude.json"} {
+		putIsolatedTestFile(t, filepath.Join(configDir, name), files[name])
+	}
+	binding := isolatedClaudeTeamBinding(t, files[".credentials.json"])
+	verificationCalls := 0
+	vault.ClaudeIdentityVerifier = func(_ context.Context, captured []byte) (*identity.ClaudeIdentityBinding, error) {
+		verificationCalls++
+		if !bytes.Equal(captured, []byte(files[".credentials.json"])) {
+			t.Fatal("prepared backup verified a different credential generation")
+		}
+		return binding, nil
+	}
+	if err := vault.BackupIsolatedClaude(root, "saved"); err != nil {
+		t.Fatal(err)
+	}
+	if verificationCalls != 1 {
+		t.Fatalf("isolated snapshot did not use the caller verifier exactly once: %d", verificationCalls)
+	}
+	assertIsolatedSavedBinding(t, vault, "saved", binding)
+	assertIsolatedSnapshot(t, vault, "saved", files, &binding.Identity)
+	assertIsolatedUnchanged(t, root, files)
+	if _, err := os.Lstat(filepath.Join(configDir, identity.ClaudeIdentityCacheFile)); !os.IsNotExist(err) {
+		t.Fatalf("import mutated the isolated source by writing an identity cache: %v", err)
+	}
+}
+
 func TestBackupIsolatedClaudeRejectsInvalidSources(t *testing.T) {
-	for _, fault := range []string{"missing-credentials", "missing-identity", "malformed-credentials", "malformed-settings", "null-settings", "no-refresh", "no-identity", "conflicting-identity", "locked", "metadata-redirect", "metadata-malformed", "credential-link", "identity-link", "directory-link"} {
+	for _, fault := range []string{"missing-credentials", "missing-identity", "malformed-credentials", "malformed-settings", "null-settings", "no-refresh", "no-identity", "locked", "metadata-redirect", "metadata-malformed", "credential-link", "identity-link", "directory-link"} {
 		t.Run(fault, func(t *testing.T) {
 			root, vault, _ := isolatedClaudeFixture(t)
 			config := filepath.Join(root, "xdg_config", "claude-code")
@@ -179,8 +336,6 @@ func TestBackupIsolatedClaudeRejectsInvalidSources(t *testing.T) {
 				putIsolatedTestFile(t, filepath.Join(config, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"access"}}`)
 			case "no-identity":
 				putIsolatedTestFile(t, filepath.Join(config, ".claude.json"), `{}`)
-			case "conflicting-identity":
-				putIsolatedTestFile(t, filepath.Join(config, ".claude.json"), `{"oauthAccount":{"accountUuid":"other-id","emailAddress":"other@example.test"}}`)
 			case "locked":
 				putIsolatedTestFile(t, filepath.Join(root, ".lock"), `{"pid":1}`)
 			case "metadata-redirect":

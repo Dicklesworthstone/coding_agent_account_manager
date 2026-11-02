@@ -177,6 +177,7 @@ func runIsolatedVaultBackup(cmd *cobra.Command, tool, source, target string) err
 		result.Published = true
 		result.Path = vault.ProfilePath("claude", target)
 		result.Warnings = []string{isolatedBackupWarning}
+		result.Warnings = append(result.Warnings, claudeBackupIdentityWarnings(result.Path)...)
 		return nil
 	}
 	err = backup()
@@ -189,6 +190,7 @@ func runIsolatedVaultBackup(cmd *cobra.Command, tool, source, target string) err
 			result.Published = true
 			result.Path = published.Path
 			result.Warnings = []string{isolatedBackupWarning}
+			result.Warnings = append(result.Warnings, claudeBackupIdentityWarnings(result.Path)...)
 		}
 	}
 	if jsonOutput {
@@ -202,6 +204,8 @@ func runIsolatedVaultBackup(cmd *cobra.Command, tool, source, target string) err
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Saved isolated claude/%s to vault claude/%s. The live login was not changed.\n", source, target)
-	fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", isolatedBackupWarning)
+	for _, warning := range result.Warnings {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+	}
 	return nil
 }

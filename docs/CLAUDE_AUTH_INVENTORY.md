@@ -1,6 +1,7 @@
 # Claude Auth/Session Assumptions Inventory
 
 **Generated:** 2026-01-21
+**Identity handling updated:** 2026-11-02, issue #132
 **Bead:** caam-nqjf
 **Purpose:** Audit Claude-specific features for broken assumptions about auth/session data
 
@@ -8,13 +9,19 @@
 
 ## Executive Summary
 
+The classification counts below record the original January audit. The
+CLAUDE-001 section describes the current account and organization ownership
+contract; the other entries retain their historical findings.
+
 | Classification | Count | Action |
 |----------------|-------|--------|
 | Correct | 4 | No changes needed |
 | Fixable | 3 | Graceful degradation / warnings |
 | Remove/Disable | 3 | Hard-disable to avoid misleading users |
 
-**Key Finding:** Recent Claude Code auth files no longer include `email` or `accountId` fields, and access tokens are opaque (not JWTs). Features relying on these assumptions should be disabled or updated.
+**Key finding:** Claude OAuth access tokens are opaque, and current credential
+files may omit account identifiers. A separate `.claude.json` can contain a
+stale account label. Local metadata and email alone cannot prove token ownership.
 
 ---
 
@@ -22,25 +29,78 @@
 
 ### CLAUDE-001: Identity Extraction from Credentials
 
-**File:** `internal/identity/claude.go:12-41`
-**Function:** `ExtractFromClaudeCredentials`
-**Classification:** Fixable
-**Status:** ✅ RESOLVED (2026-01-21, caam-u8wz)
+**Files:** `internal/identity/claude.go`, `internal/authfile/claude_identity.go`,
+`internal/authfile/switch.go`, `internal/keepalive/keepalive.go`
+**Functions:** `ExtractFromClaudeCredentials`, `VerifyClaudeCredentials`,
+`ClaudeSameAccount`
+**Status:** Token-bound account and organization identification implemented for
+[issue #132](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/132).
 
-**Assumptions:**
-- `claudeAiOauth` contains `accountId`, `email`, `subscriptionType`, `expiresAt`
+**Ownership model:** A Claude account UUID and organization UUID together
+identify the selected account context. Personal and Team organizations can
+share an account UUID and email, and organization names can also collide.
+Neither email nor a name is a safe matching key. `.claude.json` is independently
+mutable state, so even a complete `oauthAccount` block is only a local hint
+until checked against the selected credential.
 
-**Reality:**
-- `expiresAt` and `subscriptionType` ARE present
-- `accountId` and `email` are NO LONGER present in current versions
+At backup, activation, or keepalive boundaries, a bounded HTTPS request to
+`https://api.anthropic.com/api/oauth/profile` can identify the captured access
+token. The verifier requires both provider identifiers, rejects redirects,
+limits the response body and request duration, and does not include tokens or
+provider response bodies in diagnostics. Expired access tokens are not sent
+for verification. The read-only identity extractor and profile listing do
+not initiate requests.
 
-**Action:** Return empty strings for missing fields; update TUI to handle empty identity gracefully.
+The result is stored in a `claude_identity` envelope containing the identity,
+a fingerprint of the access/refresh token pair, and a verification timestamp.
+Vault profiles use `meta.json`; native credentials can use the private sibling
+`.caam-identity.json`. These files contain no duplicate token values. A binding
+is accepted only for its captured token pair. A stale or malformed binding
+does not revive the paired `.claude.json` label as trusted identity. The cache
+survives process restarts and remains useful for ownership after token expiry;
+it is not evidence of current login usability or independent verification of
+the opaque refresh token.
 
-**Resolution:**
-- Function already returns empty strings for missing fields (graceful degradation)
-- Added detailed documentation warning that email/accountId are no longer present
-- Added test cases for current Claude auth format without email/accountId
-- Added test cases for opaque tokens
+| Evidence | Permitted use |
+|----------|---------------|
+| Exact saved/live credentials | Recognize the matching snapshot offline; identity can remain unknown |
+| Matching token-bound account and organization | Match different verified generations and preserve a newer same-account credential |
+| Email or unverified `.claude.json` alone | Display a marked legacy hint; never authorize a cross-generation match or overwrite |
+| Provider unavailable or access token expired, no existing binding | Preserve or explicitly activate the grant with unverified labels omitted and a warning |
+| Tokens replaced in a profile with an existing binding | Refuse activation unless verification confirms the recorded account and organization |
+
+Successful verification corrects stale `oauthAccount` labels in a new backup
+or in the settings prepared for activation. Backup leaves its native source
+unchanged. A named saved account cannot silently become another organization;
+unsaved credentials can instead be preserved under a separate automatic backup.
+Keepalive synchronizes strictly newer credentials only into a verified matching
+user snapshot, and binds the new generation before it can be treated as that
+profile's identity. `_original` and automatic recovery snapshots retain the
+captured credential bytes even when their account labels must be corrected or
+omitted; preserving a grant does not assert its current usability.
+
+`caam ls` displays organization names and stable UUIDs. Legacy local labels
+are marked `[unverified]`; JSON exposes `organization_id` and a true
+`identity_verified` field for matching provider bindings. The coordinator
+carries stable account and organization identifiers when known. The browser
+agent refuses organization-specific recovery requests because its email-based
+configuration cannot reliably choose a Claude organization.
+
+Participating CAAM processes serialize managed mutations with a private
+per-vault process lock. Native Claude clients do not acquire that lock, so
+source and destination checks still detect changes during capture and publication.
+The existing switch publication path recovers from reported errors, but it
+is not a crash-atomic transaction across all files and the native keychain.
+CAAM cannot change credentials already held in a running pane or prevent a
+native session from rewriting shared files after the switch. Use isolated or
+shallow profiles for concurrent accounts. The report's suspected concurrent
+session race is distinct from these deterministic simulated-writer tests.
+
+**Coverage:** Synthetic tests exercise Personal and Team organizations sharing
+an email, same-name organizations, stale settings, provider outages and expired
+tokens, substituted access tokens, concurrent source/destination changes,
+automatic backups, activation, keepalive synchronization, browser refusal,
+credential-free diagnostics, and restart persistence.
 
 ---
 
@@ -236,7 +296,7 @@
 
 | Feature ID | Module | Action |
 |------------|--------|--------|
-| CLAUDE-001 | identity/claude | Handle missing email/accountId gracefully |
+| CLAUDE-001 | identity/claude, authfile | Require token-bound account and organization evidence; preserve unknown grants without asserting labels |
 | CLAUDE-007 | usage/claude | Add fallback when API fails |
 | CLAUDE-008 | pricing/claude | Add "API key only" warning |
 
@@ -261,7 +321,7 @@
 
 | Feature | Unit Tests | E2E Tests | Docs |
 |---------|-----------|-----------|------|
-| CLAUDE-001 | `identity/claude_test.go` | N/A | Update README |
+| CLAUDE-001 | `identity/claude_test.go`, `authfile/claude_rotation_test.go`, `keepalive/keepalive_test.go` | `cmd/caam/cmd/activate_test.go`, `cmd/caam/cmd/ls_type_test.go` | README account and organization identity |
 | CLAUDE-002 | `discovery/identity_test.go` | N/A | N/A |
 | CLAUDE-003 | `provider/claude/claude_test.go` | Backup/restore | N/A |
 | CLAUDE-004 | `provider/claude/claude_test.go` | Status command | N/A |

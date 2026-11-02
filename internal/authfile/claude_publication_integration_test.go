@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func TestClaudeRestorePublicationFailureRestoresIncomingOAuthAndSettings(t *testing.T) {
@@ -129,6 +131,12 @@ func TestClaudeRecoverableRestoreUsesExistingSameAccountFreshnessProtection(t *t
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 			const fresh = `{"claudeAiOauth":{"accessToken":"newer","refreshToken":"newer-refresh","expiresAt":1993456000000}}`
 			stale := keychainCreds("snapshot")
+			liveAccount := identity.Identity{AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.invalid"}
+			savedAccount := liveAccount
+			if !sameAccount {
+				savedAccount = identity.Identity{AccountID: "account-bob", OrganizationID: "org-bob", Email: "bob@example.invalid"}
+			}
+			setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{fresh: liveAccount, stale: savedAccount})
 			f.storeToken(fresh)
 			publicationWrite(t, f.credPath, fresh)
 			publicationWrite(t, f.statePath, keychainState("alice@example.invalid"))

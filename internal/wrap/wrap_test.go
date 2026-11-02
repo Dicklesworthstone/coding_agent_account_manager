@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	claudeidentity "github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
@@ -548,6 +550,25 @@ func TestWrapperRateLimitPreservesLatestLiveCredentials(t *testing.T) {
 			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
 				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
 				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+				if name != "bob" || !tc.malformed {
+					metadata, err := json.Marshal(map[string]any{"claude_identity": wrapSwitchIdentityBinding(t, data, name)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeWrapSwitchFile(t, vault.BackupPath("claude", name, "meta.json"), metadata)
+				}
+			}
+			// Native token rotation does not create a CAAM identity cache. The
+			// failover must verify the new exact token pair before updating Alice
+			// or identifying Carol's independent recovery snapshot.
+			rotatedBinding := wrapSwitchIdentityBinding(t, rotated, tc.liveOwner)
+			verificationCalls := 0
+			vault.ClaudeIdentityVerifier = func(_ context.Context, captured []byte) (*claudeidentity.ClaudeIdentityBinding, error) {
+				verificationCalls++
+				if !rotatedBinding.MatchesCredentials(captured) {
+					return nil, fmt.Errorf("unexpected credential generation in test identity verifier")
+				}
+				return rotatedBinding, nil
 			}
 			livePath := filepath.Join(home, ".claude", ".credentials.json")
 			identityPath := filepath.Join(home, ".claude.json")
@@ -612,6 +633,9 @@ func TestWrapperRateLimitPreservesLatestLiveCredentials(t *testing.T) {
 			if result.RetryCount != wantCalls-1 {
 				t.Fatalf("retry count = %d, want %d actual additional launches", result.RetryCount, wantCalls-1)
 			}
+			if !tc.malformed && verificationCalls == 0 {
+				t.Fatal("failover did not verify the independently rotated live credential")
+			}
 			assertWrapSwitchFile(t, livePath, wantLive)
 			wantAlice := oldAlice
 			if !tc.malformed && tc.liveOwner == "alice" {
@@ -646,6 +670,19 @@ func TestWrapSwitchProcess(t *testing.T) {
 	case "success":
 		fmt.Fprintln(os.Stdout, "request completed")
 		os.Exit(0)
+	}
+}
+
+func wrapSwitchIdentityBinding(t *testing.T, credentials []byte, account string) *claudeidentity.ClaudeIdentityBinding {
+	t.Helper()
+	fingerprint, err := claudeidentity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &claudeidentity.ClaudeIdentityBinding{
+		Identity: claudeidentity.Identity{Provider: "claude", AccountID: "id-" + account,
+			OrganizationID: "organization-" + account, Email: account + "@example.com"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
 	}
 }
 

@@ -61,6 +61,14 @@ func writeDiscoveryClaude(t *testing.T, home, id, email, refresh string) {
 	writeDiscoveryFile(t, filepath.Join(home, ".claude.json"), string(state))
 }
 
+func bindDiscoveryClaude(t *testing.T, home, account, organization, email string) {
+	t.Helper()
+	path := filepath.Join(home, ".claude", ".credentials.json")
+	writeSyncBinding(t, path, readSyncFile(t, path), AccountIdentity{
+		AccountID: account, OrganizationID: organization, Email: email,
+	}, true)
+}
+
 func writeDiscoveryGrok(t *testing.T, configDir, id, email, refresh string) {
 	t.Helper()
 	credentials := map[string]any{"synthetic-issuer::client": map[string]any{
@@ -100,16 +108,20 @@ func TestDiscoverOwnership(t *testing.T) {
 		shallowEmail       string
 		hostRefresh        string
 		shallowRefresh     string
+		verified           bool
+		differentAccess    bool
+		differentMetadata  bool
 		secondShallow      bool
 		wantHostBlocked    bool
 		wantShallowBlocked bool
 		wantOwner          string
 	}{
-		{name: "shallow owns copied host account", hostID: "a", hostEmail: "a@example.test", shallowID: "a", shallowEmail: "a@example.test", wantHostBlocked: true, wantOwner: "shallow:claude/work"},
-		{name: "different authoritative IDs keep same email independent", hostID: "a", hostEmail: "shared@example.test", shallowID: "b", shallowEmail: "shared@example.test"},
-		{name: "email fallback ignores case", hostEmail: "Account@Example.test", shallowID: "a", shallowEmail: "account@example.test", wantHostBlocked: true, wantOwner: "shallow:claude/work"},
+		{name: "verified shallow owns copied host account", hostID: "a", hostEmail: "a@example.test", shallowID: "a", shallowEmail: "a@example.test", verified: true, wantHostBlocked: true, wantOwner: "shallow:claude/work"},
+		{name: "different verified IDs keep same email independent", hostID: "a", hostEmail: "shared@example.test", shallowID: "b", shallowEmail: "shared@example.test", verified: true},
+		{name: "email alone cannot choose a shallow owner", hostEmail: "Account@Example.test", shallowID: "a", shallowEmail: "account@example.test", wantHostBlocked: true, wantShallowBlocked: true},
 		{name: "two shallow homes refuse duplicate grant", hostID: "a", hostEmail: "a@example.test", shallowID: "a", shallowEmail: "a@example.test", secondShallow: true, wantHostBlocked: true, wantShallowBlocked: true},
-		{name: "same refresh value contradicts account labels", hostID: "a", hostEmail: "a@example.test", shallowID: "b", shallowEmail: "b@example.test", hostRefresh: "same-family", shallowRefresh: "same-family", wantHostBlocked: true, wantShallowBlocked: true},
+		{name: "same token pair overrides stale labels and metadata", hostID: "a", hostEmail: "a@example.test", shallowID: "b", shallowEmail: "b@example.test", hostRefresh: "same-family", shallowRefresh: "same-family", differentMetadata: true, wantHostBlocked: true, wantOwner: "shallow:claude/work"},
+		{name: "matching refresh cannot identify a replaced access token", hostID: "a", hostEmail: "a@example.test", shallowID: "a", shallowEmail: "a@example.test", hostRefresh: "same-family", shallowRefresh: "same-family", differentAccess: true, wantHostBlocked: true, wantShallowBlocked: true},
 		{name: "unknown home cannot hide competing family", hostID: "a", hostEmail: "a@example.test", wantHostBlocked: true, wantShallowBlocked: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,6 +136,29 @@ func TestDiscoverOwnership(t *testing.T) {
 			}
 			writeDiscoveryClaude(t, opts.Home, tc.hostID, tc.hostEmail, hostRefresh)
 			writeDiscoveryShallow(t, opts, "work", tc.shallowID, tc.shallowEmail, shallowRefresh)
+			shallowHome := filepath.Join(opts.ShallowBase, "work")
+			if tc.differentAccess || tc.differentMetadata {
+				path := filepath.Join(shallowHome, ".claude", ".credentials.json")
+				var document map[string]map[string]any
+				if err := json.Unmarshal(readSyncFile(t, path), &document); err != nil {
+					t.Fatal(err)
+				}
+				if tc.differentAccess {
+					document["claudeAiOauth"]["accessToken"] = "other-organization-access"
+				}
+				if tc.differentMetadata {
+					document["claudeAiOauth"]["expiresAt"] = time.Date(2026, 10, 7, 22, 0, 0, 0, time.UTC).UnixMilli()
+				}
+				updated, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeDiscoveryFile(t, path, string(updated))
+			}
+			if tc.verified {
+				bindDiscoveryClaude(t, opts.Home, tc.hostID, "org-"+tc.hostID, tc.hostEmail)
+				bindDiscoveryClaude(t, shallowHome, tc.shallowID, "org-"+tc.shallowID, tc.shallowEmail)
+			}
 			if tc.secondShallow {
 				writeDiscoveryShallow(t, opts, "other", tc.shallowID, tc.shallowEmail, "third-family")
 			}
@@ -141,6 +176,79 @@ func TestDiscoverOwnership(t *testing.T) {
 			}
 			if tc.secondShallow && findDiscoveryGrant(t, grants, "shallow:claude/other").BlockedReason == "" {
 				t.Error("second competing home remained eligible")
+			}
+		})
+	}
+}
+
+func TestDiscoverClaudeOwnershipRequiresTokenBoundOrganization(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		localOrg    string
+		staleProof  bool
+		verified    bool
+		wantBlocked bool
+	}{
+		{name: "missing organization proof", wantBlocked: true},
+		{name: "stale shared organization labels", localOrg: "personal", wantBlocked: true},
+		{name: "proof belongs to previous token pair", localOrg: "personal", staleProof: true, wantBlocked: true},
+		{name: "verified personal and Team remain independent", localOrg: "personal", verified: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := discoveryFixture(t)
+			opts.Provider = "claude"
+			writeDiscoveryClaude(t, opts.Home, "same-account", "shared@example.test", "personal-refresh")
+			writeDiscoveryShallow(t, opts, "team", "same-account", "shared@example.test", "team-refresh")
+			teamHome := filepath.Join(opts.ShallowBase, "team")
+			state, err := json.Marshal(map[string]any{"oauthAccount": map[string]string{
+				"accountUuid": "same-account", "emailAddress": "shared@example.test", "organizationUuid": tc.localOrg,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := make(map[string][]byte)
+			for _, home := range []string{opts.Home, teamHome} {
+				statePath := filepath.Join(home, ".claude.json")
+				writeDiscoveryFile(t, statePath, string(state))
+				authPath := filepath.Join(home, ".claude", ".credentials.json")
+				before[statePath], before[authPath] = readSyncFile(t, statePath), readSyncFile(t, authPath)
+				if tc.staleProof {
+					old := []byte(`{"claudeAiOauth":{"accessToken":"previous-access","refreshToken":"previous-refresh"}}`)
+					writeSyncBinding(t, authPath, old, AccountIdentity{
+						AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.test",
+					}, true)
+				}
+			}
+			if tc.verified {
+				bindDiscoveryClaude(t, opts.Home, "same-account", "personal", "shared@example.test")
+				bindDiscoveryClaude(t, teamHome, "same-account", "team", "shared@example.test")
+			}
+			grants, err := Discover(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, ref := range []string{"host:claude", "shallow:claude/team"} {
+				grant := findDiscoveryGrant(t, grants, ref)
+				if grant.Owner != "" || (grant.BlockedReason != "") != tc.wantBlocked {
+					t.Fatalf("unproven organization delegated a distinct native grant: %+v", grant)
+				}
+				if grant.Identity.Verified != tc.verified {
+					t.Fatal("stale metadata or previous tokens conferred verified ownership")
+				}
+				if tc.verified {
+					wantOrg := "personal"
+					if ref == "shallow:claude/team" {
+						wantOrg = "team"
+					}
+					if grant.Identity.OrganizationID != wantOrg {
+						t.Fatal("stale settings merged verified personal and Team organizations")
+					}
+				}
+			}
+			for path, expected := range before {
+				if string(readSyncFile(t, path)) != string(expected) {
+					t.Fatal("read-only ownership discovery modified native state")
+				}
 			}
 		})
 	}
@@ -629,17 +737,35 @@ func TestSameAccountAuthority(t *testing.T) {
 		a, b AccountIdentity
 		want bool
 	}{
-		{"known IDs disagree", AccountIdentity{"one", "same@example.test"}, AccountIdentity{"two", "same@example.test"}, false},
-		{"known ID survives email change", AccountIdentity{"one", "old@example.test"}, AccountIdentity{"one", "new@example.test"}, true},
-		{"email fallback", AccountIdentity{"", "Same@Example.test"}, AccountIdentity{"one", "same@example.test"}, true},
+		{"known IDs disagree", AccountIdentity{AccountID: "one", Email: "same@example.test"}, AccountIdentity{AccountID: "two", Email: "same@example.test"}, false},
+		{"known ID survives email change", AccountIdentity{AccountID: "one", Email: "old@example.test"}, AccountIdentity{AccountID: "one", Email: "new@example.test"}, true},
+		{"email fallback without provider organization", AccountIdentity{Email: "Same@Example.test"}, AccountIdentity{AccountID: "one", Email: "same@example.test"}, true},
 		{"both unknown", AccountIdentity{}, AccountIdentity{}, false},
-		{"one unknown", AccountIdentity{}, AccountIdentity{"one", "one@example.test"}, false},
+		{"one unknown", AccountIdentity{}, AccountIdentity{AccountID: "one", Email: "one@example.test"}, false},
+		{"same account different organization", AccountIdentity{AccountID: "one", OrganizationID: "personal", Email: "same@example.test"}, AccountIdentity{AccountID: "one", OrganizationID: "team", Email: "same@example.test"}, false},
+		{"organization cannot fall back to email", AccountIdentity{OrganizationID: "team", Email: "same@example.test"}, AccountIdentity{AccountID: "one", Email: "same@example.test"}, false},
+		{"same account and organization", AccountIdentity{AccountID: "one", OrganizationID: "team", Email: "old@example.test"}, AccountIdentity{AccountID: "one", OrganizationID: "team", Email: "new@example.test"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if SameAccount(tc.a, tc.b) != tc.want {
 				t.Fatal("wrong account comparison")
 			}
 		})
+	}
+}
+
+func TestAccountThrottleDistinguishesSameEmailOrganizations(t *testing.T) {
+	personal := AccountIdentity{AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.test"}
+	team := personal
+	team.OrganizationID = "team"
+	if accountStateKey(personal) == accountStateKey(team) {
+		t.Fatal("personal and Team organization share a renewal throttle")
+	}
+	team.Email = "renamed@example.test"
+	original := team
+	original.Email = "shared@example.test"
+	if accountStateKey(team) != accountStateKey(original) {
+		t.Fatal("email rename changed the stable account-and-organization throttle")
 	}
 }
 
@@ -865,6 +991,8 @@ func TestDiscoverInvalidHostStillYieldsToUniqueShallowOwner(t *testing.T) {
 	writeDiscoveryClaude(t, opts.Home, "owner", "owner@example.test", "old-refresh")
 	writeDiscoveryFile(t, filepath.Join(opts.Home, ".claude", ".credentials.json"), `{"claudeAiOauth":{"accessToken":"old-access","refreshToken":null,"expiresAt":"unreadable"}}`)
 	writeDiscoveryShallow(t, opts, "work", "owner", "owner@example.test", "current-refresh")
+	bindDiscoveryClaude(t, opts.Home, "owner", "org-owner", "owner@example.test")
+	bindDiscoveryClaude(t, filepath.Join(opts.ShallowBase, "work"), "owner", "org-owner", "owner@example.test")
 	grants, err := Discover(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 var engineNow = time.Date(2026, 10, 6, 20, 0, 0, 0, time.UTC)
@@ -42,6 +45,10 @@ func engineGrant(t *testing.T, provider string, expiry time.Time) Grant {
 	}
 	if err := os.WriteFile(grant.AuthPath, engineAuth(provider, expiry, "test-access-before"), 0600); err != nil {
 		t.Fatal(err)
+	}
+	if provider == "claude" {
+		writeSyncBinding(t, grant.AuthPath, engineAuth(provider, expiry, "test-access-before"),
+			AccountIdentity{AccountID: "test-account", OrganizationID: "test-organization", Email: "keepalive@example.invalid"}, true)
 	}
 	grant = inspectGrant(grant, []string{filepath.Join(home, "vault")})
 	if grant.BlockedReason != "" {
@@ -82,6 +89,130 @@ func runEngine(t *testing.T, grant Grant, opts Options) Result {
 	return results[0]
 }
 
+type keepaliveIdentityTransport func(*http.Request) (*http.Response, error)
+
+func (f keepaliveIdentityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestRunClaudeVerificationBindsCapturedTokensAndCachesOffline(t *testing.T) {
+	for _, behavior := range []string{"success", "endpoint unavailable", "concurrent replacement"} {
+		t.Run(behavior, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			grant := engineGrant(t, "claude", now.Add(6*time.Hour))
+			// Simulate a native refresh: the old proof no longer binds either
+			// token pair even though the old local account label remains.
+			current := engineAuth("claude", now.Add(6*time.Hour), "rotated-access")
+			writeSyncFile(t, grant.AuthPath, current)
+			grant = inspectGrant(Grant{Provider: "claude", Kind: "host", Home: grant.Home, AuthPath: grant.AuthPath,
+				IdentityPath: grant.IdentityPath, Env: grant.Env}, nil)
+			opts := engineOptions(t, "claude", filepath.Join(t.TempDir(), "must-not-run"))
+			opts.Now = func() time.Time { return now }
+			calls, synchronized := 0, 0
+			opts.IdentityClient = &http.Client{Transport: keepaliveIdentityTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.Scheme != "https" || req.URL.Host != "api.anthropic.com" || req.URL.Path != "/api/oauth/profile" || req.Header.Get("Authorization") != "Bearer rotated-access" {
+					t.Error("verification did not use the captured access token at the fixed provider endpoint")
+				}
+				if behavior == "endpoint unavailable" {
+					return nil, errors.New("transport diagnostic with rotated-access and test-refresh")
+				}
+				if behavior == "concurrent replacement" {
+					writeSyncFile(t, grant.AuthPath, engineAuth("claude", now.Add(7*time.Hour), "other-organization"))
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"account":{"uuid":"test-account","email":"keepalive@example.invalid"},"organization":{"uuid":"team-organization","name":"Team"}}`)), Header: make(http.Header)}, nil
+			})}
+			opts.AfterRenew = func(_ context.Context, _ Grant, snapshot CredentialSnapshot) ([]SyncResult, error) {
+				synchronized++
+				if snapshot.claudeIdentity == nil || snapshot.Identity.OrganizationID != "team-organization" || !snapshot.claudeIdentity.MatchesCredentials(current) {
+					t.Fatal("synchronization received an unbound organization identity")
+				}
+				return nil, nil
+			}
+			result := runEngine(t, grant, opts)
+			if !result.Success || result.Attempted || calls != 1 {
+				t.Fatalf("identity-only synchronization unexpectedly ran a native command: %+v, calls=%d", result, calls)
+			}
+			if behavior == "success" {
+				if synchronized != 1 {
+					t.Fatal("verified exact token pair did not reach synchronization")
+				}
+				// A new discovery simulates a process restart; it must use the
+				// persisted proof even with the endpoint now unavailable.
+				grant = inspectGrant(Grant{Provider: "claude", Kind: "host", Home: grant.Home, AuthPath: grant.AuthPath,
+					IdentityPath: grant.IdentityPath, Env: grant.Env}, nil)
+				opts.IdentityClient.Transport = keepaliveIdentityTransport(func(*http.Request) (*http.Response, error) {
+					t.Fatal("cached identity introduced an unnecessary online dependency")
+					return nil, nil
+				})
+				result = runEngine(t, grant, opts)
+				if !result.Success || synchronized != 2 {
+					t.Fatalf("restart lost verified identity: %+v", result)
+				}
+			} else if synchronized != 0 || len(result.Sync) != 1 || result.Sync[0].Status != "skipped" {
+				t.Fatalf("uncertain identity allowed synchronization: %+v", result)
+			}
+			encoded, _ := json.Marshal(result)
+			if strings.Contains(string(encoded), "rotated-access") || strings.Contains(string(encoded), "test-refresh") {
+				t.Fatal("identity verification leaked a credential through diagnostics")
+			}
+		})
+	}
+}
+
+func TestRunClaudeRefusesChangedCredentialsBehindStaleMetadata(t *testing.T) {
+	grant := engineGrant(t, "claude", engineNow.Add(time.Hour))
+	writeSyncFile(t, grant.AuthPath, engineAuth("claude", engineNow.Add(time.Hour), "another-access-token"))
+	opts := engineOptions(t, "claude", filepath.Join(t.TempDir(), "must-not-run"))
+	result := runEngine(t, grant, opts)
+	if result.Attempted || result.Success || result.Reason != "account_changed_since_discovery" {
+		t.Fatalf("stale metadata authorized a substituted token: %+v", result)
+	}
+}
+
+func TestRunClaudeRenewsExpiredBoundTokenBeforeIdentityVerification(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("endpoint_unavailable=%t", unavailable), func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			grant := engineGrant(t, "claude", now.Add(-time.Hour))
+			next := filepath.Join(t.TempDir(), "renewed.json")
+			writeSyncFile(t, next, engineAuth("claude", now.Add(6*time.Hour), "renewed-active"))
+			t.Setenv("CAAM_TEST_RENEWED_CREDENTIAL", next)
+			opts := engineOptions(t, "claude", engineCLI(t, `cp "$CAAM_TEST_RENEWED_CREDENTIAL" "$HOME/.claude/.credentials.json"`))
+			opts.Now = func() time.Time { return now }
+			calls, synchronized := 0, 0
+			opts.IdentityClient = &http.Client{Transport: keepaliveIdentityTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Header.Get("Authorization") != "Bearer renewed-active" {
+					t.Fatal("keepalive attempted online verification using the expired token")
+				}
+				if unavailable {
+					return nil, errors.New("endpoint unavailable")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"account":{"uuid":"test-account","email":"keepalive@example.invalid"},"organization":{"uuid":"test-organization"}}`)), Header: make(http.Header)}, nil
+			})}
+			opts.AfterRenew = func(context.Context, Grant, CredentialSnapshot) ([]SyncResult, error) {
+				synchronized++
+				return nil, nil
+			}
+			result := runEngine(t, grant, opts)
+			if !result.Attempted || calls != 1 {
+				t.Fatalf("expired bound token could not reach native renewal: %+v, requests=%d", result, calls)
+			}
+			if unavailable {
+				if result.Success || result.Reason != "renewed_identity_unverified" || synchronized != 0 {
+					t.Fatalf("unverified rotation reached saved credentials: %+v", result)
+				}
+			} else if !result.Success || result.Status != "rotated" || synchronized != 1 {
+				t.Fatalf("verified native rotation did not complete: %+v", result)
+			}
+			if string(readSyncFile(t, grant.AuthPath)) != string(readSyncFile(t, next)) {
+				t.Fatal("identity verification rewrote the native token generation")
+			}
+		})
+	}
+}
+
 func TestRunNativeUsesLiveOwnerAndScrubsOverrides(t *testing.T) {
 	for _, provider := range []string{"claude", "grok"} {
 		t.Run(provider, func(t *testing.T) {
@@ -90,6 +221,10 @@ func TestRunNativeUsesLiveOwnerAndScrubsOverrides(t *testing.T) {
 			next := filepath.Join(t.TempDir(), "next.json")
 			if err := os.WriteFile(next, engineAuth(provider, engineNow.Add(6*time.Hour), "test-access-after"), 0600); err != nil {
 				t.Fatal(err)
+			}
+			if provider == "claude" {
+				writeSyncBinding(t, next, readSyncFile(t, next), grant.Identity, true)
+				t.Setenv("CAAM_KEEPALIVE_NEXT_BINDING", filepath.Join(filepath.Dir(next), identity.ClaudeIdentityCacheFile))
 			}
 			t.Setenv("CAAM_KEEPALIVE_CAPTURE", capture)
 			t.Setenv("CAAM_KEEPALIVE_NEXT", next)
@@ -107,7 +242,8 @@ printf 'provider might echo test-access-after test-refresh\n' >&2
 			if provider == "claude" {
 				script += `test -z "${CLAUDE_CONFIG_DIR:-}"
 test "$CLAUDE_CODE_DISABLE_AGENT_VIEW" = 1
-cp "$CAAM_KEEPALIVE_NEXT" "$HOME/.claude/.credentials.json"`
+cp "$CAAM_KEEPALIVE_NEXT" "$HOME/.claude/.credentials.json"
+cp "$CAAM_KEEPALIVE_NEXT_BINDING" "$HOME/.claude/.caam-identity.json"`
 			} else {
 				script += `test "$GROK_HOME" = "$HOME/.grok"
 cp "$CAAM_KEEPALIVE_NEXT" "$GROK_HOME/auth.json"`

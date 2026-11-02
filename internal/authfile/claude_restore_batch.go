@@ -46,7 +46,10 @@ func (batch *claudeRestoreBatch) Apply() error {
 			}
 			removals = append(removals, removal)
 		}
-		var finalize func() error
+		// Even file-only switches recheck the complete installed bundle before
+		// success, so a concurrent writer cannot silently separate tokens from
+		// the identity cache published in this batch.
+		finalize := func() error { return nil }
 		if batch.authority != nil {
 			defer batch.authority.cleanup()
 			if err := batch.authority.stage(); err != nil {

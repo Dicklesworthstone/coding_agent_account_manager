@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // SyncResult explains whether one saved profile received a newer live
@@ -63,6 +64,9 @@ func SnapshotIdentity(vault *authfile.Vault, provider, profile string) (AccountI
 	if err != nil {
 		return AccountIdentity{}, err
 	}
+	if provider == "claude" && snapshot.claudeIdentity == nil {
+		return AccountIdentity{}, fmt.Errorf("saved Claude token identity is unverified")
+	}
 	if !knownIdentity(snapshot.Identity) {
 		return AccountIdentity{}, fmt.Errorf("saved account identity is unavailable")
 	}
@@ -81,9 +85,10 @@ func snapshotCredentialPaths(dir, provider string) (authPath, identityPath strin
 // vault credential. Call it after the native CLI exits: the native credential
 // lock is acquired here only for the stable read and saved-copy update.
 //
-// Only the credential file is replaced. The already-matching saved Claude
-// identity and all settings/metadata stay in place, so an unrelated auxiliary
-// auth source or the calling process's macOS keychain cannot enter the copy.
+// Claude's credential, token-bound proof and verified account fields advance
+// together in a recoverable batch. Other settings and profile metadata stay in
+// place; auxiliary auth sources and the caller's macOS keychain are not copied.
+// Grok retains its single-credential-file update.
 func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, vault *authfile.Vault) ([]SyncResult, error) {
 	if vault == nil {
 		return nil, fmt.Errorf("keepalive vault is not configured")
@@ -119,7 +124,21 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 	if !live.HasRefreshToken {
 		return syncSkipped("source_not_renewable", "live credential has no refresh token; saved credentials were left unchanged"), nil
 	}
-	if !SameAccount(grant.Identity, live.Identity) || !SameAccount(observed.Identity, live.Identity) {
+	if grant.Provider == "claude" {
+		// Verification belongs to the exact token pair, not a nearby state
+		// file or profile name. A proof captured after the native command can
+		// be reused only while it still matches this locked reread.
+		if observed.claudeIdentity != nil && observed.claudeIdentity.MatchesCredentials(live.data) {
+			live.claudeIdentity = observed.claudeIdentity
+			live.Identity = accountIdentityFromClaude(observed.claudeIdentity.Identity)
+		}
+		if live.claudeIdentity == nil || observed.claudeIdentity == nil {
+			return syncSkipped("source_identity_unverified", "Claude token identity is unverified; saved credentials were left unchanged"), nil
+		}
+		if !identity.ClaudeSameAccount(&live.claudeIdentity.Identity, &observed.claudeIdentity.Identity) {
+			return syncSkipped("source_owner_changed", "live Claude account or organization changed after renewal"), nil
+		}
+	} else if !SameAccount(grant.Identity, live.Identity) || !SameAccount(observed.Identity, live.Identity) {
 		return syncSkipped("source_owner_changed", "live account changed after renewal; saved credentials were left unchanged"), nil
 	}
 	if observed.Fingerprint == "" || (live.Fingerprint != observed.Fingerprint && !live.ExpiresAt.After(observed.ExpiresAt)) {
@@ -178,6 +197,11 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 			results = append(results, result)
 			continue
 		}
+		if grant.Provider == "claude" && snapshot.claudeIdentity == nil {
+			result.Code, result.Reason = "snapshot_identity_unproven", "saved Claude token identity is unverified; verify or back up that profile before synchronizing it"
+			results = append(results, result)
+			continue
+		}
 		if !SameAccount(live.Identity, snapshot.Identity) {
 			result.Code, result.Reason = "identity_mismatch", "saved account does not match the live owner"
 			results = append(results, result)
@@ -194,27 +218,39 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 			continue
 		}
 
-		// Re-read both members of the Claude credential/identity pair before
-		// the atomic replacement. The native lock protects compliant live
-		// writers; the byte checks also detect independent settings changes
-		// and vault updates that occurred while this copy was prepared.
-		err = replaceSavedCredential(authPath, live.data, func(stagedPath string) error {
+		// Keep the live-source guard separate from the saved-generation check:
+		// the transaction repeats this after waiting for its vault lock and
+		// after publication, when the saved generation has intentionally changed.
+		checkSource := func() error {
 			if err := ctx.Err(); err != nil {
 				return err
-			}
-			// Opaque modern Claude tokens may rely entirely on their paired
-			// account state. Do not erase the only identity embedded in an
-			// older saved credential when no saved sidecar can replace it.
-			replacement, err := readCredentialFiles(grant.Provider, stagedPath, identityPath)
-			if err != nil || !SameAccount(live.Identity, replacement.Identity) {
-				return errSyncIdentityUnproven
 			}
 			if !credentialLockIsCurrent(lock, nativeCredentialLockPath(grant)) {
 				return errSyncChanged
 			}
 			current, err := ReadCredential(grant)
+			if grant.Provider == "claude" && err == nil && live.claudeIdentity.MatchesCredentials(current.data) {
+				current.claudeIdentity = live.claudeIdentity
+				current.Identity = live.Identity
+			}
 			if err != nil || !sameCredentialSnapshot(current, live) || !current.ExpiresAt.After(time.Now()) {
 				return errSyncChanged
+			}
+			return nil
+		}
+		// Re-read both saved members before replacement. The vault transaction
+		// independently guards these bytes through staging and publication.
+		unchanged := func(stagedPath string) error {
+			// Other providers carry their identity in the credential document;
+			// the staged replacement must still identify the same account.
+			if grant.Provider != "claude" {
+				replacement, err := readCredentialFiles(grant.Provider, stagedPath, identityPath)
+				if err != nil || !SameAccount(live.Identity, replacement.Identity) {
+					return errSyncIdentityUnproven
+				}
+			}
+			if err := checkSource(); err != nil {
+				return err
 			}
 			if err := regularSnapshotDirectory(profileDir); err != nil {
 				return errSyncChanged
@@ -235,7 +271,15 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 				return errSyncChanged
 			}
 			return nil
-		})
+		}
+		if grant.Provider == "claude" {
+			err = unchanged("")
+			if err == nil {
+				err = vault.SyncClaudeCredentials(profile, snapshot.data, live.data, live.claudeIdentity, checkSource)
+			}
+		} else {
+			err = replaceSavedCredential(authPath, live.data, unchanged)
+		}
 		switch {
 		case errors.Is(err, errSyncIdentityUnproven):
 			result.Code, result.Reason = "snapshot_identity_unproven", "new credential needs matching saved account state; back up this live home first"
@@ -254,6 +298,32 @@ func SyncVault(ctx context.Context, grant Grant, observed CredentialSnapshot, va
 
 var errSyncChanged = errors.New("credential files changed before copy")
 var errSyncIdentityUnproven = errors.New("replacement cannot prove the saved account identity")
+
+// cacheClaudeIdentity makes the next read independent of the identity endpoint.
+// The proof is bound to both token values, so a concurrent native replacement
+// can only invalidate it; it cannot inherit the previous organization's ID.
+func cacheClaudeIdentity(grant Grant, snapshot CredentialSnapshot) error {
+	if snapshot.claudeIdentity == nil || !snapshot.claudeIdentity.MatchesCredentials(snapshot.data) {
+		return errSyncIdentityUnproven
+	}
+	path := filepath.Join(filepath.Dir(grant.AuthPath), identity.ClaudeIdentityCacheFile)
+	if err := regularSnapshotFile(path, true); err != nil {
+		return err
+	}
+	data, err := json.Marshal(struct {
+		Binding *identity.ClaudeIdentityBinding `json:"claude_identity"`
+	}{snapshot.claudeIdentity})
+	if err != nil {
+		return err
+	}
+	return replaceSavedCredential(path, data, func(string) error {
+		current, err := ReadCredential(grant)
+		if err != nil || !bytes.Equal(current.data, snapshot.data) {
+			return errSyncChanged
+		}
+		return regularSnapshotFile(path, true)
+	})
+}
 
 func syncSkipped(code, reason string) []SyncResult {
 	return []SyncResult{{Status: "skipped", Code: code, Reason: reason}}

@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -58,6 +59,12 @@ var stubbedBinaries = []string{
 // test runs. TestEveryTestPackageIsolatesHome fails the suite when a package
 // with tests lacks it.
 func IsolatedMain(m *testing.M) int {
+	// Identity verification tests inject an explicit transport. Unrelated
+	// backup/switch fixtures must never send their synthetic credentials to
+	// the real provider or become dependent on its availability.
+	transport := http.DefaultTransport
+	http.DefaultTransport = isolatedIdentityTransport{base: transport}
+	defer func() { http.DefaultTransport = transport }()
 	if os.Getenv(isolatedMarker) == "1" {
 		// A helper process spawned by a test: keep the HOME it was given.
 		return m.Run()
@@ -70,6 +77,17 @@ func IsolatedMain(m *testing.M) int {
 	code := m.Run()
 	restore()
 	return code
+}
+
+type isolatedIdentityTransport struct {
+	base http.RoundTripper
+}
+
+func (t isolatedIdentityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Hostname() == "api.anthropic.com" && req.URL.Path == "/api/oauth/profile" {
+		return nil, fmt.Errorf("provider identity verification requires an injected test transport")
+	}
+	return t.base.RoundTrip(req)
 }
 
 // IsolateEnv redirects HOME to a fresh temporary directory, unsets the other

@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func writeSyncFile(t *testing.T, path string, data []byte) {
@@ -35,6 +37,9 @@ func syncCredentialJSON(t *testing.T, provider, token string, owner AccountIdent
 		}
 		if owner.Email != "" {
 			oauth["email"] = owner.Email
+		}
+		if owner.OrganizationID != "" {
+			oauth["organizationUuid"] = owner.OrganizationID
 		}
 		if !expires.IsZero() {
 			oauth["expiresAt"] = expires.UnixMilli()
@@ -63,13 +68,45 @@ func syncCredentialJSON(t *testing.T, provider, token string, owner AccountIdent
 func syncIdentityJSON(t *testing.T, owner AccountIdentity) []byte {
 	t.Helper()
 	data, err := json.Marshal(map[string]any{
-		"oauthAccount":           map[string]any{"accountUuid": owner.AccountID, "emailAddress": owner.Email},
+		"oauthAccount":           map[string]any{"accountUuid": owner.AccountID, "organizationUuid": owner.OrganizationID, "emailAddress": owner.Email},
 		"hasCompletedOnboarding": true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func writeSyncBinding(t *testing.T, authPath string, credentials []byte, owner AccountIdentity, native bool) {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner.AccountID == "" || owner.OrganizationID == "" {
+		t.Fatal("test binding requires both stable identity components")
+	}
+	path := filepath.Join(filepath.Dir(authPath), "meta.json")
+	if native {
+		path = filepath.Join(filepath.Dir(authPath), identity.ClaudeIdentityCacheFile)
+	}
+	metadata := map[string]any{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			t.Fatal(err)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	metadata["claude_identity"] = &identity.ClaudeIdentityBinding{
+		Identity:              identity.Identity{Provider: "claude", AccountID: owner.AccountID, OrganizationID: owner.OrganizationID, Email: owner.Email},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSyncFile(t, path, data)
 }
 
 func syncFixture(t *testing.T, provider string) (Grant, CredentialSnapshot, *authfile.Vault) {
@@ -81,12 +118,16 @@ func syncFixture(t *testing.T, provider string) (Grant, CredentialSnapshot, *aut
 	env := map[string]string{"HOME": home, "GROK_HOME": filepath.Dir(authPath)}
 	owner := AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}
 	if provider == "claude" {
+		owner.OrganizationID = "org-a"
 		authPath = filepath.Join(home, ".claude", ".credentials.json")
 		identityPath = filepath.Join(home, ".claude.json")
 		env = map[string]string{"HOME": home}
 		writeSyncFile(t, identityPath, syncIdentityJSON(t, owner))
 	}
 	writeSyncFile(t, authPath, syncCredentialJSON(t, provider, "live-access", owner, time.Now().Add(4*time.Hour).UTC().Truncate(time.Second)))
+	if provider == "claude" {
+		writeSyncBinding(t, authPath, readSyncFile(t, authPath), owner, true)
+	}
 	vault := authfile.NewVault(filepath.Join(root, "vault"))
 	grant := inspectGrant(Grant{Provider: provider, Kind: "host", Home: home, AuthPath: authPath,
 		IdentityPath: identityPath, Env: env}, []string{vault.BasePath()})
@@ -122,23 +163,30 @@ func TestSyncVaultCopiesOnlyNewerCredentialsOfTheSameAccount(t *testing.T) {
 				metadata     string
 				wantCode     string
 			}{
-				{name: "same account", owner: AccountIdentity{"account-a", "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
-				{name: "known id wins over changed email", owner: AccountIdentity{"account-a", "old-address@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
-				{name: "different ids cannot fall back to matching email", owner: AccountIdentity{"account-b", "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "identity_mismatch"},
-				{name: "email fallback when snapshot lacks id", owner: AccountIdentity{"", "ALICE@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
-				{name: "different email", owner: AccountIdentity{"", "bob@example.test"}, expiryOffset: -time.Hour, wantCode: "identity_mismatch"},
+				{name: "same account", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
+				{name: "known id wins over changed email", owner: AccountIdentity{AccountID: "account-a", Email: "old-address@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
+				{name: "different ids cannot fall back to matching email", owner: AccountIdentity{AccountID: "account-b", Email: "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "identity_mismatch"},
+				{name: "email fallback when snapshot lacks id", owner: AccountIdentity{Email: "ALICE@example.test"}, expiryOffset: -time.Hour, wantCode: "newer_live_credential"},
+				{name: "different email", owner: AccountIdentity{Email: "bob@example.test"}, expiryOffset: -time.Hour, wantCode: "identity_mismatch"},
 				{name: "unknown identity", owner: AccountIdentity{}, expiryOffset: -time.Hour, wantCode: "identity_mismatch"},
-				{name: "same expiry", owner: AccountIdentity{"account-a", "alice@example.test"}, wantCode: "not_newer"},
-				{name: "newer saved copy", owner: AccountIdentity{"account-a", "alice@example.test"}, expiryOffset: time.Hour, wantCode: "not_newer"},
-				{name: "unknown saved age", owner: AccountIdentity{"account-a", "alice@example.test"}, unknown: true, wantCode: "snapshot_expiry_unknown"},
+				{name: "same expiry", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, wantCode: "not_newer"},
+				{name: "newer saved copy", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, expiryOffset: time.Hour, wantCode: "not_newer"},
+				{name: "unknown saved age", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, unknown: true, wantCode: "snapshot_expiry_unknown"},
 				{name: "malformed saved credentials", malformed: true, wantCode: "snapshot_invalid"},
-				{name: "original system snapshot", profile: "_original", owner: AccountIdentity{"account-a", "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "system_profile"},
-				{name: "automatic system snapshot", profile: "_backup_20261006", owner: AccountIdentity{"account-a", "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "system_profile"},
-				{name: "metadata marks system profile", owner: AccountIdentity{"account-a", "alice@example.test"}, metadata: `{"type":"system","created_by":"auto"}`, expiryOffset: -time.Hour, wantCode: "system_profile"},
+				{name: "original system snapshot", profile: "_original", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "system_profile"},
+				{name: "automatic system snapshot", profile: "_backup_20261006", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, expiryOffset: -time.Hour, wantCode: "system_profile"},
+				{name: "metadata marks system profile", owner: AccountIdentity{AccountID: "account-a", Email: "alice@example.test"}, metadata: `{"type":"system","created_by":"auto"}`, expiryOffset: -time.Hour, wantCode: "system_profile"},
 			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
 					grant, observed, vault := syncFixture(t, provider)
+					if provider == "claude" && !tc.malformed {
+						if tc.owner.AccountID != "" {
+							tc.owner.OrganizationID = "org-a"
+						} else {
+							tc.wantCode = "snapshot_identity_unproven"
+						}
+					}
 					profile := tc.profile
 					if profile == "" {
 						profile = "saved-account"
@@ -159,6 +207,10 @@ func TestSyncVaultCopiesOnlyNewerCredentialsOfTheSameAccount(t *testing.T) {
 						metadata = []byte(`{"type":"user","description":"preserve my profile notes"}`)
 					}
 					writeSyncFile(t, filepath.Join(dir, "meta.json"), metadata)
+					if provider == "claude" && tc.owner.AccountID != "" && !tc.malformed {
+						writeSyncBinding(t, authPath, saved, tc.owner, false)
+						metadata = readSyncFile(t, filepath.Join(dir, "meta.json"))
+					}
 					settings := []byte(`{"policy":"saved settings must survive"}`)
 					writeSyncFile(t, filepath.Join(dir, "settings.json"), settings)
 					results, err := SyncVault(context.Background(), grant, observed, vault)
@@ -181,8 +233,19 @@ func TestSyncVaultCopiesOnlyNewerCredentialsOfTheSameAccount(t *testing.T) {
 					if got := readSyncFile(t, grant.AuthPath); !bytes.Equal(got, observed.data) {
 						t.Fatal("vault synchronization wrote into the live credential")
 					}
-					if !bytes.Equal(readSyncFile(t, filepath.Join(dir, "meta.json")), metadata) ||
-						!bytes.Equal(readSyncFile(t, filepath.Join(dir, "settings.json")), settings) {
+					if provider == "claude" && tc.wantCode == "newer_live_credential" {
+						binding, err := identity.ReadClaudeIdentityBinding(authPath)
+						if err != nil || binding == nil || !binding.MatchesCredentials(observed.data) {
+							t.Fatalf("updated credential lost its identity binding: %v", err)
+						}
+						var meta map[string]any
+						if err := json.Unmarshal(readSyncFile(t, filepath.Join(dir, "meta.json")), &meta); err != nil || meta["description"] != "preserve my profile notes" {
+							t.Fatal("identity update discarded profile notes")
+						}
+					} else if !bytes.Equal(readSyncFile(t, filepath.Join(dir, "meta.json")), metadata) {
+						t.Fatal("rejected synchronization changed profile metadata")
+					}
+					if !bytes.Equal(readSyncFile(t, filepath.Join(dir, "settings.json")), settings) {
 						t.Fatal("vault synchronization changed unrelated settings or profile metadata")
 					}
 					if info, err := os.Stat(authPath); err != nil || info.Mode().Perm() != 0600 {
@@ -194,13 +257,14 @@ func TestSyncVaultCopiesOnlyNewerCredentialsOfTheSameAccount(t *testing.T) {
 	}
 }
 
-func TestSyncVaultUsesPairedClaudeIdentityAndTheActualLiveHome(t *testing.T) {
-	grant, _, vault := syncFixture(t, "claude")
+func TestSyncVaultUsesVerifiedClaudeIdentityAndTheActualLiveHome(t *testing.T) {
+	grant, initial, vault := syncFixture(t, "claude")
 	now := time.Now().UTC().Truncate(time.Second)
 	// Current native Claude credentials can have opaque tokens and no identity;
-	// only the .claude.json paired with this particular live home identifies it.
+	// their identity must come from proof bound to those particular tokens.
 	live := syncCredentialJSON(t, "claude", "opaque-live", AccountIdentity{}, now.Add(8*time.Hour))
 	writeSyncFile(t, grant.AuthPath, live)
+	writeSyncBinding(t, grant.AuthPath, live, initial.Identity, true)
 	observed, err := ReadCredential(grant)
 	if err != nil {
 		t.Fatal(err)
@@ -208,10 +272,13 @@ func TestSyncVaultUsesPairedClaudeIdentityAndTheActualLiveHome(t *testing.T) {
 	dir := vault.ProfilePath("claude", "alice")
 	saved := syncCredentialJSON(t, "claude", "opaque-saved", AccountIdentity{}, now.Add(time.Hour))
 	writeSyncFile(t, filepath.Join(dir, ".credentials.json"), saved)
-	identity := syncIdentityJSON(t, observed.Identity)
-	writeSyncFile(t, filepath.Join(dir, ".claude.json"), identity)
+	writeSyncBinding(t, filepath.Join(dir, ".credentials.json"), saved, initial.Identity, false)
+	// An independent Claude session can leave a different organization label
+	// alongside the saved credential. Correct only that label from the proof.
+	accountState := []byte(`{"oauthAccount":{"accountUuid":"old-account","organizationUuid":"old-organization","organizationName":"Stale Team","emailAddress":"alice@example.test"},"hasCompletedOnboarding":true,"numStartups":7,"projects":{"/repo":{"allowedTools":["Read"],"lastSessionId":"saved-session"}},"permissions":{"allow":["Read"],"defaultMode":"auto"}}`)
+	writeSyncFile(t, filepath.Join(dir, ".claude.json"), accountState)
 	wrongHome := t.TempDir()
-	wrongCredential := syncCredentialJSON(t, "claude", "unrelated-live", AccountIdentity{"account-b", "bob@example.test"}, now.Add(9*time.Hour))
+	wrongCredential := syncCredentialJSON(t, "claude", "unrelated-live", AccountIdentity{AccountID: "account-b", Email: "bob@example.test"}, now.Add(9*time.Hour))
 	wrongPath := filepath.Join(wrongHome, ".claude", ".credentials.json")
 	writeSyncFile(t, wrongPath, wrongCredential)
 	t.Setenv("HOME", wrongHome)
@@ -223,11 +290,105 @@ func TestSyncVaultUsesPairedClaudeIdentityAndTheActualLiveHome(t *testing.T) {
 	if !bytes.Equal(readSyncFile(t, filepath.Join(dir, ".credentials.json")), live) {
 		t.Fatal("did not copy the grant's own credential")
 	}
-	if !bytes.Equal(readSyncFile(t, filepath.Join(dir, ".claude.json")), identity) {
-		t.Fatal("paired saved account state was overwritten")
+	var before, after map[string]any
+	if err := json.Unmarshal(accountState, &before); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(readSyncFile(t, filepath.Join(dir, ".claude.json")), &after); err != nil {
+		t.Fatal(err)
+	}
+	wantAccount := map[string]any{
+		"accountUuid": observed.Identity.AccountID, "organizationUuid": observed.Identity.OrganizationID,
+		"emailAddress": observed.Identity.Email,
+	}
+	if !reflect.DeepEqual(after["oauthAccount"], wantAccount) {
+		t.Fatal("saved account and organization were not corrected from the token-bound proof")
+	}
+	delete(before, "oauthAccount")
+	delete(after, "oauthAccount")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("synchronization changed nonidentity Claude state")
 	}
 	if !bytes.Equal(readSyncFile(t, wrongPath), wrongCredential) || os.Getenv("HOME") != wrongHome || os.Getenv("CLAUDE_CONFIG_DIR") != filepath.Dir(wrongPath) {
 		t.Fatal("sync changed the caller's unrelated home or environment")
+	}
+}
+
+func TestSyncVaultSeparatesClaudeOrganizationsAndPersistsProof(t *testing.T) {
+	grant, initial, vault := syncFixture(t, "claude")
+	personal := initial.Identity
+	personal.OrganizationID = "personal-organization"
+	team := personal
+	team.OrganizationID = "team-organization"
+	live := syncCredentialJSON(t, "claude", "team-current", AccountIdentity{}, initial.ExpiresAt.Add(time.Hour))
+	writeSyncFile(t, grant.AuthPath, live)
+	writeSyncFile(t, grant.IdentityPath, syncIdentityJSON(t, personal)) // stale concurrent Claude session
+	writeSyncBinding(t, grant.AuthPath, live, team, true)
+	grant = inspectGrant(Grant{Provider: "claude", Kind: "host", Home: grant.Home, AuthPath: grant.AuthPath,
+		IdentityPath: grant.IdentityPath, Env: grant.Env}, []string{vault.BasePath()})
+	observed, err := ReadCredential(grant)
+	if err != nil || observed.Identity.OrganizationID != team.OrganizationID {
+		t.Fatalf("stale native metadata outranked token ownership: %+v, %v", observed.Identity, err)
+	}
+	saved := map[string][]byte{}
+	for name, owner := range map[string]AccountIdentity{"personal": personal, "team": team} {
+		path := filepath.Join(vault.ProfilePath("claude", name), ".credentials.json")
+		saved[name] = syncCredentialJSON(t, "claude", name+"-saved", AccountIdentity{}, initial.ExpiresAt.Add(-time.Hour))
+		writeSyncFile(t, path, saved[name])
+		writeSyncBinding(t, path, saved[name], owner, false)
+		// Both saved state files carry the same misleading label.
+		writeSyncFile(t, filepath.Join(filepath.Dir(path), ".claude.json"), syncIdentityJSON(t, personal))
+	}
+	results, err := SyncVault(context.Background(), grant, observed, vault)
+	if err != nil || len(results) != 2 {
+		t.Fatalf("organization sync = %+v, %v", results, err)
+	}
+	for _, result := range results {
+		want := "identity_mismatch"
+		if result.Profile == "team" {
+			want = "newer_live_credential"
+		}
+		if result.Code != want {
+			t.Fatalf("organization %s: %+v; want %s", result.Profile, result, want)
+		}
+	}
+	personalPath := filepath.Join(vault.ProfilePath("claude", "personal"), ".credentials.json")
+	if !bytes.Equal(readSyncFile(t, personalPath), saved["personal"]) {
+		t.Fatal("Team renewal overwrote the same-email personal profile")
+	}
+	restarted := authfile.NewVault(vault.BasePath())
+	id, err := SnapshotIdentity(restarted, "claude", "team")
+	if err != nil || !id.Verified || !SameAccount(id, team) {
+		t.Fatalf("restart lost the exact-token organization proof: %+v, %v", id, err)
+	}
+	data, err := json.Marshal(results)
+	if err != nil || strings.Contains(string(data), "team-current") || strings.Contains(string(data), "synthetic-refresh") {
+		t.Fatal("sync result exposed credentials")
+	}
+}
+
+func TestSyncVaultRejectsReplacedAccessTokenWithUnchangedRefresh(t *testing.T) {
+	grant, observed, vault := syncFixture(t, "claude")
+	path := filepath.Join(vault.ProfilePath("claude", "saved"), ".credentials.json")
+	old := syncCredentialJSON(t, "claude", "saved-access", observed.Identity, observed.ExpiresAt.Add(-time.Hour))
+	writeSyncFile(t, path, old)
+	writeSyncBinding(t, path, old, observed.Identity, false)
+	var changed map[string]any
+	if err := json.Unmarshal(observed.data, &changed); err != nil {
+		t.Fatal(err)
+	}
+	changed["claudeAiOauth"].(map[string]any)["accessToken"] = "other-organization-access"
+	data, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSyncFile(t, grant.AuthPath, data)
+	results, err := SyncVault(context.Background(), grant, observed, vault)
+	if err != nil || len(results) != 1 || results[0].Code != "source_identity_unverified" {
+		t.Fatalf("replaced access token reused an old identity binding: %+v, %v", results, err)
+	}
+	if !bytes.Equal(readSyncFile(t, path), old) {
+		t.Fatal("mismatched access token escaped into the saved profile")
 	}
 }
 
@@ -244,7 +405,7 @@ func TestSyncVaultRefusesAmbiguousEmailOnlyLiveOwner(t *testing.T) {
 	before := make(map[string][]byte)
 	for _, id := range []string{"account-a", "account-b"} {
 		path := filepath.Join(vault.ProfilePath("grok", id), "auth.json")
-		before[path] = syncCredentialJSON(t, "grok", "saved-"+id, AccountIdentity{id, owner.Email}, observed.ExpiresAt.Add(-time.Hour))
+		before[path] = syncCredentialJSON(t, "grok", "saved-"+id, AccountIdentity{AccountID: id, Email: owner.Email}, observed.ExpiresAt.Add(-time.Hour))
 		writeSyncFile(t, path, before[path])
 	}
 	results, err := SyncVault(context.Background(), grant, observed, vault)
@@ -264,6 +425,7 @@ func TestSyncVaultDoesNotLoseIdentityWhenClaudeTokensBecomeOpaque(t *testing.T) 
 	old := syncCredentialJSON(t, "claude", "old-inline-identity", observed.Identity, observed.ExpiresAt.Add(-time.Hour))
 	writeSyncFile(t, path, old)
 	writeSyncFile(t, grant.AuthPath, syncCredentialJSON(t, "claude", "opaque-modern-token", AccountIdentity{}, observed.ExpiresAt.Add(time.Hour)))
+	writeSyncBinding(t, grant.AuthPath, readSyncFile(t, grant.AuthPath), observed.Identity, true)
 	current, err := ReadCredential(grant)
 	if err != nil {
 		t.Fatal(err)
@@ -275,9 +437,8 @@ func TestSyncVaultDoesNotLoseIdentityWhenClaudeTokensBecomeOpaque(t *testing.T) 
 	if !bytes.Equal(readSyncFile(t, path), old) {
 		t.Fatal("opaque replacement erased the saved profile's only account identity")
 	}
-	id, err := SnapshotIdentity(vault, "claude", "alice")
-	if err != nil || !SameAccount(observed.Identity, id) {
-		t.Fatalf("original saved account can no longer be identified: %+v, %v", id, err)
+	if _, err := SnapshotIdentity(vault, "claude", "alice"); err == nil {
+		t.Fatal("unverified inline identity was presented as the saved token's owner")
 	}
 }
 
@@ -347,6 +508,7 @@ func TestSnapshotIdentityIsReadOnlyAndRejectsUnsafePaths(t *testing.T) {
 	dir := vault.ProfilePath("claude", "alice")
 	path := filepath.Join(dir, ".credentials.json")
 	writeSyncFile(t, path, observed.data)
+	writeSyncBinding(t, path, observed.data, observed.Identity, false)
 	for _, profile := range []string{"../alice", "../../live", filepath.Join(dir, ".."), "missing"} {
 		if _, err := SnapshotIdentity(vault, "claude", profile); err == nil {
 			t.Errorf("accepted invalid or missing profile %q", profile)
@@ -382,10 +544,11 @@ func TestSyncVaultRereadsLiveOwnerAfterTheNativeCommand(t *testing.T) {
 			old := syncCredentialJSON(t, provider, "old", observed.Identity, observed.ExpiresAt.Add(-time.Hour))
 			writeSyncFile(t, path, old)
 			// Keep the email identical: a changed account ID must still refuse.
-			changed := AccountIdentity{"account-b", observed.Identity.Email}
+			changed := AccountIdentity{AccountID: "account-b", OrganizationID: observed.Identity.OrganizationID, Email: observed.Identity.Email}
 			writeSyncFile(t, grant.AuthPath, syncCredentialJSON(t, provider, "changed-owner", changed, observed.ExpiresAt.Add(time.Hour)))
 			if provider == "claude" {
 				writeSyncFile(t, grant.IdentityPath, syncIdentityJSON(t, changed))
+				writeSyncBinding(t, grant.AuthPath, readSyncFile(t, grant.AuthPath), changed, true)
 			}
 			results, err := SyncVault(context.Background(), grant, observed, vault)
 			if err != nil || len(results) != 1 || results[0].Code != "source_owner_changed" {
@@ -405,6 +568,7 @@ func TestSyncVaultRereadsFilesAfterNativeLockContention(t *testing.T) {
 			path := filepath.Join(vault.ProfilePath("claude", "alice"), ".credentials.json")
 			old := syncCredentialJSON(t, "claude", "old", observed.Identity, observed.ExpiresAt.Add(-time.Hour))
 			writeSyncFile(t, path, old)
+			writeSyncBinding(t, path, old, observed.Identity, false)
 			lock, err := acquireNativeCredentialLock(context.Background(), grant)
 			if err != nil {
 				t.Fatal(err)
@@ -432,13 +596,16 @@ func TestSyncVaultRereadsFilesAfterNativeLockContention(t *testing.T) {
 			case "newer live rotation":
 				want = syncCredentialJSON(t, "claude", "newest-live", observed.Identity, observed.ExpiresAt.Add(time.Hour))
 				writeSyncFile(t, grant.AuthPath, want)
+				writeSyncBinding(t, grant.AuthPath, want, observed.Identity, true)
 			case "newer vault snapshot":
 				want = syncCredentialJSON(t, "claude", "newest-vault", observed.Identity, observed.ExpiresAt.Add(time.Hour))
 				writeSyncFile(t, path, want)
+				writeSyncBinding(t, path, want, observed.Identity, false)
 				wantCode = "not_newer"
 			case "changed Claude sidecar":
-				writeSyncFile(t, grant.IdentityPath, syncIdentityJSON(t, AccountIdentity{"account-b", "bob@example.test"}))
-				wantCode = "source_unavailable"
+				writeSyncFile(t, grant.IdentityPath, syncIdentityJSON(t, AccountIdentity{AccountID: "account-b", OrganizationID: "wrong-org", Email: "bob@example.test"}))
+				// Bound token identity outranks the stale shared state file.
+				want = observed.data
 			}
 			closeCredentialLock(lock)
 			locked = false

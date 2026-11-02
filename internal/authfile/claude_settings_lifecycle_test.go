@@ -414,8 +414,11 @@ func TestClaudeLegacyMCPRoundTripAndLogout(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := readJSONMap(t, legacy)
-		if got["oauthAccount"].(map[string]interface{})["accountUuid"] != "bob" {
-			t.Fatal("legacy auth did not switch")
+		if got["oauthAccount"] != nil {
+			t.Fatal("unverified legacy account label was published as token ownership")
+		}
+		if got := readFixtureFile(t, fileSet.Files[0].Path); got != `{"claudeAiOauth":{"accessToken":"bob-at","refreshToken":"bob-rt"}}` {
+			t.Fatal("requested account credentials did not switch")
 		}
 		if _, ok := got["mcpServers"].(map[string]interface{})["live"]; !ok {
 			t.Fatal("live MCP registration lost")

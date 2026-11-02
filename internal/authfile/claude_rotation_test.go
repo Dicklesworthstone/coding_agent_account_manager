@@ -3,22 +3,30 @@ package authfile
 // Tests for issue #73: Claude Code rotates both OAuth tokens in place while a
 // profile is active, so vault recognition (ActiveProfile), the outgoing
 // re-snapshot, and the restore freshness guard must key on the account
-// identity carried by ~/.claude.json rather than on token bytes.
+// provider-confirmed account AND organization identity. Issue #132 establishes
+// that ~/.claude.json can be stale even while the credentials are valid.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 const (
 	rotAliceUUID  = "11111111-2222-3333-4444-555555555555"
 	rotAliceEmail = "alice@example.com"
 	rotAliceUser  = "useridhash-alice"
+	rotAliceOrg   = "org-1"
+	rotTeamOrg    = "org-team"
 	rotBobUUID    = "66666666-7777-8888-9999-000000000000"
 	rotBobEmail   = "bob@example.com"
 )
@@ -61,6 +69,7 @@ type claudeRotationFixture struct {
 	fileSet      AuthFileSet
 	liveCreds    string
 	liveSettings string
+	proofs       map[string]*identity.ClaudeIdentityBinding
 }
 
 func newClaudeRotationFixture(t *testing.T) *claudeRotationFixture {
@@ -78,6 +87,44 @@ func newClaudeRotationFixture(t *testing.T) *claudeRotationFixture {
 		liveSettings: filepath.Join(home, ".claude.json"),
 	}
 	f.vault = NewVault(f.vaultDir)
+	// This oracle is deliberately independent of .claude.json and all embedded
+	// credential labels. Each synthetic token pair has one provider identity.
+	f.proofs = make(map[string]*identity.ClaudeIdentityBinding)
+	for _, entry := range []struct {
+		credentials  string
+		account      string
+		organization string
+		email        string
+	}{
+		{aliceGen1, rotAliceUUID, rotAliceOrg, rotAliceEmail},
+		{aliceGen2, rotAliceUUID, rotAliceOrg, rotAliceEmail},
+		{aliceTeamGen1, rotAliceUUID, rotTeamOrg, rotAliceEmail},
+		{bobGen1, rotBobUUID, rotAliceOrg, rotBobEmail},
+		{claudeRotationCreds("sk-ant-oat01-bob-gen9", "sk-ant-ort01-bob-gen9", 9999), rotBobUUID, rotAliceOrg, rotBobEmail},
+		{claudeRotationCreds("sk-ant-oat01-alice-dead", "", 2000), rotAliceUUID, rotAliceOrg, rotAliceEmail},
+	} {
+		fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(entry.credentials))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.proofs[fingerprint] = &identity.ClaudeIdentityBinding{
+			Identity:              identity.Identity{Provider: "claude", AccountID: entry.account, OrganizationID: entry.organization, Email: entry.email},
+			CredentialFingerprint: fingerprint,
+			VerifiedAt:            time.Now().UTC(),
+		}
+	}
+	f.vault.ClaudeIdentityVerifier = func(_ context.Context, credentials []byte) (*identity.ClaudeIdentityBinding, error) {
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			return nil, err
+		}
+		binding := f.proofs[fingerprint]
+		if binding == nil {
+			return nil, identity.ErrClaudeIdentityUnavailable
+		}
+		copy := *binding
+		return &copy, nil
+	}
 	f.fileSet = AuthFileSet{
 		Tool: "claude",
 		Files: []AuthFileSpec{
@@ -112,10 +159,11 @@ func (f *claudeRotationFixture) writeLive(creds, settings string) {
 	if settings != "" {
 		writeFixtureFile(f.t, f.liveSettings, settings)
 	}
+	f.writeBinding(filepath.Join(filepath.Dir(f.liveCreds), identity.ClaudeIdentityCacheFile), creds)
 }
 
-// writeProfile creates a vault profile directly (no meta.json, as vaults
-// written before #73 look); an empty settings string omits .claude.json.
+// writeProfile creates a previously verified vault snapshot; an empty settings
+// string omits .claude.json without discarding the token-bound provider proof.
 func (f *claudeRotationFixture) writeProfile(name, creds, settings string) {
 	f.t.Helper()
 	dir := filepath.Join(f.vaultDir, "claude", name)
@@ -125,6 +173,54 @@ func (f *claudeRotationFixture) writeProfile(name, creds, settings string) {
 	writeFixtureFile(f.t, filepath.Join(dir, ".credentials.json"), creds)
 	if settings != "" {
 		writeFixtureFile(f.t, filepath.Join(dir, ".claude.json"), settings)
+	}
+	f.writeBinding(filepath.Join(dir, "meta.json"), creds)
+}
+
+func (f *claudeRotationFixture) writeBinding(path, credentials string) {
+	f.t.Helper()
+	binding, err := f.vault.ClaudeIdentityVerifier(context.Background(), []byte(credentials))
+	if err != nil {
+		writeFixtureFile(f.t, path, `{}`)
+		return
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	writeFixtureFile(f.t, path, string(metadata))
+}
+
+// setClaudeFixtureIdentities models the provider response for exact synthetic
+// token pairs. The assignment is explicit; no local identity metadata or profile
+// name is ever read to infer the answer the verifier is supposed to establish.
+func setClaudeFixtureIdentities(t *testing.T, vault *Vault, accounts map[string]identity.Identity) {
+	t.Helper()
+	bindings := make(map[string]*identity.ClaudeIdentityBinding, len(accounts))
+	for credentials, account := range accounts {
+		fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(credentials))
+		if err != nil {
+			t.Fatal(err)
+		}
+		account.Provider, account.Verified = "claude", true
+		if account.AccountID == "" || account.OrganizationID == "" {
+			t.Fatal("fixture provider response must identify both account and organization")
+		}
+		bindings[fingerprint] = &identity.ClaudeIdentityBinding{
+			Identity: account, CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}
+	}
+	vault.ClaudeIdentityVerifier = func(_ context.Context, credentials []byte) (*identity.ClaudeIdentityBinding, error) {
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			return nil, err
+		}
+		binding := bindings[fingerprint]
+		if binding == nil {
+			return nil, identity.ErrClaudeIdentityUnavailable
+		}
+		copy := *binding
+		return &copy, nil
 	}
 }
 
@@ -142,9 +238,10 @@ func (f *claudeRotationFixture) active() string {
 }
 
 var (
-	aliceGen1 = claudeRotationCreds("sk-ant-oat01-alice-gen1", "sk-ant-ort01-alice-gen1", 1000)
-	aliceGen2 = claudeRotationCreds("sk-ant-oat01-alice-gen2", "sk-ant-ort01-alice-gen2", 2000)
-	bobGen1   = claudeRotationCreds("sk-ant-oat01-bob-gen1", "sk-ant-ort01-bob-gen1", 1000)
+	aliceGen1     = claudeRotationCreds("sk-ant-oat01-alice-gen1", "sk-ant-ort01-alice-gen1", 1000)
+	aliceGen2     = claudeRotationCreds("sk-ant-oat01-alice-gen2", "sk-ant-ort01-alice-gen2", 2000)
+	bobGen1       = claudeRotationCreds("sk-ant-oat01-bob-gen1", "sk-ant-ort01-bob-gen1", 1000)
+	aliceTeamGen1 = claudeRotationCreds("sk-ant-oat01-alice-team-gen1", "sk-ant-ort01-alice-team-gen1", 1000)
 )
 
 func aliceSettings(numStartups int) string {
@@ -247,10 +344,8 @@ func TestActiveProfileDoesNotMatchCredentiallessIdentity(t *testing.T) {
 func TestActiveProfileIdentityFromMetaWhenSnapshotLacksSettings(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	// Snapshot has no .claude.json (backed up while it was absent) but Backup
-	// recorded the identity keys in meta.json.
+	// recorded provider-confirmed ownership of these exact tokens in meta.json.
 	f.writeProfile("alice", aliceGen1, "")
-	writeFixtureFile(t, f.profileFile("alice", "meta.json"),
-		`{"tool":"claude","profile":"alice","identity":"alice@example.com","identity_keys":["uuid:`+rotAliceUUID+`"]}`)
 	f.writeLive(aliceGen2, aliceSettings(9))
 
 	if got := f.active(); got != "alice" {
@@ -258,14 +353,61 @@ func TestActiveProfileIdentityFromMetaWhenSnapshotLacksSettings(t *testing.T) {
 	}
 }
 
-func TestActiveProfileIdentityMatchesOnAnySharedKey(t *testing.T) {
+func TestActiveProfileRejectsUnverifiedSharedEmail(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	// Older snapshot shape: email only, no accountUuid, no userID.
 	f.writeProfile("alice", aliceGen1, claudeRotationSettings("", "Alice@Example.com", "", 1))
+	writeFixtureFile(t, f.profileFile("alice", "meta.json"), `{"identity":"alice@example.com","identity_keys":["email:alice@example.com"]}`)
 	f.writeLive(aliceGen2, aliceSettings(9))
 
-	if got := f.active(); got != "alice" {
-		t.Fatalf("ActiveProfile = %q, want alice matched on the (normalized) email key", got)
+	if got := f.active(); got != "" {
+		t.Fatalf("ActiveProfile = %q, want no cross-generation match from an unverified email", got)
+	}
+}
+
+func TestActiveProfileRejectsMissingOrganizationProof(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("alice", aliceGen1, aliceSettings(1))
+	f.writeLive(aliceGen2, aliceSettings(9))
+	metadata := readJSONMap(t, f.profileFile("alice", "meta.json"))
+	binding := metadata["claude_identity"].(map[string]interface{})
+	boundIdentity := binding["identity"].(map[string]interface{})
+	delete(boundIdentity, "organization_id")
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, f.profileFile("alice", "meta.json"), string(data))
+	if got := f.active(); got != "" {
+		t.Fatalf("missing organization proof selected profile %q", got)
+	}
+}
+
+func TestActiveProfileDistinguishesOrganizationsWithStaleSharedMetadata(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("personal", aliceGen1, aliceSettings(1))
+	// Both snapshots and the live metadata claim the personal organization.
+	// The token oracle independently associates the Team grant with Team.
+	f.writeProfile("team", aliceTeamGen1, aliceSettings(1))
+	f.writeLive(aliceGen2, aliceSettings(9))
+	if got := f.active(); got != "personal" {
+		t.Fatalf("personal grant selected %q with the same email in two organizations", got)
+	}
+	f.writeLive(aliceTeamGen1, aliceSettings(10))
+	if got := f.active(); got != "team" {
+		t.Fatalf("Team grant selected %q under stale personal metadata", got)
+	}
+}
+
+func TestActiveProfileDoesNotReuseProofAfterConcurrentTokenReplacement(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("alice", aliceGen1, aliceSettings(1))
+	f.writeLive(aliceGen2, aliceSettings(9))
+	// A different session replaces the token without updating either shared
+	// .claude.json or CAAM's previous token-bound cache.
+	writeFixtureFile(t, f.liveCreds, claudeRotationCreds("sk-ant-oat01-bob-gen9", "sk-ant-ort01-bob-gen9", 9999))
+	if got := f.active(); got != "" {
+		t.Fatalf("concurrently replaced credentials inherited old owner %q", got)
 	}
 }
 
@@ -293,14 +435,14 @@ func TestActiveProfileIdentityIgnoresSharedMachineUserID(t *testing.T) {
 	}
 }
 
-func TestActiveProfileNoIdentityWithoutLiveSettings(t *testing.T) {
+func TestActiveProfileBoundIdentityDoesNotRequireLiveSettings(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))
-	// Rotated tokens but no live ~/.claude.json: nothing to identify the account by.
+	// Provider proof remains valid when volatile native metadata is absent.
 	f.writeLive(aliceGen2, "")
 
-	if got := f.active(); got != "" {
-		t.Fatalf("ActiveProfile = %q, want no match without any identity source", got)
+	if got := f.active(); got != "alice" {
+		t.Fatalf("ActiveProfile = %q, want alice from a token-bound proof", got)
 	}
 }
 
@@ -319,7 +461,7 @@ func TestBackupRecordsClaudeIdentityInMeta(t *testing.T) {
 		t.Errorf("meta identity = %v, want %q", meta["identity"], rotAliceEmail)
 	}
 	keys, _ := meta["identity_keys"].([]interface{})
-	want := map[string]bool{"uuid:" + rotAliceUUID: true, "email:" + rotAliceEmail: true}
+	want := map[string]bool{"uuid:" + rotAliceUUID: true, "org:" + rotAliceOrg: true}
 	for _, k := range keys {
 		if fmt.Sprint(k) == "userid:"+rotAliceUser {
 			t.Errorf("meta identity_keys must not carry the per-installation userID: %v", keys)
@@ -328,6 +470,10 @@ func TestBackupRecordsClaudeIdentityInMeta(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("meta identity_keys %v missing %v", keys, want)
+	}
+	binding, err := identity.ReadClaudeIdentityBinding(f.profileFile("alice", ".credentials.json"))
+	if err != nil || binding == nil || binding.Identity.OrganizationID != rotAliceOrg {
+		t.Fatalf("backup did not persist an exact-token organization proof: %v", err)
 	}
 }
 
@@ -345,9 +491,9 @@ func TestRestoreKeepsFresherLiveClaudeCredentials(t *testing.T) {
 	if got := readFixtureFile(t, f.liveCreds); got != aliceGen2 {
 		t.Fatalf("live credentials were clobbered with the stale snapshot:\n got %s\nwant %s", got, aliceGen2)
 	}
-	// The settings snapshot itself is still restored (it holds no tokens).
-	if got := readJSONMap(t, f.liveSettings)["numStartups"]; got != float64(1) {
-		t.Fatalf("live .claude.json numStartups = %v, want the snapshot's 1", got)
+	// A same-account freshness no-op preserves the current session state too.
+	if got := readJSONMap(t, f.liveSettings)["numStartups"]; got != float64(9) {
+		t.Fatalf("live .claude.json numStartups = %v, want the live value 9", got)
 	}
 }
 
@@ -413,6 +559,12 @@ func TestClaudeRestoreFreshnessRequiresConsistentAccount(t *testing.T) {
 			liveSettings: claudeRotationSettings(rotBobUUID, rotAliceEmail, rotAliceUser, 9),
 		},
 		{
+			name:         "same account and email do not override a different verified organization",
+			snapshot:     aliceGen1,
+			live:         claudeRotationCreds("sk-ant-oat01-alice-team-gen1", "sk-ant-ort01-alice-team-gen1", 9999),
+			liveSettings: aliceSettings(9),
+		},
+		{
 			name:         "live embedded account conflicts with stale paired settings",
 			snapshot:     aliceGen1,
 			live:         withIdentity(bobNewer, rotBobUUID, rotAliceEmail),
@@ -431,8 +583,7 @@ func TestClaudeRestoreFreshnessRequiresConsistentAccount(t *testing.T) {
 			f.writeLive(tc.live, tc.liveSettings)
 			snapshotPath := f.profileFile("alice", ".credentials.json")
 
-			if got := f.vault.claudeLiveIsNewer(claudeLiveIdentityKeys(f.fileSet),
-				f.vault.ProfilePath("claude", "alice"), f.liveCreds, snapshotPath); got != tc.wantKeepLive {
+			if got := f.vault.claudeLiveIsNewer(f.liveCreds, snapshotPath); got != tc.wantKeepLive {
 				t.Errorf("claudeLiveIsNewer() = %v, want %v", got, tc.wantKeepLive)
 			}
 			if err := f.vault.Restore(f.fileSet, "alice"); err != nil {
@@ -447,6 +598,24 @@ func TestClaudeRestoreFreshnessRequiresConsistentAccount(t *testing.T) {
 			}
 			if got := readFixtureFile(t, snapshotPath); got != tc.snapshot {
 				t.Fatal("Restore changed the saved profile")
+			}
+		})
+	}
+}
+
+func TestClaudeFreshnessRejectsUnverifiedIdentityHints(t *testing.T) {
+	for _, missing := range []string{"live", "snapshot"} {
+		t.Run(missing, func(t *testing.T) {
+			f := newClaudeRotationFixture(t)
+			f.writeProfile("alice", aliceGen1, aliceSettings(1))
+			f.writeLive(aliceGen2, aliceSettings(9))
+			path := filepath.Join(filepath.Dir(f.liveCreds), identity.ClaudeIdentityCacheFile)
+			if missing == "snapshot" {
+				path = f.profileFile("alice", "meta.json")
+			}
+			writeFixtureFile(t, path, `{"identity_keys":["uuid:`+rotAliceUUID+`","org:`+rotAliceOrg+`","email:`+rotAliceEmail+`"]}`)
+			if f.vault.claudeLiveIsNewer(f.liveCreds, f.profileFile("alice", ".credentials.json")) {
+				t.Fatal("shared local labels authorized a freshness decision without a token-bound proof")
 			}
 		})
 	}
@@ -598,8 +767,21 @@ func TestClaudeBackupAcceptsLargeStateDocument(t *testing.T) {
 	if err := f.vault.Backup(f.fileSet, "alice"); err != nil {
 		t.Fatalf("Backup with a %d MiB ~/.claude.json: %v", len(big)>>20, err)
 	}
-	if got := readFixtureFile(t, f.profileFile("alice", ".claude.json")); got != string(big) {
-		t.Fatalf("saved ~/.claude.json is %d bytes, want %d", len(got), len(big))
+	saved := readJSONMap(t, f.profileFile("alice", ".claude.json"))
+	savedAccount, _ := saved["oauthAccount"].(map[string]interface{})
+	if savedAccount["accountUuid"] != rotAliceUUID || savedAccount["organizationUuid"] != rotAliceOrg || savedAccount["emailAddress"] != rotAliceEmail {
+		t.Fatal("large state backup lost the verified account and organization")
+	}
+	// Rewriting oauthAccount and JSON whitespace is intentional; every other
+	// setting, including the complete large project history, must survive.
+	var original map[string]interface{}
+	if err := json.Unmarshal(big, &original); err != nil {
+		t.Fatal(err)
+	}
+	delete(saved, "oauthAccount")
+	delete(original, "oauthAccount")
+	if !reflect.DeepEqual(saved, original) {
+		t.Fatal("large state backup changed unrelated native settings")
 	}
 
 	// The auth pool validates saved files the same way: a large state document
@@ -628,7 +810,7 @@ func TestClaudeIdentityKeys(t *testing.T) {
 		root string
 		want []string
 	}{
-		{"full account", aliceSettings(1), []string{"uuid:" + rotAliceUUID, "email:" + rotAliceEmail}},
+		{"full account", aliceSettings(1), []string{"uuid:" + rotAliceUUID, "org:" + rotAliceOrg, "email:" + rotAliceEmail}},
 		{"normalizes case and whitespace", `{"oauthAccount":{"accountUuid":" ABCD ","emailAddress":" Alice@Example.com "}}`, []string{"uuid:abcd", "email:alice@example.com"}},
 		{"legacy string account", `{"oauthAccount":"Legacy@Example.com"}`, []string{"account:legacy@example.com"}},
 		{"userID alone is not an identity (per-installation value)", `{"userID":"u-1"}`, nil},
@@ -648,19 +830,28 @@ func TestClaudeIdentityKeys(t *testing.T) {
 	}
 }
 
-func TestClaudeProfileIdentityLabelPrefersEmail(t *testing.T) {
+func TestClaudeProfileIdentityUsesVerifiedAccountAndOrganization(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))
 	f.writeProfile("uuid-only", aliceGen1, claudeRotationSettings(rotAliceUUID, "", "", 1))
-	f.writeProfile("opaque", aliceGen1, "")
+	f.writeProfile("team", aliceTeamGen1, aliceSettings(1))
+	f.writeProfile("opaque", claudeRotationCreds("unknown-access", "unknown-refresh", 1000), aliceSettings(1))
 
-	if got := f.vault.ProfileIdentity("claude", "alice"); got != rotAliceEmail {
-		t.Errorf("ProfileIdentity(alice) = %q, want %q", got, rotAliceEmail)
+	want := `claude:["` + rotAliceUUID + `","` + rotAliceOrg + `"]`
+	if got := f.vault.ProfileIdentity("claude", "alice"); got != want {
+		t.Errorf("ProfileIdentity(alice) = %q, want %q", got, want)
 	}
-	if got := f.vault.ProfileIdentity("claude", "uuid-only"); got != rotAliceUUID {
-		t.Errorf("ProfileIdentity(uuid-only) = %q, want %q", got, rotAliceUUID)
+	if got := f.vault.ProfileIdentity("claude", "uuid-only"); got != want {
+		t.Errorf("ProfileIdentity(uuid-only) = %q, want %q", got, want)
+	}
+	if got := f.vault.ProfileIdentity("claude", "team"); got == "" || got == want {
+		t.Errorf("same-email Team organization collapsed into personal identity: %q", got)
 	}
 	if got := f.vault.ProfileIdentity("claude", "opaque"); got != "" {
-		t.Errorf("ProfileIdentity(opaque) = %q, want empty (opaque tokens carry no identity)", got)
+		t.Errorf("ProfileIdentity(opaque) = %q, want empty (metadata does not prove ownership)", got)
+	}
+	writeFixtureFile(t, f.profileFile("alice", ".credentials.json"), bobGen1)
+	if got := f.vault.ProfileIdentity("claude", "alice"); got != "" {
+		t.Errorf("replaced token retained a stale duplicate-detection key: %q", got)
 	}
 }

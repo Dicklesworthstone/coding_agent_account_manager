@@ -2,12 +2,16 @@ package authfile
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func TestHasAuthFilesReadOnlyFileSources(t *testing.T) {
@@ -317,7 +321,7 @@ func TestSwitchPreservesRotatedClaudeCredential(t *testing.T) {
 	f.writeProfile("bob", bobGen1, bobSettings(1))
 	f.writeProfile("_backup_exact", aliceGen2, aliceSettings(9))
 	f.writeLive(aliceGen2, aliceSettings(9))
-	settingsBefore := readFixtureFile(t, f.profileFile("alice", claudeSettingsFile))
+	settingsBefore := readJSONMap(t, f.profileFile("alice", claudeSettingsFile))
 
 	result, err := f.vault.Switch(f.fileSet, "bob", SwitchOptions{})
 	if err != nil {
@@ -329,10 +333,14 @@ func TestSwitchPreservesRotatedClaudeCredential(t *testing.T) {
 	if got := readFixtureFile(t, f.profileFile("alice", claudeCredentialsFile)); got != aliceGen2 {
 		t.Fatal("outgoing Claude credential was not saved")
 	}
-	if got := readFixtureFile(t, f.profileFile("alice", claudeSettingsFile)); got != settingsBefore {
+	if got := readJSONMap(t, f.profileFile("alice", claudeSettingsFile)); !reflect.DeepEqual(got, settingsBefore) {
 		t.Fatal("credential preservation changed saved Claude settings")
 	}
-	if got := readFixtureFile(t, f.profileFile(result.AutoBackup, claudeSettingsFile)); got != aliceSettings(9) {
+	var expectedSettings map[string]interface{}
+	if err := json.Unmarshal([]byte(aliceSettings(9)), &expectedSettings); err != nil {
+		t.Fatal(err)
+	}
+	if got := readJSONMap(t, f.profileFile(result.AutoBackup, claudeSettingsFile)); !reflect.DeepEqual(got, expectedSettings) {
 		t.Fatal("changed auxiliary files were not preserved in the recovery snapshot")
 	}
 	if got := readFixtureFile(t, f.liveCreds); got != bobGen1 {
@@ -478,8 +486,18 @@ func TestSwitchAccountIDOverridesSharedEmail(t *testing.T) {
 	f := newClaudeRotationFixture(t)
 	f.writeProfile("alice", aliceGen1, aliceSettings(1))
 	f.writeProfile("bob", bobGen1, bobSettings(1))
-	// The email matches Alice but the account ID explicitly does not.
-	f.writeLive(aliceGen2, claudeRotationSettings("other-account", rotAliceEmail, "", 9))
+	// The provider confirms Alice's email belongs to a different account for
+	// this token pair. The assertion is independent of mutable local metadata.
+	otherCredential := claudeRotationCreds("other-account-access", "other-account-refresh", 2000)
+	fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(otherCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.proofs[fingerprint] = &identity.ClaudeIdentityBinding{
+		Identity:              identity.Identity{Provider: "claude", AccountID: "other-account", OrganizationID: rotAliceOrg, Email: rotAliceEmail},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+	f.writeLive(otherCredential, claudeRotationSettings("other-account", rotAliceEmail, "", 9))
 	result, err := f.vault.Switch(f.fileSet, "bob", SwitchOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -695,11 +713,29 @@ func TestSwitchRetentionKeepsCurrentRecoveryAfterClockRollback(t *testing.T) {
 
 func TestSwitchReadsKeychainWithoutMirroringBeforeStaleGuard(t *testing.T) {
 	f := newKeychainFixture(t)
+	account := identity.Identity{AccountID: rotAliceUUID, OrganizationID: rotAliceOrg, Email: rotAliceEmail}
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{aliceGen1: account, aliceGen2: account})
 	f.storeToken(aliceGen2)
 	writeFixtureFile(t, f.statePath, aliceSettings(9))
 	writeSwitchProfile(t, f.vault, "claude", "alice", map[string]string{
 		claudeCredentialsFile: aliceGen1, claudeSettingsFile: aliceSettings(1),
 	})
+	// Previously verified generations survive restart without materializing
+	// a file mirror or calling the provider during read-only owner detection.
+	for path, credentials := range map[string]string{
+		filepath.Join(filepath.Dir(f.credPath), identity.ClaudeIdentityCacheFile): aliceGen2,
+		f.vault.BackupPath("claude", "alice", "meta.json"):                        aliceGen1,
+	} {
+		binding, err := f.vault.ClaudeIdentityVerifier(context.Background(), []byte(credentials))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFixtureFile(t, path, string(data))
+	}
 	owner, err := f.vault.CurrentProfile(f.fileSet)
 	if err != nil || owner != "alice" {
 		t.Fatalf("read-only owner = %q, %v", owner, err)

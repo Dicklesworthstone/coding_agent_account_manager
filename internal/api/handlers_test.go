@@ -22,6 +22,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	claudeidentity "github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
@@ -447,6 +448,9 @@ func TestActivatePreservesOutgoingCredentials(t *testing.T) {
 			for name, credentials := range map[string][]byte{"alice": oldAlice, "bob": bob} {
 				writeAPIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), credentials)
 				writeAPIActivationFile(t, vault.BackupPath("claude", name, ".claude.json"), apiActivationIdentity(name))
+				if name != "bob" || !tc.malformed {
+					writeAPIActivationBinding(t, vault.BackupPath("claude", name, "meta.json"), credentials, name)
+				}
 			}
 			// A pre-existing recovery snapshot is immutable, even when its
 			// account matches the live login.
@@ -456,6 +460,7 @@ func TestActivatePreservesOutgoingCredentials(t *testing.T) {
 			identityPath := filepath.Join(home, ".claude.json")
 			writeAPIActivationFile(t, livePath, live)
 			writeAPIActivationFile(t, identityPath, apiActivationIdentity(tc.liveOwner))
+			writeAPIActivationBinding(t, filepath.Join(filepath.Dir(livePath), claudeidentity.ClaudeIdentityCacheFile), live, tc.liveOwner)
 
 			h := NewHandlers(vault, nil, nil)
 			result, err := h.Activate(ActivateRequest{Tool: "claude", Profile: "bob"})
@@ -551,8 +556,10 @@ func TestActivateReportsKeptLiveCredentials(t *testing.T) {
 			livePath := filepath.Join(home, ".claude", ".credentials.json")
 			writeAPIActivationFile(t, savedPath, saved)
 			writeAPIActivationFile(t, vault.BackupPath("claude", "alice", ".claude.json"), identity)
+			writeAPIActivationBinding(t, vault.BackupPath("claude", "alice", "meta.json"), saved, "alice")
 			writeAPIActivationFile(t, livePath, live)
 			writeAPIActivationFile(t, filepath.Join(home, ".claude.json"), identity)
+			writeAPIActivationBinding(t, filepath.Join(filepath.Dir(livePath), claudeidentity.ClaudeIdentityCacheFile), live, "alice")
 			h := NewHandlers(vault, nil, nil)
 			for attempt := 0; attempt < 2; attempt++ {
 				result, err := h.Activate(ActivateRequest{Tool: "claude", Profile: "alice"})
@@ -578,6 +585,26 @@ func apiActivationCredentials(token string, expires int64) []byte {
 
 func apiActivationIdentity(account string) []byte {
 	return []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q,"emailAddress":%q},"userID":"shared-machine"}`, "account-"+account, account+"@example.com"))
+}
+
+func writeAPIActivationBinding(t *testing.T, path string, credentials []byte, account string) {
+	t.Helper()
+	fingerprint, err := claudeidentity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// These synthetic grants have already been checked by the provider. Their
+	// local oauthAccount labels alone must never authorize a rotated overwrite.
+	binding := &claudeidentity.ClaudeIdentityBinding{
+		Identity: claudeidentity.Identity{Provider: "claude", AccountID: "account-" + account,
+			OrganizationID: "organization-" + account, Email: account + "@example.com"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+	metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAPIActivationFile(t, path, metadata)
 }
 
 func writeAPIActivationFile(t *testing.T, path string, data []byte) {

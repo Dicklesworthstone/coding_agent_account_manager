@@ -65,6 +65,7 @@ type DiscoveryResult struct {
 	Updated   bool               `json:"updated,omitempty"`
 	Unchanged bool               `json:"unchanged,omitempty"`
 	KeptNewer bool               `json:"kept_newer,omitempty"`
+	Warnings  []string           `json:"warnings,omitempty"`
 }
 
 type discoverySnapshot struct {
@@ -93,6 +94,13 @@ func (v *Vault) CaptureDiscovery(fileSet AuthFileSet) (*DiscoveryResult, error) 
 	if err != nil {
 		return nil, err
 	}
+	// An observation without a complete grant is read-only, including an
+	// absent vault. Only a real discovery mutation needs a persistent lock.
+	release, err := v.lockMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	result := &DiscoveryResult{Identity: live.identity}
 
 	// Reuse switch ownership to prioritize known named profiles. Inspecting
@@ -115,6 +123,11 @@ func (v *Vault) CaptureDiscovery(fileSet AuthFileSet) (*DiscoveryResult, error) 
 	var owner string
 	var saved discoverySnapshot
 	ambiguous := false
+	type savedCandidate struct {
+		name     string
+		snapshot discoverySnapshot
+	}
+	candidates := make([]savedCandidate, 0, len(profiles))
 	for _, profile := range profiles {
 		dir, err := v.safeProfileDir(fileSet.Tool, profile)
 		if err != nil {
@@ -128,11 +141,42 @@ func (v *Vault) CaptureDiscovery(fileSet AuthFileSet) (*DiscoveryResult, error) 
 		if err != nil {
 			continue
 		}
+		// Repeated watcher observations of a previously saved token pair need
+		// no online dependency. A changed local expiry or label cannot turn the
+		// same exact opaque tokens into a different account or a new grant.
+		sameClaudeTokens := fileSet.Tool == "claude" && live.state.credentialName == claudeCredentialsFile &&
+			live.state.sameCredential(candidate.state) && onlyDiscoveryPrimaryChanged(live, candidate)
 		if !IsSystemProfile(profile) && live.state.authMethod == candidate.state.authMethod &&
-			live.state.selectedKey == candidate.state.selectedKey && sameSwitchFiles(live.material, candidate.material) {
+			live.state.selectedKey == candidate.state.selectedKey && (sameSwitchFiles(live.material, candidate.material) || sameClaudeTokens) {
+			if sameClaudeTokens && candidate.state.claudeIdentity != nil {
+				live.state.setClaudeIdentity(candidate.state.claudeIdentity)
+				if err := discoveryIdentity(&live); err != nil {
+					return nil, err
+				}
+				result.Identity = live.identity
+			}
 			result.Profile, result.Unchanged = profile, true
 			return result, nil
 		}
+		candidates = append(candidates, savedCandidate{name: profile, snapshot: candidate})
+	}
+	// Initial imports and actual rotations may need one provider check. The
+	// verifier first reuses exact cached proofs, including expired tokens.
+	// Native files remain untouched; unknown ownership is a separate snapshot.
+	if fileSet.Tool == "claude" && live.state.credentialName == claudeCredentialsFile && live.state.selectedKey == "" {
+		if warning, err := v.verifyClaudeState(fileSet, "", &live.state); err != nil {
+			return nil, err
+		} else if warning != "" {
+			result.Warnings = append(result.Warnings, warning)
+		}
+		if err := discoveryIdentity(&live); err != nil {
+			return nil, fmt.Errorf("inspect verified discovery identity: %w", err)
+		}
+		result.Identity = live.identity
+		liveState = live.state
+	}
+	for _, entry := range candidates {
+		profile, candidate := entry.name, entry.snapshot
 		if !IsSystemProfile(profile) && sameDiscoveryOwner(live, candidate) {
 			if owner != "" {
 				// Multiple named accounts can intentionally share credentials.
@@ -161,10 +205,18 @@ func (v *Vault) CaptureDiscovery(fileSet AuthFileSet) (*DiscoveryResult, error) 
 			if err := checkDiscoveryUnchanged(fileSet, liveState); err != nil {
 				return nil, err
 			}
-			// A single atomic credential replacement preserves the profile's
-			// policy, aliases, tags, notes, and any unknown metadata verbatim.
-			if err := writeSwitchFile(filepath.Join(dir, live.state.credentialName), live.state.credential, false); err != nil {
-				return nil, fmt.Errorf("save discovered %s rotation: %w", fileSet.Tool, err)
+			// Claude's token and provider proof must advance together. Other
+			// providers retain their existing single-file publication path.
+			var publishErr error
+			if fileSet.Tool == "claude" && live.state.credentialName == claudeCredentialsFile {
+				publishErr = v.syncClaudeCredentials(owner, saved.state.credential, live.state.credential, live.state.claudeIdentity, func() error {
+					return checkDiscoveryUnchanged(fileSet, liveState)
+				})
+			} else {
+				publishErr = writeSwitchFile(filepath.Join(dir, live.state.credentialName), live.state.credential, false)
+			}
+			if publishErr != nil {
+				return nil, fmt.Errorf("save discovered %s rotation: %w", fileSet.Tool, publishErr)
 			}
 			result.Profile, result.Updated = owner, true
 			return result, nil
@@ -243,6 +295,12 @@ func sameDiscoveryOwner(live, saved discoverySnapshot) bool {
 	if live.state.authMethod != saved.state.authMethod || live.state.selectedKey != saved.state.selectedKey {
 		return false // An unused OAuth refresh token cannot identify a selected key.
 	}
+	if live.state.provider == "claude" {
+		// The access token can be replaced independently of an unchanged
+		// refresh token. Only exact credentials or provider-confirmed account
+		// AND organization ownership can authorize a Claude profile update.
+		return live.state.sameCredential(saved.state) || live.state.sameAccount(saved.state)
+	}
 	if discoveryAccountsConflict(live.observedAccount, saved.observedAccount) {
 		return false
 	}
@@ -315,6 +373,11 @@ func checkDiscoveryUnchanged(fileSet AuthFileSet, captured switchState) error {
 
 func inspectDiscovery(fileSet AuthFileSet, state switchState) (discoverySnapshot, error) {
 	snapshot := discoverySnapshot{state: state, material: make(map[string][]byte), observedAccount: state.account}
+	if fileSet.Tool == "claude" {
+		// A token replacement is observed in material. Separate settings labels
+		// and cached-proof availability are not a native credential generation.
+		snapshot.observedAccount = switchAccount{}
+	}
 	if state.identityConflict {
 		return snapshot, fmt.Errorf("%w: %s credential identity conflicts with its captured account state", ErrInvalidCredentials, fileSet.Tool)
 	}
@@ -733,16 +796,13 @@ func discoveryIdentity(snapshot *discoverySnapshot) error {
 		}
 	}
 	if s.provider == "claude" {
-		// Paired settings can still describe the previous login during an
-		// atomic credential replacement. Only credential-carried identity
-		// authorizes overwriting a previously saved grant during discovery.
+		// Embedded and paired labels can both outlive a native token change.
+		// Only a proof bound to the selected token pair provides ownership.
 		s.account, s.identityConflict = switchAccount{}, false
 		if s.credentialName == claudeCredentialsFile {
 			entry, _ = root["claudeAiOauth"].(map[string]interface{})
-			var valid bool
-			s.account, valid = claudeSwitchAccount(entry, nil)
-			if !valid {
-				return fmt.Errorf("invalid account fields")
+			if s.claudeIdentity != nil && s.claudeIdentity.MatchesCredentials(s.credential) {
+				s.setClaudeIdentity(s.claudeIdentity)
 			}
 		}
 	}
@@ -804,6 +864,11 @@ func discoveryIdentity(snapshot *discoverySnapshot) error {
 		id.AccountID = s.account.subject
 	}
 	if s.provider == "claude" {
+		if s.claudeIdentity != nil && s.claudeIdentity.MatchesCredentials(s.credential) {
+			verified := s.claudeIdentity.Identity
+			id = &verified
+			id.Verified = true
+		}
 		id.PlanType = jsonString(entry, "subscriptionType")
 		id.ExpiresAt = switchExpiry(entry["expiresAt"], true)
 	}
@@ -875,6 +940,10 @@ func (v *Vault) saveDiscovery(fileSet AuthFileSet, state switchState, ident *ide
 				if _, err := claudesettings.MergeLegacy(data, data, policy); err != nil {
 					return "", fmt.Errorf("%w: captured Claude session state: %v", ErrInvalidCredentials, err)
 				}
+				data, err = claudeSnapshotSettings(data, state)
+				if err != nil {
+					return "", fmt.Errorf("prepare discovered Claude identity: %w", err)
+				}
 			}
 		}
 		if err := writeSwitchFile(filepath.Join(stage, name), data, true); err != nil {
@@ -916,6 +985,9 @@ func (v *Vault) saveDiscovery(fileSet AuthFileSet, state switchState, ident *ide
 		}
 		if ident.Email != "" {
 			meta["identity"] = ident.Email
+		}
+		if fileSet.Tool == "claude" {
+			addClaudeIdentityMetadata(meta, state.claudeIdentity)
 		}
 		data, err := json.Marshal(meta)
 		if err != nil {

@@ -31,9 +31,9 @@ const (
 )
 
 var (
-	ErrClaudeIdentityUnavailable = errors.New("Claude token identity could not be verified")
-	ErrClaudeTokenExpired        = errors.New("Claude access token is expired; identity verification was skipped")
-	ErrClaudeTokenRejected       = errors.New("Claude access token was rejected by the identity endpoint")
+	ErrClaudeIdentityUnavailable = errors.New("claude token identity could not be verified")
+	ErrClaudeTokenExpired        = errors.New("claude access token is expired; identity verification was skipped")
+	ErrClaudeTokenRejected       = errors.New("claude access token was rejected by the identity endpoint")
 )
 
 // ClaudeIdentityBinding persists provider-confirmed ownership without storing a
@@ -76,7 +76,7 @@ func ClaudeCredentialFingerprint(credentials []byte) (string, error) {
 		} `json:"claudeAiOauth"`
 	}
 	if json.Unmarshal(credentials, &root) != nil || root.OAuth == nil || strings.TrimSpace(root.OAuth.AccessToken) == "" {
-		return "", errors.New("Claude credentials have no usable OAuth access token")
+		return "", errors.New("claude credentials have no usable OAuth access token")
 	}
 	// JSON's array/string framing prevents ambiguous concatenations.
 	pair, err := json.Marshal([]string{root.OAuth.AccessToken, root.OAuth.RefreshToken})
@@ -136,8 +136,9 @@ func ReadClaudeIdentityBindingForCredentials(credentialsPath string, credentials
 // .claude.json label from the previous login.
 func readClaudeIdentityBinding(credentialsPath string, credentials []byte) (*ClaudeIdentityBinding, bool, error) {
 	dir := filepath.Dir(credentialsPath)
-	known := false
-	for _, name := range []string{ClaudeIdentityCacheFile, "meta.json"} {
+	// A saved profile's metadata defines its expected owner. A copied native
+	// cache must not relabel that profile after its token file was replaced.
+	for _, name := range []string{"meta.json", ClaudeIdentityCacheFile} {
 		f, err := os.Open(filepath.Join(dir, name))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -160,11 +161,11 @@ func readClaudeIdentityBinding(credentialsPath string, credentials []byte) (*Cla
 		var envelope map[string]json.RawMessage
 		if json.Unmarshal(data, &envelope) == nil {
 			if raw, ok := envelope["claude_identity"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-				known = true
+				return nil, true, nil
 			}
 		}
 	}
-	return nil, known, nil
+	return nil, false, nil
 }
 
 // VerifyClaudeCredentials makes a single bounded request for the captured access
@@ -283,6 +284,10 @@ func ExtractFromClaudeCredentials(path string) (*Identity, error) {
 	}
 	if !known && bindingErr == nil {
 		fillFromClaudeSettings(id, claudeSettingsCandidates(path))
+	} else {
+		// A token replacement invalidates all previously associated labels,
+		// including descriptive fields copied into the credential document.
+		id.AccountID, id.OrganizationID, id.Email, id.Organization = "", "", "", ""
 	}
 	return id, nil
 }
@@ -444,25 +449,6 @@ func ClaudeSignedInIdentity() *Identity {
 		return nil
 	}
 	return id
-}
-
-// ClaudeSignedInEmail returns the email from Claude Code's state file. This
-// presentation field does not distinguish organizations or prove token ownership.
-func ClaudeSignedInEmail() string {
-	path := ""
-	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
-		path = filepath.Join(dir, claudeSettingsFile)
-	} else if home, err := os.UserHomeDir(); err == nil {
-		path = filepath.Join(home, claudeSettingsFile)
-	}
-	if path == "" {
-		return ""
-	}
-	account, ok := readClaudeOAuthAccount(path)
-	if !ok {
-		return ""
-	}
-	return account.EmailAddress
 }
 
 // readClaudeOAuthAccount returns the oauthAccount block of the .claude.json

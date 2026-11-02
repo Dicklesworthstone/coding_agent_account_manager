@@ -69,7 +69,7 @@ func TestBackupFromProfilePublishesUsableVaultWithoutTouchingLive(t *testing.T) 
 		t.Fatalf("import failed: %v; stdout=%s; stderr=%s", err, out, stderr)
 	}
 	var result profileBackupResult
-	if err := json.Unmarshal([]byte(out), &result); err != nil || !result.Success || result.Tool != "claude" || result.Profile != "saved" || result.SourceProfile != "isolated" || len(result.Warnings) != 1 {
+	if err := json.Unmarshal([]byte(out), &result); err != nil || !result.Success || result.Tool != "claude" || result.Profile != "saved" || result.SourceProfile != "isolated" || !reflect.DeepEqual(result.Warnings, []string{isolatedBackupWarning, claudeBackupIdentityWarning}) {
 		t.Fatalf("invalid isolated backup result: %s: %v", out, err)
 	}
 	assertBackupTreeUnchanged(t, liveRoot, before)
@@ -444,9 +444,10 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 						t.Fatal(err)
 					}
 					got, err := os.ReadFile(filepath.Join(result.Path, filepath.Base(path)))
-					if err != nil || !bytes.Equal(want, got) {
+					if err != nil {
 						t.Fatalf("source state not preserved: %s: %v", path, err)
 					}
+					requireOfflineClaudeSnapshot(t, filepath.Base(path), want, got)
 				}
 				data, err := os.ReadFile(filepath.Join(result.Path, "meta.json"))
 				if err != nil {
@@ -457,7 +458,7 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 					OriginalPaths []string `json:"original_paths"`
 					Identity      string   `json:"identity"`
 				}
-				if err := json.Unmarshal(data, &metadata); err != nil || metadata.ConfigDir != env["CLAUDE_CONFIG_DIR"] || !reflect.DeepEqual(paths, metadata.OriginalPaths) || !strings.Contains(metadata.Identity, "new@example.test") {
+				if err := json.Unmarshal(data, &metadata); err != nil || metadata.ConfigDir != env["CLAUDE_CONFIG_DIR"] || !reflect.DeepEqual(paths, metadata.OriginalPaths) || metadata.Identity != "" {
 					t.Fatalf("wrong source metadata: %+v: %v", metadata, err)
 				}
 				v := authfile.NewVault(authfile.DefaultVaultPath())
@@ -474,8 +475,8 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 					t.Fatalf("wrong activated credential: %v", err)
 				}
 				got, err = os.ReadFile(filepath.Join(home, ".claude.json"))
-				if err != nil || !bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("ignored-xdg")) {
-					t.Fatalf("wrong activated identity: %v", err)
+				if err != nil || bytes.Contains(got, []byte("oauthAccount")) || bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("ignored-xdg")) {
+					t.Fatalf("offline activation asserted an unverified identity: %v", err)
 				}
 				assertBackupTreeUnchanged(t, root, sourceBefore)
 				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
@@ -595,9 +596,10 @@ func TestClaudeBackupKeepsOnlyXDGWhenLegacyIsNotConflicting(t *testing.T) {
 					t.Fatal(err)
 				}
 				got, err := os.ReadFile(v.BackupPath("claude", "saved", name))
-				if err != nil || !bytes.Equal(got, want) {
+				if err != nil {
 					t.Fatalf("legacy guard leaked into %s: %v", name, err)
 				}
+				requireOfflineClaudeSnapshot(t, name, want, got)
 			}
 			assertBackupTreeUnchanged(t, root, sourceBefore)
 			assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)

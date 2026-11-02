@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
@@ -72,6 +73,11 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 
 	switchMu.Lock()
 	defer switchMu.Unlock()
+	release, err := v.lockMutation()
+	if err != nil {
+		return result, err
+	}
+	defer release()
 
 	// Validate the target before even mirroring a keychain or creating a
 	// recovery directory. Preparing Claude settings is read-only.
@@ -85,6 +91,11 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 	incoming, err := readSwitchState(fileSet, targetDir)
 	if err != nil {
 		return result, err
+	}
+	if warning, err := v.verifyClaudeState(fileSet, targetDir, &incoming); err != nil {
+		return result, err
+	} else if warning != "" {
+		result.Warnings = append(result.Warnings, warning)
 	}
 	if incoming.identityConflict {
 		return result, fmt.Errorf("%w: incoming credential has conflicting account identities", ErrInvalidCredentials)
@@ -108,11 +119,36 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 	if err != nil {
 		return result, fmt.Errorf("read outgoing auth: %w", err)
 	}
+	if live.claudeIdentity == nil {
+		// An exact copy of the just-verified target needs no second request.
+		live.setClaudeIdentity(incoming.claudeIdentity)
+	}
+	if warning, err := v.verifyClaudeState(fileSet, "", &live); err != nil {
+		return result, err
+	} else if warning != "" && len(result.Warnings) == 0 {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if incoming.claudeIdentity == nil {
+		incoming.setClaudeIdentity(live.claudeIdentity)
+	}
+	if fileSet.Tool == "claude" && incoming.claudeIdentity != nil && live.claudeIdentity != nil {
+		result.Warnings = nil // An exact native proof may resolve legacy target uncertainty.
+	}
+	if err := live.checkUnchanged(fileSet); err != nil {
+		return result, err
+	}
+	verifiedTarget, err := readSwitchState(fileSet, targetDir)
+	if err != nil || !sameSwitchFiles(incoming.files, verifiedTarget.files) {
+		return result, fmt.Errorf("incoming profile changed during identity verification")
+	}
 
-	// This guard precedes all writes, including metadata and the keychain
-	// mirror. Activating an older copy of the current account is a no-op.
+	// Keep fresher credentials and keychain state unchanged. Retain both
+	// verified generations so offline activation still recognizes freshness.
 	if live.sameAccount(incoming) && live.complete && !live.freshness.IsZero() &&
 		!incoming.freshness.IsZero() && live.freshness.After(incoming.freshness) {
+		if err := v.persistClaudeKeptIdentity(fileSet, targetDir, incoming, live); err != nil {
+			return result, err
+		}
 		result.PreviousProfile = target
 		result.KeptLive = true
 		return result, nil
@@ -128,6 +164,9 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 		recoveryProfile = outgoing
 	}
 	if outgoing == target && preserved {
+		if err := v.persistClaudeKeptIdentity(fileSet, targetDir, incoming, live); err != nil {
+			return result, err
+		}
 		result.KeptLive = true
 		return result, nil
 	}
@@ -151,8 +190,8 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 			}
 		}
 
-		// Only update the credential file of a proven same-account owner.
-		// Settings and user metadata are intentionally left as saved. A partial,
+		// Update the credential and its proven account metadata together.
+		// Unrelated settings and user metadata stay as saved. A partial,
 		// older, or unmeasured live credential goes into a separate recovery
 		// snapshot instead of weakening a possibly working named profile.
 		if outgoing != "" && outgoing != target && !IsSystemProfile(outgoing) && !preserved &&
@@ -169,15 +208,24 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 			if err := live.checkUnchanged(fileSet); err != nil {
 				return result, err
 			}
-			if err := writeSwitchFile(filepath.Join(outgoingDir, live.credentialName), live.credential, false); err != nil {
-				return result, fmt.Errorf("preserve outgoing profile %s: %w", outgoing, err)
+			var preserveErr error
+			if fileSet.Tool == "claude" && live.credentialName == claudeCredentialsFile {
+				preserveErr = v.syncClaudeCredentials(outgoing, saved.credential, live.credential, live.claudeIdentity, func() error {
+					return live.checkUnchanged(fileSet)
+				})
+			} else {
+				preserveErr = writeSwitchFile(filepath.Join(outgoingDir, live.credentialName), live.credential, false)
+			}
+			if preserveErr != nil {
+				return result, fmt.Errorf("preserve outgoing profile %s: %w", outgoing, preserveErr)
 			}
 			result.ResnapshottedProfile = outgoing
 			recoveryProfile = outgoing
-			// Auxiliary credentials can rotate independently. Updating the
-			// primary file alone does not preserve a changed secondary source.
+			// Auxiliary credentials and session state can change independently.
+			// Canonicalizing a verified account label alone does not require an
+			// additional recovery snapshot of the same saved credential.
 			saved.files[live.credentialName] = live.credential
-			preserved = sameSwitchFiles(live.files, saved.files)
+			preserved = samePreservedSwitchFiles(live, *saved)
 		}
 
 		if mode == "always" || (mode == "smart" && !preserved) {
@@ -200,7 +248,7 @@ func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (
 		return result, fmt.Errorf("incoming profile changed before activation")
 	}
 	result.RestoreStarted = true
-	if err := v.Restore(fileSet, target); err != nil {
+	if err := v.restoreWithClaudeIdentity(fileSet, target, &incoming); err != nil {
 		return result, fmt.Errorf("restore target: %w", err)
 	}
 	if result.AutoBackup != "" && opts.MaxAutoBackups > 0 {
@@ -525,15 +573,20 @@ func HasAuthFilesReadOnly(fileSet AuthFileSet) bool {
 }
 
 type switchAccount struct {
-	account string
-	subject string
-	email   string
+	account      string
+	organization string
+	subject      string
+	email        string
 }
 
 func (a switchAccount) matches(b switchAccount) bool {
 	// A shared email must never override a conflicting account/workspace ID.
 	if a.account != "" && b.account != "" && a.account != b.account {
 		return false
+	}
+	if a.organization != "" || b.organization != "" {
+		return a.organization != "" && a.organization == b.organization &&
+			a.account != "" && a.account == b.account
 	}
 	if a.subject != "" && b.subject != "" && a.subject != b.subject {
 		return false
@@ -554,6 +607,7 @@ type switchState struct {
 	freshness        time.Time
 	complete         bool
 	identityConflict bool
+	claudeIdentity   *identity.ClaudeIdentityBinding
 }
 
 func (s switchState) hasAuth() bool { return len(bytes.TrimSpace(s.credential)) != 0 }
@@ -564,6 +618,11 @@ func (s switchState) sameCredential(other switchState) bool {
 	}
 	if s.selectedKey != "" || other.selectedKey != "" {
 		return s.selectedKey != "" && s.selectedKey == other.selectedKey
+	}
+	if s.provider == "claude" && s.credentialName == claudeCredentialsFile && other.credentialName == claudeCredentialsFile {
+		a, err := identity.ClaudeCredentialFingerprint(s.credential)
+		b, otherErr := identity.ClaudeCredentialFingerprint(other.credential)
+		return err == nil && otherErr == nil && a != "" && a == b
 	}
 	if s.account != (switchAccount{}) && other.account != (switchAccount{}) && !s.account.matches(other.account) {
 		return false
@@ -577,6 +636,11 @@ func (s switchState) sameAccount(other switchState) bool {
 	}
 	if s.selectedKey != "" || other.selectedKey != "" {
 		return s.sameCredential(other)
+	}
+	if s.provider == "claude" {
+		return s.claudeIdentity != nil && other.claudeIdentity != nil &&
+			s.claudeIdentity.MatchesCredentials(s.credential) && other.claudeIdentity.MatchesCredentials(other.credential) &&
+			identity.ClaudeSameAccount(&s.claudeIdentity.Identity, &other.claudeIdentity.Identity)
 	}
 	// OpenAI's subject identifies a person, not their selected workspace.
 	// A workspace-scoped grant cannot match an unscoped snapshot by email.
@@ -603,6 +667,37 @@ func sameSwitchFiles(a, b map[string][]byte) bool {
 	for name, data := range a {
 		other, exists := b[name]
 		if !exists || !bytes.Equal(data, other) {
+			return false
+		}
+	}
+	return true
+}
+
+// samePreservedSwitchFiles is used only after preserving a proven newer grant.
+// Native Claude can rewrite its account label without retaining CAAM's verified
+// fields. Compare that label in its normalized form while requiring every other
+// captured value to be preserved. Concurrency guards still compare exact bytes.
+func samePreservedSwitchFiles(live, saved switchState) bool {
+	if sameSwitchFiles(live.files, saved.files) {
+		return true
+	}
+	if live.provider != "claude" || !live.sameAccount(saved) || len(live.files) != len(saved.files) {
+		return false
+	}
+	for name, data := range live.files {
+		other, exists := saved.files[name]
+		if !exists {
+			return false
+		}
+		if bytes.Equal(data, other) {
+			continue
+		}
+		if name != claudeSettingsFile {
+			return false
+		}
+		normalizedLive, liveErr := claudeSnapshotSettings(data, live)
+		normalizedSaved, savedErr := claudeSnapshotSettings(other, live)
+		if liveErr != nil || savedErr != nil || !bytes.Equal(normalizedLive, normalizedSaved) {
 			return false
 		}
 	}
@@ -677,6 +772,29 @@ func readSwitchStateLimited(fileSet AuthFileSet, profileDir string, maxFileBytes
 		}
 	}
 	state.identify(fileSet)
+	if fileSet.Tool == "claude" && state.credentialName == claudeCredentialsFile {
+		path := claudeFileSetPath(fileSet, claudeCredentialsFile)
+		if profileDir != "" {
+			path = filepath.Join(profileDir, claudeCredentialsFile)
+		}
+		var binding *identity.ClaudeIdentityBinding
+		var err error
+		if profileDir != "" {
+			binding, err = readStoredClaudeBinding(profileDir)
+		} else {
+			binding, err = identity.ReadClaudeIdentityBindingForCredentials(path, state.credential)
+		}
+		if err != nil {
+			return state, fmt.Errorf("read Claude identity binding: %w", err)
+		}
+		state.setClaudeIdentity(binding)
+		if profileDir != "" && binding != nil && !binding.MatchesCredentials(state.credential) {
+			// A named profile whose proof no longer covers its token pair must
+			// not become active merely because the same substituted bytes are
+			// now live. Mutation paths can reverify against the expected owner.
+			state.identityConflict = true
+		}
+	}
 	return state, nil
 }
 
@@ -795,10 +913,8 @@ func (s *switchState) identify(fileSet AuthFileSet) {
 			return
 		}
 		entry, _ = root["claudeAiOauth"].(map[string]interface{})
-		var settings map[string]interface{}
-		_ = json.Unmarshal(s.files[claudeSettingsFile], &settings)
 		var identityOK bool
-		s.account, identityOK = claudeSwitchAccount(entry, claudeIdentityKeys(settings))
+		s.account, identityOK = claudeSwitchAccount(entry, nil)
 		s.identityConflict = !identityOK
 		s.complete = jsonString(entry, "accessToken") != "" && jsonString(entry, "refreshToken") != ""
 		s.freshness = switchExpiry(entry["expiresAt"], true)
@@ -957,6 +1073,8 @@ func (v *Vault) switchOwnerLimited(fileSet AuthFileSet, live switchState, maxFil
 	var saved *switchState
 	var systemOwner string
 	var systemSaved *switchState
+	var systemIdentityOwner string
+	var systemIdentitySaved *switchState
 	ambiguous := false
 	for _, name := range profiles {
 		dir, err := v.safeProfileDir(fileSet.Tool, name)
@@ -981,11 +1099,17 @@ func (v *Vault) switchOwnerLimited(fileSet AuthFileSet, live switchState, maxFil
 			}
 			owner, saved = name, &candidate
 		}
+		if IsSystemProfile(name) && systemIdentityOwner == "" && live.sameAccount(candidate) {
+			systemIdentityOwner, systemIdentitySaved = name, &candidate
+		}
 	}
 	if ambiguous {
 		return systemOwner, systemSaved, nil
 	}
 	if owner == "" {
+		if systemOwner == "" {
+			return systemIdentityOwner, systemIdentitySaved, nil
+		}
 		return systemOwner, systemSaved, nil
 	}
 	return owner, saved, nil
@@ -1028,6 +1152,12 @@ func (v *Vault) saveSwitchRecovery(fileSet AuthFileSet, state switchState, name 
 		if !exists {
 			continue
 		}
+		if fileSet.Tool == "claude" && filename == claudeSettingsFile {
+			data, err = claudeSnapshotSettings(data, state)
+			if err != nil {
+				return "", err
+			}
+		}
 		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
 			var root map[string]json.RawMessage
 			if err := json.Unmarshal(data, &root); err != nil {
@@ -1061,12 +1191,7 @@ func (v *Vault) saveSwitchRecovery(fileSet AuthFileSet, state switchState, name 
 		"backed_up_at": time.Now().Format(time.RFC3339Nano), "files": len(paths), "original_paths": paths,
 	}
 	if fileSet.Tool == "claude" {
-		var settings map[string]interface{}
-		_ = json.Unmarshal(state.files[claudeSettingsFile], &settings)
-		keys := claudeIdentityKeys(settings)
-		if len(keys) > 0 {
-			meta["identity_keys"], meta["identity"] = keys, claudeIdentityLabel(keys)
-		}
+		addClaudeIdentityMetadata(meta, state.claudeIdentity)
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {

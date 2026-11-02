@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -34,6 +35,57 @@ func (f *fakeOAuth) CompleteOAuth(ctx context.Context, oauthURL string, accounts
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestOrganizationSpecificRequestDoesNotSelectByEmail(t *testing.T) {
+	for _, mode := range []string{"single", "multiple coordinators"} {
+		t.Run(mode, func(t *testing.T) {
+			var response completion
+			var completed atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/auth/pending":
+					_ = json.NewEncoder(w).Encode([]pendingRequest{{ID: "organization-request", URL: "https://claude.ai/oauth/authorize?state=synthetic", LimitedAccount: "shared@example.test", LimitedAccountID: "same-account", LimitedOrganizationID: "team", LimitReset: "in 1h"}})
+				case "/auth/complete":
+					if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+						t.Error(err)
+					}
+					completed.Add(1)
+					_, _ = io.WriteString(w, `{"status":"accepted"}`)
+				default:
+					t.Errorf("unexpected endpoint %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+			oauth := &fakeOAuth{code: "must-not-authorize", account: "shared@example.test"}
+			if mode == "single" {
+				cfg := DefaultConfig()
+				cfg.CoordinatorURL, cfg.Accounts, cfg.Logger = srv.URL, []string{"shared@example.test"}, discardLogger()
+				a := New(cfg)
+				a.client, a.oauth = srv.Client(), oauth
+				a.checkPendingRequests(context.Background())
+				if len(a.accountUsage) != 0 {
+					t.Fatal("organization limit became an email-wide cooldown")
+				}
+			} else {
+				cfg := DefaultMultiConfig()
+				cfg.Accounts, cfg.Logger = []string{"shared@example.test"}, discardLogger()
+				a := NewMulti(cfg)
+				a.oauth = oauth
+				a.checkCoordinator(context.Background(), &CoordinatorEndpoint{Name: "synthetic", URL: srv.URL, client: srv.Client()})
+				a.inflight.Wait()
+				if len(a.accountUsage) != 0 {
+					t.Fatal("organization limit became an email-wide cooldown")
+				}
+			}
+			if completed.Load() != 1 || oauth.calls.Load() != 0 || response.Code != "" || response.Account != "" ||
+				!strings.Contains(response.Error, "verified Claude organization") {
+				t.Fatalf("unsafe organization selection: calls=%d, response=%+v", oauth.calls.Load(), response)
+			}
+		})
+	}
 }
 
 func TestDeliverCompletionRetriesTransientFailures(t *testing.T) {

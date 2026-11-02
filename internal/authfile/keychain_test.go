@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
@@ -185,6 +186,9 @@ func TestExplicitClaudeConfigDoesNotUseDefaultKeychain(t *testing.T) {
 // in the keychain, the vault profile must still get a .credentials.json.
 func TestBackupCapturesKeychainToken(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-live"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-live"))
 	writeFixtureFile(t, f.statePath, keychainState("alice@example.com"))
 
@@ -400,6 +404,10 @@ func TestClaudeActivationKeychainAvailability(t *testing.T) {
 				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
 				incoming := keychainCreds("incoming")
 				outgoing := keychainCreds("outgoing")
+				setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+					incoming: {AccountID: "account-incoming", OrganizationID: "org-incoming", Email: "incoming@example.com"},
+					outgoing: {AccountID: "account-outgoing", OrganizationID: "org-outgoing", Email: "outgoing@example.com"},
+				})
 				writeFixtureFile(t, f.credPath, incoming)
 				writeFixtureFile(t, f.statePath, keychainState("incoming@example.com"))
 				if err := f.vault.Backup(f.fileSet, "incoming"); err != nil {

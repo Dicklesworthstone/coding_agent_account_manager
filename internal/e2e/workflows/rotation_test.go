@@ -1,12 +1,15 @@
 package workflows
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,10 +50,22 @@ stealth:
 		require.NoError(t, os.MkdirAll(dir, 0755))
 		// Each account needs real credential material as well as identity. An
 		// oauthAccount label alone cannot install a different Claude login.
-		content := fmt.Sprintf(`{"oauthAccount":{"emailAddress":"%s@example.com","accountUuid":"uuid-%s"}}`, name, name)
+		content := fmt.Sprintf(`{"oauthAccount":{"emailAddress":"%s@example.com","accountUuid":"uuid-%s","organizationUuid":"organization-%s"}}`, name, name, name)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(content), 0600))
 		credentials := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"%s-access","refreshToken":"%s-refresh"}}`, name, name)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(credentials), 0600))
+		// Each CLI invocation starts afresh. Persist exact-token ownership as
+		// a real verified backup would, rather than trusting a nearby label.
+		fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(credentials))
+		require.NoError(t, err)
+		binding := &identity.ClaudeIdentityBinding{
+			Identity: identity.Identity{Provider: "claude", AccountID: "uuid-" + name,
+				OrganizationID: "organization-" + name, Email: name + "@example.com"},
+			CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}
+		metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "meta.json"), metadata, 0600))
 	}
 
 	createProfile("p1")
@@ -99,9 +114,15 @@ stealth:
 	}
 	assertLiveCredentials := func(name string) {
 		t.Helper()
-		credentials, err := os.ReadFile(filepath.Join(homeDir, ".claude", ".credentials.json"))
+		credentialPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		credentials, err := os.ReadFile(credentialPath)
 		require.NoError(t, err)
 		assert.JSONEq(t, fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"%s-access","refreshToken":"%s-refresh"}}`, name, name), string(credentials))
+		binding, err := identity.ReadClaudeIdentityBindingForCredentials(credentialPath, credentials)
+		require.NoError(t, err)
+		require.NotNil(t, binding, "activation must persist the identity for the installed credential generation")
+		assert.Equal(t, "uuid-"+name, binding.Identity.AccountID)
+		assert.Equal(t, "organization-"+name, binding.Identity.OrganizationID)
 	}
 
 	h.EndStep("Setup")

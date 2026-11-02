@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamexec "github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
@@ -270,6 +271,14 @@ func TestInteractiveRunUsesLiveClaudeGrant(t *testing.T) {
 			}
 			saved := credential("SYNTHETIC-SAVED", tc.savedExpiry)
 			live := credential("SYNTHETIC-LIVE", tc.liveExpiry)
+			bindingFor := func(data []byte) *identity.ClaudeIdentityBinding {
+				binding := claudeCLIIdentityBinding(t, data, "synthetic-org", "Test organization")
+				binding.Identity.AccountID = "synthetic-account"
+				return binding
+			}
+			vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				return bindingFor(data), nil
+			}
 			require.NoError(t, os.WriteFile(authPath, saved, 0600))
 			require.NoError(t, vault.Backup(authfile.ClaudeAuthFiles(), "active"))
 			if tc.rejectSaved {
@@ -280,6 +289,12 @@ func TestInteractiveRunUsesLiveClaudeGrant(t *testing.T) {
 				}))
 			}
 			require.NoError(t, os.WriteFile(authPath, live, 0600))
+			// This test concerns launch health after an identity-preserving
+			// refresh. Model provider confirmation of both generations; an
+			// embedded accountId alone cannot prove an opaque token's owner.
+			liveBinding, err := json.Marshal(map[string]any{"claude_identity": bindingFor(live)})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(authPath), identity.ClaudeIdentityCacheFile), liveBinding, 0600))
 			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
 			require.NoError(t, err)
 			require.Equal(t, "active", current, "rotated grant must remain owned by the same account")

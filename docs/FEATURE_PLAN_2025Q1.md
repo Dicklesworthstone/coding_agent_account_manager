@@ -457,6 +457,43 @@ destinations, cancellation and cross-process refresh exclusion, invalid token
 responses, real child environments, Windows environment aliases, and every
 rotation algorithm and policy used for rate-limit handoff.
 
+**Claude account and organization ownership (issue #132):** OAuth ownership is
+the pair of account UUID and organization UUID. Email, organization name and
+an independently mutable `.claude.json` do not prove which grant is active.
+Provider identity results are bound to the complete access/refresh token pair,
+persisted with vault metadata or a private native cache, and reused offline
+only while the credential pair matches. Initial or rotated credentials may
+need a bounded `/api/oauth/profile` lookup at a mutation boundary; profile
+listing stays offline.
+
+Backup and activation use verified ownership to correct stale account labels.
+An unavailable endpoint or expired access token leaves an unverified grant
+preservable, with unverified labels omitted and a warning. A changed token in
+an already bound profile must be verified for the same account and organization
+before activation. Exact credential matches remain available without online
+identity lookup; matching different generations, updating a named outgoing
+profile, and keepalive synchronization require verified ownership. `caam ls`
+shows organization names and UUIDs, with unverified legacy labels marked.
+The first-use `_original` and automatic recovery snapshots retain captured
+credential bytes while correcting or omitting unsupported account metadata.
+
+Coordinator reports carry stable account and organization IDs when known.
+The browser agent declines organization-specific requests because its email
+configuration cannot select the intended organization. Participating CAAM
+processes serialize managed vault mutations with a private per-vault process
+lock; native Claude clients do not acquire it. Captured source and destination
+changes stop unsafe publication, but a file switch does not change
+credentials already held in a running Claude process. The existing publication
+path provides recovery for returned errors; this is not a claim of crash-atomic
+transactions across files and the native keychain.
+
+Synthetic regressions cover shared-email Personal and Team organizations,
+stale metadata, concurrent source replacement, substituted access tokens,
+automatic backups, activation, offline/expired verification, restart persistence,
+keepalive synchronization, and organization-aware browser refusal. Cached
+ownership is distinct from token liveness and does not independently verify
+the opaque refresh token.
+
 #### 5.4 Explicit setup tokens for a single shallow launch
 
 For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately

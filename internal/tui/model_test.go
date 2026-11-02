@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	claudeidentity "github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
@@ -155,10 +157,14 @@ func TestActivateCommandPreservesLiveLogin(t *testing.T) {
 			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
 				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
 				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+				if name != "bob" || !tc.malformed {
+					writeTUIActivationBinding(t, vault.BackupPath("claude", name, "meta.json"), data, name)
+				}
 			}
 			livePath := filepath.Join(home, ".claude", ".credentials.json")
 			writeTUIActivationFile(t, livePath, rotated)
 			writeTUIActivationFile(t, filepath.Join(home, ".claude.json"), identity(tc.owner))
+			writeTUIActivationBinding(t, filepath.Join(filepath.Dir(livePath), claudeidentity.ClaudeIdentityCacheFile), rotated, tc.owner)
 
 			msg, ok := m.doActivateProfile("claude", "bob")().(activateResultMsg)
 			if !ok {
@@ -198,6 +204,26 @@ func TestActivateCommandPreservesLiveLogin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func writeTUIActivationBinding(t *testing.T, path string, credentials []byte, account string) {
+	t.Helper()
+	fingerprint, err := claudeidentity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Persist provider-confirmed ownership so the TUI's independently created
+	// Vault instance can recognize the same account after token rotation.
+	binding := &claudeidentity.ClaudeIdentityBinding{
+		Identity: claudeidentity.Identity{Provider: "claude", AccountID: "id-" + account,
+			OrganizationID: "organization-" + account, Email: account + "@example.com"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+	metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTUIActivationFile(t, path, metadata)
 }
 
 func writeTUIActivationFile(t *testing.T, path string, data []byte) {

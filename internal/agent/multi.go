@@ -642,6 +642,13 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 	coord.SetHealth(true, "")
 
 	for _, p := range pending {
+		if err := organizationSelectionError(p); err != nil {
+			if deliveryErr := deliverCompletion(ctx, coord.httpClient(), coord.URL, coord.Token,
+				failureCompletion(p.ID, err), a.delivery, a.logger); deliveryErr != nil {
+				a.logger.Warn("could not deliver organization selection refusal", "request_id", p.ID, "error", deliveryErr)
+			}
+			continue
+		}
 		// Avoid processing same request multiple times
 		a.procMu.Lock()
 		if a.processing[p.ID] {
@@ -669,7 +676,7 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 
 // noteLimit holds the account a request reports at its usage limit.
 func (a *MultiAgent) noteLimit(coord *CoordinatorEndpoint, p pendingRequest) {
-	if p.LimitedAccount == "" {
+	if p.LimitedAccount == "" || organizationSelectionError(p) != nil {
 		return
 	}
 	until := limitResetTime(p.LimitReset, time.Now())
