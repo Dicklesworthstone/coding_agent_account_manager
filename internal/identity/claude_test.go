@@ -1,9 +1,14 @@
 package identity
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -212,6 +217,7 @@ func TestExtractFromClaudeCredentials_IdentityFromClaudeJSON(t *testing.T) {
 	}
 	writeClaudeSettings(t, dir, map[string]interface{}{
 		"accountUuid":      "uuid-1234",
+		"organizationUuid": "org-1234",
 		"emailAddress":     "vault@example.com",
 		"organizationName": "vault-org",
 	})
@@ -228,6 +234,9 @@ func TestExtractFromClaudeCredentials_IdentityFromClaudeJSON(t *testing.T) {
 	}
 	if id.Organization != "vault-org" {
 		t.Errorf("Organization = %q, want %q", id.Organization, "vault-org")
+	}
+	if id.OrganizationID != "org-1234" || id.Verified {
+		t.Errorf("expected unverified organization UUID from metadata, got %+v", id)
 	}
 	if id.PlanType != "max" {
 		t.Errorf("PlanType = %q, want %q (credentials stay authoritative)", id.PlanType, "max")
@@ -392,8 +401,8 @@ func TestExtractFromClaudeCredentials_CredentialsFieldsWin(t *testing.T) {
 	if id.Email != "legacy@example.com" || id.AccountID != "acc-legacy" {
 		t.Errorf("identity = %+v, want the credentials' own email/accountId", id)
 	}
-	if id.Organization != "settings-org" {
-		t.Errorf("Organization = %q, want %q (filled from .claude.json since credentials have none)", id.Organization, "settings-org")
+	if id.Organization != "" || id.OrganizationID != "" {
+		t.Errorf("conflicting settings must not supply another account's organization: %+v", id)
 	}
 }
 
@@ -551,34 +560,275 @@ func TestFixture_ClaudeInvalid(t *testing.T) {
 	}
 }
 
-func TestClaudeSignedInEmail(t *testing.T) {
+func TestClaudeSignedInIdentity(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	if got := ClaudeSignedInEmail(); got != "" {
-		t.Fatalf("no state file: got %q, want empty", got)
+	if got := ClaudeSignedInIdentity(); got != nil {
+		t.Fatalf("no credentials: got %+v, want nil", got)
 	}
 
 	write := func(path, email string) {
 		t.Helper()
-		body := `{"numStartups": 3, "oauthAccount": {"accountUuid": "u", "emailAddress": "` + email + `"}}`
+		body := `{"numStartups": 3, "oauthAccount": {"accountUuid": "u", "organizationUuid": "org", "emailAddress": "` + email + `"}}`
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	write(filepath.Join(home, ".claude.json"), "home@example.com")
-	if got := ClaudeSignedInEmail(); got != "home@example.com" {
-		t.Fatalf("~/.claude.json: got %q", got)
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-
+	if err := os.WriteFile(filepath.Join(home, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"home-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	write(filepath.Join(home, ".claude.json"), "home@example.com")
+	if got := ClaudeSignedInIdentity(); got == nil || got.Email != "home@example.com" || got.OrganizationID != "org" || got.Verified {
+		t.Fatalf("~/.claude.json: got %+v", got)
+	}
 	// CLAUDE_CONFIG_DIR moves the state file into that directory.
 	cfg := filepath.Join(home, "alt")
 	if err := os.MkdirAll(cfg, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(cfg, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"isolated-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	write(filepath.Join(cfg, ".claude.json"), "alt@example.com")
 	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
-	if got := ClaudeSignedInEmail(); got != "alt@example.com" {
-		t.Fatalf("CLAUDE_CONFIG_DIR: got %q", got)
+	if got := ClaudeSignedInIdentity(); got == nil || got.Email != "alt@example.com" || got.OrganizationID != "org" || got.Verified {
+		t.Fatalf("CLAUDE_CONFIG_DIR: got %+v", got)
+	}
+}
+
+func TestClaudeSameAccountRequiresAccountAndOrganization(t *testing.T) {
+	personal := &Identity{Provider: "claude", AccountID: "user-uuid", OrganizationID: "personal-org", Email: "same@example.com"}
+	cases := []struct {
+		name     string
+		other    *Identity
+		same     bool
+		conflict bool
+	}{
+		{"same account and org", &Identity{AccountID: "user-uuid", OrganizationID: "personal-org", Email: "renamed@example.com"}, true, false},
+		{"same email different org", &Identity{AccountID: "user-uuid", OrganizationID: "team-org", Email: "same@example.com"}, false, true},
+		{"different account same org", &Identity{AccountID: "other-user", OrganizationID: "personal-org", Email: "same@example.com"}, false, true},
+		{"missing organization", &Identity{AccountID: "user-uuid", Email: "same@example.com"}, false, false},
+		{"email only", &Identity{Email: "same@example.com"}, false, false},
+		{"missing", nil, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClaudeSameAccount(personal, tc.other); got != tc.same {
+				t.Fatalf("same = %v, want %v", got, tc.same)
+			}
+			if got := ClaudeIdentityConflicts(personal, tc.other); got != tc.conflict {
+				t.Fatalf("conflict = %v, want %v", got, tc.conflict)
+			}
+		})
+	}
+}
+
+func TestParseClaudeIdentityRejectsConflictingOrganizationMetadata(t *testing.T) {
+	credentials := []byte(`{"claudeAiOauth":{"accountId":"user","organizationUuid":"team","email":"same@example.com","subscriptionType":"team"}}`)
+	settings := []byte(`{"oauthAccount":{"accountUuid":"user","organizationUuid":"personal","organizationName":"Personal","emailAddress":"same@example.com"}}`)
+	id, err := ParseClaudeIdentity(credentials, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.OrganizationID != "team" || id.Organization != "" || id.Verified {
+		t.Fatalf("stale metadata was combined with credentials: %+v", id)
+	}
+}
+
+type claudeIdentityTransport func(*http.Request) (*http.Response, error)
+
+func (f claudeIdentityTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func claudeProfileResponse(body string, status int) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func TestVerifyClaudeCredentialsBindsProviderIdentityToBothTokens(t *testing.T) {
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"test-access-secret","refreshToken":"test-refresh-secret","subscriptionType":"team","expiresAt":4102444800000}}`)
+	client := &http.Client{Transport: claudeIdentityTransport(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.String() != "https://api.anthropic.com/api/oauth/profile" {
+			t.Fatalf("unexpected identity request destination")
+		}
+		if r.Header.Get("Authorization") != "Bearer test-access-secret" || r.Header.Get("anthropic-beta") != "oauth-2025-04-20" {
+			t.Fatal("missing OAuth request headers")
+		}
+		if !strings.Contains(r.UserAgent(), "coding_agent_account_manager") {
+			t.Fatalf("request does not identify CAAM")
+		}
+		if _, ok := r.Context().Deadline(); !ok {
+			t.Fatal("identity request is not bounded")
+		}
+		return claudeProfileResponse(`{"account":{"uuid":"account-uuid","email":"same@example.com"},"organization":{"uuid":"team-org","name":"Work Team"}}`, http.StatusOK), nil
+	})}
+	binding, err := VerifyClaudeCredentials(context.Background(), credentials, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.Identity.AccountID != "account-uuid" || binding.Identity.OrganizationID != "team-org" || binding.Identity.Organization != "Work Team" || !binding.Identity.Verified {
+		t.Fatalf("incorrect verified identity: %+v", binding.Identity)
+	}
+	if !binding.MatchesCredentials(credentials) {
+		t.Fatal("binding does not match the verified credentials")
+	}
+	for name, changed := range map[string]string{
+		"access token":  `{"claudeAiOauth":{"accessToken":"other-access","refreshToken":"test-refresh-secret"}}`,
+		"refresh token": `{"claudeAiOauth":{"accessToken":"test-access-secret","refreshToken":"other-refresh"}}`,
+		"both tokens":   `{"claudeAiOauth":{"accessToken":"other-access","refreshToken":"other-refresh"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if binding.MatchesCredentials([]byte(changed)) {
+				t.Fatal("binding accepted different token credentials")
+			}
+		})
+	}
+	if !binding.MatchesCredentials([]byte(`{"telemetry":true,"claudeAiOauth":{"refreshToken":"test-refresh-secret","accessToken":"test-access-secret","expiresAt":1}}`)) {
+		t.Fatal("unrelated metadata must not change the identity of an exact token pair")
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(metadata), "test-access-secret") || strings.Contains(string(metadata), "test-refresh-secret") {
+		t.Fatal("persisted identity contains credentials")
+	}
+	restarted, err := DecodeClaudeIdentityBinding(metadata, credentials)
+	if err != nil || restarted == nil || !restarted.Identity.Verified || !ClaudeSameAccount(&binding.Identity, &restarted.Identity) {
+		t.Fatalf("binding did not survive metadata reload: %v", err)
+	}
+}
+
+func TestVerifyClaudeCredentialsFailureIsUncertaintyAndSecretFree(t *testing.T) {
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"private-access-token","refreshToken":"private-refresh-token"}}`)
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   error
+	}{
+		{"unauthorized", 401, "private-access-token", ErrClaudeTokenRejected},
+		{"missing scope", 403, "private-access-token", ErrClaudeIdentityUnavailable},
+		{"rate limited", 429, "private-access-token", ErrClaudeIdentityUnavailable},
+		{"server unavailable", 503, "private-access-token", ErrClaudeIdentityUnavailable},
+		{"null profile", 200, `null`, ErrClaudeIdentityUnavailable},
+		{"malformed profile", 200, `{"account":"private-access-token"}`, ErrClaudeIdentityUnavailable},
+		{"no org", 200, `{"account":{"uuid":"user","email":"same@example.com"}}`, ErrClaudeIdentityUnavailable},
+		{"no account UUID", 200, `{"account":{"email":"same@example.com"},"organization":{"uuid":"org"}}`, ErrClaudeIdentityUnavailable},
+		{"empty org UUID", 200, `{"account":{"uuid":"user"},"organization":{"uuid":"  "}}`, ErrClaudeIdentityUnavailable},
+		{"oversized body", 200, strings.Repeat("x", claudeIdentityMaxBytes+1), ErrClaudeIdentityUnavailable},
+		{"trailing response", 200, `{"account":{"uuid":"u"},"organization":{"uuid":"o"}} {}`, ErrClaudeIdentityUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &http.Client{Transport: claudeIdentityTransport(func(*http.Request) (*http.Response, error) {
+				return claudeProfileResponse(tc.body, tc.status), nil
+			})}
+			binding, err := VerifyClaudeCredentials(context.Background(), credentials, client)
+			if binding != nil || !errors.Is(err, tc.want) {
+				t.Fatalf("got binding=%v, error=%v; want %v", binding != nil, err, tc.want)
+			}
+			if strings.Contains(err.Error(), "private-") {
+				t.Fatal("failure exposed a credential")
+			}
+		})
+	}
+	client := &http.Client{Transport: claudeIdentityTransport(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("transport logged private-access-token")
+	})}
+	if _, err := VerifyClaudeCredentials(context.Background(), credentials, client); !errors.Is(err, ErrClaudeIdentityUnavailable) || strings.Contains(err.Error(), "private-") {
+		t.Fatal("transport diagnostics must not leak into identity errors")
+	}
+}
+
+func TestVerifyClaudeCredentialsDoesNotFollowRedirects(t *testing.T) {
+	for _, location := range []string{"https://evil.example/steal", "https://api.anthropic.com/other"} {
+		t.Run(location, func(t *testing.T) {
+			calls := 0
+			client := &http.Client{
+				CheckRedirect: func(*http.Request, []*http.Request) error {
+					t.Fatal("caller redirect policy must not override credential protection")
+					return nil
+				},
+				Transport: claudeIdentityTransport(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if calls > 1 {
+						t.Fatal("bearer identity request followed a redirect")
+					}
+					response := claudeProfileResponse("", http.StatusFound)
+					response.Header.Set("Location", location)
+					return response, nil
+				}),
+			}
+			binding, err := VerifyClaudeCredentials(context.Background(), []byte(`{"claudeAiOauth":{"accessToken":"opaque"}}`), client)
+			if binding != nil || !errors.Is(err, ErrClaudeIdentityUnavailable) || calls != 1 {
+				t.Fatalf("unexpected redirect result: %v, calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestVerifyClaudeCredentialsExpiredAndCanceled(t *testing.T) {
+	calls := 0
+	client := &http.Client{Transport: claudeIdentityTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	if _, err := VerifyClaudeCredentials(context.Background(), []byte(`{"claudeAiOauth":{"accessToken":"opaque","expiresAt":1}}`), client); !errors.Is(err, ErrClaudeTokenExpired) || calls != 0 {
+		t.Fatalf("expired token must be handled offline: %v, calls=%d", err, calls)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := VerifyClaudeCredentials(ctx, []byte(`{"claudeAiOauth":{"accessToken":"opaque"}}`), client); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation not preserved: %v", err)
+	}
+}
+
+func TestExtractClaudeBindingOverridesStaleSettingsAndSurvivesRestart(t *testing.T) {
+	for _, metadataName := range []string{"meta.json", ClaudeIdentityCacheFile} {
+		t.Run(metadataName, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".credentials.json")
+			credentials := []byte(`{"claudeAiOauth":{"accessToken":"team-token","refreshToken":"team-refresh","subscriptionType":"team","expiresAt":4102444800000}}`)
+			if err := os.WriteFile(path, credentials, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, err := ClaudeCredentialFingerprint(credentials)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding := &ClaudeIdentityBinding{Identity: Identity{Provider: "claude", AccountID: "same-user", OrganizationID: "team-org", Organization: "Team", Email: "same@example.com"}, CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC()}
+			metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, metadataName), metadata, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			writeClaudeSettings(t, dir, map[string]interface{}{"accountUuid": "same-user", "organizationUuid": "personal-org", "organizationName": "Personal", "emailAddress": "same@example.com"})
+			for range 2 { // Separate reads, with all authority reconstructed from disk.
+				id, err := ExtractFromClaudeCredentials(path)
+				if err != nil || id.OrganizationID != "team-org" || id.Organization != "Team" || !id.Verified || id.PlanType != "team" {
+					t.Fatalf("stale settings overrode bound token identity: %+v, %v", id, err)
+				}
+			}
+			// Another session replaced only the access token, leaving both the
+			// refresh token and the shared metadata untouched.
+			if err := os.WriteFile(path, []byte(`{"claudeAiOauth":{"accessToken":"personal-token","refreshToken":"team-refresh","subscriptionType":"max"}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			id, err := ExtractFromClaudeCredentials(path)
+			if err != nil || id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "" {
+				t.Fatalf("replacement token inherited stale identity: %+v, %v", id, err)
+			}
+			captured, err := ReadClaudeIdentityBindingForCredentials(path, credentials)
+			if err != nil || captured == nil || captured.Identity.OrganizationID != "team-org" {
+				t.Fatalf("captured token generation should still match its binding: %v", err)
+			}
+		})
 	}
 }
