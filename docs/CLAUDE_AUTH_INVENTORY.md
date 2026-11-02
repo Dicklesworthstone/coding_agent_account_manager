@@ -30,7 +30,8 @@ stale account label. Local metadata and email alone cannot prove token ownership
 ### CLAUDE-001: Identity Extraction from Credentials
 
 **Files:** `internal/identity/claude.go`, `internal/authfile/claude_identity.go`,
-`internal/authfile/switch.go`, `internal/keepalive/keepalive.go`
+`internal/authfile/switch.go`, `internal/keepalive/keepalive.go`,
+`internal/provider/claude/claude.go`, `internal/profile/profile.go`
 **Functions:** `ExtractFromClaudeCredentials`, `VerifyClaudeCredentials`,
 `ClaudeSameAccount`
 **Status:** Token-bound account and organization identification implemented for
@@ -78,6 +79,23 @@ user snapshot, and binds the new generation before it can be treated as that
 profile's identity. `_original` and automatic recovery snapshots retain the
 captured credential bytes even when their account labels must be corrected or
 omitted; preserving a grant does not assert its current usability.
+
+Isolated profile imports carry a matching binding with the exact captured
+credentials into a private `.caam-identity.json`, including after access-token
+expiry, without contacting the provider. A saved `meta.json` binding that no
+longer matches blocks import; a stale native cache contributes no identity.
+The imported `.claude.json` account block is corrected or omitted while unrelated
+session state is retained. Source credentials, keychain authority when selected,
+and the metadata used for the decision are rechecked during the recoverable
+credential/cache/state batch and before the prepared profile directory is
+published. Source changes leave a previously installed profile in place.
+
+Execution and isolated profile identity loading share one directory selector:
+an installed XDG `xdg_config/claude-code` authentication source is authoritative,
+even when its token is expired or malformed. Legacy-only profiles use
+`home/.claude`. A newer credential in an ignored directory cannot change the
+reported organization, and a cached `profile.json` identity cannot replace
+missing or unreadable current Claude credentials. These lookups stay offline.
 
 `caam ls` displays organization names and stable UUIDs. Legacy local labels
 are marked `[unverified]`; JSON exposes `organization_id` and a true

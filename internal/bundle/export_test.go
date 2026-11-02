@@ -3,11 +3,192 @@ package bundle
 import (
 	"archive/zip"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
+
+func TestVaultExporterRejectsChangingClaudeProfileGeneration(t *testing.T) {
+	for _, scenario := range []string{"rotate before metadata copy", "rotate after metadata copy", "add file during copy", "replace same bytes", "replace profile directory"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			vault := filepath.Join(root, "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			credentials := claudeBundleCredentials(t, "synthetic-personal-access", "synthetic-personal-refresh", time.Now().Add(time.Hour))
+			metadata := claudeBundleMetadata(t, credentials, "account-shared", "org-personal")
+			rotated := claudeBundleCredentials(t, "synthetic-team-access", "synthetic-team-refresh", time.Now().Add(2*time.Hour))
+			rotatedMetadata := claudeBundleMetadata(t, rotated, "account-shared", "org-team")
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), credentials)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), metadata)
+			exporter := &VaultExporter{VaultPath: vault}
+			changed := false
+			exporter.afterCopyFile = func(relative string) {
+				trigger := "meta.json"
+				if scenario == "rotate before metadata copy" {
+					trigger = ".credentials.json"
+				}
+				if changed || filepath.Base(relative) != trigger {
+					return
+				}
+				changed = true
+				switch scenario {
+				case "rotate before metadata copy", "rotate after metadata copy":
+					writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), rotated)
+					writeRecoveryFile(t, filepath.Join(profile, "meta.json"), rotatedMetadata)
+				case "add file during copy":
+					writeRecoveryFile(t, filepath.Join(profile, "new-state.json"), `{"state":"concurrent"}`)
+				case "replace same bytes":
+					path := filepath.Join(profile, ".credentials.json")
+					info, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					replacement := filepath.Join(root, "replacement")
+					writeRecoveryFile(t, replacement, credentials)
+					if err := os.Chtimes(replacement, info.ModTime(), info.ModTime()); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(replacement, path); err != nil {
+						t.Fatal(err)
+					}
+				case "replace profile directory":
+					if err := os.Rename(profile, filepath.Join(root, "previous-profile")); err != nil {
+						t.Fatal(err)
+					}
+					writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), credentials)
+					writeRecoveryFile(t, filepath.Join(profile, "meta.json"), metadata)
+				}
+			}
+			output := filepath.Join(root, "output")
+			result, err := exporter.Export(&ExportOptions{OutputDir: output})
+			if !changed || err == nil || result != nil || !strings.Contains(err.Error(), "changed during transfer") {
+				t.Fatalf("changing profile exported: changed=%t, result=%+v, error=%v", changed, result, err)
+			}
+			if strings.Contains(err.Error(), "synthetic-") {
+				t.Fatalf("export error disclosed a credential: %v", err)
+			}
+			if entries, err := os.ReadDir(output); err == nil && len(entries) != 0 || err != nil && !os.IsNotExist(err) {
+				t.Fatalf("rejected export published an archive: %v, %v", entries, err)
+			}
+			want := credentials
+			if strings.HasPrefix(scenario, "rotate") {
+				want = rotated
+			}
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), want)
+		})
+	}
+}
+
+func TestVaultExporterRejectsStaleClaudeBindingIncludingDryRun(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dry=%t", dryRun), func(t *testing.T) {
+			root := t.TempDir()
+			vault := filepath.Join(root, "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			previous := claudeBundleCredentials(t, "synthetic-previous", "synthetic-refresh", time.Now().Add(time.Hour))
+			current := claudeBundleCredentials(t, "synthetic-substituted", "synthetic-refresh", time.Now().Add(2*time.Hour))
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), current)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), claudeBundleMetadata(t, previous, "account-shared", "org-personal"))
+			result, err := (&VaultExporter{VaultPath: vault}).Export(&ExportOptions{OutputDir: filepath.Join(root, "output"), DryRun: dryRun})
+			if err == nil || result != nil || !strings.Contains(err.Error(), "does not match") {
+				t.Fatalf("stale proof exported: %+v, %v", result, err)
+			}
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), current)
+			if dryRun {
+				if _, err := os.Stat(filepath.Join(vault, ".caam-mutation.lock")); !os.IsNotExist(err) {
+					t.Fatalf("dry-run export changed the vault: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestVaultExporterCanonicalClaudeProofOmitsStaleNativeCache(t *testing.T) {
+	root := t.TempDir()
+	vault := filepath.Join(root, "vault")
+	profile := filepath.Join(vault, "claude", "work")
+	previous := claudeBundleCredentials(t, "synthetic-previous", "synthetic-previous-refresh", time.Now().Add(-time.Hour))
+	current := claudeBundleCredentials(t, "synthetic-current", "synthetic-current-refresh", time.Now().Add(time.Hour))
+	staleCache := claudeBundleMetadata(t, previous, "account-shared", "org-team")
+	canonical := claudeBundleMetadata(t, current, "account-shared", "org-personal")
+	writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), current)
+	writeRecoveryFile(t, filepath.Join(profile, "meta.json"), canonical)
+	writeRecoveryFile(t, filepath.Join(profile, identity.ClaudeIdentityCacheFile), staleCache)
+	exported, err := (&VaultExporter{VaultPath: vault}).Export(&ExportOptions{OutputDir: filepath.Join(root, "output")})
+	if err != nil {
+		t.Fatalf("unused stale cache overrode canonical ownership: %v", err)
+	}
+	extracted := t.TempDir()
+	if err := (&VaultImporter{BundlePath: exported.OutputPath}).extractBundle(extracted); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{profile, filepath.Join(extracted, "vault", "claude", "work")} {
+		requireRecoveryFile(t, filepath.Join(path, ".credentials.json"), current)
+		requireRecoveryFile(t, filepath.Join(path, "meta.json"), canonical)
+	}
+	if _, err := os.Lstat(filepath.Join(extracted, "vault", "claude", "work", identity.ClaudeIdentityCacheFile)); !os.IsNotExist(err) {
+		t.Fatalf("export retained redundant stale ownership metadata: %v", err)
+	}
+	requireRecoveryFile(t, filepath.Join(profile, identity.ClaudeIdentityCacheFile), staleCache)
+
+	// Existing archives may also have this redundant cache. Honor exact
+	// canonical ownership and omit the cache only in the staged destination.
+	manifest := NewManifest()
+	manifest.AddProfile("claude", "work")
+	archive := writeRecoveryBundle(t, manifest, map[string]string{
+		"vault/claude/work/.credentials.json":                   current,
+		"vault/claude/work/meta.json":                           canonical,
+		"vault/claude/work/" + identity.ClaudeIdentityCacheFile: staleCache,
+	})
+	destination := filepath.Join(root, "destination")
+	result, err := (&VaultImporter{BundlePath: archive}).Import(&ImportOptions{VaultPath: destination, Mode: ImportModeSmart})
+	if err != nil || result == nil || result.NewProfiles != 1 {
+		t.Fatalf("canonical archive import: %+v, %v", result, err)
+	}
+	imported := filepath.Join(destination, "claude", "work")
+	requireRecoveryFile(t, filepath.Join(imported, ".credentials.json"), current)
+	requireRecoveryFile(t, filepath.Join(imported, "meta.json"), canonical)
+	if _, err := os.Lstat(filepath.Join(imported, identity.ClaudeIdentityCacheFile)); !os.IsNotExist(err) {
+		t.Fatalf("import retained redundant stale ownership metadata: %v", err)
+	}
+}
+
+func TestVaultExporterClaudeSameEmailOrganizationsRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	vault := filepath.Join(root, "vault")
+	credentialsByProfile := make(map[string]string)
+	for _, organization := range []string{"personal", "team"} {
+		credentials := claudeBundleCredentials(t, "synthetic-"+organization+"-access", "synthetic-"+organization+"-refresh", time.Now().Add(-24*time.Hour))
+		credentialsByProfile[organization] = credentials
+		profile := filepath.Join(vault, "claude", organization)
+		writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), credentials)
+		writeRecoveryFile(t, filepath.Join(profile, "meta.json"), claudeBundleMetadata(t, credentials, "shared-account", "org-"+organization))
+		writeRecoveryFile(t, filepath.Join(profile, "settings.json"), fmt.Sprintf(`{"isolation":%q}`, organization))
+	}
+	exported, err := (&VaultExporter{VaultPath: vault}).Export(&ExportOptions{OutputDir: filepath.Join(root, "output")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "destination")
+	result, err := (&VaultImporter{BundlePath: exported.OutputPath}).Import(&ImportOptions{VaultPath: destination, Mode: ImportModeSmart})
+	if err != nil || result == nil || result.NewProfiles != 2 || result.UpdatedProfiles != 0 {
+		t.Fatalf("round trip failed: %+v, %v", result, err)
+	}
+	for organization, credentials := range credentialsByProfile {
+		path := filepath.Join(destination, "claude", organization, ".credentials.json")
+		requireRecoveryFile(t, path, credentials)
+		requireRecoveryFile(t, filepath.Join(destination, "claude", organization, "settings.json"), fmt.Sprintf(`{"isolation":%q}`, organization))
+		binding, err := identity.ReadClaudeIdentityBinding(path)
+		if err != nil || binding == nil || binding.Identity.Email != "shared@example.test" || binding.Identity.OrganizationID != "org-"+organization {
+			t.Fatalf("round trip lost organization identity: %+v, %v", binding, err)
+		}
+	}
+}
 
 func TestDefaultExportOptions(t *testing.T) {
 	opts := DefaultExportOptions()

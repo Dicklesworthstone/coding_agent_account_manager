@@ -3,12 +3,17 @@ package bundle
 import (
 	"archive/zip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // Write raw manifests so recovery tests exercise the importer, including cases
@@ -78,6 +83,636 @@ func requireRecoveryFile(t *testing.T, path, want string) {
 	got, err := os.ReadFile(path)
 	if err != nil || string(got) != want {
 		t.Errorf("preserved file %s: got %q, error %v; want %q", path, got, err, want)
+	}
+}
+
+func claudeBundleCredentials(t *testing.T, access, refresh string, expiry time.Time) string {
+	t.Helper()
+	oauth := map[string]any{"accessToken": access, "refreshToken": refresh}
+	if !expiry.IsZero() {
+		oauth["expiresAt"] = expiry.UnixMilli()
+	}
+	data, err := json.Marshal(map[string]any{"claudeAiOauth": oauth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func claudeBundleMetadata(t *testing.T, credentials, account, organization string) string {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint([]byte(credentials))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"description": "preserve unrelated profile metadata",
+		"claude_identity": identity.ClaudeIdentityBinding{
+			Identity: identity.Identity{
+				Provider: "claude", AccountID: account, OrganizationID: organization,
+				Email: "shared@example.test", Organization: organization,
+			},
+			CredentialFingerprint: fingerprint,
+			VerifiedAt:            time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func proveLegacyBundleProfile(t *testing.T, profilePath string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(profilePath, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy struct {
+		OAuthToken struct {
+			Access  string `json:"access_token"`
+			Refresh string `json:"refresh_token"`
+		} `json:"oauthToken"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	credentials := claudeBundleCredentials(t, legacy.OAuthToken.Access, legacy.OAuthToken.Refresh, time.Time{})
+	writeRecoveryFile(t, filepath.Join(profilePath, "meta.json"), claudeBundleMetadata(t, credentials, "account-shared", "org-personal"))
+}
+
+func TestVaultImporterClaudeSmartOwnership(t *testing.T) {
+	cases := []struct {
+		name                              string
+		localBound, incomingBound         bool
+		samePair, sameAccess, sameRefresh bool
+		incomingAccount, incomingOrg      string
+		breakLocal                        bool
+		wantAction, reason                string
+	}{
+		{name: "verified rotation", localBound: true, incomingBound: true, wantAction: "update", reason: "fresher"},
+		{name: "same email different organization", localBound: true, incomingBound: true, incomingOrg: "org-team", wantAction: "skip", reason: "organization differs"},
+		{name: "different account", localBound: true, incomingBound: true, incomingAccount: "account-other", wantAction: "skip", reason: "account or organization differs"},
+		{name: "unknown local owner", incomingBound: true, wantAction: "skip", reason: "ownership is unverified"},
+		{name: "unknown incoming owner", localBound: true, wantAction: "skip", reason: "ownership is unverified"},
+		{name: "same email is not proof", wantAction: "skip", reason: "ownership is unverified"},
+		{name: "exact unverified pair", samePair: true, wantAction: "update", reason: "fresher"},
+		{name: "same access different refresh", sameAccess: true, wantAction: "skip", reason: "ownership is unverified"},
+		{name: "different access same refresh", sameRefresh: true, wantAction: "skip", reason: "ownership is unverified"},
+		{name: "exact pair gains proof", samePair: true, incomingBound: true, wantAction: "update", reason: "importing verified"},
+		{name: "exact pair preserves proof", samePair: true, localBound: true, wantAction: "skip", reason: "discard its verification"},
+		{name: "conflicting proof for identical pair", samePair: true, localBound: true, incomingBound: true, incomingOrg: "org-team", wantAction: "skip", reason: "organization differs"},
+		{name: "local credentials replaced", localBound: true, incomingBound: true, breakLocal: true, wantAction: "skip", reason: "credentials changed"},
+	}
+	for _, test := range cases {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(test.name+"/dry="+fmt.Sprint(dryRun), func(t *testing.T) {
+				vault := filepath.Join(t.TempDir(), "vault")
+				profile := filepath.Join(vault, "claude", "shared@example.test")
+				expiry := time.Now().Add(12 * time.Hour).Truncate(time.Second)
+				localCredentials := claudeBundleCredentials(t, "synthetic-local-access", "synthetic-local-refresh", expiry)
+				access, refresh := "synthetic-incoming-access", "synthetic-incoming-refresh"
+				if test.samePair || test.sameAccess {
+					access = "synthetic-local-access"
+				}
+				if test.samePair || test.sameRefresh {
+					refresh = "synthetic-local-refresh"
+				}
+				incomingCredentials := claudeBundleCredentials(t, access, refresh, expiry.Add(24*time.Hour))
+				localMetadata := `{"email":"shared@example.test","organization":"Personal"}`
+				incomingMetadata := `{"email":"shared@example.test","organization":"Personal"}`
+				if test.localBound {
+					localMetadata = claudeBundleMetadata(t, localCredentials, "account-shared", "org-personal")
+				}
+				if test.breakLocal {
+					localCredentials = claudeBundleCredentials(t, "synthetic-replaced-access", "synthetic-local-refresh", expiry)
+				}
+				account, organization := test.incomingAccount, test.incomingOrg
+				if account == "" {
+					account = "account-shared"
+				}
+				if organization == "" {
+					organization = "org-personal"
+				}
+				if test.incomingBound {
+					incomingMetadata = claudeBundleMetadata(t, incomingCredentials, account, organization)
+				}
+				writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), localCredentials)
+				writeRecoveryFile(t, filepath.Join(profile, "meta.json"), localMetadata)
+				writeRecoveryFile(t, filepath.Join(profile, "settings.json"), `{"isolation":"original-local"}`)
+				manifest := NewManifest()
+				manifest.AddProfile("claude", "shared@example.test")
+				bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+					"vault/claude/shared@example.test/.credentials.json": incomingCredentials,
+					"vault/claude/shared@example.test/meta.json":         incomingMetadata,
+					"vault/claude/shared@example.test/.claude.json":      `{"oauthAccount":{"emailAddress":"shared@example.test","organizationName":"stale shared label"},"numStartups":7,"projects":{"/synthetic/project":{"trusted":true}}}`,
+				})
+				result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, Mode: ImportModeSmart, DryRun: dryRun})
+				if err != nil || result == nil || len(result.ProfileActions) != 1 {
+					t.Fatalf("smart import: result=%+v, error=%v", result, err)
+				}
+				action := result.ProfileActions[0]
+				if action.Action != test.wantAction || !strings.Contains(action.Reason, test.reason) {
+					t.Fatalf("action=%+v, want %s (%s)", action, test.wantAction, test.reason)
+				}
+				if dryRun || test.wantAction == "skip" {
+					requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), localCredentials)
+					requireRecoveryFile(t, filepath.Join(profile, "meta.json"), localMetadata)
+					requireRecoveryFile(t, filepath.Join(profile, "settings.json"), `{"isolation":"original-local"}`)
+					if action.RecoveryPath != "" {
+						t.Fatal("read-only decision created a recovery snapshot")
+					}
+				} else {
+					requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), incomingCredentials)
+					requireRecoveryFile(t, filepath.Join(action.RecoveryPath, ".credentials.json"), localCredentials)
+					requireRecoveryFile(t, filepath.Join(action.RecoveryPath, "meta.json"), localMetadata)
+					requireRecoveryFile(t, filepath.Join(action.RecoveryPath, "settings.json"), `{"isolation":"original-local"}`)
+					if !authfile.IsPrivateVaultEntry(filepath.Base(filepath.Dir(action.RecoveryPath))) {
+						t.Fatalf("recovery path is routable: %s", action.RecoveryPath)
+					}
+					settings, err := os.ReadFile(filepath.Join(profile, ".claude.json"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					var state struct {
+						Account *struct {
+							OrganizationID string `json:"organizationUuid"`
+						} `json:"oauthAccount"`
+						NumStartups int `json:"numStartups"`
+						Projects    map[string]struct {
+							Trusted bool `json:"trusted"`
+						} `json:"projects"`
+					}
+					if err := json.Unmarshal(settings, &state); err != nil || state.NumStartups != 7 || !state.Projects["/synthetic/project"].Trusted {
+						t.Fatalf("normalizing account changed unrelated state: %+v, %v", state, err)
+					}
+					if test.incomingBound {
+						if state.Account == nil || state.Account.OrganizationID != organization {
+							t.Fatalf("import retained stale account label: %+v", state.Account)
+						}
+					} else if state.Account != nil || !strings.Contains(action.Reason, "labels omitted") {
+						t.Fatalf("unverified account label retained without warning: state=%+v, action=%+v", state.Account, action)
+					}
+				}
+				profiles, err := authfile.NewVault(vault).List("claude")
+				if err != nil || len(profiles) != 1 || profiles[0] != "shared@example.test" {
+					t.Fatalf("profile isolation changed: %v, %v", profiles, err)
+				}
+				if dryRun {
+					if _, err := os.Lstat(filepath.Join(vault, ".caam-mutation.lock")); !os.IsNotExist(err) {
+						t.Fatalf("dry run mutated vault lock: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestVaultImporterClaudePrimaryControlsFreshness(t *testing.T) {
+	for _, test := range []struct {
+		name                      string
+		primaryHours, legacyHours int
+		unknownPrimary            bool
+		wantAction                string
+	}{
+		{name: "new primary old secondary", primaryHours: 48, legacyHours: 1, wantAction: "update"},
+		{name: "old primary newer secondary", primaryHours: 1, legacyHours: 96, wantAction: "skip"},
+		{name: "unknown primary newer secondary", unknownPrimary: true, legacyHours: 96, wantAction: "skip"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			vault := filepath.Join(t.TempDir(), "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			now := time.Now().Truncate(time.Second)
+			localCredentials := claudeBundleCredentials(t, "synthetic-local", "synthetic-local-refresh", now.Add(12*time.Hour))
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), localCredentials)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), claudeBundleMetadata(t, localCredentials, "account-shared", "org-personal"))
+			expiry := now.Add(time.Duration(test.primaryHours) * time.Hour)
+			if test.unknownPrimary {
+				expiry = time.Time{}
+			}
+			incoming := claudeBundleCredentials(t, "synthetic-primary", "synthetic-primary-refresh", expiry)
+			legacy := fmt.Sprintf(`{"oauthToken":{"access_token":"synthetic-secondary","refresh_token":"synthetic-secondary-refresh","expiry":%q}}`, now.Add(time.Duration(test.legacyHours)*time.Hour).Format(time.RFC3339))
+			manifest := NewManifest()
+			manifest.AddProfile("claude", "work")
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+				"vault/claude/work/.credentials.json": incoming,
+				"vault/claude/work/.claude.json":      legacy,
+				"vault/claude/work/meta.json":         claudeBundleMetadata(t, incoming, "account-shared", "org-personal"),
+			})
+			result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, Mode: ImportModeSmart})
+			if err != nil || result == nil || len(result.ProfileActions) != 1 || result.ProfileActions[0].Action != test.wantAction {
+				t.Fatalf("primary freshness decision: %+v, %v", result, err)
+			}
+			want := localCredentials
+			if test.wantAction == "update" {
+				want = incoming
+			}
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), want)
+		})
+	}
+}
+
+func TestVaultImporterClaudeAuthJSONDoesNotMatchOrUseSecondaryLogin(t *testing.T) {
+	for _, test := range []struct {
+		name, incomingAuth, secondary string
+		wantError                     bool
+	}{
+		{name: "different selected grants identical secondary pair", incomingAuth: `{"access_token":"synthetic-team-access","refresh_token":"synthetic-team-refresh"}`},
+		{name: "same selected pair has no supported expiry", incomingAuth: `{"access_token":"synthetic-personal-access","refresh_token":"synthetic-personal-refresh"}`},
+		{name: "API key must not inherit secondary pair", incomingAuth: `{"apiKey":"synthetic-team-key"}`},
+		{name: "malformed unused secondary", incomingAuth: `{"access_token":"synthetic-team-access","refresh_token":"synthetic-team-refresh"}`, secondary: `{"ignored secondary`},
+		{name: "malformed selected source cannot fall back", incomingAuth: `{"access_token":42}`, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			vault := filepath.Join(t.TempDir(), "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			localAuth := `{"access_token":"synthetic-personal-access","refresh_token":"synthetic-personal-refresh"}`
+			writeRecoveryFile(t, filepath.Join(profile, "auth.json"), localAuth)
+			writeRecoveryFile(t, filepath.Join(profile, ".claude.json"), `{"oauthToken":{"access_token":"synthetic-unused","refresh_token":"synthetic-unused-refresh","expiry":"2000-01-01T00:00:00Z"}}`)
+			secondary := test.secondary
+			if secondary == "" {
+				secondary = `{"oauthToken":{"access_token":"synthetic-unused","refresh_token":"synthetic-unused-refresh","expiry":"2099-01-01T00:00:00Z"}}`
+			}
+			manifest := NewManifest()
+			manifest.AddProfile("claude", "work")
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+				"vault/claude/work/auth.json":    test.incomingAuth,
+				"vault/claude/work/.claude.json": secondary,
+			})
+			result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, Mode: ImportModeSmart})
+			if (err != nil) != test.wantError || result == nil || result.UpdatedProfiles != 0 {
+				t.Fatalf("ignored secondary selected another login: %+v, %v", result, err)
+			}
+			if !test.wantError && result.SkippedProfiles != 1 {
+				t.Fatalf("unproven selected auth was not preserved: %+v", result)
+			}
+			requireRecoveryFile(t, filepath.Join(profile, "auth.json"), localAuth)
+		})
+	}
+}
+
+func TestVaultImporterRejectsInvalidClaudeIdentityBeforeAnyChanges(t *testing.T) {
+	credentials := claudeBundleCredentials(t, "synthetic-private-access", "synthetic-private-refresh", time.Now().Add(time.Hour))
+	otherCredentials := claudeBundleCredentials(t, "synthetic-substituted-access", "synthetic-private-refresh", time.Now().Add(2*time.Hour))
+	validMetadata := claudeBundleMetadata(t, credentials, "account-shared", "org-team")
+	for _, test := range []struct {
+		name, credentials, metadata, cache string
+	}{
+		{name: "changed access token", credentials: otherCredentials, metadata: validMetadata},
+		{name: "malformed proof", credentials: credentials, metadata: `{"claude_identity":{"secret":"synthetic-private-access"}}`},
+		{name: "invalid metadata", credentials: credentials, metadata: `{"synthetic-private-access"`},
+		{name: "invalid primary cannot fall back", credentials: `{"claudeAiOauth":{"accessToken":42}}`, metadata: `{}`},
+		{name: "stale native cache without canonical proof", credentials: credentials, metadata: `{}`, cache: claudeBundleMetadata(t, otherCredentials, "account-shared", "org-team")},
+		{name: "changed canonical proof cannot fall back", credentials: otherCredentials, metadata: validMetadata, cache: claudeBundleMetadata(t, otherCredentials, "account-shared", "org-team")},
+		{name: "invalid canonical proof cannot fall back", credentials: credentials, metadata: `{"claude_identity":false}`, cache: validMetadata},
+	} {
+		for _, mode := range []ImportMode{ImportModeSmart, ImportModeMerge, ImportModeReplace} {
+			for _, dryRun := range []bool{false, true} {
+				t.Run(test.name+"/"+string(mode)+"/dry="+fmt.Sprint(dryRun), func(t *testing.T) {
+					root := t.TempDir()
+					vault := filepath.Join(root, "vault")
+					localPath := filepath.Join(vault, "claude", "work", ".credentials.json")
+					writeRecoveryFile(t, localPath, credentials)
+					configPath := filepath.Join(root, "config.json")
+					writeRecoveryFile(t, configPath, "original-config")
+					manifest := NewManifest()
+					manifest.AddProfile("claude", "work")
+					manifest.AddProfile("codex", "new-account")
+					manifest.SetConfig(true, "config.json")
+					files := map[string]string{
+						"vault/claude/work/.credentials.json": test.credentials,
+						"vault/claude/work/meta.json":         test.metadata,
+						"vault/claude/work/.claude.json":      `{"oauthToken":{"access_token":"valid-secondary","refresh_token":"secondary-refresh","expiry":"2099-01-01T00:00:00Z"}}`,
+						"vault/codex/new-account/auth.json":   `{"access_token":"synthetic-new-account"}`,
+						"config.json":                         "incoming-config",
+					}
+					if test.cache != "" {
+						files["vault/claude/work/"+identity.ClaudeIdentityCacheFile] = test.cache
+					}
+					bundlePath := writeRecoveryBundle(t, manifest, files)
+					result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, ConfigPath: configPath, Mode: mode, DryRun: dryRun})
+					if err == nil || result == nil || result.NewProfiles != 0 || result.UpdatedProfiles != 0 || len(result.Errors) != 1 {
+						t.Fatalf("invalid incoming ownership accepted: %+v, %v", result, err)
+					}
+					if strings.Contains(err.Error(), "synthetic-private") || strings.Contains(err.Error(), "synthetic-substituted") {
+						t.Fatalf("error disclosed credential material: %v", err)
+					}
+					if len(result.ProfileActions) != 1 || result.ProfileActions[0].Action != "error" {
+						t.Fatalf("invalid profile not reported: %+v", result.ProfileActions)
+					}
+					requireRecoveryFile(t, localPath, credentials)
+					requireRecoveryFile(t, configPath, "original-config")
+					if _, err := os.Lstat(filepath.Join(vault, "codex", "new-account")); !os.IsNotExist(err) {
+						t.Fatalf("invalid bundle partly imported another profile: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestVaultImporterClaudeReplaceRetainsOldOrganizationAndExpiredProof(t *testing.T) {
+	for _, originalMetadata := range []string{"", `{"description":"keep this description"}`, `{"description":"keep this description","claude_identity":null}`} {
+		t.Run("metadata="+originalMetadata, func(t *testing.T) {
+			vault := filepath.Join(t.TempDir(), "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			oldCredentials := claudeBundleCredentials(t, "synthetic-personal-access", "synthetic-personal-refresh", time.Now().Add(time.Hour))
+			oldMetadata := claudeBundleMetadata(t, oldCredentials, "account-shared", "org-personal")
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), oldCredentials)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), oldMetadata)
+			writeRecoveryFile(t, filepath.Join(profile, "nested", "settings.json"), `{"isolation":"personal"}`)
+			expired := claudeBundleCredentials(t, "synthetic-team-access", "synthetic-team-refresh", time.Now().Add(-24*time.Hour))
+			cache := claudeBundleMetadata(t, expired, "account-shared", "org-team")
+			manifest := NewManifest()
+			manifest.AddProfile("claude", "work")
+			files := map[string]string{
+				"vault/claude/work/.credentials.json":                   expired,
+				"vault/claude/work/" + identity.ClaudeIdentityCacheFile: cache,
+				"vault/claude/work/.claude.json":                        `{"oauthAccount":{"accountUuid":"account-shared","organizationUuid":"org-personal","organizationName":"Personal"},"numStartups":11,"projects":{"/synthetic/team":{"trusted":true}}}`,
+			}
+			if originalMetadata != "" {
+				files["vault/claude/work/meta.json"] = originalMetadata
+			}
+			bundlePath := writeRecoveryBundle(t, manifest, files)
+			result, err := (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vault, Mode: ImportModeReplace})
+			if err != nil || result == nil || result.UpdatedProfiles != 1 || len(result.ProfileActions) != 1 {
+				t.Fatalf("explicit replacement: %+v, %v", result, err)
+			}
+			recovery := result.ProfileActions[0].RecoveryPath
+			if recovery == "" {
+				t.Fatal("replacement lost the previous profile's recovery path")
+			}
+			requireRecoveryFile(t, filepath.Join(recovery, ".credentials.json"), oldCredentials)
+			requireRecoveryFile(t, filepath.Join(recovery, "meta.json"), oldMetadata)
+			requireRecoveryFile(t, filepath.Join(recovery, "nested", "settings.json"), `{"isolation":"personal"}`)
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), expired)
+			state, err := os.ReadFile(filepath.Join(profile, ".claude.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stateDoc struct {
+				Account struct {
+					OrganizationID string `json:"organizationUuid"`
+				} `json:"oauthAccount"`
+				NumStartups int `json:"numStartups"`
+				Projects    map[string]struct {
+					Trusted bool `json:"trusted"`
+				} `json:"projects"`
+			}
+			if err := json.Unmarshal(state, &stateDoc); err != nil || stateDoc.Account.OrganizationID != "org-team" || stateDoc.NumStartups != 11 || !stateDoc.Projects["/synthetic/team"].Trusted {
+				t.Fatalf("verified Team import retained Personal label or lost unrelated state: %+v, %v", stateDoc, err)
+			}
+			metadata, err := os.ReadFile(filepath.Join(profile, "meta.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assessment, err := identity.InspectClaudeIdentityBinding(metadata, []byte(expired))
+			if err != nil || assessment.Binding == nil || assessment.Binding.Identity.OrganizationID != "org-team" {
+				t.Fatalf("expired identity did not persist canonically: %+v, %v", assessment, err)
+			}
+			if originalMetadata != "" && !strings.Contains(string(metadata), "keep this description") {
+				t.Fatal("normalizing identity discarded unrelated profile metadata")
+			}
+			for _, path := range []string{filepath.Join(profile, ".credentials.json"), filepath.Join(profile, "meta.json"), filepath.Join(recovery, ".credentials.json")} {
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("credential artifact permissions: %s, %v", path, err)
+				}
+			}
+			// Reopen through the production reader: expiry must not discard an
+			// exact credential binding after process restart.
+			binding, err := identity.ReadClaudeIdentityBinding(filepath.Join(profile, ".credentials.json"))
+			if err != nil || binding == nil || !binding.Identity.Verified || binding.Identity.OrganizationID != "org-team" {
+				t.Fatalf("offline restart lost imported identity: %+v, %v", binding, err)
+			}
+			if _, err := os.Lstat(filepath.Join(profile, identity.ClaudeIdentityCacheFile)); !os.IsNotExist(err) {
+				t.Fatalf("import retained duplicate native ownership metadata: %v", err)
+			}
+			// A legitimate later rotation maintains canonical vault metadata.
+			// It must not leave a copied native cache that breaks the next export.
+			rotated := claudeBundleCredentials(t, "synthetic-team-rotated-access", "synthetic-team-rotated-refresh", time.Now().Add(12*time.Hour))
+			rotatedMetadata := claudeBundleMetadata(t, rotated, "account-shared", "org-team")
+			rotatedProof, err := identity.InspectClaudeIdentityBinding([]byte(rotatedMetadata), []byte(rotated))
+			if err != nil || rotatedProof.Binding == nil {
+				t.Fatalf("invalid rotated fixture: %+v, %v", rotatedProof, err)
+			}
+			if err := authfile.NewVault(vault).SyncClaudeCredentials("work", []byte(expired), []byte(rotated), rotatedProof.Binding, nil); err != nil {
+				t.Fatalf("same-owner synchronization after import: %v", err)
+			}
+			exported, err := (&VaultExporter{VaultPath: vault}).Export(&ExportOptions{OutputDir: t.TempDir()})
+			if err != nil || exported == nil || exported.Manifest.Contents.Vault.TotalProfiles != 1 {
+				t.Fatalf("post-rotation export: %+v, %v", exported, err)
+			}
+			extracted := t.TempDir()
+			if err := (&VaultImporter{BundlePath: exported.OutputPath}).extractBundle(extracted); err != nil {
+				t.Fatal(err)
+			}
+			exportedCredential := filepath.Join(extracted, "vault", "claude", "work", ".credentials.json")
+			requireRecoveryFile(t, exportedCredential, rotated)
+			exportedProof, err := identity.ReadClaudeIdentityBinding(exportedCredential)
+			if err != nil || exportedProof == nil || exportedProof.Identity.OrganizationID != "org-team" || !exportedProof.MatchesCredentials([]byte(rotated)) {
+				t.Fatalf("post-rotation export lost canonical ownership: %+v, %v", exportedProof, err)
+			}
+			requireRecoveryFile(t, filepath.Join(recovery, ".credentials.json"), oldCredentials)
+		})
+	}
+}
+
+func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
+	for _, scenario := range []string{"incoming changes", "destination rotates", "same bytes replaced", "publication fails", "concurrent login before publication", "concurrent login after publication"} {
+		t.Run(scenario, func(t *testing.T) {
+			vault := filepath.Join(t.TempDir(), "vault")
+			profile := filepath.Join(vault, "claude", "work")
+			old := claudeBundleCredentials(t, "synthetic-old-access", "synthetic-old-refresh", time.Now().Add(time.Hour))
+			incoming := claudeBundleCredentials(t, "synthetic-incoming-access", "synthetic-incoming-refresh", time.Now().Add(2*time.Hour))
+			concurrent := claudeBundleCredentials(t, "synthetic-concurrent-access", "synthetic-concurrent-refresh", time.Now().Add(3*time.Hour))
+			oldMetadata := claudeBundleMetadata(t, old, "account-shared", "org-personal")
+			concurrentMetadata := claudeBundleMetadata(t, concurrent, "account-shared", "org-team")
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), old)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), oldMetadata)
+			manifest := NewManifest()
+			manifest.AddProfile("claude", "work")
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+				"vault/claude/work/.credentials.json": incoming,
+				"vault/claude/work/meta.json":         claudeBundleMetadata(t, incoming, "account-shared", "org-personal"),
+			})
+			importer := &VaultImporter{BundlePath: bundlePath}
+			importer.beforeProfilePublish = func(source, destination string) {
+				switch scenario {
+				case "incoming changes":
+					writeRecoveryFile(t, filepath.Join(source, ".credentials.json"), concurrent)
+				case "destination rotates":
+					writeRecoveryFile(t, filepath.Join(destination, ".credentials.json"), concurrent)
+					writeRecoveryFile(t, filepath.Join(destination, "meta.json"), concurrentMetadata)
+				case "same bytes replaced":
+					path := filepath.Join(destination, ".credentials.json")
+					info, err := os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					replacement := filepath.Join(t.TempDir(), "replacement")
+					writeRecoveryFile(t, replacement, old)
+					if err := os.Chtimes(replacement, info.ModTime(), info.ModTime()); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(replacement, path); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			importer.renameProfile = func(from, to string) error {
+				if strings.HasPrefix(filepath.Base(from), "_caam-vault-backup~import-") {
+					switch scenario {
+					case "publication fails":
+						return errors.New("injected publication interruption")
+					case "concurrent login before publication":
+						writeRecoveryFile(t, filepath.Join(to, ".credentials.json"), concurrent)
+						writeRecoveryFile(t, filepath.Join(to, "meta.json"), concurrentMetadata)
+						return errors.New("destination occupied during publication")
+					case "concurrent login after publication":
+						if err := os.Rename(from, to); err != nil {
+							return err
+						}
+						writeRecoveryFile(t, filepath.Join(to, ".credentials.json"), concurrent)
+						writeRecoveryFile(t, filepath.Join(to, "meta.json"), concurrentMetadata)
+						return nil
+					}
+				}
+				return os.Rename(from, to)
+			}
+			result, err := importer.Import(&ImportOptions{VaultPath: vault, Mode: ImportModeReplace})
+			if err == nil || result == nil || result.UpdatedProfiles != 0 || len(result.ProfileActions) != 1 || result.ProfileActions[0].Action != "error" {
+				t.Fatalf("changed or interrupted transfer reported success: %+v, %v", result, err)
+			}
+			if strings.Contains(err.Error(), "synthetic-") {
+				t.Fatalf("error disclosed credentials: %v", err)
+			}
+			want, wantMetadata := old, oldMetadata
+			if scenario == "destination rotates" || strings.HasPrefix(scenario, "concurrent login") {
+				want, wantMetadata = concurrent, concurrentMetadata
+			}
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), want)
+			requireRecoveryFile(t, filepath.Join(profile, "meta.json"), wantMetadata)
+			recovery := result.ProfileActions[0].RecoveryPath
+			if strings.HasPrefix(scenario, "concurrent login") {
+				if recovery == "" {
+					t.Fatal("failed publication lost the original snapshot")
+				}
+				requireRecoveryFile(t, filepath.Join(recovery, ".credentials.json"), old)
+				requireRecoveryFile(t, filepath.Join(recovery, "meta.json"), oldMetadata)
+			} else if recovery != "" {
+				t.Fatalf("reported recovery path after preserving/restoring original: %s", recovery)
+			}
+		})
+	}
+}
+
+func TestBundleOperationsCaptureGenerationAfterManagedLockWait(t *testing.T) {
+	for _, operation := range []string{"import", "export"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			vaultPath := filepath.Join(root, "vault")
+			profile := filepath.Join(vaultPath, "claude", "work")
+			personal := claudeBundleCredentials(t, "synthetic-personal", "synthetic-personal-refresh", time.Now().Add(time.Hour))
+			team := claudeBundleCredentials(t, "synthetic-team", "synthetic-team-refresh", time.Now().Add(2*time.Hour))
+			teamMetadata := claudeBundleMetadata(t, team, "account-shared", "org-team")
+			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), personal)
+			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), claudeBundleMetadata(t, personal, "account-shared", "org-personal"))
+			incoming := claudeBundleCredentials(t, "synthetic-incoming", "synthetic-incoming-refresh", time.Now().Add(3*time.Hour))
+			manifest := NewManifest()
+			manifest.AddProfile("claude", "work")
+			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+				"vault/claude/work/.credentials.json": incoming,
+				"vault/claude/work/meta.json":         claudeBundleMetadata(t, incoming, "account-shared", "org-personal"),
+			})
+			held, release, lockDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			lockErrors := make(chan error, 1)
+			var releaseOnce sync.Once
+			go func() {
+				defer close(lockDone)
+				lockErrors <- authfile.NewVault(vaultPath).WithMutationLock(func() error {
+					close(held)
+					<-release
+					if err := os.WriteFile(filepath.Join(profile, ".credentials.json"), []byte(team), 0600); err != nil {
+						return err
+					}
+					return os.WriteFile(filepath.Join(profile, "meta.json"), []byte(teamMetadata), 0600)
+				})
+			}()
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				select {
+				case <-lockDone:
+				case <-time.After(10 * time.Second):
+					t.Error("managed mutation did not finish")
+				}
+			})
+			select {
+			case <-held:
+			case err := <-lockErrors:
+				t.Fatalf("failed to acquire managed lock: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("managed mutation never acquired the lock")
+			}
+			type outcome struct {
+				imported *ImportResult
+				exported *ExportResult
+				err      error
+			}
+			started, transferDone := make(chan struct{}), make(chan struct{})
+			completed := make(chan outcome, 1)
+			go func() {
+				defer close(transferDone)
+				close(started)
+				var result outcome
+				if operation == "import" {
+					result.imported, result.err = (&VaultImporter{BundlePath: bundlePath}).Import(&ImportOptions{VaultPath: vaultPath, Mode: ImportModeSmart})
+				} else {
+					result.exported, result.err = (&VaultExporter{VaultPath: vaultPath}).Export(&ExportOptions{OutputDir: filepath.Join(root, "output")})
+				}
+				completed <- result
+			}()
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				select {
+				case <-transferDone:
+				case <-time.After(10 * time.Second):
+					t.Error("bundle transfer did not finish")
+				}
+			})
+			<-started
+			select {
+			case result := <-completed:
+				t.Fatalf("transfer bypassed the held mutation lock: %+v", result)
+			case <-time.After(40 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(release) })
+			if err := <-lockErrors; err != nil {
+				t.Fatal(err)
+			}
+			var result outcome
+			select {
+			case result = <-completed:
+			case <-time.After(10 * time.Second):
+				t.Fatal("bundle transfer did not resume after mutation completed")
+			}
+			if result.err != nil {
+				t.Fatalf("transfer failed after waiting: %v", result.err)
+			}
+			requireRecoveryFile(t, filepath.Join(profile, ".credentials.json"), team)
+			if operation == "import" {
+				if result.imported.SkippedProfiles != 1 || !strings.Contains(result.imported.ProfileActions[0].Reason, "organization differs") {
+					t.Fatalf("import used stale ownership from before lock wait: %+v", result.imported)
+				}
+			} else {
+				extracted := t.TempDir()
+				if err := (&VaultImporter{BundlePath: result.exported.OutputPath}).extractBundle(extracted); err != nil {
+					t.Fatal(err)
+				}
+				requireRecoveryFile(t, filepath.Join(extracted, "vault", "claude", "work", ".credentials.json"), team)
+				requireRecoveryFile(t, filepath.Join(extracted, "vault", "claude", "work", "meta.json"), teamMetadata)
+			}
+		})
 	}
 }
 
@@ -737,6 +1372,7 @@ func TestVaultImporter_Import_SmartMode_FresherBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), authJSON, 0600); err != nil {
 		t.Fatal(err)
 	}
+	proveLegacyBundleProfile(t, profileDir)
 
 	// Export
 	exporter := &VaultExporter{VaultPath: vaultDir, DataPath: tempDir}
@@ -765,6 +1401,7 @@ func TestVaultImporter_Import_SmartMode_FresherBundle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(existingProfileDir, ".claude.json"), existingJSON, 0600); err != nil {
 		t.Fatal(err)
 	}
+	proveLegacyBundleProfile(t, existingProfileDir)
 
 	// Import in smart mode (should update because bundle is fresher)
 	importer := &VaultImporter{BundlePath: exportResult.OutputPath}
@@ -817,6 +1454,7 @@ func TestVaultImporter_Import_SmartMode_FresherLocal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), authJSON, 0600); err != nil {
 		t.Fatal(err)
 	}
+	proveLegacyBundleProfile(t, profileDir)
 
 	// Export
 	exporter := &VaultExporter{VaultPath: vaultDir, DataPath: tempDir}
@@ -845,6 +1483,7 @@ func TestVaultImporter_Import_SmartMode_FresherLocal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(existingProfileDir, ".claude.json"), existingJSON, 0600); err != nil {
 		t.Fatal(err)
 	}
+	proveLegacyBundleProfile(t, existingProfileDir)
 
 	// Import in smart mode (should skip because local is fresher)
 	importer := &VaultImporter{BundlePath: exportResult.OutputPath}

@@ -494,6 +494,16 @@ keepalive synchronization, and organization-aware browser refusal. Cached
 ownership is distinct from token liveness and does not independently verify
 the opaque refresh token.
 
+Vault ZIP bundles carry and validate this token-bound proof offline. Smart
+import requires the same verified account and organization, or the exact
+credential pair, before considering freshness from the selected primary file.
+Unknown or conflicting ownership is reported and preserved. Profile generation
+checks and the managed vault lock cover export and import; replacement retains
+the complete previous snapshot in a private, non-routable recovery directory.
+Tests cover modern/legacy source precedence, shared-email organization conflicts,
+stale bindings, expired cached proof, concurrent copy/publication changes,
+recovery retention, and read-only previews.
+
 #### 5.4 Explicit setup tokens for a single shallow launch
 
 For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately

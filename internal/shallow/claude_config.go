@@ -73,6 +73,13 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	repairs, err := m.prepareClaudeIdentityRepairs(home)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.applyClaudeIdentityRepairs(home, repairs); err != nil {
+		return nil, err
+	}
 	if err := claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy}); err != nil {
 		return nil, fmt.Errorf("write private Claude configuration: %w", err)
 	}
@@ -120,6 +127,13 @@ func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 		)
 	}
 	if err != nil {
+		return err
+	}
+	repairs, err := m.prepareClaudeIdentityRepairs(home)
+	if err != nil {
+		return err
+	}
+	if err := m.applyClaudeIdentityRepairs(home, repairs); err != nil {
 		return err
 	}
 	return claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy})
@@ -172,6 +186,9 @@ func (m *Manager) ValidateClaudeConfigBoundary(name string) error {
 		if _, err := claudesettings.PreparePrivate(document.path, document.shared, document.defaultShared); err != nil {
 			return refuse(err)
 		}
+	}
+	if err := m.validateClaudeIdentityBoundary(home); err != nil {
+		return refuse(err)
 	}
 	return nil
 }

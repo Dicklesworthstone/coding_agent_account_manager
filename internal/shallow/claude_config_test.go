@@ -107,14 +107,15 @@ func TestCreateFromFileStripsRealAccountKeys(t *testing.T) {
 	}
 }
 
-// An explicit source is the identity's home: copied verbatim.
-func TestCreateExplicitSourceKeepsIdentityVerbatim(t *testing.T) {
+// An explicit state source supplies settings, while the selected credential's
+// provider proof supplies identity even if that state was concurrently stale.
+func TestCreateExplicitSourceUsesVerifiedIdentity(t *testing.T) {
 	mgr, _ := onboardingEnv(t, realClaudeJSONFixture)
 	src := filepath.Join(t.TempDir(), "snapshot.json")
 	if err := os.WriteFile(src, []byte(`{"oauthAccount":{"emailAddress":"snap@example.com"},"hasCompletedOnboarding":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cred := writeTempFile(t, "creds.json", validClaudeCred)
+	cred := shallowIdentityCredential(t, t.TempDir(), "snapshot", "team", "meta.json")
 	home, err := mgr.Create("snap", CreateOptions{Provider: "claude", CredentialSource: cred, SourceClaudeJSON: src})
 	if err != nil {
 		t.Fatal(err)
@@ -123,8 +124,8 @@ func TestCreateExplicitSourceKeepsIdentityVerbatim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "snap@example.com") {
-		t.Fatalf("explicit source identity dropped: %s", raw)
+	if !strings.Contains(string(raw), "shared@example.com") || strings.Contains(string(raw), "snap@example.com") {
+		t.Fatalf("explicit source did not use the credential's verified identity: %s", raw)
 	}
 }
 

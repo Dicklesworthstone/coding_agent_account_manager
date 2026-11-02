@@ -31,6 +31,7 @@
 package claude
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -149,80 +151,12 @@ func claudeSettingsPathsForProfile(prof *profile.Profile) []string {
 	return paths
 }
 
-// Existing XDG authentication is authoritative because that is the directory
-// modern isolated profiles launch with. Legacy-only profiles keep their native
-// store; a newer or healthier ignored token must never decide which account runs.
-func effectiveClaudeConfigDir(prof *profile.Profile) (string, error) {
-	xdg, legacy := claudeConfigDirForProfile(prof), claudeLegacyDirForProfile(prof)
-	xdgAuth, err := claudeDirHasAuth(xdg, filepath.Join(xdg, ".claude.json"))
-	if err != nil {
-		return "", err
-	}
-	legacyAuth, err := claudeDirHasAuth(legacy, legacyClaudeStatePath(prof))
-	if err != nil {
-		return "", err
-	}
-	if xdgAuth && legacyAuth {
-		xdgID, legacyID := claudeDirAccountID(xdg), claudeDirAccountID(legacy)
-		if xdgID != "" && legacyID != "" && xdgID != legacyID {
-			return "", fmt.Errorf("Claude profile contains conflicting accounts in legacy and XDG config directories")
-		}
-	}
-	if xdgAuth || !legacyAuth {
-		return xdg, nil
-	}
-	return legacy, nil
-}
-
 func legacyClaudeStatePath(prof *profile.Profile) string {
 	path := filepath.Join(claudeLegacyDirForProfile(prof), ".claude.json")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		return path
 	}
 	return filepath.Join(prof.HomePath(), ".claude.json")
-}
-
-func claudeDirHasAuth(dir, statePath string) (bool, error) {
-	for _, filename := range []string{".credentials.json", "auth.json"} {
-		if _, err := os.Stat(filepath.Join(dir, filename)); err == nil {
-			// Even malformed or expired credentials select this store. Their
-			// error must not be hidden by another directory's valid login.
-			return true, nil
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("inspect Claude auth: %w", err)
-		}
-	}
-	for _, path := range []string{filepath.Join(dir, "settings.json"), statePath} {
-		hasAuth, err := claudeDocumentHasAuth(path)
-		if err != nil || hasAuth {
-			return true, nil // A malformed selected document fails validation.
-		}
-	}
-	return false, nil
-}
-
-func claudeDirAccountID(dir string) string {
-	if data, err := os.ReadFile(filepath.Join(dir, ".credentials.json")); err == nil {
-		if creds, err := parseClaudeCredentials(data); err == nil && creds.ClaudeAiOauth != nil && strings.TrimSpace(creds.ClaudeAiOauth.AccountID) != "" {
-			return strings.TrimSpace(creds.ClaudeAiOauth.AccountID)
-		}
-	}
-	data, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
-	if err != nil && filepath.Base(dir) == ".claude" {
-		data, err = os.ReadFile(filepath.Join(filepath.Dir(dir), ".claude.json"))
-	}
-	if err != nil {
-		return ""
-	}
-	var state struct {
-		Account struct {
-			ID string `json:"accountUuid"`
-		} `json:"oauthAccount"`
-	}
-	if json.Unmarshal(data, &state) != nil {
-		return ""
-	}
-	return strings.TrimSpace(state.Account.ID)
 }
 
 // AuthFiles returns the auth file specifications for Claude Code.
@@ -396,7 +330,7 @@ func shareClaudeUserAssets(realHome, profileClaudeDir string) error {
 func (p *Provider) setupAPIKeyHelper(prof *profile.Profile) error {
 	// Create a helper script path
 	helperPath := filepath.Join(prof.BasePath, "api_key_helper.sh")
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		return err
 	}
@@ -452,7 +386,7 @@ exit 1
 
 // Env returns the environment variables for running Claude in this profile's context.
 func (p *Provider) Env(ctx context.Context, prof *profile.Profile) (map[string]string, error) {
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		return nil, err
 	}
@@ -585,7 +519,7 @@ func (p *Provider) Status(ctx context.Context, prof *profile.Profile) (*provider
 		HasLockFile: prof.IsLocked(),
 	}
 
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		return nil, err
 	}
@@ -749,24 +683,294 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 	return detection, nil
 }
 
-// ImportAuth imports detected auth files into a profile directory.
-func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
-	// The canonical native primary follows native authority, including a
-	// keychain-only login. Arbitrary explicit files remain file-only imports.
-	var captured []byte
-	if filepath.Clean(sourcePath) == filepath.Clean(p.AuthFiles()[0].Path) {
-		name, data, err := authfile.ReadLiveCredential(authfile.ClaudeAuthFiles())
+type claudeImportFile struct {
+	path  string
+	data  []byte
+	entry os.FileInfo
+	file  os.FileInfo
+	limit int64
+}
+
+// Capture both the directory entry and the opened file so replacing a source
+// with identical bytes still invalidates this particular import generation.
+func readClaudeImportFile(path string, limit int64) (claudeImportFile, error) {
+	snapshot := claudeImportFile{path: path, limit: limit}
+	entry, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return snapshot, nil
+	}
+	if err != nil {
+		return snapshot, fmt.Errorf("inspect Claude import source: %w", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return snapshot, fmt.Errorf("read Claude import source: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > limit {
+		return snapshot, fmt.Errorf("claude import source must be a bounded regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return snapshot, fmt.Errorf("cannot read bounded Claude import source")
+	}
+	current, err := os.Lstat(path)
+	opened, fileErr := os.Stat(path)
+	if err != nil || fileErr != nil || !os.SameFile(entry, current) || !os.SameFile(info, opened) ||
+		info.Size() != opened.Size() || !info.ModTime().Equal(opened.ModTime()) {
+		return snapshot, fmt.Errorf("claude import source changed while reading; retry")
+	}
+	snapshot.data, snapshot.entry, snapshot.file = data, entry, info
+	return snapshot, nil
+}
+
+func (source claudeImportFile) checkUnchanged() error {
+	current, err := readClaudeImportFile(source.path, source.limit)
+	if err != nil {
+		return err
+	}
+	if (source.entry == nil) != (current.entry == nil) || !bytes.Equal(source.data, current.data) {
+		return fmt.Errorf("claude import source changed; retry")
+	}
+	if source.entry != nil && (!os.SameFile(source.entry, current.entry) || !os.SameFile(source.file, current.file) ||
+		!source.file.ModTime().Equal(current.file.ModTime())) {
+		return fmt.Errorf("claude import source generation changed; retry")
+	}
+	return nil
+}
+
+type claudeImportSource struct {
+	credentials []byte
+	binding     *identity.ClaudeIdentityBinding
+	files       []claudeImportFile
+	native      *authfile.AuthFileSet
+}
+
+func captureClaudeImportSource(sourcePath string, native *authfile.AuthFileSet) (*claudeImportSource, error) {
+	path, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	file, err := readClaudeImportFile(path, authfile.MaxDiscoveryFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	source := &claudeImportSource{credentials: file.data, files: []claudeImportFile{file}, native: native}
+	if native != nil {
+		name, data, err := authfile.ReadLiveCredential(*native)
 		if err != nil {
 			return nil, fmt.Errorf("capture native Claude authentication: %w", err)
 		}
 		if name != ".credentials.json" {
 			return nil, fmt.Errorf("native Claude primary credential is unavailable")
 		}
-		hasAuth, err := claudeDocumentBytesHaveAuth(name, data)
-		if err != nil || !hasAuth {
-			return nil, fmt.Errorf("native Claude primary does not contain usable authentication")
+		source.credentials = data
+	}
+	if err := authfile.ValidateCredentialData("claude", ".credentials.json", source.credentials); err != nil {
+		return nil, fmt.Errorf("claude import source does not contain usable OAuth credentials")
+	}
+	if hasAuth, err := claudeDocumentBytesHaveAuth(".credentials.json", source.credentials); err != nil || !hasAuth {
+		return nil, fmt.Errorf("claude import source does not contain usable OAuth credentials")
+	}
+	for _, name := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
+		metadata, err := readClaudeImportFile(filepath.Join(filepath.Dir(path), name), 1<<20)
+		if err != nil {
+			return nil, err
 		}
-		captured = data
+		source.files = append(source.files, metadata)
+		assessment, err := identity.InspectClaudeIdentityBinding(metadata.data, source.credentials)
+		if err != nil {
+			return nil, fmt.Errorf("cannot import Claude identity metadata: %w", err)
+		}
+		if name == "meta.json" && assessment.State == identity.ClaudeIdentityCredentialChanged {
+			return nil, fmt.Errorf("saved Claude credential no longer matches its verified account and organization; repair it before importing")
+		}
+		if assessment.Binding != nil {
+			source.binding = assessment.Binding
+			break
+		}
+	}
+	return source, source.checkUnchanged(context.Background())
+}
+
+func (source *claudeImportSource) checkUnchanged(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, file := range source.files {
+		if err := file.checkUnchanged(); err != nil {
+			return err
+		}
+	}
+	if source.native != nil {
+		name, data, err := authfile.ReadLiveCredential(*source.native)
+		if err != nil || name != ".credentials.json" || !bytes.Equal(data, source.credentials) {
+			return fmt.Errorf("native Claude credential changed during import; retry")
+		}
+	}
+	return nil
+}
+
+func (source *claudeImportSource) checkDestination(configDir string, prof *profile.Profile) error {
+	base, err := filepath.Abs(prof.BasePath)
+	if err != nil {
+		return err
+	}
+	dir, err := filepath.Abs(configDir)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(base, dir)
+	if err != nil || !filepath.IsLocal(rel) {
+		return fmt.Errorf("claude import destination is outside its profile")
+	}
+	for current := dir; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+			return fmt.Errorf("claude import requires private profile directories")
+		}
+		if current == base {
+			break
+		}
+	}
+	privateDir, privateErr := os.Stat(dir)
+	for _, file := range source.files {
+		sharedDir, sharedErr := os.Stat(filepath.Dir(file.path))
+		if privateErr == nil && sharedErr == nil && os.SameFile(privateDir, sharedDir) {
+			return fmt.Errorf("claude import destination aliases the source directory")
+		}
+		for _, name := range []string{".credentials.json", identity.ClaudeIdentityCacheFile, ".claude.json"} {
+			if err := claudesettings.CheckPrivate(filepath.Join(dir, name), file.path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (source *claudeImportSource) publish(ctx context.Context, configDir string, prof *profile.Profile) ([]string, error) {
+	checkSource := func() error { return source.checkUnchanged(ctx) }
+	if err := checkSource(); err != nil {
+		return nil, err
+	}
+	if err := source.checkDestination(configDir, prof); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, fmt.Errorf("create Claude config dir: %w", err)
+	}
+	if err := source.checkDestination(configDir, prof); err != nil {
+		return nil, err
+	}
+	// A private staged copy lets the guarded batch use the same captured
+	// generation when the native authority is keychain-only or differs from
+	// an old file mirror. The original source is rechecked at each write.
+	selected, err := os.CreateTemp(configDir, ".caam-import-credential-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(selected.Name())
+	if _, err := selected.Write(source.credentials); err != nil {
+		selected.Close()
+		return nil, err
+	}
+	if err := selected.Close(); err != nil {
+		return nil, err
+	}
+	target := filepath.Join(configDir, ".credentials.json")
+	before, err := claudesettings.Read(target)
+	if err != nil {
+		return nil, err
+	}
+	check := func() error {
+		if err := checkSource(); err != nil {
+			return err
+		}
+		if err := source.checkDestination(configDir, prof); err != nil {
+			return err
+		}
+		current, err := prof.ClaudeConfigDir()
+		if err != nil {
+			return err
+		}
+		if current != configDir {
+			return fmt.Errorf("selected Claude config directory changed during import; retry")
+		}
+		return nil
+	}
+	credential, err := claudesettings.PrepareCredentialReplacement(selected.Name(), target, before, source.credentials,
+		map[string][]byte{selected.Name(): source.credentials}, check)
+	if err != nil {
+		return nil, err
+	}
+	updates := []*claudesettings.Update{credential}
+	copied := []string{target}
+	cachePath := filepath.Join(configDir, identity.ClaudeIdentityCacheFile)
+	cache, err := claudesettings.Read(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	if source.binding != nil || cache != nil {
+		update, err := claudesettings.PrepareIdentityMetadata(cachePath, target, cache, source.credentials, source.binding, check)
+		if err != nil {
+			return nil, err
+		}
+		updates, copied = append(updates, update), append(copied, cachePath)
+	}
+	statePath := filepath.Join(configDir, ".claude.json")
+	state, err := claudesettings.Read(statePath)
+	if err != nil {
+		return nil, err
+	}
+	var account json.RawMessage
+	if source.binding != nil {
+		owner := source.binding.Identity
+		account, err = json.Marshal(map[string]string{
+			"accountUuid": owner.AccountID, "organizationUuid": owner.OrganizationID,
+			"emailAddress": owner.Email, "organizationName": owner.Organization,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	stateUpdate, err := claudesettings.PrepareOAuthAccount(statePath, state, account, check)
+	if err != nil {
+		return nil, err
+	}
+	updates = append(updates, stateUpdate)
+	if stateUpdate.Changed() {
+		copied = append(copied, statePath)
+	}
+	if err := claudesettings.ApplyUpdatesWithFinalizer(updates, nil, check); err != nil {
+		return nil, fmt.Errorf("publish captured Claude authentication: %w", err)
+	}
+	prof.GuardImportSource(checkSource)
+	return copied, nil
+}
+
+// ImportAuth imports detected auth files into a profile directory.
+func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *profile.Profile) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// The canonical native primary follows native authority, including a
+	// keychain-only login. Arbitrary explicit files remain file-only imports.
+	var captured *claudeImportSource
+	if filepath.Base(sourcePath) == ".credentials.json" {
+		var native *authfile.AuthFileSet
+		files := authfile.ClaudeAuthFiles()
+		if filepath.Clean(sourcePath) == filepath.Clean(files.Files[0].Path) {
+			native = &files
+		}
+		var err error
+		captured, err = captureClaudeImportSource(sourcePath, native)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		info, err := os.Stat(sourcePath)
 		if err != nil {
@@ -776,7 +980,7 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 			return nil, fmt.Errorf("source path is a directory, not a file")
 		}
 	}
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		return nil, err
 	}
@@ -806,14 +1010,17 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 			ignoredDir = claudeConfigDirForProfile(prof)
 			ignoredState = filepath.Join(ignoredDir, ".claude.json")
 		}
-		ignoredAuth, err := claudeDirHasAuth(ignoredDir, ignoredState)
+		ignoredAuth, err := profile.ClaudeDirectoryHasAuth(ignoredDir, ignoredState)
 		if err != nil {
 			return nil, err
 		}
-		sourceID, ignoredID := claudeDirAccountID(filepath.Dir(sourcePath)), claudeDirAccountID(ignoredDir)
+		sourceID, ignoredID := profile.ClaudeDirectoryAccountID(filepath.Dir(sourcePath)), profile.ClaudeDirectoryAccountID(ignoredDir)
 		if captured != nil {
-			creds, _ := parseClaudeCredentials(captured)
+			creds, _ := parseClaudeCredentials(captured.credentials)
 			sourceID = creds.ClaudeAiOauth.AccountID
+			if captured.binding != nil {
+				sourceID = captured.binding.Identity.AccountID
+			}
 		}
 		if ignoredAuth && sourceID != "" && ignoredID != "" && sourceID != ignoredID {
 			return nil, fmt.Errorf("import would create conflicting Claude accounts in legacy and XDG config directories")
@@ -823,20 +1030,7 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 	case ".credentials.json":
 		// Import one native credential store. Duplicating a rotating token
 		// into the ignored directory would leave another stale generation.
-		if err := os.MkdirAll(configDir, 0700); err != nil {
-			return nil, fmt.Errorf("create Claude config dir: %w", err)
-		}
-		targetPath := filepath.Join(configDir, ".credentials.json")
-		if captured != nil {
-			if err := atomicWriteFile(targetPath, captured, 0600); err != nil {
-				return nil, fmt.Errorf("import native .credentials.json: %w", err)
-			}
-		} else {
-			if err := copyFile(sourcePath, targetPath); err != nil {
-				return nil, fmt.Errorf("copy .credentials.json: %w", err)
-			}
-		}
-		copiedFiles = append(copiedFiles, targetPath)
+		return captured.publish(ctx, configDir, prof)
 
 	case ".claude.json":
 		targetPath := filepath.Join(configDir, ".claude.json")
@@ -1008,7 +1202,7 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 // validateTokenPassive performs passive validation without network calls.
 func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profile, result *provider.ValidationResult) (*provider.ValidationResult, error) {
 	result.Method = "passive"
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		result.Error = err.Error()
 		return result, nil

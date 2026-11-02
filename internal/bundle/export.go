@@ -10,10 +10,13 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // ExportOptions configures the export operation.
@@ -109,6 +112,8 @@ type VaultExporter struct {
 
 	// SyncPath is the path to sync configuration directory.
 	SyncPath string
+
+	afterCopyFile func(relativePath string)
 }
 
 // Export creates a vault bundle with the given options.
@@ -120,7 +125,23 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 	if opts.Encrypt && opts.Password == "" {
 		return nil, fmt.Errorf("encryption enabled but no password provided")
 	}
+	if opts.DryRun {
+		return e.export(opts)
+	}
+	// Do not create an empty vault merely to report that it cannot be exported.
+	if err := validateRestorePath(e.VaultPath, true, false); err != nil {
+		return nil, fmt.Errorf("read vault: %w", err)
+	}
+	var result *ExportResult
+	err := authfile.NewVault(e.VaultPath).WithMutationLock(func() error {
+		var err error
+		result, err = e.export(opts)
+		return err
+	})
+	return result, err
+}
 
+func (e *VaultExporter) export(opts *ExportOptions) (*ExportResult, error) {
 	// Create manifest
 	manifest := NewManifest()
 	if err := e.populateSourceInfo(manifest); err != nil {
@@ -142,6 +163,9 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 
 	// If dry run, return early
 	if opts.DryRun {
+		if err := checkExportGenerations(files); err != nil {
+			return nil, err
+		}
 		return &ExportResult{
 			OutputPath: outputPath,
 			Manifest:   manifest,
@@ -165,8 +189,19 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 			return nil, fmt.Errorf("create dir for %s: %w", f.RelPath, err)
 		}
 
-		if err := copyFileForExport(f.SrcPath, destPath); err != nil {
+		if f.generation != nil {
+			data, _, err := f.generation.readFile(f.profileRelativePath)
+			if err != nil {
+				return nil, fmt.Errorf("copy %s: %w", f.RelPath, err)
+			}
+			if err := atomicWriteBytes(destPath, data, 0600); err != nil {
+				return nil, fmt.Errorf("copy %s: %w", f.RelPath, err)
+			}
+		} else if err := copyFileForExport(f.SrcPath, destPath); err != nil {
 			return nil, fmt.Errorf("copy %s: %w", f.RelPath, err)
+		}
+		if e.afterCopyFile != nil {
+			e.afterCopyFile(f.RelPath)
 		}
 
 		// Compute checksum
@@ -181,6 +216,9 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 			totalSize += info.Size()
 		}
 	}
+	if err := checkExportGenerations(files); err != nil {
+		return nil, err
+	}
 
 	// Write manifest
 	if err := SaveManifest(tempDir, manifest); err != nil {
@@ -191,6 +229,9 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 	zipPath := filepath.Join(tempDir, "bundle.zip")
 	if err := createZipFromDir(tempDir, zipPath); err != nil {
 		return nil, fmt.Errorf("create zip: %w", err)
+	}
+	if err := checkExportGenerations(files); err != nil {
+		return nil, err
 	}
 
 	// Handle encryption if requested
@@ -232,6 +273,23 @@ func (e *VaultExporter) Export(opts *ExportOptions) (*ExportResult, error) {
 type fileEntry struct {
 	SrcPath string
 	RelPath string
+
+	generation          *profileGeneration
+	profileRelativePath string
+}
+
+func checkExportGenerations(files []fileEntry) error {
+	checked := make(map[*profileGeneration]bool)
+	for _, file := range files {
+		if file.generation == nil || checked[file.generation] {
+			continue
+		}
+		if err := file.generation.check(); err != nil {
+			return fmt.Errorf("export refused: %w", err)
+		}
+		checked[file.generation] = true
+	}
+	return nil
 }
 
 // collectFiles gathers all files to include in the bundle.
@@ -308,6 +366,9 @@ func (e *VaultExporter) collectVaultFiles(opts *ExportOptions, manifest *Manifes
 		}
 
 		provider := providerEntry.Name()
+		if authfile.IsPrivateVaultEntry(provider) {
+			continue
+		}
 
 		// Check provider filter
 		if len(opts.ProviderFilter) > 0 && !contains(opts.ProviderFilter, provider) {
@@ -317,7 +378,7 @@ func (e *VaultExporter) collectVaultFiles(opts *ExportOptions, manifest *Manifes
 		providerPath := filepath.Join(e.VaultPath, provider)
 		profiles, err := os.ReadDir(providerPath)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("read provider %s: %w", provider, err)
 		}
 
 		for _, profileEntry := range profiles {
@@ -333,14 +394,14 @@ func (e *VaultExporter) collectVaultFiles(opts *ExportOptions, manifest *Manifes
 			}
 
 			// Skip system profiles
-			if strings.HasPrefix(profile, "_") {
+			if authfile.IsSystemProfile(profile) || strings.HasPrefix(profile, ".caam_import_") {
 				continue
 			}
 
 			profilePath := filepath.Join(providerPath, profile)
 			profileFiles, err := e.collectProfileFiles(profilePath, provider, profile)
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("profile %s/%s: %w", provider, profile, err)
 			}
 
 			if len(profileFiles) > 0 {
@@ -356,32 +417,40 @@ func (e *VaultExporter) collectVaultFiles(opts *ExportOptions, manifest *Manifes
 // collectProfileFiles collects all files from a profile directory.
 func (e *VaultExporter) collectProfileFiles(profilePath, provider, profile string) ([]fileEntry, error) {
 	var files []fileEntry
-
-	err := filepath.WalkDir(profilePath, func(path string, d fs.DirEntry, err error) error {
+	generation, err := captureProfileGeneration(profilePath)
+	if err != nil {
+		return nil, err
+	}
+	if !generation.exists() {
+		return nil, fmt.Errorf("profile disappeared during export")
+	}
+	omittedFile := ""
+	if strings.EqualFold(provider, "claude") {
+		claude, err := inspectClaudeBundleIdentity(generation)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if d.IsDir() {
-			return nil
+		if claude.bindingFile == "meta.json" {
+			omittedFile = identity.ClaudeIdentityCacheFile
 		}
-		if !d.Type().IsRegular() {
-			return nil
+	}
+	names := make([]string, 0, len(generation.entries))
+	for name, entry := range generation.entries {
+		if entry.info.Mode().IsRegular() && name != omittedFile {
+			names = append(names, name)
 		}
-
-		relToProfile, err := filepath.Rel(profilePath, path)
-		if err != nil {
-			return err
-		}
-
-		bundlePath := filepath.Join("vault", provider, profile, relToProfile)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		bundlePath := filepath.Join("vault", provider, profile, name)
 		files = append(files, fileEntry{
-			SrcPath: path,
-			RelPath: NormalizePath(bundlePath),
+			SrcPath:             filepath.Join(profilePath, name),
+			RelPath:             NormalizePath(bundlePath),
+			generation:          generation,
+			profileRelativePath: name,
 		})
-		return nil
-	})
-
-	return files, err
+	}
+	return files, nil
 }
 
 // collectConfigFiles collects config files.

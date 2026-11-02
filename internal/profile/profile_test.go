@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // =============================================================================
@@ -1768,7 +1770,7 @@ func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy home-side credentials win when both exist", func(t *testing.T) {
+	t.Run("selected XDG credentials win when both exist", func(t *testing.T) {
 		prof := &Profile{
 			Name:     "second",
 			Provider: "claude",
@@ -1783,8 +1785,8 @@ func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
 		if prof.Identity == nil {
 			t.Fatal("Identity should be loaded")
 		}
-		if prof.Identity.PlanType != "legacy-plan" {
-			t.Errorf("PlanType = %q, want legacy path to take precedence", prof.Identity.PlanType)
+		if prof.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want the selected XDG store", prof.Identity.PlanType)
 		}
 	})
 }
@@ -1817,9 +1819,9 @@ func writeClaudeCredentialsExpiring(t *testing.T, path, subscriptionType string,
 }
 
 // TestLoadIdentity_ClaudeStaleLegacyPrecedence is a regression test for issue
-// #72: a stale (expired or corrupt) legacy home/.claude/.credentials.json
-// must not shadow fresh XDG-side credentials, and when both are valid the
-// fresher expiry wins.
+// #72: a stale legacy home/.claude/.credentials.json must not shadow the
+// selected XDG-side credentials. Native selection also remains authoritative
+// when the ignored legacy token happens to have the later expiry (issue #132).
 func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 	legacyPath := func(prof *Profile) string {
 		return filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
@@ -1868,7 +1870,7 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("both valid: fresher expiry wins", func(t *testing.T) {
+	t.Run("both valid: XDG selection wins regardless of expiry", func(t *testing.T) {
 		prof := newProf(t)
 		writeClaudeCredentialsExpiring(t, legacyPath(prof), "legacy-plan", future)
 		writeClaudeCredentialsExpiring(t, xdgPath(prof), "xdg-plan", fresher)
@@ -1881,7 +1883,7 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 			t.Errorf("PlanType = %q, want the fresher-expiry (XDG) identity", prof.Identity.PlanType)
 		}
 
-		// Mirror case: legacy fresher -> legacy wins.
+		// A later legacy expiry must not change which account is reported.
 		prof2 := newProf(t)
 		writeClaudeCredentialsExpiring(t, legacyPath(prof2), "legacy-plan", fresher)
 		writeClaudeCredentialsExpiring(t, xdgPath(prof2), "xdg-plan", future)
@@ -1890,10 +1892,118 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 		if prof2.Identity == nil {
 			t.Fatal("Identity should be loaded")
 		}
-		if prof2.Identity.PlanType != "legacy-plan" {
-			t.Errorf("PlanType = %q, want the fresher-expiry (legacy) identity", prof2.Identity.PlanType)
+		if prof2.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want the selected XDG identity", prof2.Identity.PlanType)
 		}
 	})
+}
+
+func writeBoundProfileClaudeCredential(t *testing.T, path, org string, expires time.Time) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken": "synthetic-access-" + org, "refreshToken": "synthetic-refresh-" + org,
+			"expiresAt": expires.UnixMilli(), "subscriptionType": org,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := identity.ClaudeCredentialFingerprint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: org,
+			Organization: org, Email: "same@example.com", Verified: true},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Unix(1700000000, 0),
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{path: data, filepath.Join(filepath.Dir(path), identity.ClaudeIdentityCacheFile): metadata} {
+		if err := os.WriteFile(name, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return data
+}
+
+func TestLoadIdentityClaudeUsesSelectedOrganizationAcrossRestart(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("claude", "team", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	xdg := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+	legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+	writeBoundProfileClaudeCredential(t, xdg, "team-org", past)
+	writeBoundProfileClaudeCredential(t, legacy, "personal-org", time.Now().Add(8*time.Hour))
+	prof.Identity = &identity.Identity{Provider: "claude", OrganizationID: "cached-wrong-org", Verified: true}
+	if err := prof.Save(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		loaded, err := store.Load("claude", "team")
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := loaded.Identity
+		if id == nil || !id.Verified || id.OrganizationID != "team-org" || id.AccountID != "shared-account" ||
+			id.Email != "same@example.com" || !id.ExpiresAt.Equal(past) {
+			t.Fatalf("load did not preserve the selected expired Team identity: %+v", id)
+		}
+		if dir, err := loaded.ClaudeConfigDir(); err != nil || dir != filepath.Dir(xdg) {
+			t.Fatalf("identity disagrees with native source: %q, %v", dir, err)
+		}
+		if err := loaded.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLoadIdentityClaudeDoesNotReviveIgnoredOrPersistedIdentity(t *testing.T) {
+	for _, changed := range []string{"stale cache", "invalid cache", "malformed credential", "selected helper"} {
+		t.Run(changed, func(t *testing.T) {
+			prof := &Profile{Name: "team", Provider: "claude", BasePath: t.TempDir(),
+				Identity: &identity.Identity{Provider: "claude", AccountID: "cached-account", OrganizationID: "cached-org", Verified: true}}
+			xdg := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+			legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+			writeBoundProfileClaudeCredential(t, legacy, "personal-org", time.Now().Add(8*time.Hour))
+			if err := os.MkdirAll(filepath.Dir(xdg), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if changed == "selected helper" {
+				if err := os.WriteFile(filepath.Join(filepath.Dir(xdg), "settings.json"), []byte(`{"apiKeyHelper":"selected-helper"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				writeBoundProfileClaudeCredential(t, xdg, "team-org", time.Now().Add(-time.Hour))
+				path, replacement := xdg, []byte(`{"claudeAiOauth":{"accessToken":"replacement","refreshToken":"replacement-refresh"}}`)
+				switch changed {
+				case "invalid cache":
+					path, replacement = filepath.Join(filepath.Dir(xdg), identity.ClaudeIdentityCacheFile), []byte(`{"claude_identity":`)
+				case "malformed credential":
+					replacement = []byte(`{"claudeAiOauth":`)
+				}
+				if err := os.WriteFile(path, replacement, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id != nil && (id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "") {
+				t.Fatalf("reported another generation's identity: %+v", id)
+			}
+			if dir, err := prof.ClaudeConfigDir(); err != nil || dir != filepath.Dir(xdg) {
+				t.Fatalf("ignored legacy login replaced the selected source: %q, %v", dir, err)
+			}
+		})
+	}
 }
 
 // TestProfileEnsureLayout covers issue #104: a profile whose profile.json

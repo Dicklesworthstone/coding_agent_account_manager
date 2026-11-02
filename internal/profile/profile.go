@@ -9,6 +9,7 @@
 package profile
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 )
@@ -85,6 +87,11 @@ type Profile struct {
 	// Examples: "Work Google", "Personal GitHub"
 	// Used for display purposes only.
 	BrowserProfileName string `json:"browser_profile_name,omitempty"`
+
+	// Import source guards belong only to an unpublished preparation. They
+	// prevent a later validation step from publishing a snapshot after its
+	// native source has changed and are never persisted in profile.json.
+	importSourceGuards []func() error
 }
 
 // HomePath returns the pseudo-HOME directory for this profile.
@@ -103,6 +110,112 @@ func (p *Profile) XDGConfigPath() string {
 // Codex CLI specifically uses this for auth.json.
 func (p *Profile) CodexHomePath() string {
 	return filepath.Join(p.BasePath, "codex_home")
+}
+
+// ClaudeConfigDir selects the same native credential store for execution and
+// identity reporting. A present XDG store owns the profile even when its token
+// is expired or malformed; a newer ignored legacy token cannot replace it.
+func (p *Profile) ClaudeConfigDir() (string, error) {
+	xdg := filepath.Join(p.XDGConfigPath(), "claude-code")
+	legacy := filepath.Join(p.HomePath(), ".claude")
+	legacyState := filepath.Join(legacy, ".claude.json")
+	if _, err := os.Lstat(legacyState); os.IsNotExist(err) {
+		legacyState = filepath.Join(p.HomePath(), ".claude.json")
+	}
+	xdgAuth, err := ClaudeDirectoryHasAuth(xdg, filepath.Join(xdg, ".claude.json"))
+	if err != nil {
+		return "", err
+	}
+	legacyAuth, err := ClaudeDirectoryHasAuth(legacy, legacyState)
+	if err != nil {
+		return "", err
+	}
+	if xdgAuth && legacyAuth {
+		xdgID, legacyID := ClaudeDirectoryAccountID(xdg), ClaudeDirectoryAccountID(legacy)
+		if xdgID != "" && legacyID != "" && xdgID != legacyID {
+			return "", fmt.Errorf("claude profile contains conflicting accounts in legacy and XDG config directories")
+		}
+	}
+	if xdgAuth || !legacyAuth {
+		return xdg, nil
+	}
+	return legacy, nil
+}
+
+// ClaudeDirectoryHasAuth recognizes an installed authentication source rather
+// than an account label or workflow policy. Malformed selected documents retain
+// their authority so later validation cannot revive an ignored login.
+func ClaudeDirectoryHasAuth(dir, statePath string) (bool, error) {
+	for _, filename := range []string{".credentials.json", "auth.json"} {
+		if _, err := os.Lstat(filepath.Join(dir, filename)); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("inspect Claude auth: %w", err)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "settings.json"), statePath} {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return true, nil
+		}
+		if err := authfile.ValidateCredentialData("claude", filepath.Base(path), data); !errors.Is(err, authfile.ErrNoCredentials) {
+			return true, nil
+		}
+		// Discovery intentionally ignores malformed mixed policy documents.
+		// They still select this native store. Only the no-credential case
+		// needs this syntax check; do not decode a large credential-bearing
+		// settings document twice just to decide its source directory.
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ClaudeDirectoryAccountID is only a conflict hint for legacy layouts. It may
+// be unverified and must never authorize account matching or credential writes.
+func ClaudeDirectoryAccountID(dir string) string {
+	if id, err := identity.ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json")); err == nil {
+		return id.AccountID
+	}
+	path := filepath.Join(dir, ".claude.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) && filepath.Base(dir) == ".claude" {
+		data, err = os.ReadFile(filepath.Join(filepath.Dir(dir), ".claude.json"))
+	}
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		Account struct {
+			ID string `json:"accountUuid"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(data, &state) != nil {
+		return ""
+	}
+	return strings.TrimSpace(state.Account.ID)
+}
+
+// GuardImportSource adds a read-only guard for the final directory publication.
+// Providers also check their captured sources while writing the prepared files.
+func (p *Profile) GuardImportSource(check func() error) {
+	if check != nil {
+		p.importSourceGuards = append(p.importSourceGuards, check)
+	}
+}
+
+func (p *Profile) checkImportSources() error {
+	for _, check := range p.importSourceGuards {
+		if err := check(); err != nil {
+			return fmt.Errorf("import source changed before publication: %w", err)
+		}
+	}
+	return nil
 }
 
 // EnsureLayout creates the profile's directory structure if any of it is
@@ -157,9 +270,9 @@ func (p *Profile) MetaPath() string {
 // Errors are ignored to keep identity extraction best-effort.
 //
 // The identity is always re-derived from the live auth files when they can be
-// read. A previously cached value persisted in profile.json is used only as a
-// fallback when live extraction yields nothing. Short-circuiting on a non-nil
-// cached identity (the old behavior) pinned stale plan_type/expires_at forever
+// read. Except for Claude's token-bound identity, a previously cached value in
+// profile.json is used only when live extraction yields nothing. Short-circuiting
+// on a non-nil cached identity pinned stale plan_type/expires_at forever
 // with no way to refresh them (issue #60): the health/status display kept
 // showing a warning for a credential that was in fact healthy.
 func (p *Profile) LoadIdentity() {
@@ -174,17 +287,22 @@ func (p *Profile) LoadIdentity() {
 			filepath.Join(p.CodexHomePath(), "auth.json"),
 		}, identity.ExtractFromCodexAuth)
 	case "claude":
-		// XDG-aware Claude Code builds honor the XDG_CONFIG_HOME /
-		// CLAUDE_CONFIG_DIR the profile env sets and write .credentials.json
-		// under xdg_config/claude-code/ instead of the legacy home/.claude/.
-		// Probe both, legacy first (issue #70) — but a stale or corrupt
-		// legacy file must not shadow fresh XDG-side credentials (issue
-		// #72), so prefer whichever candidate is unexpired, breaking ties
-		// on the fresher expiry.
-		id = loadIdentityPreferValid([]string{
-			filepath.Join(p.HomePath(), ".claude", ".credentials.json"),
-			filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"),
-		}, identity.ExtractFromClaudeCredentials)
+		// Stored profile.json labels are not bound to the current token. Do
+		// not revive them if the selected store is missing or unreadable.
+		p.Identity = nil
+		// The extractor below only understands modern credentials. When
+		// neither store has that file, scanning potentially large policy or
+		// helper documents cannot supply an identity and does no useful work.
+		_, xdgErr := os.Lstat(filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"))
+		_, legacyErr := os.Lstat(filepath.Join(p.HomePath(), ".claude", ".credentials.json"))
+		if os.IsNotExist(xdgErr) && os.IsNotExist(legacyErr) {
+			return
+		}
+		configDir, err := p.ClaudeConfigDir()
+		if err != nil {
+			return
+		}
+		id, _ = identity.ExtractFromClaudeCredentials(filepath.Join(configDir, ".credentials.json"))
 	case "gemini":
 		candidates := []string{
 			filepath.Join(p.HomePath(), ".gemini", "settings.json"),
@@ -247,43 +365,6 @@ func (p *Profile) CountAuthFiles() int {
 		})
 	}
 	return count
-}
-
-// loadIdentityPreferValid extracts an identity from every readable candidate
-// path and returns the best one: an unexpired identity beats an expired one,
-// within the same tier the fresher expiry wins (an identity without an expiry
-// ranks oldest), and remaining ties keep the earlier-listed path. Extraction
-// errors fall through to later candidates, matching loadIdentityFromPaths.
-// This keeps a stale legacy credential file from shadowing a fresh one while
-// preserving the listed precedence when both are equally usable (issue #72).
-func loadIdentityPreferValid(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
-	var best *identity.Identity
-	now := time.Now()
-	for _, path := range paths {
-		if strings.TrimSpace(path) == "" {
-			continue
-		}
-		id, err := extractor(path)
-		if err != nil || id == nil {
-			continue
-		}
-		if best == nil || identityFresher(id, best, now) {
-			best = id
-		}
-	}
-	return best
-}
-
-// identityFresher reports whether a should be preferred over b. An identity
-// with a zero ExpiresAt counts as unexpired (no expiry info) but ranks oldest
-// for the freshness tie-break.
-func identityFresher(a, b *identity.Identity, now time.Time) bool {
-	aValid := a.ExpiresAt.IsZero() || !a.ExpiresAt.Before(now)
-	bValid := b.ExpiresAt.IsZero() || !b.ExpiresAt.Before(now)
-	if aValid != bValid {
-		return aValid
-	}
-	return a.ExpiresAt.After(b.ExpiresAt)
 }
 
 func loadIdentityFromPaths(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
@@ -873,6 +954,9 @@ func (s *Store) Import(ctx context.Context, provider, name, authMode string, for
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := prepared.checkImportSources(); err != nil {
+		return nil, err
+	}
 
 	result := &ImportResult{Profile: prepared}
 	if previousLock != nil {
@@ -894,6 +978,7 @@ func (s *Store) Import(ctx context.Context, provider, name, authMode string, for
 		return nil, fmt.Errorf("publish imported profile: %w", err)
 	}
 	preparedLock.BasePath = target
+	prepared.importSourceGuards = nil
 	return result, nil
 }
 

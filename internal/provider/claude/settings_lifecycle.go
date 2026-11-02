@@ -28,7 +28,7 @@ func (p *Provider) PrepareRun(ctx context.Context, prof *profile.Profile) error 
 	if filepath.Clean(prof.HomePath()) == filepath.Clean(home) {
 		return nil // Vault/global launches already use the live settings.
 	}
-	configDir, err := effectiveClaudeConfigDir(prof)
+	configDir, err := prof.ClaudeConfigDir()
 	if err != nil {
 		return err
 	}

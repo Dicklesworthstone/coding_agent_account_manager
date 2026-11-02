@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -24,17 +25,25 @@ var bundleImportCmd = &cobra.Command{
 	Long: `Restore saved auth profiles from a previously exported bundle.
 
 Import Modes:
-  smart (default): Uses freshness comparison for conflicts.
+  smart (default): Uses ownership and freshness checks for conflicts.
     - New profiles: added to vault
     - Existing profiles: keeps the token with later expiry time
+    - Claude: requires verified matching account and organization, or the same
+      access/refresh token pair; unknown or conflicting ownership is skipped
 
   merge: Conservative approach.
     - New profiles: added to vault
     - Existing profiles: skipped (local preserved)
 
-  replace: Aggressive approach.
+  replace: Explicit replacement.
     - Overwrites all matching profiles from bundle
     - Does NOT delete local profiles not in bundle
+    - Retains the previous profile and reports its private recovery path
+
+Claude identity bindings are checked offline against the copied credentials.
+Canonical vault proof takes precedence over a copied native cache. Broken or
+stale canonical proof, or a stale cache used as the sole proof, is rejected in
+every mode. Redundant native caches are omitted after canonicalization.
 
 Encrypted Bundles:
   Bundles with .enc.zip extension require a password.
@@ -150,19 +159,28 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 
 	// Perform import
 	result, err := importer.Import(opts)
-	if err != nil {
-		// If we have partial results, show them before the error
-		if result != nil && opts.DryRun {
+	if result != nil && err != nil && len(result.Errors) == 0 {
+		// Validation can fail before per-profile actions exist. Keep the
+		// rendered partial result from claiming a completed import.
+		result.Errors = append(result.Errors, err.Error())
+	}
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	if result != nil {
+		if jsonOutput {
+			if encodeErr := json.NewEncoder(cmd.OutOrStdout()).Encode(result); encodeErr != nil {
+				return fmt.Errorf("write import result: %w", encodeErr)
+			}
+		} else if opts.DryRun {
 			printImportPreview(cmd, result)
+		} else {
+			printImportResult(cmd, result)
 		}
+	}
+	if err != nil {
 		return fmt.Errorf("import failed: %w", err)
 	}
-
-	// Print results
-	if opts.DryRun {
-		printImportPreview(cmd, result)
-	} else {
-		printImportResult(cmd, result)
+	if result != nil && len(result.Errors) > 0 {
+		return fmt.Errorf("import completed with %d errors", len(result.Errors))
 	}
 
 	return nil
@@ -217,6 +235,8 @@ func printImportPreview(cmd *cobra.Command, result *bundle.ImportResult) {
 					symbol = "↑"
 				case "skip":
 					symbol = "-"
+				case "error":
+					symbol = "!"
 				}
 				fmt.Fprintf(out, "    %s %s: %s\n", symbol, action.Profile, action.Reason)
 			}
@@ -249,8 +269,8 @@ func printImportPreview(cmd *cobra.Command, result *bundle.ImportResult) {
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Summary (would):")
 	fmt.Fprintf(out, "  Add: %d new profiles\n", result.NewProfiles)
-	fmt.Fprintf(out, "  Update: %d profiles (fresher in bundle)\n", result.UpdatedProfiles)
-	fmt.Fprintf(out, "  Skip: %d profiles (local fresher or equal)\n", result.SkippedProfiles)
+	fmt.Fprintf(out, "  Update: %d profiles\n", result.UpdatedProfiles)
+	fmt.Fprintf(out, "  Skip: %d profiles\n", result.SkippedProfiles)
 
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "This is a preview. Run without --dry-run to apply changes.")
@@ -259,7 +279,11 @@ func printImportPreview(cmd *cobra.Command, result *bundle.ImportResult) {
 func printImportResult(cmd *cobra.Command, result *bundle.ImportResult) {
 	out := cmd.OutOrStdout()
 
-	fmt.Fprintln(out, "Import Complete")
+	if len(result.Errors) > 0 {
+		fmt.Fprintln(out, "Import Incomplete")
+	} else {
+		fmt.Fprintln(out, "Import Complete")
+	}
 	fmt.Fprintln(out, "──────────────────────────────────────────")
 
 	// Profile summary
@@ -273,14 +297,19 @@ func printImportResult(cmd *cobra.Command, result *bundle.ImportResult) {
 	if len(result.ProfileActions) > 0 {
 		fmt.Fprintln(out)
 		for _, action := range result.ProfileActions {
-			if action.Action == "skip" {
-				continue // Don't show skipped in summary
-			}
 			symbol := "+"
-			if action.Action == "update" {
+			switch action.Action {
+			case "update":
 				symbol = "↑"
+			case "skip":
+				symbol = "-"
+			case "error":
+				symbol = "!"
 			}
 			fmt.Fprintf(out, "  %s %s/%s: %s\n", symbol, action.Provider, action.Profile, action.Reason)
+			if action.RecoveryPath != "" {
+				fmt.Fprintf(out, "    Previous profile preserved: %s\n", action.RecoveryPath)
+			}
 		}
 	}
 
@@ -315,7 +344,11 @@ func printImportResult(cmd *cobra.Command, result *bundle.ImportResult) {
 	}
 
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "Import complete. Use 'caam status' to verify.")
+	if len(result.Errors) > 0 {
+		fmt.Fprintln(out, "Review the errors and retained profiles before retrying.")
+	} else {
+		fmt.Fprintln(out, "Import complete. Use 'caam status' to verify.")
+	}
 }
 
 // promptPasswordImport reads a password from the terminal for import.

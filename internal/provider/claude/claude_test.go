@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -1494,6 +1496,359 @@ func TestImportAuth(t *testing.T) {
 			t.Error("Should fail if source is directory")
 		}
 	})
+}
+
+func claudeImportTestCredential(t *testing.T, org string, expires time.Time) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{"claudeAiOauth": map[string]interface{}{
+		"accessToken": "synthetic-access-" + org, "refreshToken": "synthetic-refresh-" + org,
+		"expiresAt": expires.UnixMilli(), "subscriptionType": org,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func writeClaudeImportTestBinding(t *testing.T, path string, credentials []byte, org string) []byte {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: org,
+			Organization: org, Email: "same@example.com", Verified: true},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Unix(1700000000, 0),
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeLifecycleJSON(t, path, string(metadata))
+	return metadata
+}
+
+func TestImportAuthCarriesVerifiedOrganizationOffline(t *testing.T) {
+	for _, metadataName := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
+		t.Run(metadataName, func(t *testing.T) {
+			realHome, prof := claudeLifecycleFixture(t)
+			host := filepath.Join(realHome, ".claude", "settings.json")
+			writeClaudeLifecycleJSON(t, host, `{"model":"host-policy","apiKeyHelper":"host-account"}`)
+			p := New()
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			expiry := time.Now().Add(-time.Hour).Truncate(time.Second)
+			credentials := claudeImportTestCredential(t, "team-org", expiry)
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			metadataPath := filepath.Join(filepath.Dir(source), metadataName)
+			metadata := writeClaudeImportTestBinding(t, metadataPath, credentials, "team-org")
+			staleState := `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal-org","emailAddress":"same@example.com"},"mcpServers":{"source-only":{}}}`
+			writeClaudeLifecycleJSON(t, filepath.Join(filepath.Dir(source), ".claude.json"), staleState)
+			state := filepath.Join(claudeConfigDirForProfile(prof), ".claude.json")
+			writeClaudeLifecycleJSON(t, state, `{"oauthAccount":{"organizationUuid":"old-org"},"mcpServers":{"kept":{}},"history":["kept-session"]}`)
+
+			files, err := p.ImportAuth(context.Background(), source, prof)
+			if err != nil || len(files) != 3 {
+				t.Fatalf("import credential, proof and corrected state: %v, %v", files, err)
+			}
+			env, err := p.Env(context.Background(), prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(env["CLAUDE_CONFIG_DIR"], ".credentials.json")
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, credentials) {
+				t.Fatalf("import changed the captured expired credentials: %v", err)
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id == nil || !id.Verified || id.OrganizationID != "team-org" || id.AccountID != "shared-account" ||
+				id.Email != "same@example.com" || !id.ExpiresAt.Equal(expiry) {
+				t.Fatalf("expired token lost matching verified ownership: %+v", id)
+			}
+			validation, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || !validation.Valid || !validation.ExpiresAt.Equal(expiry) {
+				t.Fatalf("offline renewable import validation: %+v, %v", validation, err)
+			}
+			got := readClaudeLifecycleJSON(t, state)
+			if got["oauthAccount"].(map[string]interface{})["organizationUuid"] != "team-org" ||
+				got["mcpServers"].(map[string]interface{})["kept"] == nil || got["history"] == nil {
+				t.Fatalf("import did not preserve independent state while correcting the organization: %#v", got)
+			}
+			for _, path := range files {
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("imported credential artifacts are not private: %v", err)
+				}
+			}
+			for path, want := range map[string][]byte{source: credentials, metadataPath: metadata,
+				filepath.Join(filepath.Dir(source), ".claude.json"): []byte(staleState), host: []byte(`{"model":"host-policy","apiKeyHelper":"host-account"}`)} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("import mutated a source or host file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestImportAuthRejectsBrokenSavedProofAndDiscardsStaleNativeProof(t *testing.T) {
+	for _, scenario := range []string{"no proof", "stale native proof", "changed access only", "saved proof mismatch", "invalid saved proof", "invalid native proof"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			personal := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			team := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			if scenario == "changed access only" {
+				team = bytes.Replace(personal, []byte("synthetic-access-personal-org"), []byte("synthetic-access-team-org"), 1)
+			}
+			writeClaudeLifecycleJSON(t, source, string(team))
+			sourceCache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			meta := filepath.Join(filepath.Dir(source), "meta.json")
+			switch scenario {
+			case "stale native proof", "changed access only":
+				writeClaudeImportTestBinding(t, sourceCache, personal, "personal-org")
+			case "saved proof mismatch":
+				writeClaudeImportTestBinding(t, meta, personal, "personal-org")
+				// A matching copied sidecar must not bypass the saved owner.
+				writeClaudeImportTestBinding(t, sourceCache, team, "team-org")
+			case "invalid saved proof":
+				writeClaudeLifecycleJSON(t, meta, `{"claude_identity":`)
+			case "invalid native proof":
+				writeClaudeLifecycleJSON(t, sourceCache, `{"claude_identity":`)
+			}
+			target := claudeXDGCredentialsPathForProfile(prof)
+			writeClaudeLifecycleJSON(t, target, string(personal))
+			cache := filepath.Join(filepath.Dir(target), identity.ClaudeIdentityCacheFile)
+			beforeCache := writeClaudeImportTestBinding(t, cache, personal, "personal-org")
+			state := filepath.Join(filepath.Dir(target), ".claude.json")
+			beforeState := `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal-org","emailAddress":"same@example.com"},"history":["preserved"]}`
+			writeClaudeLifecycleJSON(t, state, beforeState)
+			_, err := New().ImportAuth(context.Background(), source, prof)
+			wantError := strings.Contains(scenario, "saved") || scenario == "invalid native proof"
+			if (err != nil) != wantError {
+				t.Fatalf("import error = %v, want error %v", err, wantError)
+			}
+			if wantError {
+				for path, before := range map[string][]byte{target: personal, cache: beforeCache, state: []byte(beforeState)} {
+					if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+						t.Fatalf("rejected proof changed the previous profile: %v", err)
+					}
+				}
+				return
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id == nil || id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "" {
+				t.Fatalf("unproven import acquired an old account label: %+v", id)
+			}
+			got := readClaudeLifecycleJSON(t, state)
+			if got["oauthAccount"] != nil || got["history"] == nil {
+				t.Fatalf("unproven import kept an account label or lost independent state: %#v", got)
+			}
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, team) {
+				t.Fatalf("unproven import changed credential bytes: %v", err)
+			}
+		})
+	}
+}
+
+func TestCapturedClaudeImportRejectsSourceReplacementBeforeWrites(t *testing.T) {
+	for _, changed := range []string{"credentials", "binding", "identical replacement", "previously absent metadata"} {
+		t.Run(changed, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			captured, err := captureClaudeImportSource(source, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch changed {
+			case "credentials":
+				writeClaudeLifecycleJSON(t, source, string(claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))))
+			case "binding":
+				writeClaudeImportTestBinding(t, cache, credentials, "personal-org")
+			case "identical replacement":
+				replacement := source + ".replacement"
+				writeClaudeLifecycleJSON(t, replacement, string(credentials))
+				if err := os.Rename(replacement, source); err != nil {
+					t.Fatal(err)
+				}
+			case "previously absent metadata":
+				writeClaudeImportTestBinding(t, filepath.Join(filepath.Dir(source), "meta.json"), credentials, "personal-org")
+			}
+			if _, err := captured.publish(context.Background(), claudeConfigDirForProfile(prof), prof); err == nil {
+				t.Fatal("published credentials after the source generation changed")
+			}
+			for _, name := range []string{".credentials.json", identity.ClaudeIdentityCacheFile, ".claude.json"} {
+				if _, err := os.Stat(filepath.Join(claudeConfigDirForProfile(prof), name)); !os.IsNotExist(err) {
+					t.Fatalf("source rejection left a partial profile artifact %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportRechecksSourceAfterStagedValidation(t *testing.T) {
+	for _, changed := range []string{"credentials", "binding", "unchanged"} {
+		t.Run(changed, func(t *testing.T) {
+			claudeLifecycleFixture(t)
+			store := profile.NewStore(t.TempDir())
+			previous, err := store.Create("claude", "work", "oauth")
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous.Description = "keep this working profile on failed import"
+			if err := previous.Save(); err != nil {
+				t.Fatal(err)
+			}
+			beforeProfile, err := os.ReadFile(previous.MetaPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldCredential := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			oldPath := claudeXDGCredentialsPathForProfile(previous)
+			writeClaudeLifecycleJSON(t, oldPath, string(oldCredential))
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(-time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			result, err := store.Import(context.Background(), "claude", "work", "oauth", true, func(staged *profile.Profile) error {
+				if _, err := New().ImportAuth(context.Background(), source, staged); err != nil {
+					return err
+				}
+				validation, err := New().ValidateToken(context.Background(), staged, true)
+				if err != nil || !validation.Valid {
+					t.Fatalf("staged profile failed passive validation: %+v, %v", validation, err)
+				}
+				// Another Claude session changes the source after preparation
+				// but before Store.Import can publish the isolated directory.
+				switch changed {
+				case "credentials":
+					writeClaudeLifecycleJSON(t, source, string(oldCredential))
+				case "binding":
+					writeClaudeImportTestBinding(t, cache, credentials, "personal-org")
+				}
+				return nil
+			})
+			if changed == "unchanged" {
+				if err != nil || result == nil || result.BackupPath == "" {
+					t.Fatalf("publish verified staged import: %+v, %v", result, err)
+				}
+				loaded, err := store.Load("claude", "work")
+				if err != nil || loaded.Identity == nil || !loaded.Identity.Verified || loaded.Identity.OrganizationID != "team-org" {
+					t.Fatalf("restarted import lost verified Team ownership: %+v, %v", loaded, err)
+				}
+				return
+			}
+			if err == nil || result != nil {
+				t.Fatal("published a stale prepared import")
+			}
+			for path, before := range map[string][]byte{previous.MetaPath(): beforeProfile, oldPath: oldCredential} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("source conflict replaced the existing isolated profile: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportUsesKeychainTokenIdentityWithoutChangingMirror(t *testing.T) {
+	for _, scenario := range []string{"matching keychain proof", "stale mirror proof", "changed keychain"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			items := testutil.FakeKeychain(t)
+			personal := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			team := claudeImportTestCredential(t, "team-org", time.Now().Add(-time.Hour))
+			testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), string(team))
+			files := authfile.ClaudeAuthFiles()
+			source := files.Files[0].Path
+			writeClaudeLifecycleJSON(t, source, string(personal))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			proof, org := team, "team-org"
+			if scenario == "stale mirror proof" {
+				proof, org = personal, "personal-org"
+			}
+			metadata := writeClaudeImportTestBinding(t, cache, proof, org)
+			captured, err := captureClaudeImportSource(source, &files)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "changed keychain" {
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), string(personal))
+			}
+			_, err = captured.publish(context.Background(), claudeConfigDirForProfile(prof), prof)
+			if (err != nil) != (scenario == "changed keychain") {
+				t.Fatalf("native import outcome = %v", err)
+			}
+			if scenario == "changed keychain" {
+				if _, err := os.Stat(claudeXDGCredentialsPathForProfile(prof)); !os.IsNotExist(err) {
+					t.Fatal("changed native authority published captured credentials")
+				}
+			} else {
+				if got, err := os.ReadFile(claudeXDGCredentialsPathForProfile(prof)); err != nil || !bytes.Equal(got, team) {
+					t.Fatalf("import selected the stale file mirror: %v", err)
+				}
+				prof.LoadIdentity()
+				if prof.Identity == nil || prof.Identity.Verified != (scenario == "matching keychain proof") {
+					t.Fatalf("native import proof mismatch: %+v", prof.Identity)
+				}
+				if scenario == "matching keychain proof" && prof.Identity.OrganizationID != "team-org" ||
+					scenario == "stale mirror proof" && prof.Identity.OrganizationID != "" {
+					t.Fatalf("native import inferred ownership from a stale mirror: %+v", prof.Identity)
+				}
+			}
+			for path, before := range map[string][]byte{source: personal, cache: metadata} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("native import changed a host file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportRejectsSharedDestinationAliases(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink isolation fixture")
+	}
+	for _, alias := range []string{"directory", "credential", "cache"} {
+		t.Run(alias, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			metadata := writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			configDir := claudeConfigDirForProfile(prof)
+			if err := os.MkdirAll(filepath.Dir(configDir), 0700); err != nil {
+				t.Fatal(err)
+			}
+			target, referent := configDir, filepath.Dir(source)
+			if alias != "directory" {
+				if err := os.MkdirAll(configDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				target, referent = filepath.Join(configDir, ".credentials.json"), source
+				if alias == "cache" {
+					target, referent = filepath.Join(configDir, identity.ClaudeIdentityCacheFile), cache
+				}
+			}
+			if err := os.Symlink(referent, target); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New().ImportAuth(context.Background(), source, prof); err == nil {
+				t.Fatal("import accepted a shared authentication destination")
+			}
+			for path, before := range map[string][]byte{source: credentials, cache: metadata} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("rejected alias changed a host source: %v", err)
+				}
+			}
+		})
+	}
 }
 
 func TestImportSettingsSelectsCredentialMode(t *testing.T) {

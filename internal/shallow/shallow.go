@@ -17,6 +17,7 @@
 //	  .credentials.json            (real file — copied from a vault profile)
 //	  .credentials.lock            (real file — empty, prevents Claude from
 //	                                touching the symlinked .claude folder above)
+//	  .caam-identity.json           (private, exact-token identity proof)
 //	  settings.json                (private account fields plus shared policy)
 //	  projects/, todos/, ...       (symlinks to ~/.claude/projects, etc.)
 //	.claude.json                   (real file — the user's settings minus the
@@ -52,6 +53,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 )
 
@@ -141,9 +143,13 @@ func layoutFor(provider string) (*providerLayout, error) {
 	switch NormalizeProvider(provider) {
 	case "claude":
 		return &providerLayout{
-			provider:          "claude",
-			realDirs:          claudeRealDirs(),
-			realEntries:       []string{".claude/.credentials.json", ".claude/.credentials.lock", ".claude/settings.json", ".claude.json", ProfileMetaFilename},
+			provider: "claude",
+			realDirs: claudeRealDirs(),
+			realEntries: []string{
+				".claude/.credentials.json", ".claude/.credentials.lock", ".claude/auth.json",
+				".claude/" + identity.ClaudeIdentityCacheFile, ".claude/meta.json",
+				".claude/settings.json", ".claude/.claude.json", ".claude.json", ProfileMetaFilename,
+			},
 			innerSymlinkRoots: claudeInnerSymlinkRoots(),
 			primaryCredRel:    ".claude/.credentials.json",
 			skillShareDirs:    []skillShareDir{{rel: ".claude/skills"}},
@@ -417,6 +423,10 @@ type CreateOptions struct {
 	// Force overwrites an existing shallow profile of the same name.
 	// Without this, Create returns an error if the directory already exists.
 	Force bool
+
+	// Captured once by Create so the credential and its cached provider proof
+	// cannot come from different source generations during staging.
+	claudeSeed *claudeCredentialSeed
 }
 
 // Create provisions a new shallow profile.
@@ -468,6 +478,12 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("stat profile dir: %w", err)
 	}
+	if layout.provider == "claude" {
+		opts.claudeSeed, err = captureClaudeCredentialSeed(opts.CredentialSource)
+		if err != nil {
+			return "", fmt.Errorf("capture Claude source identity: %w", err)
+		}
+	}
 
 	// Ensure the base dir exists so the staging dir and the final rename happen
 	// on the same filesystem (rename is only atomic within one filesystem).
@@ -484,6 +500,12 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 	if err := m.buildProfile(staging, name, layout, opts); err != nil {
 		_ = m.safeRemoveAll(staging)
 		return "", err
+	}
+	if opts.claudeSeed != nil {
+		if err := opts.claudeSeed.checkUnchanged(); err != nil {
+			_ = m.safeRemoveAll(staging)
+			return "", err
+		}
 	}
 
 	// Swap the fully-built staging profile into place. Only here, and only after
@@ -601,7 +623,11 @@ func (m *Manager) swapIntoPlace(staging, home, clean string, exists bool) error 
 func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts CreateOptions) error {
 	// Principal credential file (every provider has exactly one).
 	primary := filepath.Join(home, filepath.FromSlash(layout.primaryCredRel))
-	if opts.CredentialSource != "" {
+	if opts.claudeSeed != nil {
+		if err := writeFileAtomic(primary, opts.claudeSeed.credentials, 0o600); err != nil {
+			return fmt.Errorf("write captured Claude credentials: %w", err)
+		}
+	} else if opts.CredentialSource != "" {
 		if err := copyFileMode(opts.CredentialSource, primary, 0o600); err != nil {
 			return fmt.Errorf("copy credentials: %w", err)
 		}
@@ -630,6 +656,9 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 		if err := m.ensureClaudeOnboarding(home, opts); err != nil {
 			return err
 		}
+		if err := writeClaudeSeedIdentity(home, opts); err != nil {
+			return err
+		}
 	case "codex":
 		// Seed the shallow config.toml from the user's real ~/.codex/config.toml
 		// (preserving [mcp_servers.*] and every other user section), THEN force
@@ -649,8 +678,9 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 }
 
 // writeClaudeJSON writes <home>/.claude.json. An explicit source (a vault
-// snapshot or --from-claude-json) is copied verbatim — its identity belongs
-// to the credentials it came with. Otherwise the user's real ~/.claude.json
+// snapshot or --from-claude-json) supplies preferences and session state;
+// writeClaudeSeedIdentity separately binds its account label to the captured
+// credentials. Otherwise the user's real ~/.claude.json
 // is used as the seed (automatic onboarding: preferences, theme, project
 // approvals) with the account-bound keys stripped, so the new profile never
 // reports the real HOME's identity or usage as its own (issue #92; policy in
@@ -1868,6 +1898,15 @@ func copyFileMode(src, dst string, mode os.FileMode) error {
 
 // writeFileAtomic writes data to path with mode, atomically.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicGuarded(path, data, mode, nil)
+}
+
+func writeFileAtomicGuarded(path string, data []byte, mode os.FileMode, guard func() error) error {
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
 	parent := filepath.Dir(path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("create parent: %w", err)
@@ -1896,6 +1935,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
 	}
 	return os.Rename(tmpName, path)
 }

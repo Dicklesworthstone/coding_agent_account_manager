@@ -216,6 +216,8 @@ Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-f
 |------|------------------|-----|
 | `.claude/.credentials.json` | **real file** | The whole point: per-identity OAuth token. |
 | `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
+| `.claude/.caam-identity.json`, `.claude/meta.json` | **private when present** | Cached account and organization proof is bound to the exact access and refresh tokens. Neither metadata filename is inherited from the real HOME, including when the profile has no proof yet. |
+| `.claude/auth.json`, `.claude/.claude.json` | **private when present** | Alternate authentication and nested account state must belong to the profile. Host copies are never linked into new profiles. |
 | `.claude/settings.json` | **real file** | Workflow policy is refreshed from the canonical user settings; API-key helpers and credential environment remain private to this account. Existing links to the user's settings are converted to private files before launch. |
 | `.claude.json` | **real file** | Claude Code rewrites this on every run (it holds the login identity); a symlink would mutate the user's real settings under the shallow identity. Seeded from your real `~/.claude.json` minus the account-bound keys (`oauthAccount`, usage/entitlement caches), and the shared preference keys (theme, editor mode, notification channel, user/project `mcpServers`, project trust and `allowedTools`) are refreshed from the real file on every `shallow-spawn` — the main lane is the source of truth for configuration; pass `--no-sync-config` to keep a profile's own values. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
@@ -226,11 +228,27 @@ Per-provider real (private) files — everything else under the provider's home 
 
 | Provider | Real / private files | Spawn pins |
 |----------|----------------------|------------|
-| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | (none; `$HOME/.claude` is the config dir) |
+| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude/settings.json`, `.claude.json`; optional `.claude/.caam-identity.json`, `.claude/meta.json`, `.claude/auth.json`, `.claude/.claude.json` | (none; `$HOME/.claude` is the config dir) |
 | `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced; shared tables refreshed from your real config on every spawn, hook/project/notice state kept private) | `CODEX_HOME=<profile>/.codex` |
 | `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
 
 Every shallow spawn, whatever its provider, scrubs every inherited provider-home override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_HOME`) plus `CAAM_HOME`/`XDG_DATA_HOME` before applying its own pins, so a shallow session started from inside another shallow session cannot inherit the outer profile's identity (issue #106).
+
+Claude creation preserves a cached provider proof from `--from-vault` or
+`--from-file` only when it matches the exact copied token pair. This works
+offline, including for expired access tokens with a previously verified proof.
+The copied `.claude.json` account label is derived from that proof; unverified
+labels are omitted while unrelated settings remain intact. If saved vault
+metadata identifies a different token generation, creation refuses the copy:
+use `caam verify identity claude <profile> --repair` to verify the saved owner.
+
+Normal spawn repairs recognized older links to host identity caches and nested
+state before launching, including with `--no-sync-config`. A cached proof is
+retained only if it matches the profile's private credentials. An inherited
+`auth.json` alias is removed from the profile without changing the host file;
+existing private alternate credentials remain untouched. Links to unrecognized
+locations fail closed. `--print-env` refuses these unsafe layouts without
+repairing them.
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
@@ -279,7 +297,8 @@ check success before launching the provider:
 
 Export is read-only: it does not create or repair profiles, refresh shared
 policy, migrate CAAM stores, run token-health checks, or start a child.
-Claude settings and state must already be valid private files; unsafe links
+Claude settings, identity metadata, and alternate auth documents must already
+be valid private files; unsafe links
 or malformed documents are refused before any environment is printed. Run
 `caam shallow-spawn alice -- true` with the same base override to perform normal
 preparation, resolving any reported configuration errors before exporting.
@@ -1137,10 +1156,36 @@ destination paths before restoring files. A malformed path, a symlink that
 redirects a restore, a missing checksum, or a checksum mismatch stops the
 import. These checks also apply to `--dry-run` and `--force`.
 
-The default `smart` mode compares credential freshness. `--mode merge` adds
-new profiles while preserving existing ones; `--mode replace` replaces the
-selected profiles and leaves other accounts in place. Replacing `work` cannot
-overwrite a separate profile named `work.bak`.
+The default `smart` mode compares credential freshness. For Claude, automatic
+replacement also requires verified matching account **and organization UUIDs**,
+or the exact same access/refresh token pair. A shared email or profile name is
+not proof of ownership. Conflicting or unverified ownership across different
+token generations preserves the local profile and reports why it was skipped.
+The selected `.credentials.json` controls freshness even if an older
+`.claude.json` claims a later expiry; an unknown expiry does not authorize a
+replacement. A selected legacy `auth.json` never falls back to secondary state.
+
+`--mode merge` adds new profiles while preserving existing ones. `--mode replace`
+intentionally replaces selected profiles and leaves other accounts in place.
+Every replacement retains the complete previous profile in a private recovery
+directory, whose path appears in text and `--json` results. These recovery
+snapshots are excluded from account selection and later bundle exports.
+Replacing `work` cannot overwrite a separate profile named `work.bak`.
+
+Bundle identity checks stay offline. A valid binding travels with its token
+pair, including expired credentials, and an accepted native cache is promoted
+to canonical vault metadata on import. Matching canonical metadata takes
+precedence over a redundant native cache; import and export omit the redundant
+cache so later token rotations retain a single source of vault ownership.
+A broken or token-mismatched canonical binding, or a stale native cache used as
+the sole proof, stops import even with `--mode replace` or `--force`. Imported
+account labels are corrected from verified ownership or omitted when unverified,
+while unrelated settings remain intact. Export and
+import participate in the vault mutation lock and recheck captured profile
+generations while copying and publishing. A detected concurrent change returns
+an error; an independently written login is preserved during recovery.
+`--dry-run` performs the same ownership checks without creating a vault lock or
+changing profiles. These guarantees describe `caam bundle` ZIP transfers.
 
 #### Scheduled vault backups
 

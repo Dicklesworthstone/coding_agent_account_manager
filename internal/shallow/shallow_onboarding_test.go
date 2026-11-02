@@ -84,7 +84,8 @@ func onboardingValue(t *testing.T, m map[string]json.RawMessage) (present bool, 
 }
 
 // Case 1: a vault-style source whose own .claude.json already carries the
-// onboarding state — it must be preserved verbatim, never overwritten.
+// onboarding state — unrelated state is retained while unverified identity
+// labels are omitted.
 func TestOnboarding_SourceStateWithMarkerIsPreserved(t *testing.T) {
 	mgr, _ := onboardingEnv(t, `{"real":"home-state"}`)
 	cred := writeTempFile(t, "creds.json", validClaudeCred)
@@ -98,18 +99,16 @@ func TestOnboarding_SourceStateWithMarkerIsPreserved(t *testing.T) {
 	if present, val := onboardingValue(t, m); !present || !val {
 		t.Fatalf("marker lost: present=%v val=%v", present, val)
 	}
-	// Version-specific source fields must survive.
-	if _, ok := m["oauthAccount"]; !ok {
-		t.Fatal("oauthAccount dropped from seeded state")
+	if _, ok := m["oauthAccount"]; ok {
+		t.Fatal("unverified oauthAccount was copied into the new profile")
 	}
 	if _, ok := m["theme"]; !ok {
 		t.Fatal("theme dropped from seeded state")
 	}
-	// And since the marker was already there, the file is the source verbatim.
-	raw, _ := os.ReadFile(filepath.Join(home, ".claude.json"))
+	// The source remains untouched, including its unverified label.
 	src, _ := os.ReadFile(state)
-	if string(raw) != string(src) {
-		t.Fatalf("source with marker should be copied verbatim; got %s", raw)
+	if string(src) != `{"hasCompletedOnboarding":true,"oauthAccount":{"accountUuid":"u-1"},"theme":"dark"}` {
+		t.Fatal("identity normalization modified the source state")
 	}
 }
 
@@ -188,8 +187,8 @@ func TestOnboarding_ExplicitSourceMissingMarkerGetsMerged(t *testing.T) {
 	if present, val := onboardingValue(t, m); !present || !val {
 		t.Fatalf("marker not merged into explicit source: present=%v val=%v", present, val)
 	}
-	if _, ok := m["oauthAccount"]; !ok {
-		t.Fatal("oauthAccount dropped by the onboarding merge")
+	if _, ok := m["oauthAccount"]; ok {
+		t.Fatal("unverified oauthAccount was copied by the onboarding merge")
 	}
 	// The explicit SOURCE file itself must be untouched.
 	srcRaw, _ := os.ReadFile(state)

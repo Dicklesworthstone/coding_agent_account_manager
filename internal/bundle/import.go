@@ -9,9 +9,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 )
 
@@ -19,8 +23,9 @@ import (
 type ImportMode string
 
 const (
-	// ImportModeSmart compares token freshness for conflicts.
-	// New profiles are added, existing profiles keep the fresher token.
+	// ImportModeSmart compares token freshness for conflicts. Claude profiles
+	// must also prove the same account and organization, or contain exactly the
+	// same credential pair, before an existing profile can be replaced.
 	ImportModeSmart ImportMode = "smart"
 
 	// ImportModeMerge adds new profiles but skips existing ones.
@@ -123,6 +128,9 @@ type ProfileAction struct {
 	Reason       string
 	LocalExpiry  *time.Time
 	BundleExpiry *time.Time
+	// RecoveryPath retains the complete previous profile after a replacement.
+	// It is a private vault entry, not a selectable account.
+	RecoveryPath string `json:",omitempty"`
 }
 
 // OptionalAction describes what happened to an optional file during import.
@@ -137,6 +145,9 @@ type OptionalAction struct {
 type VaultImporter struct {
 	// BundlePath is the path to the bundle file.
 	BundlePath string
+
+	beforeProfilePublish func(source, destination string)
+	renameProfile        func(oldPath, newPath string) error
 }
 
 // Import restores vault from a bundle with the given options.
@@ -219,19 +230,30 @@ func (i *VaultImporter) Import(opts *ImportOptions) (*ImportResult, error) {
 
 	// If dry run, determine what would happen without doing it
 	if opts.DryRun {
-		i.previewImport(tempDir, manifest, opts, result)
-		return result, nil
+		return result, i.previewImport(tempDir, manifest, opts, result)
 	}
 
-	// Import vault profiles
-	if err := i.importVault(tempDir, manifest, opts, result); err != nil {
-		return result, fmt.Errorf("import vault: %w", err)
+	importFiles := func() error {
+		// A managed writer may have changed the destination while we waited for
+		// the lock. Capture and decide from the generation that is present now.
+		if err := preflightImport(tempDir, manifest, opts); err != nil {
+			return fmt.Errorf("unsafe import: %w", err)
+		}
+		plans, err := i.planVaultImport(tempDir, manifest, opts, result)
+		if err != nil {
+			return err
+		}
+		if err := i.importVault(plans, result); err != nil {
+			return fmt.Errorf("import vault: %w", err)
+		}
+		i.importOptionalFiles(tempDir, manifest, opts, result)
+		return nil
 	}
-
-	// Import optional files
-	i.importOptionalFiles(tempDir, manifest, opts, result)
-
-	return result, nil
+	if opts.VaultPath == "" {
+		return result, importFiles()
+	}
+	err = authfile.NewVault(opts.VaultPath).WithMutationLock(importFiles)
+	return result, err
 }
 
 // extractBundle extracts a regular (unencrypted) zip bundle.
@@ -560,53 +582,109 @@ func validateRestorePath(path string, directory, allowMissing bool) error {
 }
 
 // previewImport determines what would happen during import without making changes.
-func (i *VaultImporter) previewImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) {
-	// Preview vault profiles
-	for provider, profiles := range manifest.Contents.Vault.Profiles {
-		// Check provider filter
+func (i *VaultImporter) previewImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) error {
+	plans, err := i.planVaultImport(bundleDir, manifest, opts, result)
+	if err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		result.ProfileActions = append(result.ProfileActions, plan.action)
+		switch plan.action.Action {
+		case "add":
+			result.NewProfiles++
+		case "update":
+			result.UpdatedProfiles++
+		case "skip":
+			result.SkippedProfiles++
+		}
+	}
+	i.previewOptionalFiles(manifest, opts, result)
+	return nil
+}
+
+type profileImportPlan struct {
+	action      ProfileAction
+	source      *profileGeneration
+	destination *profileGeneration
+}
+
+// Inspect all selected incoming profiles before publishing any of them. A
+// checksum-valid archive can still contain a stale or broken identity binding.
+func (i *VaultImporter) planVaultImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) ([]profileImportPlan, error) {
+	providers := make([]string, 0, len(manifest.Contents.Vault.Profiles))
+	for provider := range manifest.Contents.Vault.Profiles {
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	var plans []profileImportPlan
+	for _, provider := range providers {
 		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
 			continue
 		}
-
-		for _, profile := range profiles {
-			// Check profile filter
+		for _, profile := range manifest.Contents.Vault.Profiles[provider] {
 			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
 				continue
 			}
-
-			action := i.determineProfileAction(bundleDir, opts, provider, profile)
-			result.ProfileActions = append(result.ProfileActions, action)
-
-			switch action.Action {
-			case "add":
-				result.NewProfiles++
-			case "update":
-				result.UpdatedProfiles++
-			case "skip":
-				result.SkippedProfiles++
+			plan, err := i.planProfileImport(bundleDir, opts, provider, profile)
+			if err != nil {
+				plan.action.Action = "error"
+				plan.action.Reason = err.Error()
+				result.ProfileActions = append(result.ProfileActions, plan.action)
+				result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", provider, profile, err))
+				return nil, fmt.Errorf("profile %s/%s: %w", provider, profile, err)
 			}
+			plans = append(plans, plan)
 		}
 	}
-
-	// Preview optional files
-	i.previewOptionalFiles(manifest, opts, result)
+	return plans, nil
 }
 
-// determineProfileAction determines what action to take for a profile.
-func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOptions, provider, profile string) ProfileAction {
+func (i *VaultImporter) planProfileImport(bundleDir string, opts *ImportOptions, provider, profile string) (profileImportPlan, error) {
+	plan := profileImportPlan{action: ProfileAction{Provider: provider, Profile: profile}}
+	var err error
+	plan.source, err = captureProfileGeneration(filepath.Join(bundleDir, "vault", provider, profile))
+	if err != nil {
+		return plan, fmt.Errorf("capture incoming profile: %w", err)
+	}
+	if !plan.source.exists() {
+		return plan, fmt.Errorf("incoming profile is missing")
+	}
+	plan.destination, err = captureProfileGeneration(filepath.Join(opts.VaultPath, provider, profile))
+	if err != nil {
+		return plan, fmt.Errorf("capture local profile: %w", err)
+	}
+	plan.action, err = i.determineProfileAction(opts, provider, profile, plan.destination, plan.source)
+	if err != nil {
+		return plan, err
+	}
+	if err := plan.source.check(); err != nil {
+		return plan, err
+	}
+	return plan, plan.destination.check()
+}
+
+// determineProfileAction uses only the captured source and destination. Email
+// and display labels never authorize overwriting a Claude credential pair.
+func (i *VaultImporter) determineProfileAction(opts *ImportOptions, provider, profile string, local, incoming *profileGeneration) (ProfileAction, error) {
 	action := ProfileAction{
 		Provider: provider,
 		Profile:  profile,
 	}
-
-	// Check if profile exists locally
-	localProfilePath := filepath.Join(opts.VaultPath, provider, profile)
-	localExists := directoryExists(localProfilePath)
-
-	if !localExists {
+	var incomingClaude *claudeBundleIdentity
+	if strings.EqualFold(provider, "claude") {
+		var err error
+		incomingClaude, err = inspectClaudeBundleIdentity(incoming)
+		if err != nil {
+			return action, fmt.Errorf("incoming Claude identity: %w", err)
+		}
+	}
+	if !local.exists() {
 		action.Action = "add"
 		action.Reason = "new profile"
-		return action
+		if incomingClaude != nil && incomingClaude.binding == nil {
+			action.Reason += "; Claude account and organization are unverified; unverified account labels omitted"
+		}
+		return action, nil
 	}
 
 	// Profile exists locally - determine action based on mode
@@ -614,17 +692,52 @@ func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOpt
 	case ImportModeMerge:
 		action.Action = "skip"
 		action.Reason = "profile exists (merge mode)"
-		return action
+		return action, nil
 
 	case ImportModeReplace:
 		action.Action = "update"
-		action.Reason = "overwriting (replace mode)"
-		return action
+		action.Reason = "replacing profile; previous snapshot will be retained"
+		if incomingClaude != nil && incomingClaude.binding == nil {
+			action.Reason += "; Claude account and organization are unverified; unverified account labels omitted"
+		}
+		return action, nil
 
 	case ImportModeSmart:
-		// Compare freshness
-		bundleProfilePath := filepath.Join(bundleDir, "vault", provider, profile)
-		localFresh, bundleFresh := i.compareFreshness(provider, profile, localProfilePath, bundleProfilePath)
+		if incomingClaude != nil {
+			localClaude, err := inspectClaudeBundleIdentity(local)
+			if err != nil {
+				action.Action = "skip"
+				action.Reason = "local Claude identity is invalid or its credentials changed; inspect it before using --mode replace"
+				return action, nil
+			}
+			sameCredentials := incomingClaude.fingerprint != "" && incomingClaude.fingerprint == localClaude.fingerprint
+			sameOwner := incomingClaude.binding != nil && localClaude.binding != nil &&
+				identity.ClaudeSameAccount(&incomingClaude.binding.Identity, &localClaude.binding.Identity)
+			if incomingClaude.binding != nil && localClaude.binding != nil && !sameOwner {
+				action.Action = "skip"
+				action.Reason = "Claude account or organization differs; use another profile name or explicit --mode replace"
+				return action, nil
+			}
+			if !sameCredentials && !sameOwner {
+				action.Action = "skip"
+				action.Reason = "Claude ownership is unverified for different credentials; verify both profiles or use explicit --mode replace"
+				return action, nil
+			}
+			if sameCredentials && localClaude.binding != nil && incomingClaude.binding == nil {
+				action.Action = "skip"
+				action.Reason = "local Claude identity is verified; bundle would discard its verification"
+				return action, nil
+			}
+			if sameCredentials && localClaude.binding == nil && incomingClaude.binding != nil {
+				action.Action = "update"
+				action.Reason = "same Claude credential pair; importing verified account and organization"
+				return action, nil
+			}
+		}
+		localFresh, bundleFresh, err := i.compareFreshness(provider, profile, local, incoming)
+		if err != nil {
+			return action, err
+		}
 
 		if localFresh != nil {
 			action.LocalExpiry = &localFresh.ExpiresAt
@@ -633,43 +746,57 @@ func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOpt
 			action.BundleExpiry = &bundleFresh.ExpiresAt
 		}
 
-		if bundleFresh == nil {
+		if bundleFresh == nil || incomingClaude != nil && bundleFresh.ExpiresAt.IsZero() {
 			action.Action = "skip"
 			action.Reason = "cannot determine bundle freshness"
-			return action
+			return action, nil
 		}
 
+		if incomingClaude != nil && (localFresh == nil || localFresh.ExpiresAt.IsZero()) {
+			action.Action = "skip"
+			action.Reason = "cannot determine local Claude token expiry; local profile preserved"
+			return action, nil
+		}
 		if localFresh == nil {
 			action.Action = "update"
 			action.Reason = "cannot determine local freshness, importing bundle"
-			return action
+			return action, nil
 		}
 
-		if sync.CompareFreshness(bundleFresh, localFresh) {
+		fresher := sync.CompareFreshness(bundleFresh, localFresh)
+		if incomingClaude != nil {
+			// ZIP extraction times are not evidence that a token was refreshed.
+			fresher = bundleFresh.ExpiresAt.After(localFresh.ExpiresAt)
+		}
+		if fresher {
 			action.Action = "update"
 			action.Reason = fmt.Sprintf("bundle token fresher (expires %s vs %s)",
 				bundleFresh.ExpiresAt.Format("2006-01-02 15:04"),
 				localFresh.ExpiresAt.Format("2006-01-02 15:04"))
+			if incomingClaude != nil && incomingClaude.binding == nil {
+				action.Reason += "; unverified Claude account labels omitted"
+			}
 		} else {
 			action.Action = "skip"
 			action.Reason = "local token fresher or equal"
 		}
-		return action
+		return action, nil
 
 	default:
 		action.Action = "skip"
 		action.Reason = "unknown import mode"
-		return action
+		return action, nil
 	}
 }
 
 // compareFreshness extracts freshness info from local and bundle profiles.
-func (i *VaultImporter) compareFreshness(provider, profile, localPath, bundlePath string) (*sync.TokenFreshness, *sync.TokenFreshness) {
+func (i *VaultImporter) compareFreshness(provider, profile string, local, incoming *profileGeneration) (*sync.TokenFreshness, *sync.TokenFreshness, error) {
+	provider = strings.ToLower(provider)
 	// Get auth files for this provider
 	var authFileNames []string
 	switch provider {
 	case "claude":
-		authFileNames = []string{".claude.json", "auth.json"}
+		authFileNames = []string{".credentials.json", "auth.json", ".claude.json"}
 	case "codex":
 		authFileNames = []string{"auth.json"}
 	case "gemini":
@@ -679,30 +806,129 @@ func (i *VaultImporter) compareFreshness(provider, profile, localPath, bundlePat
 	case "cursor":
 		authFileNames = []string{"auth.json", "settings.json"}
 	default:
-		return nil, nil
+		return nil, nil, nil
 	}
+	readFreshness := func(generation *profileGeneration) (*sync.TokenFreshness, error) {
+		files := make(map[string][]byte)
+		for _, name := range authFileNames {
+			data, exists, err := generation.readFile(name)
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
+				continue
+			}
+			files[filepath.Join(generation.path, name)] = data
+			if provider == "claude" && (name == ".credentials.json" || name == "auth.json") {
+				// The native runtime uses this source even when its expiry is
+				// missing. A secondary legacy file cannot make it look fresher.
+				break
+			}
+		}
+		freshness, _ := sync.ExtractFreshnessFromBytes(provider, profile, files)
+		return freshness, nil
+	}
+	localFresh, err := readFreshness(local)
+	if err != nil {
+		return nil, nil, err
+	}
+	bundleFresh, err := readFreshness(incoming)
+	return localFresh, bundleFresh, err
+}
 
-	// Extract local freshness
-	localFiles := make(map[string][]byte)
-	for _, name := range authFileNames {
-		path := filepath.Join(localPath, name)
-		if data, err := os.ReadFile(path); err == nil {
-			localFiles[path] = data
+type claudeBundleIdentity struct {
+	fingerprint string
+	binding     *identity.ClaudeIdentityBinding
+	bindingFile string
+}
+
+// Inspect the authoritative native credential source and its selected proof.
+// Legacy OAuth pairs can be compared exactly, but .claude.json labels never
+// establish account ownership. No bundle transfer contacts the provider.
+func inspectClaudeBundleIdentity(generation *profileGeneration) (*claudeBundleIdentity, error) {
+	result := &claudeBundleIdentity{}
+	credentials, present, err := generation.readFile(".credentials.json")
+	if err != nil {
+		return nil, err
+	}
+	if present {
+		if err := authfile.ValidateCredentialData("claude", ".credentials.json", credentials); err != nil {
+			return nil, fmt.Errorf("invalid primary Claude credentials")
+		}
+	} else {
+		for _, name := range []string{"auth.json", ".claude.json"} {
+			data, exists, err := generation.readFile(name)
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
+				continue
+			}
+			var legacy struct {
+				AccessToken  string          `json:"access_token"`
+				RefreshToken string          `json:"refresh_token"`
+				CamelAccess  string          `json:"accessToken"`
+				CamelRefresh string          `json:"refreshToken"`
+				OAuthToken   json.RawMessage `json:"oauthToken"`
+			}
+			if json.Unmarshal(data, &legacy) != nil {
+				return nil, fmt.Errorf("invalid legacy Claude credentials")
+			}
+			if name == ".claude.json" && len(legacy.OAuthToken) > 0 && legacy.OAuthToken[0] == '{' {
+				if json.Unmarshal(legacy.OAuthToken, &legacy) != nil {
+					return nil, fmt.Errorf("invalid legacy Claude OAuth credentials")
+				}
+			}
+			if legacy.AccessToken == "" {
+				legacy.AccessToken = legacy.CamelAccess
+			}
+			if legacy.RefreshToken == "" {
+				legacy.RefreshToken = legacy.CamelRefresh
+			}
+			if strings.TrimSpace(legacy.AccessToken) == "" {
+				if name == "auth.json" {
+					// A present auth.json owns the login even for an API key or
+					// unsupported format. An optional legacy cache is not a fallback.
+					break
+				}
+				continue
+			}
+			credentials, err = json.Marshal(map[string]any{"claudeAiOauth": map[string]string{
+				"accessToken": legacy.AccessToken, "refreshToken": legacy.RefreshToken,
+			}})
+			if err != nil {
+				return nil, fmt.Errorf("cannot inspect legacy Claude credentials")
+			}
+			break
 		}
 	}
-	localFresh, _ := sync.ExtractFreshnessFromBytes(provider, profile, localFiles)
-
-	// Extract bundle freshness
-	bundleFiles := make(map[string][]byte)
-	for _, name := range authFileNames {
-		path := filepath.Join(bundlePath, name)
-		if data, err := os.ReadFile(path); err == nil {
-			bundleFiles[path] = data
+	result.fingerprint, _ = identity.ClaudeCredentialFingerprint(credentials)
+	for _, name := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
+		metadata, exists, err := generation.readFile(name)
+		if err != nil {
+			return nil, err
 		}
+		if !exists {
+			continue
+		}
+		assessment, err := identity.InspectClaudeIdentityBinding(metadata, credentials)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Claude identity binding in %s", name)
+		}
+		if assessment.State == identity.ClaudeIdentityCredentialChanged {
+			return nil, fmt.Errorf("claude identity binding in %s does not match its credential pair", name)
+		}
+		if assessment.Binding == nil {
+			continue
+		}
+		result.binding = assessment.Binding
+		result.bindingFile = name
+		// Canonical vault ownership wins over a copied native cache. The latter
+		// may be stale after a legitimate managed token rotation and must never
+		// invalidate or override an exact matching canonical proof.
+		return result, nil
 	}
-	bundleFresh, _ := sync.ExtractFreshnessFromBytes(provider, profile, bundleFiles)
-
-	return localFresh, bundleFresh
+	return result, nil
 }
 
 // previewOptionalFiles determines what would happen to optional files.
@@ -790,137 +1016,201 @@ func (i *VaultImporter) previewOptionalFiles(manifest *ManifestV1, opts *ImportO
 }
 
 // importVault imports vault profiles from the bundle.
-func (i *VaultImporter) importVault(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) error {
-	for provider, profiles := range manifest.Contents.Vault.Profiles {
-		// Check provider filter
-		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
+func (i *VaultImporter) importVault(plans []profileImportPlan, result *ImportResult) error {
+	for _, plan := range plans {
+		action := plan.action
+		if action.Action == "skip" {
+			result.ProfileActions = append(result.ProfileActions, action)
+			result.SkippedProfiles++
 			continue
 		}
-
-		for _, profile := range profiles {
-			// Check profile filter
-			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
-				continue
-			}
-
-			action := i.determineProfileAction(bundleDir, opts, provider, profile)
+		recoveryPath, err := i.copyProfileDirectory(plan.source, plan.destination, action.Provider)
+		action.RecoveryPath = recoveryPath
+		if err != nil {
+			action.Action = "error"
+			action.Reason = err.Error()
 			result.ProfileActions = append(result.ProfileActions, action)
-
-			if action.Action == "skip" {
-				result.SkippedProfiles++
-				continue
-			}
-
-			// Import the profile
-			bundleProfilePath := filepath.Join(bundleDir, "vault", provider, profile)
-			localProfilePath := filepath.Join(opts.VaultPath, provider, profile)
-
-			if err := copyProfileDirectory(bundleProfilePath, localProfilePath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", provider, profile, err))
-				continue
-			}
-
-			switch action.Action {
-			case "add":
-				result.NewProfiles++
-			case "update":
-				result.UpdatedProfiles++
-			}
+			result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", action.Provider, action.Profile, err))
+			return err
+		}
+		result.ProfileActions = append(result.ProfileActions, action)
+		if action.Action == "add" {
+			result.NewProfiles++
+		} else {
+			result.UpdatedProfiles++
 		}
 	}
-
 	return nil
 }
 
-// copyProfileDirectory copies a profile directory from bundle to vault atomically.
-// Uses a temporary directory to ensure the original is preserved if the copy fails.
-func copyProfileDirectory(src, dst string) error {
+// copyProfileDirectory stages a complete captured profile, then publishes it
+// with rename. The old generation remains recoverable outside selectable
+// profile names, including when a later publication check fails.
+func (i *VaultImporter) copyProfileDirectory(source, destination *profileGeneration, provider string) (string, error) {
+	src, dst := source.path, destination.path
 	if err := validateRestoreTree(src, dst, true); err != nil {
-		return err
+		return "", err
 	}
-	// Ensure parent directory exists
 	parentDir := filepath.Dir(dst)
 	if err := os.MkdirAll(parentDir, 0700); err != nil {
-		return fmt.Errorf("create parent dir: %w", err)
+		return "", fmt.Errorf("create parent dir: %w", err)
 	}
-
-	// Create a temporary directory in the same parent to ensure atomic rename works
-	tmpDir, err := os.MkdirTemp(parentDir, ".caam_import_*")
+	tmpDir, err := os.MkdirTemp(parentDir, "_caam-vault-backup~import-*")
 	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
+		return "", fmt.Errorf("create temp dir: %w", err)
 	}
-
-	// Clean up temp dir on failure
 	success := false
 	defer func() {
 		if !success {
 			os.RemoveAll(tmpDir)
 		}
 	}()
-
-	// Copy to temporary directory
-	if err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+	var claude *claudeBundleIdentity
+	omittedFile := ""
+	if strings.EqualFold(provider, "claude") {
+		claude, err = inspectClaudeBundleIdentity(source)
 		if err != nil {
-			return err
+			return "", err
 		}
-
-		relPath, err := filepath.Rel(src, path)
+		if claude.binding != nil {
+			// Vault mutations maintain canonical meta.json. Carrying a second
+			// native cache would leave a stale owner behind after a token rotation.
+			omittedFile = identity.ClaudeIdentityCacheFile
+		}
+	}
+	if err := source.copyTo(tmpDir, omittedFile); err != nil {
+		return "", fmt.Errorf("copy files: %w", err)
+	}
+	if claude != nil {
+		if claude.binding != nil {
+			metadata, exists, err := source.readFile("meta.json")
+			if err != nil {
+				return "", err
+			}
+			var envelope map[string]json.RawMessage
+			if exists {
+				if json.Unmarshal(metadata, &envelope) != nil || envelope == nil {
+					return "", fmt.Errorf("invalid Claude identity metadata")
+				}
+			} else {
+				envelope = make(map[string]json.RawMessage)
+			}
+			if _, alreadyCanonical := envelope["claude_identity"]; !alreadyCanonical || string(envelope["claude_identity"]) == "null" {
+				// A transferred native cache proves this exact pair offline, even
+				// after expiry. Persist canonical vault ownership without changing
+				// either token or unrelated profile metadata.
+				envelope["claude_identity"], err = json.Marshal(claude.binding)
+				if err != nil {
+					return "", fmt.Errorf("encode Claude identity binding")
+				}
+				metadata, err = json.MarshalIndent(envelope, "", "  ")
+				if err != nil {
+					return "", fmt.Errorf("encode Claude identity metadata")
+				}
+				if err := atomicWriteBytes(filepath.Join(tmpDir, "meta.json"), metadata, 0600); err != nil {
+					return "", fmt.Errorf("save Claude identity metadata: %w", err)
+				}
+			}
+		}
+		settings, exists, err := source.readFile(".claude.json")
 		if err != nil {
-			return err
+			return "", err
 		}
-
-		dstPath := filepath.Join(tmpDir, relPath)
-
-		if d.IsDir() {
-			return os.MkdirAll(dstPath, 0700)
+		if exists {
+			var account json.RawMessage
+			if claude.binding != nil {
+				account, err = json.Marshal(struct {
+					AccountID      string `json:"accountUuid"`
+					OrganizationID string `json:"organizationUuid"`
+					Email          string `json:"emailAddress,omitempty"`
+					Organization   string `json:"organizationName,omitempty"`
+				}{claude.binding.Identity.AccountID, claude.binding.Identity.OrganizationID, claude.binding.Identity.Email, claude.binding.Identity.Organization})
+				if err != nil {
+					return "", fmt.Errorf("encode verified Claude account")
+				}
+			}
+			settings, err = claudesettings.WithOAuthAccount(settings, account)
+			if err != nil {
+				return "", fmt.Errorf("invalid Claude account settings")
+			}
+			if err := atomicWriteBytes(filepath.Join(tmpDir, ".claude.json"), settings, 0600); err != nil {
+				return "", fmt.Errorf("save Claude account settings: %w", err)
+			}
 		}
-
-		return copyFile(path, dstPath)
-	}); err != nil {
-		return fmt.Errorf("copy files: %w", err)
+	}
+	prepared, err := captureProfileGeneration(tmpDir)
+	if err != nil {
+		return "", fmt.Errorf("capture prepared profile: %w", err)
+	}
+	if i.beforeProfilePublish != nil {
+		i.beforeProfilePublish(src, dst)
+	}
+	if err := source.check(); err != nil {
+		return "", err
+	}
+	if err := destination.check(); err != nil {
+		return "", err
 	}
 
-	// Check if destination exists
-	_, statErr := os.Lstat(dst)
-	dstExists := statErr == nil
-	if statErr != nil && !os.IsNotExist(statErr) {
-		return statErr
-	}
-
-	// Reserve a private recovery directory. A predictable dst+".bak" may be
-	// another account name; replacing one profile must never erase that account.
+	// The reserved prefix cannot be a valid user profile name. Retaining this
+	// directory cannot accidentally introduce a second routable account.
 	var backupDir, backupPath string
-	if dstExists {
-		backupDir, err = os.MkdirTemp(parentDir, ".caam_import_backup_*")
+	rename := i.renameProfile
+	if rename == nil {
+		rename = os.Rename
+	}
+	if destination.exists() {
+		backupDir, err = os.MkdirTemp(parentDir, "_caam-vault-backup~bundle-*")
 		if err != nil {
-			return fmt.Errorf("reserve backup: %w", err)
+			return "", fmt.Errorf("reserve backup: %w", err)
 		}
 		backupPath = filepath.Join(backupDir, "profile")
-		if err := os.Rename(dst, backupPath); err != nil {
+		if err := rename(dst, backupPath); err != nil {
 			os.Remove(backupDir)
-			return fmt.Errorf("backup existing: %w", err)
+			return "", fmt.Errorf("backup existing: %w", err)
 		}
 	}
-
-	// Rename temp directory to destination (atomic on same filesystem)
-	if err := os.Rename(tmpDir, dst); err != nil {
-		// Restore backup if rename failed
-		if dstExists {
-			if restoreErr := os.Rename(backupPath, dst); restoreErr != nil {
-				return fmt.Errorf("publish profile: %w; restore failed: %v; original preserved at %s", err, restoreErr, backupPath)
+	restore := func(cause error) (string, error) {
+		if backupPath != "" {
+			// An unmanaged writer can create a new login after the old directory
+			// was moved aside. Do not overwrite that account while recovering.
+			if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+				return backupPath, fmt.Errorf("%w; destination changed; previous profile preserved at %s", cause, backupPath)
+			}
+			if restoreErr := rename(backupPath, dst); restoreErr != nil {
+				return backupPath, fmt.Errorf("%w; restore failed: %v; previous profile preserved at %s", cause, restoreErr, backupPath)
 			}
 			os.Remove(backupDir)
 		}
-		return fmt.Errorf("rename to destination: %w", err)
+		return "", cause
 	}
-
-	// Success - remove backup and mark success to prevent temp cleanup
+	if backupPath != "" {
+		if err := destination.checkAt(backupPath); err != nil {
+			return restore(err)
+		}
+	}
+	if err := source.check(); err != nil {
+		return restore(err)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		return restore(fmt.Errorf("destination changed before profile publication; retry"))
+	}
+	if err := rename(tmpDir, dst); err != nil {
+		return restore(fmt.Errorf("publish profile: %w", err))
+	}
 	success = true
-	if dstExists {
-		os.RemoveAll(backupDir)
+	if err := prepared.checkAt(dst); err != nil {
+		return backupPath, err
 	}
-
-	return nil
+	if err := source.check(); err != nil {
+		return backupPath, err
+	}
+	if backupPath != "" {
+		if err := destination.checkAt(backupPath); err != nil {
+			return backupPath, err
+		}
+	}
+	return backupPath, nil
 }
 
 // copyFile copies a single file.
