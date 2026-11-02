@@ -25,22 +25,10 @@ func TestExportImport_RoundTripSingleProfile(t *testing.T) {
 		t.Fatalf("WriteFile(meta.json) error = %v", err)
 	}
 
-	targets, err := resolveExportTargets(srcVault, exportRequest{Tool: "codex", Profile: "work"})
-	if err != nil {
-		t.Fatalf("resolveExportTargets() error = %v", err)
-	}
-	manifest, files, err := buildExportManifest(targets)
-	if err != nil {
-		t.Fatalf("buildExportManifest() error = %v", err)
-	}
-
-	var buf bytes.Buffer
-	if err := writeExportArchive(&buf, manifest, files); err != nil {
-		t.Fatalf("writeExportArchive() error = %v", err)
-	}
+	archive := tarExportTestBytes(t, srcVault, exportRequest{Tool: "codex", Profile: "work"})
 
 	dstVault := authfile.NewVault(filepath.Join(tmpDir, "dst-vault"))
-	if _, err := importArchive(bytes.NewReader(buf.Bytes()), dstVault, importOptions{}); err != nil {
+	if _, err := importArchive(bytes.NewReader(archive), dstVault, importOptions{}); err != nil {
 		t.Fatalf("importArchive() error = %v", err)
 	}
 
@@ -65,22 +53,10 @@ func TestImport_WithAsRenamesProfile(t *testing.T) {
 		t.Fatalf("WriteFile(auth.json) error = %v", err)
 	}
 
-	targets, err := resolveExportTargets(srcVault, exportRequest{Tool: "codex", Profile: "work"})
-	if err != nil {
-		t.Fatalf("resolveExportTargets() error = %v", err)
-	}
-	manifest, files, err := buildExportManifest(targets)
-	if err != nil {
-		t.Fatalf("buildExportManifest() error = %v", err)
-	}
-
-	var buf bytes.Buffer
-	if err := writeExportArchive(&buf, manifest, files); err != nil {
-		t.Fatalf("writeExportArchive() error = %v", err)
-	}
+	archive := tarExportTestBytes(t, srcVault, exportRequest{Tool: "codex", Profile: "work"})
 
 	dstVault := authfile.NewVault(filepath.Join(tmpDir, "dst-vault"))
-	if _, err := importArchive(bytes.NewReader(buf.Bytes()), dstVault, importOptions{AsTool: "codex", AsProfile: "server-work"}); err != nil {
+	if _, err := importArchive(bytes.NewReader(archive), dstVault, importOptions{AsTool: "codex", AsProfile: "server-work"}); err != nil {
 		t.Fatalf("importArchive() error = %v", err)
 	}
 
@@ -104,19 +80,7 @@ func TestImport_ConflictRequiresForce(t *testing.T) {
 		t.Fatalf("WriteFile(auth.json) error = %v", err)
 	}
 
-	targets, err := resolveExportTargets(srcVault, exportRequest{Tool: "codex", Profile: "work"})
-	if err != nil {
-		t.Fatalf("resolveExportTargets() error = %v", err)
-	}
-	manifest, files, err := buildExportManifest(targets)
-	if err != nil {
-		t.Fatalf("buildExportManifest() error = %v", err)
-	}
-
-	var buf bytes.Buffer
-	if err := writeExportArchive(&buf, manifest, files); err != nil {
-		t.Fatalf("writeExportArchive() error = %v", err)
-	}
+	archive := tarExportTestBytes(t, srcVault, exportRequest{Tool: "codex", Profile: "work"})
 
 	dstVault := authfile.NewVault(filepath.Join(tmpDir, "dst-vault"))
 	existingDir := dstVault.ProfilePath("codex", "work")
@@ -127,12 +91,17 @@ func TestImport_ConflictRequiresForce(t *testing.T) {
 		t.Fatalf("WriteFile(existing auth.json) error = %v", err)
 	}
 
-	if _, err := importArchive(bytes.NewReader(buf.Bytes()), dstVault, importOptions{}); err == nil {
+	if _, err := importArchive(bytes.NewReader(archive), dstVault, importOptions{}); err == nil {
 		t.Fatalf("expected conflict error without --force")
 	}
-	if _, err := importArchive(bytes.NewReader(buf.Bytes()), dstVault, importOptions{Force: true}); err != nil {
+	result, err := importArchive(bytes.NewReader(archive), dstVault, importOptions{Force: true})
+	if err != nil {
 		t.Fatalf("importArchive(force) error = %v", err)
 	}
+	if len(result.Profiles) != 1 || result.Profiles[0].RecoveryPath == "" {
+		t.Fatal("forced replacement did not retain the previous profile")
+	}
+	requireSwitchCredential(t, filepath.Join(result.Profiles[0].RecoveryPath, "auth.json"), `{"access_token":"old-token"}`)
 
 	gotAuth, err := os.ReadFile(filepath.Join(dstVault.ProfilePath("codex", "work"), "auth.json"))
 	if err != nil {
@@ -165,17 +134,10 @@ func TestExportAllForTool_ImportsAllProfiles(t *testing.T) {
 		t.Fatalf("targets = %d, want 2", len(targets))
 	}
 
-	manifest, files, err := buildExportManifest(targets)
-	if err != nil {
-		t.Fatalf("buildExportManifest() error = %v", err)
-	}
-	var buf bytes.Buffer
-	if err := writeExportArchive(&buf, manifest, files); err != nil {
-		t.Fatalf("writeExportArchive() error = %v", err)
-	}
+	archive := tarExportTestBytes(t, srcVault, exportRequest{ToolAll: true, Tool: "codex"})
 
 	dstVault := authfile.NewVault(filepath.Join(tmpDir, "dst-vault"))
-	if _, err := importArchive(bytes.NewReader(buf.Bytes()), dstVault, importOptions{}); err != nil {
+	if _, err := importArchive(bytes.NewReader(archive), dstVault, importOptions{}); err != nil {
 		t.Fatalf("importArchive() error = %v", err)
 	}
 
@@ -188,4 +150,18 @@ func TestExportAllForTool_ImportsAllProfiles(t *testing.T) {
 			t.Fatalf("%s auth.json = %q, want %q", profile, string(gotAuth), `{"p":"`+profile+`"}`)
 		}
 	}
+}
+
+func tarExportTestBytes(t *testing.T, v *authfile.Vault, request exportRequest) []byte {
+	t.Helper()
+	prepared, err := prepareExportArchive(v, request, exportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Close()
+	data, err := os.ReadFile(prepared.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

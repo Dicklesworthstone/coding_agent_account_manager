@@ -111,10 +111,14 @@ func (e *ClaudeFreshnessExtractor) Extract(provider, profile string, authFiles m
 	// Claude tokens are in .credentials.json (preferred) or legacy .claude.json
 	var credentialsData []byte
 	var credentialsModTime time.Time
+	authPresent := false
 	var claudeData []byte
 	var modTime time.Time
 
 	for path, data := range authFiles {
+		if containsPath(path, "auth.json") {
+			authPresent = true
+		}
 		// Look for .credentials.json first (preferred)
 		if credentialsData == nil && containsPath(path, ".credentials.json") {
 			credentialsData = data
@@ -149,17 +153,10 @@ func (e *ClaudeFreshnessExtractor) Extract(provider, profile string, authFiles m
 				Source:     "local",
 			}, nil
 		}
-		// If credentials do not include expiry but legacy data exists, fall back.
-		if claudeData == nil {
-			return &TokenFreshness{
-				Provider:   provider,
-				Profile:    profile,
-				ExpiresAt:  time.Time{},
-				ModifiedAt: credentialsModTime,
-				IsExpired:  false,
-				Source:     "local",
-			}, nil
-		}
+		return &TokenFreshness{Provider: provider, Profile: profile, ModifiedAt: credentialsModTime, Source: "local"}, nil
+	}
+	if authPresent {
+		return nil, fmt.Errorf("selected Claude auth.json has no supported expiry contract")
 	}
 
 	if claudeData == nil {

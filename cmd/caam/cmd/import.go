@@ -14,6 +14,11 @@ var importCmd = &cobra.Command{
 	Short: "Import profile(s) from an export archive",
 	Long: `Import profile auth files from an export archive created by "caam export".
 
+The complete archive and incoming Claude identity bindings are checked offline
+before publication. Existing profiles require --force; replacement preserves the
+complete previous profile in a private recovery directory and reports its path.
+The --as option changes the profile name within the same provider.
+
 Examples:
   caam import codex-work.tar.gz
   cat codex-work.tar.gz | caam import -
@@ -25,7 +30,7 @@ Examples:
 
 func init() {
 	importCmd.Flags().String("as", "", "import single-profile archive under a new tool/profile (e.g. codex/server-work)")
-	importCmd.Flags().Bool("force", false, "overwrite existing profile(s) if they already exist")
+	importCmd.Flags().Bool("force", false, "replace existing profile(s), preserving and reporting each previous snapshot")
 }
 
 func runImport(cmd *cobra.Command, args []string) error {
@@ -59,17 +64,30 @@ func runImport(cmd *cobra.Command, args []string) error {
 		opt.AsProfile = profile
 	}
 
-	manifest, err := importArchive(r, vault, opt)
+	result, err := importArchive(r, vault, opt)
+	count := 0
+	if result != nil {
+		for _, profile := range result.Profiles {
+			if profile.Imported {
+				count++
+			}
+			if profile.RecoveryPath != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Previous profile preserved: %s\n", profile.RecoveryPath)
+			}
+		}
+	}
 	if err != nil {
+		if count > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Imported %d profile(s) before import stopped.\n", count)
+		}
 		return err
 	}
 
-	count := len(manifest.Items)
 	if opt.AsTool != "" {
-		fmt.Printf("Imported 1 profile as %s/%s\n", opt.AsTool, opt.AsProfile)
+		fmt.Fprintf(cmd.OutOrStdout(), "Imported 1 profile as %s/%s\n", opt.AsTool, opt.AsProfile)
 		return nil
 	}
 
-	fmt.Printf("Imported %d profile(s)\n", count)
+	fmt.Fprintf(cmd.OutOrStdout(), "Imported %d profile(s)\n", count)
 	return nil
 }

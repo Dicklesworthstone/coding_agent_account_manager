@@ -1140,6 +1140,44 @@ not admit system backups. With `next --usage-aware`, force also retains the
 requirement for measured, available Grok or Cursor quota. `next --dry-run`
 performs selection without switching or saving credentials.
 
+### Transferring Saved Profiles with Tar Archives
+
+`caam export` and `caam import` transfer saved profiles in a `.tar.gz` archive,
+including credentials, token-bound identity metadata and associated settings:
+
+```bash
+caam export claude/work --output ./claude-work.tar.gz
+caam export --all claude --output ./claude-profiles.tar.gz
+caam import ./claude-work.tar.gz --as claude/server-work
+caam import ./claude-profiles.tar.gz --force
+```
+
+`--as` requires a single-profile archive and changes its name within the same
+provider. Existing destinations require `--force`, which retains each complete
+previous profile in a private recovery directory and reports its path. System
+profiles and private recovery directories are excluded from bulk exports.
+
+Import validates the entire archive, including paths, file sizes, checksums,
+missing or duplicate payloads and gzip completion. It privately prepares every
+incoming profile before publishing any of them, then checks all destination
+conflicts after acquiring the vault lock. Claude proof checks remain offline:
+an exact cached binding remains usable with expired tokens, a binding attached
+to different credentials is rejected even with `--force`, and unverified account
+labels are omitted while unrelated settings are preserved.
+
+Export captures profiles under the managed vault lock and assembles a complete
+archive privately before writing output. With `--output`, the parent directory
+must already exist and the destination must be outside the vault. CAAM writes
+a private sibling temporary file, syncs it and publishes it by rename, preserving
+an existing output if preparation or writing fails. Tar archives are unencrypted
+and contain credentials; keep them private.
+
+Profile publication rechecks captured generations and retains recovery copies
+when replacing an account. If a later filesystem operation fails, earlier
+profiles may already have been imported; the command reports that count and any
+retained recovery paths. This is per-profile recovery, without an archive-wide
+transaction or a guarantee of recovery from a process crash or power loss.
+
 ### Portable Vault Bundles
 
 Use a bundle to transfer or recover saved profiles together with CAAM's
@@ -1224,6 +1262,50 @@ Scheduled archives contain credentials and are unencrypted ZIP files; keep the
 backup directory private. If the destination filesystem cannot publish an
 archive exclusively using a hard link, the backup fails and keeps the older
 recovery copies.
+
+### Synchronizing Profiles over SSH
+
+Configure a machine and select the profiles to synchronize:
+
+```bash
+caam sync add build-host dev@build.example.com --remote-path /srv/caam
+caam sync --machine build-host --provider claude --profile work
+caam sync --machine build-host --json
+caam sync log --errors
+```
+
+`--remote-path` specifies the remote CAAM **data directory**. Both discovery and
+transfer append `vault`, so `/srv/caam` selects `/srv/caam/vault`.
+
+Claude transfers and all metadata-only transfers require CAAM with **sync
+protocol 1 on both hosts**, with `caam` available to the remote SSH session.
+An older or unavailable peer produces an update error; these transfers never
+fall back to unguarded file copying.
+
+Claude and Codex default to `host-local` policy. Metadata-only sync can create
+a missing logical profile with its provider, profile name, description and tags.
+It does not copy credentials, account UUIDs, organization UUIDs, cached identity
+proof or other arbitrary metadata, and it never replaces an existing profile.
+Each machine keeps its independently obtained login. See the [FAQ's sync policy
+example](#faq) for explicit policy overrides.
+
+With Claude credential replication explicitly enabled, replacing an existing
+profile requires the exact access/refresh pair or matching verified account
+**and organization UUIDs** before freshness is considered. Shared email addresses
+and names cannot authorize replacement. Unknown ownership across different
+grants, a conflicting organization or unavailable selected-token expiry preserves
+existing profiles. These checks use captured files and cached proof offline;
+they do not refresh tokens or establish that an expired token is still usable.
+
+The guarded exchange transfers complete profiles and holds the managed vault
+locks while checking both source and destination generations through publication.
+Replacements retain the complete previous profile in a private recovery directory;
+recovery avoids overwriting an independently changed login. Results identify the
+recovery path and its location: **remote** for a push, **local** for a pull.
+JSON output includes `recovery_path` and `recovery_location` when a retained
+recovery is reported. Profile and machine errors appear in the results and cause
+a failing exit status. Recovery handles returned errors per profile; it does not
+provide a transaction across machines or a crash-recovery guarantee.
 
 ### Uninstall Notes
 
@@ -2059,7 +2141,7 @@ Run `caam paths` to see current locations. If they change in a tool update, we'l
 
 **Q: Can I sync the vault across machines?**
 
-With care — and `caam sync` is now provider-aware about what is safe to move. Claude and Codex subscription OAuth uses a **rotating refresh-token family**: every refresh consumes the current refresh token, and replaying a stale copy from another machine can trip the provider's reuse detection and revoke the whole family (this bricked a real account — see issue #19). So by default those providers are **host-local**: `caam sync` replicates their profile *metadata* (so every machine knows the logical account exists) but never their credential payload — each machine keeps its own independent grant via `caam add`. Gemini, OpenCode, and Cursor keep the old bidirectional `replicate` behavior. You can override per provider or per profile in `~/.config/caam/config.json`:
+With care — and `caam sync` is now provider-aware about what is safe to move. Claude and Codex subscription OAuth uses a **rotating refresh-token family**: every refresh consumes the current refresh token, and replaying a stale copy from another machine can trip the provider's reuse detection and revoke the whole family (this bricked a real account — see issue #19). So by default those providers are **host-local**: `caam sync` can seed a missing logical profile with its description and tags, without copying credentials or identity proof. Each machine keeps its own independent grant via `caam add`; existing profiles are preserved. Gemini, OpenCode, and Cursor keep the old bidirectional `replicate` behavior. You can override per provider or per profile in `~/.config/caam/config.json`:
 
 ```json
 {
@@ -2071,6 +2153,10 @@ With care — and `caam sync` is now provider-aware about what is safe to move. 
 ```
 
 Forcing `replicate` for a rotating provider prints a loud warning whenever both machines already hold diverged copies, because converging them is exactly the revocation hazard. `caam sync status` shows the resolved policy per provider.
+
+Claude replication and metadata-only transfers require the guarded protocol on
+both hosts. See [Synchronizing Profiles over SSH](#synchronizing-profiles-over-ssh)
+for compatibility, account ownership checks and recovery reporting.
 
 **Q: What's the difference between vault profiles and isolated profiles?**
 

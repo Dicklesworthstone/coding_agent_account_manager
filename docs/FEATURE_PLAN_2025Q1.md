@@ -525,6 +525,40 @@ helper/key ownership stays unknown. ZIP import prepares every actionable
 profile before publication or preview success, while continuing to check the
 original extracted sources through publication.
 
+The separate tar commands, `caam export` and `caam import`, now use the same
+captured inspection and publication boundary. Import checks the complete archive
+and privately prepares all incoming profiles before publication; destination
+conflicts are checked together after waiting for the managed vault lock.
+`--as provider/name` renames a single-profile archive within its original provider.
+`--force` explicitly replaces existing profiles while retaining and reporting
+each complete previous snapshot. Export assembles the archive privately;
+`--output` requires an existing parent directory outside the vault and publishes
+through a private temporary file and final rename. An existing output survives
+returned preparation or write errors. Publication and recovery remain per
+profile: a later failure can leave earlier profiles imported, with the completed
+count and recovery paths reported. There is no archive-wide transaction or
+crash-recovery promise.
+
+SSH Claude transfers and all metadata-only seeds require guarded sync protocol 1
+on both hosts and stop with an update error if the peer is unavailable or too old;
+there is no unguarded file-copy fallback. Claude replication compares exact token
+pairs or verified account and organization UUIDs before comparing selected-token
+expiry. Unknown or conflicting ownership preserves existing profiles, and all
+identity checks stay offline. Complete profile exchanges hold both managed vault
+locks and recheck source and destination generations through publication.
+Replacing a profile retains its full predecessor, while recovery preserves an
+independently changed login.
+
+Host-local policy creates only missing logical profiles from provider/name,
+operator descriptions and tags. Metadata seeds carry no credentials, account or
+organization IDs, cached proof or arbitrary metadata, and never replace an
+existing profile. Text and JSON sync results report profile and machine errors
+and any retained recovery location: remote for push, local for pull. Errors
+produce a failing exit status. `caam sync add --remote-path` names the remote data
+root; discovery and transfer both use its `vault` subdirectory. These operations
+provide per-profile returned-error recovery, not a transaction across machines
+or a guarantee after a crash.
+
 #### 5.4 Explicit setup tokens for a single shallow launch
 
 For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately

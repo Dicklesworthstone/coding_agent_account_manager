@@ -762,3 +762,28 @@ func TestProfileRef(t *testing.T) {
 		t.Errorf("Profile = %q, want %q", ref.Profile, "test@example.com")
 	}
 }
+func TestClaudeFreshnessUsesSelectedAuthority(t *testing.T) {
+	legacy := []byte(`{"oauthToken":{"expiry":"2099-01-01T00:00:00Z"}}`)
+	for _, test := range []struct {
+		name      string
+		files     map[string][]byte
+		wantError bool
+	}{
+		{"modern unknown", map[string][]byte{".credentials.json": []byte(`{"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic-refresh"}}`), ".claude.json": legacy}, false},
+		{"selected auth", map[string][]byte{"auth.json": []byte(`{"access_token":"synthetic"}`), ".claude.json": legacy}, true},
+		{"malformed selected auth", map[string][]byte{"auth.json": []byte("{"), ".claude.json": legacy}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fresh, err := (&ClaudeFreshnessExtractor{}).Extract("claude", "work", test.files)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("unsupported selected auth borrowed legacy expiry")
+				}
+				return
+			}
+			if err != nil || fresh == nil || !fresh.ExpiresAt.IsZero() {
+				t.Fatalf("modern unknown expiry fell back to legacy: %v", err)
+			}
+		})
+	}
+}

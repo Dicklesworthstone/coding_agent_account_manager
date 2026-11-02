@@ -9,15 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/vaulttransfer"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
@@ -61,31 +60,66 @@ type exportRequest struct {
 }
 
 type exportTarget struct {
-	Tool    string
-	Profile string
-	DirPath string
+	Tool     string
+	Profile  string
+	DirPath  string
+	snapshot *vaulttransfer.Snapshot
 }
 
 type exportFileSpec struct {
-	SrcPath string
-	TarPath string
-	Mode    int64
-	Size    int64
-	ModTime time.Time
+	Snapshot     *vaulttransfer.Snapshot
+	RelativePath string
+	TarPath      string
+	Size         int64
 }
 
 type importOptions struct {
 	Force     bool
 	AsTool    string
 	AsProfile string
+	// The hooks exercise managed lock waits and interrupted publication without
+	// weakening the generation checks used by the production rename path.
+	BeforeLock    func()
+	BeforePublish func(source, destination string)
+	Rename        func(string, string) error
 }
 
 type importTarget struct {
-	Tool      string
-	Profile   string
-	FinalDir  string
-	TempDir   string
-	SeenFiles map[string]struct{}
+	Tool        string
+	Profile     string
+	FinalDir    string
+	TempDir     string
+	Source      *vaulttransfer.Snapshot
+	Destination *vaulttransfer.Snapshot
+}
+
+type importArchiveResult struct {
+	Manifest *vaultExportManifest
+	Profiles []importProfileResult
+}
+
+type importProfileResult struct {
+	Tool         string
+	Profile      string
+	Imported     bool
+	RecoveryPath string
+}
+
+func validateTransferVaultRoot(v *authfile.Vault) error {
+	if v == nil || strings.TrimSpace(v.BasePath()) == "" {
+		return fmt.Errorf("vault not initialized")
+	}
+	info, err := os.Lstat(v.BasePath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect vault directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("vault transfer root is not a real directory")
+	}
+	return nil
 }
 
 func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget, error) {
@@ -124,10 +158,17 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 			}
 			sort.Strings(profiles)
 			for _, profile := range profiles {
+				if authfile.IsSystemProfile(profile) {
+					continue
+				}
+				dir, err := vaulttransfer.ProfilePath(v.BasePath(), tool, profile)
+				if err != nil {
+					return nil, err
+				}
 				targets = append(targets, exportTarget{
 					Tool:    tool,
 					Profile: profile,
-					DirPath: v.ProfilePath(tool, profile),
+					DirPath: dir,
 				})
 			}
 		}
@@ -150,10 +191,17 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 
 		targets := make([]exportTarget, 0, len(profiles))
 		for _, profile := range profiles {
+			if authfile.IsSystemProfile(profile) {
+				continue
+			}
+			dir, err := vaulttransfer.ProfilePath(v.BasePath(), tool, profile)
+			if err != nil {
+				return nil, err
+			}
 			targets = append(targets, exportTarget{
 				Tool:    tool,
 				Profile: profile,
-				DirPath: v.ProfilePath(tool, profile),
+				DirPath: dir,
 			})
 		}
 		return targets, nil
@@ -168,7 +216,10 @@ func resolveExportTargets(v *authfile.Vault, req exportRequest) ([]exportTarget,
 			return nil, fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 		}
 
-		dirPath := v.ProfilePath(tool, profile)
+		dirPath, err := vaulttransfer.ProfilePath(v.BasePath(), tool, profile)
+		if err != nil {
+			return nil, err
+		}
 		if st, err := os.Stat(dirPath); err != nil || !st.IsDir() {
 			if os.IsNotExist(err) {
 				return nil, fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", tool, profile, tool)
@@ -206,52 +257,46 @@ func buildExportManifest(targets []exportTarget) (*vaultExportManifest, []export
 
 	allFiles := make([]exportFileSpec, 0, 8)
 	for _, t := range targets {
+		if err := vaulttransfer.ValidateProfileRef(t.Tool, t.Profile); err != nil {
+			return nil, nil, err
+		}
+		if t.snapshot == nil {
+			return nil, nil, fmt.Errorf("profile %s/%s has not been captured for export", t.Tool, t.Profile)
+		}
 		item := vaultExportItem{
 			Tool:    t.Tool,
 			Profile: t.Profile,
 			Files:   nil,
 		}
 
-		err := filepath.WalkDir(t.DirPath, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
+		for _, entry := range t.snapshot.Entries() {
+			if entry.Dir {
+				continue
 			}
-			if d.IsDir() {
-				return nil
+			rel := filepath.ToSlash(entry.Name)
+			if err := vaulttransfer.ValidateRelativePath(rel); err != nil {
+				return nil, nil, err
 			}
-			if !d.Type().IsRegular() {
-				return fmt.Errorf("unsupported file type in vault: %s", p)
+			if entry.Size > maxFileBytes {
+				return nil, nil, fmt.Errorf("refusing to export unusually large file (%d bytes): %s", entry.Size, rel)
 			}
-
-			rel, err := filepath.Rel(t.DirPath, p)
-			if err != nil {
-				return err
-			}
-			rel = filepath.ToSlash(rel)
-			tarPath := path.Join(strings.TrimSuffix(tarVaultPrefix, "/"), t.Tool, t.Profile, rel)
-
-			hash, size, mode, modTime, err := sha256File(p)
-			if err != nil {
-				return err
-			}
+			tarPath := tarVaultPrefix + t.Tool + "/" + t.Profile + "/" + rel
 
 			item.Files = append(item.Files, vaultExportFile{
 				Path:   tarPath,
-				SHA256: hash,
-				Size:   size,
-				Mode:   int64(mode.Perm()),
+				SHA256: entry.Checksum,
+				Size:   entry.Size,
+				Mode:   0600,
 			})
 			allFiles = append(allFiles, exportFileSpec{
-				SrcPath: p,
-				TarPath: tarPath,
-				Mode:    int64(mode.Perm()),
-				Size:    size,
-				ModTime: modTime,
+				Snapshot:     t.snapshot,
+				RelativePath: rel,
+				TarPath:      tarPath,
+				Size:         entry.Size,
 			})
-			return nil
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("walk profile %s/%s: %w", t.Tool, t.Profile, err)
+		}
+		if len(item.Files) == 0 {
+			return nil, nil, fmt.Errorf("profile %s/%s contains no files", t.Tool, t.Profile)
 		}
 
 		sort.Slice(item.Files, func(i, j int) bool { return item.Files[i].Path < item.Files[j].Path })
@@ -259,6 +304,9 @@ func buildExportManifest(targets []exportTarget) (*vaultExportManifest, []export
 	}
 
 	sort.Slice(allFiles, func(i, j int) bool { return allFiles[i].TarPath < allFiles[j].TarPath })
+	if err := validateExportManifest(manifest); err != nil {
+		return nil, nil, err
+	}
 	return manifest, allFiles, nil
 }
 
@@ -289,31 +337,15 @@ func writeExportArchive(w io.Writer, manifest *vaultExportManifest, files []expo
 	}
 
 	for _, f := range files {
-		if f.Size > maxFileBytes {
-			return fmt.Errorf("refusing to export unusually large file (%d bytes): %s", f.Size, f.SrcPath)
-		}
-
-		src, err := os.Open(f.SrcPath)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", f.SrcPath, err)
-		}
-
-		hdr := &tar.Header{
-			Name:    f.TarPath,
-			Mode:    f.Mode,
-			Size:    f.Size,
-			ModTime: f.ModTime,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			src.Close()
+		if err := tw.WriteHeader(&tar.Header{Name: f.TarPath, Mode: 0600, Size: f.Size, ModTime: manifest.CreatedAt}); err != nil {
 			return fmt.Errorf("write tar header: %w", err)
 		}
-		if _, err := io.Copy(tw, src); err != nil {
-			src.Close()
-			return fmt.Errorf("write tar body: %w", err)
+		exists, err := f.Snapshot.WriteFile(filepath.FromSlash(f.RelativePath), tw)
+		if err != nil {
+			return err
 		}
-		if err := src.Close(); err != nil {
-			return fmt.Errorf("close %s: %w", f.SrcPath, err)
+		if !exists {
+			return fmt.Errorf("captured export file disappeared: %s", f.TarPath)
 		}
 	}
 
@@ -358,51 +390,86 @@ func readAndValidateManifest(tr *tar.Reader) (*vaultExportManifest, error) {
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
-	if manifest.FormatVersion != exportFormatVersion {
-		return nil, fmt.Errorf("unsupported export format version: %d", manifest.FormatVersion)
+	if err := validateExportManifest(&manifest); err != nil {
+		return nil, err
 	}
-	if len(manifest.Items) == 0 {
-		return nil, fmt.Errorf("manifest contains no items")
-	}
-
-	seen := make(map[string]struct{})
-	for _, item := range manifest.Items {
-		if err := validateVaultSegment("tool", item.Tool); err != nil {
-			return nil, err
-		}
-		if _, ok := tools[item.Tool]; !ok {
-			return nil, fmt.Errorf("unsupported tool in archive: %s", item.Tool)
-		}
-		if err := validateVaultSegment("profile", item.Profile); err != nil {
-			return nil, err
-		}
-		key := item.Tool + "/" + item.Profile
-		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("duplicate item in manifest: %s", key)
-		}
-		seen[key] = struct{}{}
-		if len(item.Files) == 0 {
-			return nil, fmt.Errorf("manifest item has no files: %s", key)
-		}
-		for _, f := range item.Files {
-			if !strings.HasPrefix(f.Path, strings.TrimSuffix(tarVaultPrefix, "/")+"/") {
-				return nil, fmt.Errorf("invalid file path in manifest: %s", f.Path)
-			}
-			if f.SHA256 == "" {
-				return nil, fmt.Errorf("missing sha256 for %s", f.Path)
-			}
-		}
-	}
-
 	return &manifest, nil
 }
 
-func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*vaultExportManifest, error) {
+func validateExportManifest(manifest *vaultExportManifest) error {
+	if manifest.FormatVersion != exportFormatVersion {
+		return fmt.Errorf("unsupported export format version: %d", manifest.FormatVersion)
+	}
+	if len(manifest.Items) == 0 {
+		return fmt.Errorf("manifest contains no items")
+	}
+
+	seen := make(map[string]struct{})
+	seenFiles := make(map[string]struct{})
+	portablePaths := make(map[string]string)
+	for _, item := range manifest.Items {
+		if err := vaulttransfer.ValidateProfileRef(item.Tool, item.Profile); err != nil {
+			return err
+		}
+		if _, ok := tools[item.Tool]; !ok {
+			return fmt.Errorf("unsupported tool in archive: %s", item.Tool)
+		}
+		key := item.Tool + "/" + item.Profile
+		if _, ok := seen[strings.ToLower(key)]; ok {
+			return fmt.Errorf("duplicate item in manifest: %s", key)
+		}
+		seen[strings.ToLower(key)] = struct{}{}
+		if len(item.Files) == 0 {
+			return fmt.Errorf("manifest item has no files: %s", key)
+		}
+		for _, f := range item.Files {
+			tool, profile, _, err := splitVaultTarPath(f.Path)
+			if err != nil {
+				return err
+			}
+			if tool != item.Tool || profile != item.Profile {
+				return fmt.Errorf("manifest file %s does not belong to %s", f.Path, key)
+			}
+			fileKey := strings.ToLower(f.Path)
+			if _, exists := seenFiles[fileKey]; exists {
+				return fmt.Errorf("duplicate file in manifest: %s", f.Path)
+			}
+			seenFiles[fileKey] = struct{}{}
+			parts := strings.Split(f.Path, "/")
+			for i := range parts {
+				prefix := strings.Join(parts[:i+1], "/")
+				lower := strings.ToLower(prefix)
+				if previous, exists := portablePaths[lower]; exists && previous != prefix {
+					return fmt.Errorf("case-conflicting archive paths: %s and %s", previous, prefix)
+				}
+				portablePaths[lower] = prefix
+			}
+			digest, err := hex.DecodeString(f.SHA256)
+			if err != nil || len(digest) != sha256.Size {
+				return fmt.Errorf("invalid sha256 for %s", f.Path)
+			}
+			if f.Size < 0 || f.Size > maxFileBytes {
+				return fmt.Errorf("file size out of bounds for %s: %d", f.Path, f.Size)
+			}
+		}
+	}
+	for file := range seenFiles {
+		parts := strings.Split(file, "/")
+		for i := 1; i < len(parts); i++ {
+			if _, exists := seenFiles[strings.Join(parts[:i], "/")]; exists {
+				return fmt.Errorf("archive file is also used as a directory: %s", file)
+			}
+		}
+	}
+	return nil
+}
+
+func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*importArchiveResult, error) {
 	if r == nil {
 		return nil, fmt.Errorf("reader is nil")
 	}
-	if v == nil {
-		return nil, fmt.Errorf("vault not initialized")
+	if err := validateTransferVaultRoot(v); err != nil {
+		return nil, err
 	}
 
 	gr, err := gzip.NewReader(r)
@@ -417,9 +484,6 @@ func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*vaultExp
 		return nil, err
 	}
 
-	renameFrom := ""
-	renameToTool := ""
-	renameToProfile := ""
 	if opt.AsTool != "" || opt.AsProfile != "" {
 		if opt.AsTool == "" || opt.AsProfile == "" {
 			return nil, fmt.Errorf("--as must include both tool and profile")
@@ -427,63 +491,51 @@ func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*vaultExp
 		if len(manifest.Items) != 1 {
 			return nil, fmt.Errorf("--as requires an archive containing exactly one profile")
 		}
-		if err := validateVaultSegment("tool", opt.AsTool); err != nil {
+		if err := vaulttransfer.ValidateProfileRef(opt.AsTool, opt.AsProfile); err != nil {
 			return nil, err
 		}
 		if _, ok := tools[opt.AsTool]; !ok {
 			return nil, fmt.Errorf("unknown tool: %s (supported: %s)", opt.AsTool, supportedToolsList())
 		}
-		if err := validateVaultSegment("profile", opt.AsProfile); err != nil {
-			return nil, err
+		if opt.AsTool != manifest.Items[0].Tool {
+			return nil, fmt.Errorf("--as cannot change a profile's provider")
 		}
-		renameFrom = manifest.Items[0].Tool + "/" + manifest.Items[0].Profile
-		renameToTool = opt.AsTool
-		renameToProfile = opt.AsProfile
 	}
 
+	// Extraction remains outside the routable vault. No destination is changed
+	// until every payload and every incoming Claude binding has been checked.
+	stage, err := os.MkdirTemp("", "caam-tar-import-")
+	if err != nil {
+		return nil, fmt.Errorf("create private import directory: %w", err)
+	}
+	defer os.RemoveAll(stage)
+	result := &importArchiveResult{Manifest: manifest}
 	expected := make(map[string]vaultExportFile, 16)
 	targets := make(map[string]*importTarget)
+	ordered := make([]*importTarget, 0, len(manifest.Items))
 	for _, item := range manifest.Items {
 		origKey := item.Tool + "/" + item.Profile
 		targetTool := item.Tool
 		targetProfile := item.Profile
-		if renameFrom != "" && origKey == renameFrom {
-			targetTool = renameToTool
-			targetProfile = renameToProfile
+		if opt.AsTool != "" {
+			targetTool = opt.AsTool
+			targetProfile = opt.AsProfile
 		}
-
-		finalDir := v.ProfilePath(targetTool, targetProfile)
-		if st, err := os.Stat(finalDir); err == nil && st.IsDir() {
-			if !opt.Force {
-				return nil, fmt.Errorf("profile already exists: %s/%s (use --force or --as)", targetTool, targetProfile)
-			}
-		} else if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("stat %s/%s: %w", targetTool, targetProfile, err)
+		target := &importTarget{
+			Tool:    targetTool,
+			Profile: targetProfile,
+			TempDir: filepath.Join(stage, item.Tool, item.Profile),
 		}
-
-		tk := targetTool + "/" + targetProfile
-		if _, ok := targets[tk]; !ok {
-			targets[tk] = &importTarget{
-				Tool:      targetTool,
-				Profile:   targetProfile,
-				FinalDir:  finalDir,
-				TempDir:   "",
-				SeenFiles: make(map[string]struct{}),
-			}
-		}
-
+		targets[origKey] = target
+		ordered = append(ordered, target)
 		for _, f := range item.Files {
 			expected[f.Path] = f
 		}
 	}
 
-	cleanup := func() {
-		for _, t := range targets {
-			if t.TempDir != "" {
-				_ = os.RemoveAll(t.TempDir)
-			}
-		}
-	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i].Tool+"/"+ordered[i].Profile < ordered[j].Tool+"/"+ordered[j].Profile
+	})
 
 	extracted := make(map[string]struct{}, len(expected))
 	for {
@@ -492,129 +544,138 @@ func importArchive(r io.Reader, v *authfile.Vault, opt importOptions) (*vaultExp
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			cleanup()
 			return nil, fmt.Errorf("read tar header: %w", err)
 		}
 
 		name, err := cleanTarName(hdr.Name)
 		if err != nil {
-			cleanup()
 			return nil, err
 		}
 
 		if name == exportManifestName {
-			cleanup()
 			return nil, fmt.Errorf("duplicate manifest entry")
 		}
 		if !strings.HasPrefix(name, strings.TrimSuffix(tarVaultPrefix, "/")+"/") {
-			cleanup()
 			return nil, fmt.Errorf("unexpected entry in archive: %s", name)
 		}
-
-		if hdr.Typeflag == tar.TypeDir {
-			continue
-		}
 		if hdr.Typeflag != tar.TypeReg {
-			cleanup()
 			return nil, fmt.Errorf("unsupported tar entry type for %s", name)
 		}
 		if hdr.Size < 0 || hdr.Size > maxFileBytes {
-			cleanup()
 			return nil, fmt.Errorf("file size out of bounds for %s: %d", name, hdr.Size)
 		}
 
 		exp, ok := expected[name]
 		if !ok {
-			cleanup()
 			return nil, fmt.Errorf("unexpected file in archive: %s", name)
+		}
+		if _, duplicate := extracted[name]; duplicate {
+			return nil, fmt.Errorf("duplicate file in archive: %s", name)
+		}
+		if hdr.Size != exp.Size {
+			return nil, fmt.Errorf("archive size does not match manifest for %s", name)
 		}
 
 		origTool, origProfile, rel, err := splitVaultTarPath(name)
 		if err != nil {
-			cleanup()
 			return nil, err
 		}
-
-		targetTool := origTool
-		targetProfile := origProfile
-		if renameFrom != "" && (origTool+"/"+origProfile) == renameFrom {
-			targetTool = renameToTool
-			targetProfile = renameToProfile
-		}
-
-		tk := targetTool + "/" + targetProfile
-		tgt := targets[tk]
+		tgt := targets[origTool+"/"+origProfile]
 		if tgt == nil {
-			cleanup()
-			return nil, fmt.Errorf("no target mapping for %s/%s", targetTool, targetProfile)
-		}
-
-		if tgt.TempDir == "" {
-			toolDir := filepath.Join(v.BasePath(), targetTool)
-			if err := os.MkdirAll(toolDir, 0700); err != nil {
-				cleanup()
-				return nil, fmt.Errorf("create tool dir: %w", err)
-			}
-			tmpDir, err := os.MkdirTemp(toolDir, ".import_tmp_"+targetProfile+"_")
-			if err != nil {
-				cleanup()
-				return nil, fmt.Errorf("create temp dir: %w", err)
-			}
-			tgt.TempDir = tmpDir
+			return nil, fmt.Errorf("no target mapping for %s/%s", origTool, origProfile)
 		}
 
 		destPath, err := safeJoinPath(tgt.TempDir, filepath.FromSlash(rel))
 		if err != nil {
-			cleanup()
 			return nil, err
 		}
 
 		if err := os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
-			cleanup()
 			return nil, fmt.Errorf("create dir: %w", err)
 		}
 
 		hash, err := writeFileAtomicWithHash(destPath, tr, hdr.Size, 0600)
 		if err != nil {
-			cleanup()
 			return nil, fmt.Errorf("write %s: %w", destPath, err)
 		}
-		if hash != exp.SHA256 {
-			cleanup()
+		if !strings.EqualFold(hash, exp.SHA256) {
 			return nil, fmt.Errorf("checksum mismatch for %s", name)
 		}
 
 		extracted[name] = struct{}{}
-		tgt.SeenFiles[name] = struct{}{}
 	}
 
 	if len(extracted) != len(expected) {
-		cleanup()
 		return nil, fmt.Errorf("archive incomplete: extracted %d/%d files", len(extracted), len(expected))
 	}
-
-	// Promote temp dirs to final location atomically per profile.
-	for _, tgt := range targets {
-		if tgt.TempDir == "" {
-			continue
-		}
-
-		if opt.Force {
-			_ = os.RemoveAll(tgt.FinalDir)
-		}
-		if err := os.MkdirAll(filepath.Dir(tgt.FinalDir), 0700); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("create final parent dir: %w", err)
-		}
-		if err := os.Rename(tgt.TempDir, tgt.FinalDir); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("finalize %s/%s: %w", tgt.Tool, tgt.Profile, err)
-		}
-		tgt.TempDir = ""
+	// tar.Reader reaches EOF at its terminator, before gzip necessarily verifies
+	// its checksum. Drain the stream before any destination publication.
+	if _, err := io.Copy(io.Discard, gr); err != nil {
+		return nil, fmt.Errorf("validate gzip stream: %w", err)
 	}
-
-	cleanup()
-	return manifest, nil
+	for i, target := range ordered {
+		captured, err := vaulttransfer.Capture(target.TempDir)
+		if err != nil {
+			return result, err
+		}
+		// Normalize every profile before touching the destination vault. A later
+		// malformed settings file must not leave earlier items already installed.
+		preparedPath := filepath.Join(stage, ".prepared", fmt.Sprintf("profile-%d", i))
+		target.Source, err = vaulttransfer.Prepare(captured, preparedPath, target.Tool)
+		if err != nil {
+			return result, fmt.Errorf("invalid incoming profile %s/%s: %w", target.Tool, target.Profile, err)
+		}
+	}
+	if opt.BeforeLock != nil {
+		opt.BeforeLock()
+	}
+	err = v.WithMutationLock(func() error {
+		// Capture destinations only after waiting for the managed vault lock.
+		// All conflicts are preflighted, so --force is always an explicit choice.
+		for _, target := range ordered {
+			target.FinalDir, err = vaulttransfer.ProfilePath(v.BasePath(), target.Tool, target.Profile)
+			if err != nil {
+				return err
+			}
+			target.Destination, err = vaulttransfer.Capture(target.FinalDir)
+			if err != nil {
+				return err
+			}
+			if target.Destination.Exists() && !opt.Force {
+				return fmt.Errorf("profile already exists: %s/%s (use --force or --as)", target.Tool, target.Profile)
+			}
+		}
+		checkSources := func() error {
+			for _, target := range ordered {
+				if _, err := vaulttransfer.ProfilePath(v.BasePath(), target.Tool, target.Profile); err != nil {
+					return err
+				}
+				if err := target.Source.Check(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, target := range ordered {
+			recovery, publishErr := vaulttransfer.Publish(target.Source, target.Destination, &vaulttransfer.Options{
+				Provider:      target.Tool,
+				BeforePublish: opt.BeforePublish,
+				Rename:        opt.Rename,
+				CheckSource:   checkSources,
+			})
+			result.Profiles = append(result.Profiles, importProfileResult{
+				Tool:         target.Tool,
+				Profile:      target.Profile,
+				Imported:     publishErr == nil,
+				RecoveryPath: recovery,
+			})
+			if publishErr != nil {
+				return fmt.Errorf("publish %s/%s: %w", target.Tool, target.Profile, publishErr)
+			}
+		}
+		return nil
+	})
+	return result, err
 }
 
 func splitVaultTarPath(name string) (tool, profile, rel string, err error) {
@@ -633,10 +694,7 @@ func splitVaultTarPath(name string) (tool, profile, rel string, err error) {
 
 	tool = parts[1]
 	profile = parts[2]
-	if err := validateVaultSegment("tool", tool); err != nil {
-		return "", "", "", err
-	}
-	if err := validateVaultSegment("profile", profile); err != nil {
+	if err := vaulttransfer.ValidateProfileRef(tool, profile); err != nil {
 		return "", "", "", err
 	}
 
@@ -647,55 +705,19 @@ func splitVaultTarPath(name string) (tool, profile, rel string, err error) {
 	return tool, profile, rel, nil
 }
 
-func validateVaultSegment(kind, val string) error {
-	val = strings.TrimSpace(val)
-	if val == "" {
-		return fmt.Errorf("%s cannot be empty", kind)
-	}
-	if val == "." || val == ".." {
-		return fmt.Errorf("invalid %s: %q", kind, val)
-	}
-	if strings.ContainsAny(val, "/\\") {
-		return fmt.Errorf("invalid %s: %q", kind, val)
-	}
-	return nil
-}
-
 func cleanTarName(name string) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("empty tar entry name")
+	if err := vaulttransfer.ValidateRelativePath(name); err != nil {
+		return "", fmt.Errorf("invalid tar entry name: %w", err)
 	}
-	if strings.ContainsRune(name, 0) {
-		return "", fmt.Errorf("invalid tar entry name")
-	}
-	if strings.HasPrefix(name, "/") {
-		return "", fmt.Errorf("absolute tar entry not allowed: %s", name)
-	}
-	if strings.Contains(name, "\\") {
-		return "", fmt.Errorf("invalid tar entry name: %s", name)
-	}
-	segments := strings.Split(name, "/")
-	for _, s := range segments {
-		if s == ".." {
-			return "", fmt.Errorf("path traversal in tar entry: %s", name)
-		}
-	}
-	clean := path.Clean(name)
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
-		return "", fmt.Errorf("invalid tar entry name: %s", name)
-	}
-	return clean, nil
+	return name, nil
 }
 
 func safeJoinPath(root, rel string) (string, error) {
 	if root == "" {
 		return "", fmt.Errorf("root path is empty")
 	}
-	if rel == "" {
-		return "", fmt.Errorf("relative path is empty")
-	}
-	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("absolute paths not allowed: %s", rel)
+	if err := vaulttransfer.ValidateRelativePath(filepath.ToSlash(rel)); err != nil {
+		return "", err
 	}
 
 	cleanRel := filepath.Clean(rel)
@@ -735,28 +757,6 @@ func writeTarBytes(tw *tar.Writer, name string, mode int64, modTime time.Time, d
 	return nil
 }
 
-func sha256File(p string) (hash string, size int64, mode fs.FileMode, modTime time.Time, err error) {
-	st, err := os.Stat(p)
-	if err != nil {
-		return "", 0, 0, time.Time{}, err
-	}
-	if !st.Mode().IsRegular() {
-		return "", 0, 0, time.Time{}, fmt.Errorf("not a regular file: %s", p)
-	}
-
-	f, err := os.Open(p)
-	if err != nil {
-		return "", 0, 0, time.Time{}, err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", 0, 0, time.Time{}, err
-	}
-	return hex.EncodeToString(h.Sum(nil)), st.Size(), st.Mode(), st.ModTime(), nil
-}
-
 func writeFileAtomicWithHash(dst string, r io.Reader, size int64, mode os.FileMode) (string, error) {
 	if size < 0 || size > maxFileBytes {
 		return "", fmt.Errorf("invalid size: %d", size)
@@ -765,9 +765,14 @@ func writeFileAtomicWithHash(dst string, r io.Reader, size int64, mode os.FileMo
 		return "", fmt.Errorf("destination path is empty")
 	}
 
-	tmp := dst + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	f, err := os.CreateTemp(filepath.Dir(dst), ".caam-tar-file-")
 	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
 		return "", err
 	}
 

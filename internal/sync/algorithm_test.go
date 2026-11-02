@@ -94,6 +94,30 @@ func TestDefaultSyncerConfig(t *testing.T) {
 	}
 }
 
+func TestSyncerRemoteVaultForMachine(t *testing.T) {
+	syncer := &Syncer{remoteVaultPath: ".custom-default/vault"}
+	for _, test := range []struct {
+		name    string
+		machine *Machine
+		want    string
+	}{
+		{"no machine", nil, ".custom-default/vault"},
+		{"empty", &Machine{}, ".custom-default/vault"},
+		{"blank", &Machine{RemotePath: " \t"}, ".custom-default/vault"},
+		{"absolute", &Machine{RemotePath: "/data/caam"}, "/data/caam/vault"},
+		{"relative", &Machine{RemotePath: ".custom-caam/"}, ".custom-caam/vault"},
+		{"home relative", &Machine{RemotePath: "~/.custom-caam"}, ".custom-caam/vault"},
+		{"home", &Machine{RemotePath: "~"}, "vault"},
+		{"spaces", &Machine{RemotePath: "/data/custom caam "}, "/data/custom caam /vault"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := syncer.remoteVaultForMachine(test.machine); got != test.want {
+				t.Fatalf("resolved vault %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 // TestMergeProfileLists tests the mergeProfileLists function.
 func TestMergeProfileLists(t *testing.T) {
 	tests := []struct {
@@ -306,13 +330,13 @@ func TestSyncRejectsPrivateRecoveryBeforeReadingCredentials(t *testing.T) {
 			if _, err := syncer.getLocalFreshness(ref); err == nil {
 				t.Fatal("local credential lookup accepted private recovery")
 			}
-			if _, err := syncer.getRemoteFreshness(nil, ref); err == nil {
+			if _, err := syncer.getRemoteFreshness(nil, nil, ref); err == nil {
 				t.Fatal("remote credential lookup accepted private recovery")
 			}
-			if err := syncer.pushProfile(nil, ref.Provider, ref.Profile, false); err == nil {
+			if err := syncer.pushProfile(nil, nil, ref.Provider, ref.Profile, false); err == nil {
 				t.Fatal("push accepted private recovery")
 			}
-			if err := syncer.pullProfile(nil, ref.Provider, ref.Profile, false); err == nil {
+			if err := syncer.pullProfile(nil, nil, ref.Provider, ref.Profile, false); err == nil {
 				t.Fatal("pull accepted private recovery")
 			}
 		})

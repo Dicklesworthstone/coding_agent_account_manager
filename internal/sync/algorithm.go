@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -75,6 +77,10 @@ type SyncResult struct {
 
 	// Error is any error that occurred.
 	Error error
+
+	// RecoveryPath is a complete previous profile, remote for push and local
+	// for pull. It may be present after either success or interrupted publication.
+	RecoveryPath string
 }
 
 // ProgressStage identifies the phase a ProgressEvent describes.
@@ -129,6 +135,9 @@ type Syncer struct {
 
 	// Progress, when non-nil, receives streaming updates during sync.
 	Progress ProgressFunc
+
+	// peerDial permits testing the production protocol over helper subprocesses.
+	peerDial func(context.Context, *SSHClient) (io.ReadWriteCloser, error)
 }
 
 // SyncerConfig configures a Syncer instance.
@@ -195,6 +204,21 @@ func (s *Syncer) Close() error {
 	return s.state.Save()
 }
 
+// remoteVaultForMachine applies the machine's CAAM data root to both SFTP
+// discovery and the guarded peer protocol. The global fallback is unchanged.
+func (s *Syncer) remoteVaultForMachine(machine *Machine) string {
+	if machine == nil || strings.TrimSpace(machine.RemotePath) == "" {
+		return s.remoteVaultPath
+	}
+	dataRoot := machine.RemotePath
+	if dataRoot == "~" {
+		dataRoot = "."
+	} else {
+		dataRoot = strings.TrimPrefix(dataRoot, "~/")
+	}
+	return path.Join(dataRoot, "vault")
+}
+
 // SyncWithMachine synchronizes all profiles with a single machine.
 func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult, error) {
 	return s.SyncWithMachineFiltered(ctx, m, "", "")
@@ -222,7 +246,7 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 	}
 
 	// 3. Get remote profiles
-	remoteProfiles, err := s.listRemoteProfiles(client)
+	remoteProfiles, err := s.listRemoteProfiles(client, m)
 	if err != nil {
 		return nil, fmt.Errorf("list remote profiles: %w", err)
 	}
@@ -242,7 +266,7 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 
 		s.emit(ProgressEvent{Stage: StageCompare, Machine: m, Index: i + 1, Total: len(allProfiles), Profile: p})
 
-		op, err := s.determineSyncOperation(client, m, p)
+		result, err := s.syncProfileOperation(ctx, client, m, p)
 		if err != nil {
 			// Log error but continue with other profiles
 			failed := &SyncResult{
@@ -260,11 +284,12 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 			continue
 		}
 
-		if op == nil || (op.Direction == SyncSkip && op.Note == "") {
+		op := result.Operation
+		if op == nil || (op.Direction == SyncSkip && op.Note == "" && result.Success) {
 			continue // Already in sync
 		}
 
-		if op.Direction == SyncSkip {
+		if op.Direction == SyncSkip && result.Success {
 			// Policy-informational skip (e.g. host-local divergence):
 			// surface it to the user, but it is not a transfer — no
 			// history entry, no queue interaction.
@@ -274,7 +299,6 @@ func (s *Syncer) SyncWithMachineFiltered(ctx context.Context, m *Machine, provid
 			continue
 		}
 
-		result := s.executeOperation(client, op)
 		results = append(results, result)
 		s.emit(ProgressEvent{Stage: StageResult, Machine: m, Profile: p, Result: result})
 
@@ -411,7 +435,7 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 	}
 
 	p := ProfileRef{Provider: provider, Profile: profile}
-	op, err := s.determineSyncOperation(client, m, p)
+	result, err := s.syncProfileOperation(ctx, client, m, p)
 	if err != nil {
 		return &SyncResult{
 			Operation: &SyncOperation{
@@ -425,19 +449,10 @@ func (s *Syncer) SyncProfileWithMachine(ctx context.Context, provider, profile s
 		}, nil
 	}
 
-	if op == nil || op.Direction == SyncSkip {
-		return &SyncResult{
-			Operation: &SyncOperation{
-				Provider:  provider,
-				Profile:   profile,
-				Direction: SyncSkip,
-				Machine:   m,
-			},
-			Success: true,
-		}, nil
+	op := result.Operation
+	if op == nil || (op.Direction == SyncSkip && result.Success) {
+		return result, nil
 	}
-
-	result := s.executeOperation(client, op)
 
 	// Record in history
 	s.state.AddToHistory(HistoryEntry{
@@ -496,7 +511,7 @@ func (s *Syncer) SyncProfile(ctx context.Context, provider, profile string) ([]*
 		}
 
 		p := ProfileRef{Provider: provider, Profile: profile}
-		op, err := s.determineSyncOperation(client, m, p)
+		result, err := s.syncProfileOperation(ctx, client, m, p)
 		if err != nil {
 			allResults = append(allResults, &SyncResult{
 				Operation: &SyncOperation{
@@ -511,12 +526,14 @@ func (s *Syncer) SyncProfile(ctx context.Context, provider, profile string) ([]*
 			continue
 		}
 
-		if op == nil || op.Direction == SyncSkip {
+		op := result.Operation
+		if op == nil || (op.Direction == SyncSkip && result.Success && op.Note == "") {
 			continue
 		}
-
-		result := s.executeOperation(client, op)
 		allResults = append(allResults, result)
+		if op.Direction == SyncSkip && result.Success {
+			continue
+		}
 
 		// Record in history
 		s.state.AddToHistory(HistoryEntry{
@@ -569,7 +586,33 @@ func (s *Syncer) SyncAll(ctx context.Context) ([]*SyncResult, error) {
 	return allResults, nil
 }
 
-// determineSyncOperation determines what sync operation is needed for a profile.
+// syncProfileOperation chooses the guarded transfer before planning reads.
+func (s *Syncer) syncProfileOperation(ctx context.Context, client *SSHClient, m *Machine, p ProfileRef) (*SyncResult, error) {
+	if err := validateSyncProfileRef(p); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A timed-out peer retires the connection while this loop may still hold
+	// its old client. Reacquire before either peer or legacy SFTP work.
+	if s.pool != nil && (client == nil || !client.IsConnected()) {
+		var err error
+		client, err = s.pool.Get(m)
+		if err != nil {
+			return nil, fmt.Errorf("reconnect sync peer: %w", err)
+		}
+	}
+	if p.Provider == "claude" || s.policy.ModeFor(p.Provider, p.Profile) == ModeHostLocal {
+		return s.syncGuardedProfile(ctx, client, m, p)
+	}
+	op, err := s.determineSyncOperation(client, m, p)
+	if err != nil {
+		return nil, err
+	}
+	return s.executeOperation(client, op), nil
+}
+
 func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p ProfileRef) (*SyncOperation, error) {
 	if err := validateSyncProfileRef(p); err != nil {
 		return nil, err
@@ -580,7 +623,7 @@ func (s *Syncer) determineSyncOperation(client *SSHClient, m *Machine, p Profile
 	}
 
 	localFresh, localErr := s.getLocalFreshness(p)
-	remoteFresh, remoteErr := s.getRemoteFreshness(client, p)
+	remoteFresh, remoteErr := s.getRemoteFreshness(client, m, p)
 
 	// Check if errors are "not found" vs other errors
 	localNotFound := localErr != nil && os.IsNotExist(localErr)
@@ -673,7 +716,7 @@ func (s *Syncer) determineHostLocalOperation(client *SSHClient, m *Machine, p Pr
 		return nil, fmt.Errorf("local error: %v", err)
 	}
 
-	remotePath := posixJoin(s.remoteVaultPath, p.Provider, p.Profile)
+	remotePath := posixJoin(s.remoteVaultForMachine(m), p.Provider, p.Profile)
 	remoteExists, err := client.FileExists(remotePath)
 	if err != nil {
 		return nil, fmt.Errorf("remote error: %v", err)
@@ -687,7 +730,7 @@ func (s *Syncer) determineHostLocalOperation(client *SSHClient, m *Machine, p Pr
 		localFresh, _ = s.getLocalFreshness(p)
 	}
 	if remoteExists {
-		remoteFresh, _ = s.getRemoteFreshness(client, p)
+		remoteFresh, _ = s.getRemoteFreshness(client, m, p)
 	}
 
 	op = applyHostLocalDecision(op, localExists, remoteExists, localFresh, remoteFresh, authfile.IsSystemProfile(p.Profile))
@@ -734,12 +777,12 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 
 	switch op.Direction {
 	case SyncPush:
-		err := s.pushProfile(client, op.Provider, op.Profile, op.PayloadExcluded)
+		err := s.pushProfile(client, op.Machine, op.Provider, op.Profile, op.PayloadExcluded)
 		result.Error = err
 		result.Success = err == nil
 
 	case SyncPull:
-		err := s.pullProfile(client, op.Provider, op.Profile, op.PayloadExcluded)
+		err := s.pullProfile(client, op.Machine, op.Provider, op.Profile, op.PayloadExcluded)
 		result.Error = err
 		result.Success = err == nil
 
@@ -751,27 +794,23 @@ func (s *Syncer) executeOperation(client *SSHClient, op *SyncOperation) *SyncRes
 	return result
 }
 
-// pushProfile pushes a local profile to the remote machine. With
-// metadataOnly (host-local policy), only allowlisted metadata files are
-// written; credential payload never leaves this machine.
-func (s *Syncer) pushProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
+// pushProfile retains SFTP replication for other providers. Claude and every
+// metadata-only seed must use the guarded peer protocol.
+func (s *Syncer) pushProfile(client *SSHClient, machine *Machine, provider, profile string, metadataOnly bool) error {
 	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
 		return err
 	}
+	if provider == "claude" || metadataOnly {
+		return errPeerUnavailable
+	}
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
-	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
+	remotePath := posixJoin(s.remoteVaultForMachine(machine), provider, profile)
 
 	// Read local files
 	files, err := s.readLocalProfileFiles(localPath)
 	if err != nil {
 		return fmt.Errorf("read local files: %w", err)
-	}
-	if metadataOnly {
-		files = filterMetadataFiles(files)
-		if len(files) == 0 {
-			return nil // nothing safe to transfer; not an error
-		}
 	}
 
 	// Write to remote
@@ -785,34 +824,23 @@ func (s *Syncer) pushProfile(client *SSHClient, provider, profile string, metada
 	return nil
 }
 
-// pullProfile pulls a remote profile to the local machine. With
-// metadataOnly (host-local policy), only allowlisted metadata files are
-// fetched; the remote credential payload is never copied here.
-func (s *Syncer) pullProfile(client *SSHClient, provider, profile string, metadataOnly bool) error {
+// pullProfile retains SFTP replication for other providers. Claude and every
+// metadata-only seed must use the guarded peer protocol.
+func (s *Syncer) pullProfile(client *SSHClient, machine *Machine, provider, profile string, metadataOnly bool) error {
 	if err := validateSyncProfileRef(ProfileRef{Provider: provider, Profile: profile}); err != nil {
 		return err
 	}
+	if provider == "claude" || metadataOnly {
+		return errPeerUnavailable
+	}
 	localPath := filepath.Join(s.vaultPath, provider, profile)
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
-	remotePath := posixJoin(s.remoteVaultPath, provider, profile)
+	remotePath := posixJoin(s.remoteVaultForMachine(machine), provider, profile)
 
 	// List remote files
 	remoteFiles, err := client.ListDir(remotePath)
 	if err != nil {
 		return fmt.Errorf("list remote files: %w", err)
-	}
-
-	if metadataOnly {
-		filtered := remoteFiles[:0:0]
-		for _, fi := range remoteFiles {
-			if !fi.IsDir() && isMetadataFile(fi.Name()) {
-				filtered = append(filtered, fi)
-			}
-		}
-		remoteFiles = filtered
-		if len(remoteFiles) == 0 {
-			return nil // no metadata to seed; avoid creating an empty stub dir
-		}
 	}
 
 	// Ensure local directory exists
@@ -952,12 +980,12 @@ func (s *Syncer) getLocalFreshness(p ProfileRef) (*TokenFreshness, error) {
 }
 
 // getRemoteFreshness gets the freshness of a remote profile.
-func (s *Syncer) getRemoteFreshness(client *SSHClient, p ProfileRef) (*TokenFreshness, error) {
+func (s *Syncer) getRemoteFreshness(client *SSHClient, machine *Machine, p ProfileRef) (*TokenFreshness, error) {
 	if err := validateSyncProfileRef(p); err != nil {
 		return nil, err
 	}
 	// Use posixJoin for remote paths since SFTP always uses forward slashes
-	remotePath := posixJoin(s.remoteVaultPath, p.Provider, p.Profile)
+	remotePath := posixJoin(s.remoteVaultForMachine(machine), p.Provider, p.Profile)
 
 	// Check if remote directory exists
 	exists, err := client.FileExists(remotePath)
@@ -1034,14 +1062,14 @@ func (s *Syncer) listLocalProfiles() ([]ProfileRef, error) {
 }
 
 // listRemoteProfiles lists all profiles in the remote vault.
-func (s *Syncer) listRemoteProfiles(client *SSHClient) ([]ProfileRef, error) {
+func (s *Syncer) listRemoteProfiles(client *SSHClient, machine *Machine) ([]ProfileRef, error) {
 	var profiles []ProfileRef
 
 	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
 
 	for _, provider := range providers {
 		// Use posixJoin for remote paths since SFTP always uses forward slashes
-		providerPath := posixJoin(s.remoteVaultPath, provider)
+		providerPath := posixJoin(s.remoteVaultForMachine(machine), provider)
 
 		entries, err := client.ListDir(providerPath)
 		if err != nil {

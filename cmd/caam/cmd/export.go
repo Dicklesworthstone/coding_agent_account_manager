@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"io"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -21,7 +19,9 @@ This is the recommended way to set up profiles on headless servers:
 4. Import on server: caam import profile.tar.gz
 5. Activate: caam activate codex work
 
-The exported file contains only the auth credentials, not session state.`,
+The archive contains each selected saved profile, including its credential-bound
+identity and associated saved settings. Claude identity checks stay offline.
+System and private recovery profiles are excluded from bulk exports.`,
 	Args: cobra.RangeArgs(0, 2),
 	RunE: runExport,
 }
@@ -55,40 +55,23 @@ func runExport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("usage: caam export <tool/profile> or caam export <tool> <profile> or caam export --all [tool]")
 	}
 
-	targets, err := resolveExportTargets(vault, req)
-	if err != nil {
-		return err
-	}
-	manifest, files, err := buildExportManifest(targets)
+	prepared, err := prepareExportArchive(vault, req, exportOptions{})
 	if err != nil {
 		return err
 	}
 
-	var (
-		w     io.Writer
-		close func() error
-	)
+	defer prepared.Close()
 	if outPath != "" {
-		f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			return fmt.Errorf("open output file: %w", err)
+		if err := writeExportFile(prepared, vault.BasePath(), outPath); err != nil {
+			return err
 		}
-		w = f
-		close = f.Close
 	} else {
-		w = cmd.OutOrStdout()
-		close = func() error { return nil }
+		if err := prepared.copyTo(cmd.OutOrStdout()); err != nil {
+			return err
+		}
 	}
 
-	if err := writeExportArchive(w, manifest, files); err != nil {
-		_ = close()
-		return err
-	}
-	if err := close(); err != nil {
-		return fmt.Errorf("close output: %w", err)
-	}
-
-	fmt.Fprintf(cmd.ErrOrStderr(), "Exported %d profile(s)\n", len(targets))
+	fmt.Fprintf(cmd.ErrOrStderr(), "Exported %d profile(s)\n", len(prepared.Manifest.Items))
 	if outPath != "" {
 		fmt.Fprintf(cmd.ErrOrStderr(), "  Output: %s\n", outPath)
 	} else {

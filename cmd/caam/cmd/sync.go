@@ -258,12 +258,37 @@ func loadSyncState() (*sync.SyncState, error) {
 
 // runSync performs a sync with all or specific machines.
 func runSync(cmd *cobra.Command, args []string) error {
+	return runSyncWithRunner(cmd, args, func(progress sync.ProgressFunc) (syncCommandRunner, error) {
+		runner, err := sync.NewSyncer(sync.DefaultSyncerConfig())
+		if err != nil {
+			return nil, err
+		}
+		runner.Progress = progress
+		return runner, nil
+	})
+}
+
+type syncCommandRunner interface {
+	SyncWithMachineFiltered(context.Context, *sync.Machine, string, string) ([]*sync.SyncResult, error)
+	RecordFullSync()
+	Close() error
+}
+type syncMachineFailure struct {
+	Machine string `json:"machine"`
+	Error   string `json:"error"`
+}
+
+func runSyncWithRunner(cmd *cobra.Command, args []string, factory func(sync.ProgressFunc) (syncCommandRunner, error)) error {
+	jsonOutput, _ := cmd.Flags().GetBool("json")
 	state, err := loadSyncState()
 	if err != nil {
 		return err
 	}
 
 	if len(state.Pool.ListMachines()) == 0 {
+		if jsonOutput {
+			return writeSyncResultsJSON(cmd.OutOrStdout(), nil, nil)
+		}
 		fmt.Fprintln(cmd.OutOrStdout(), "No machines in sync pool.")
 		fmt.Fprintln(cmd.OutOrStdout(), "")
 		fmt.Fprintln(cmd.OutOrStdout(), "Get started:")
@@ -295,6 +320,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	if dryRun {
+		if jsonOutput {
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]any{"dry_run": true, "machines": machines, "provider": providerFilter, "profile": profileFilter})
+		}
 		fmt.Fprintln(cmd.OutOrStdout(), "Dry run - would sync with:")
 		for _, m := range machines {
 			fmt.Fprintf(cmd.OutOrStdout(), "  %s (%s)\n", m.Name, m.Address)
@@ -306,14 +334,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 	}
 
 	out := cmd.OutOrStdout()
-	fmt.Fprintf(out, "Syncing with %d machine(s)...\n\n", len(machines))
-
-	// Create syncer with configuration
-	syncer, err := sync.NewSyncer(sync.DefaultSyncerConfig())
-	if err != nil {
-		return fmt.Errorf("create syncer: %w", err)
+	if jsonOutput {
+		out = io.Discard
 	}
-	defer syncer.Close()
+	fmt.Fprintf(out, "Syncing with %d machine(s)...\n\n", len(machines))
 
 	// Stream per-profile progress as it happens: the freshness walk over SFTP
 	// can take minutes on large vaults, and previously nothing was printed
@@ -325,7 +349,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 			midDots = false
 		}
 	}
-	syncer.Progress = func(ev sync.ProgressEvent) {
+	progress := func(ev sync.ProgressEvent) {
 		switch ev.Stage {
 		case sync.StagePlan:
 			fmt.Fprintf(out, "    comparing %d profile(s) ", ev.Total)
@@ -336,6 +360,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 		case sync.StageResult:
 			endDots()
 			r := ev.Result
+			if r == nil || r.Operation == nil {
+				return
+			}
 			profile := fmt.Sprintf("%s/%s", r.Operation.Provider, r.Operation.Profile)
 			if r.Success {
 				switch r.Operation.Direction {
@@ -368,21 +395,32 @@ func runSync(cmd *cobra.Command, args []string) error {
 			} else {
 				fmt.Fprintf(out, "    ✗ %s: %v\n", profile, r.Error)
 			}
+			if r.RecoveryPath != "" {
+				fmt.Fprintf(out, "      Previous profile preserved (%s): %s\n", syncRecoveryLocation(r.Operation.Direction), r.RecoveryPath)
+			}
 		}
 	}
+	syncer, err := factory(progress)
+	if err != nil {
+		return fmt.Errorf("create syncer: %w", err)
+	}
+	defer syncer.Close()
 
 	// Build context
 	ctx := cmd.Context()
 
 	var allResults []*sync.SyncResult
 	machineFailures := 0
+	var failures []syncMachineFailure
 	for _, m := range machines {
 		fmt.Fprintf(out, "  %s (%s):\n", m.Name, m.Address)
 
 		results, err := syncer.SyncWithMachineFiltered(ctx, m, providerFilter, profileFilter)
 		endDots()
+		allResults = append(allResults, results...)
 		if err != nil {
 			machineFailures++
+			failures = append(failures, syncMachineFailure{Machine: m.Name, Error: err.Error()})
 			fmt.Fprintf(out, "    ✗ Error: %v\n\n", err)
 			continue
 		}
@@ -392,22 +430,76 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintln(out)
 
-		allResults = append(allResults, results...)
 	}
 
 	// A completed unfiltered sync against every pool machine counts as a full
 	// sync; persist the timestamp so `caam sync status` stops saying "never".
+	stats := sync.AggregateResults(allResults)
 	if machineName == "" && providerFilter == "" && profileFilter == "" &&
-		len(machines) > 0 && machineFailures == 0 {
+		len(machines) > 0 && machineFailures == 0 && stats.Failed == 0 {
 		syncer.RecordFullSync()
 	}
 
 	// Print summary
-	stats := sync.AggregateResults(allResults)
 	fmt.Fprintf(out, "Sync complete: %d pushed, %d pulled, %d up to date, %d errors\n",
-		stats.Pushed, stats.Pulled, stats.Skipped, stats.Failed)
+		stats.Pushed, stats.Pulled, stats.Skipped, stats.Failed+machineFailures)
+
+	if jsonOutput {
+		if err := writeSyncResultsJSON(cmd.OutOrStdout(), allResults, failures); err != nil {
+			return err
+		}
+	}
+	if stats.Failed > 0 || machineFailures > 0 {
+		return fmt.Errorf("sync failed: %d profile error(s), %d machine error(s)", stats.Failed, machineFailures)
+	}
 
 	return nil
+}
+
+func syncRecoveryLocation(direction sync.SyncDirection) string {
+	if direction == sync.SyncPush {
+		return "remote"
+	}
+	return "local"
+}
+func writeSyncResultsJSON(out io.Writer, results []*sync.SyncResult, failures []syncMachineFailure) error {
+	type row struct {
+		Machine          string             `json:"machine"`
+		Provider         string             `json:"provider"`
+		Profile          string             `json:"profile"`
+		Direction        sync.SyncDirection `json:"direction"`
+		Success          bool               `json:"success"`
+		MetadataOnly     bool               `json:"metadata_only,omitempty"`
+		Note             string             `json:"note,omitempty"`
+		Error            string             `json:"error,omitempty"`
+		RecoveryPath     string             `json:"recovery_path,omitempty"`
+		RecoveryLocation string             `json:"recovery_location,omitempty"`
+	}
+	rows := make([]row, 0, len(results))
+	var usable []*sync.SyncResult
+	for _, result := range results {
+		if result == nil || result.Operation == nil {
+			continue
+		}
+		op := result.Operation
+		item := row{Provider: op.Provider, Profile: op.Profile, Direction: op.Direction, Success: result.Success, MetadataOnly: op.PayloadExcluded, Note: op.Note, RecoveryPath: result.RecoveryPath}
+		if op.Machine != nil {
+			item.Machine = op.Machine.Name
+		}
+		if result.Error != nil {
+			item.Error = result.Error.Error()
+		}
+		if result.RecoveryPath != "" {
+			item.RecoveryLocation = syncRecoveryLocation(op.Direction)
+		}
+		rows = append(rows, item)
+		usable = append(usable, result)
+	}
+	if failures == nil {
+		failures = []syncMachineFailure{}
+	}
+	stats := sync.AggregateResults(usable)
+	return json.NewEncoder(out).Encode(map[string]any{"results": rows, "machine_errors": failures, "summary": map[string]int{"pushed": stats.Pushed, "pulled": stats.Pulled, "skipped": stats.Skipped, "failed": stats.Failed + len(failures)}})
 }
 
 // runSyncStatus shows the sync pool status.

@@ -13,10 +13,10 @@ import (
 // SyncMode describes how a profile's credential data may move between
 // machines (issue #66).
 //
-//   - ModeReplicate: current behavior — the freshest credential payload is
-//     copied bidirectionally between machines.
+//   - ModeReplicate: the freshest credential payload is copied between
+//     machines. Claude additionally requires offline account/org continuity.
 //   - ModeHostLocal: the credential payload NEVER crosses machines; only
-//     non-secret profile metadata (meta.json) is synchronized, so each
+//     operator descriptions/tags seed an absent profile, so each
 //     machine keeps its own independent OAuth grant for the same logical
 //     account.
 //
@@ -30,7 +30,7 @@ const (
 	ModeReplicate SyncMode = "replicate"
 
 	// ModeHostLocal excludes the credential payload from sync entirely;
-	// only profile metadata replicates.
+	// only logical metadata may seed an absent destination, without owner proof.
 	ModeHostLocal SyncMode = "host-local"
 )
 
@@ -233,16 +233,14 @@ func (r *PolicyResolver) InvalidEntries() []string {
 	return out
 }
 
-// metadataSyncAllowlist names the profile files that are safe, non-secret
-// metadata and may replicate for host-local profiles. Everything NOT on
-// this list is treated as credential payload and never crosses machines
-// under host-local — fail closed for filenames we have never seen.
+// metadataSyncAllowlist names planning candidates only. The guarded peer
+// copies operator descriptions/tags from meta.json into an absent profile;
+// raw metadata, credential-bound proofs and identity hints never replicate.
 var metadataSyncAllowlist = map[string]bool{
 	"meta.json": true,
 }
 
-// isMetadataFile reports whether a profile file (by base name) is
-// allowlisted non-secret metadata.
+// isMetadataFile reports whether a filename is a metadata planning candidate.
 func isMetadataFile(name string) bool {
 	return metadataSyncAllowlist[name]
 }

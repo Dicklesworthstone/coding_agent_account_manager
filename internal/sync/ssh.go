@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -40,10 +41,9 @@ func DefaultConnectOptions() ConnectOptions {
 // SSHClient wraps an SSH connection with SFTP support.
 type SSHClient struct {
 	machine    *Machine
-	client     *ssh.Client
+	client     atomic.Pointer[ssh.Client]
 	sftp       *sftp.Client
 	agentConn  net.Conn // SSH agent connection (needs cleanup)
-	connected  bool
 	lastConnAt time.Time
 	opts       ConnectOptions
 }
@@ -58,7 +58,7 @@ func NewSSHClient(m *Machine) *SSHClient {
 
 // Connect establishes an SSH connection to the machine.
 func (c *SSHClient) Connect(opts ConnectOptions) error {
-	if c.connected {
+	if c.IsConnected() {
 		return nil // Already connected
 	}
 
@@ -122,8 +122,7 @@ func (c *SSHClient) Connect(opts ConnectOptions) error {
 		}
 	}
 
-	c.client = client
-	c.connected = true
+	c.client.Store(client)
 	c.lastConnAt = time.Now()
 	c.machine.SetOnline()
 
@@ -132,6 +131,11 @@ func (c *SSHClient) Connect(opts ConnectOptions) error {
 
 // Disconnect closes the SSH connection.
 func (c *SSHClient) Disconnect() error {
+	// Close the transport first to interrupt blocked channel/SFTP operations.
+	var err error
+	if client := c.client.Swap(nil); client != nil {
+		err = client.Close()
+	}
 	if c.sftp != nil {
 		c.sftp.Close()
 		c.sftp = nil
@@ -140,45 +144,48 @@ func (c *SSHClient) Disconnect() error {
 		c.agentConn.Close()
 		c.agentConn = nil
 	}
-	if c.client != nil {
-		err := c.client.Close()
-		c.client = nil
-		c.connected = false
-		return err
-	}
-	return nil
+	return err
 }
 
 // IsConnected returns true if the connection is established.
 func (c *SSHClient) IsConnected() bool {
-	return c.connected && c.client != nil
+	return c.client.Load() != nil
 }
 
 // NewSession opens a command session on the established connection.
 func (c *SSHClient) NewSession() (*ssh.Session, error) {
-	if !c.IsConnected() {
+	client := c.Conn()
+	if client == nil {
 		return nil, errors.New("not connected")
 	}
-	return c.client.NewSession()
+	return client.NewSession()
 }
 
 // Dial opens a connection from the remote machine to addr through the SSH
 // connection, like 'ssh -L'.
 func (c *SSHClient) Dial(network, addr string) (net.Conn, error) {
-	if !c.IsConnected() {
+	client := c.Conn()
+	if client == nil {
 		return nil, errors.New("not connected")
 	}
-	return c.client.Dial(network, addr)
+	return client.Dial(network, addr)
 }
 
 // Conn returns the underlying SSH connection, or nil when not connected.
 // Its methods are safe for concurrent use; closing it interrupts blocked
 // dials, after which Disconnect still releases the remaining resources.
 func (c *SSHClient) Conn() *ssh.Client {
-	if !c.IsConnected() {
+	return c.client.Load()
+}
+
+// invalidateTransport retires only the generation used by the canceled peer.
+// Pool cleanup frees SFTP/agent state; a late abort cannot retire a replacement.
+func (c *SSHClient) invalidateTransport(client *ssh.Client) error {
+	if client == nil {
 		return nil
 	}
-	return c.client
+	c.client.CompareAndSwap(client, nil)
+	return client.Close()
 }
 
 // getAuthMethods returns available SSH authentication methods.
@@ -346,15 +353,14 @@ func defaultKeyPaths() []string {
 
 // ensureSFTP initializes the SFTP client if needed.
 func (c *SSHClient) ensureSFTP() error {
+	client := c.Conn()
+	if client == nil {
+		return errors.New("not connected")
+	}
 	if c.sftp != nil {
 		return nil
 	}
-
-	if !c.connected {
-		return errors.New("not connected")
-	}
-
-	sftpClient, err := sftp.NewClient(c.client)
+	sftpClient, err := sftp.NewClient(client)
 	if err != nil {
 		return fmt.Errorf("SFTP initialization failed: %w", err)
 	}
@@ -677,8 +683,8 @@ func TestMachineConnectivity(m *Machine, opts ConnectOptions) *ConnectivityResul
 	result.Success = true
 
 	// Get SSH version
-	if client.client != nil {
-		result.SSHVersion = string(client.client.ServerVersion())
+	if transport := client.Conn(); transport != nil {
+		result.SSHVersion = string(transport.ServerVersion())
 	}
 
 	// Test SFTP
