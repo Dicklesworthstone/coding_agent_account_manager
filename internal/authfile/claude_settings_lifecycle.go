@@ -37,7 +37,7 @@ func readClaudeSettingsSnapshot(path string, policy claudesettings.Policy) (clau
 	if err != nil {
 		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
 	}
-	hasAuth, err := claudeCredentialMaterial(data, filepath.Base(path))
+	hasAuth, err := ClaudeCredentialMaterial(data, filepath.Base(path))
 	if err != nil {
 		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
 	}
@@ -87,7 +87,7 @@ func readClaudeSettingsForBackup(fileSet AuthFileSet) (map[string]claudeSettings
 		if err != nil {
 			return nil, fmt.Errorf("%w: capture Claude backup source %s: %w", ErrInvalidCredentials, spec.Path, err)
 		}
-		hasAuth, err := claudeCredentialMaterial(data, filename)
+		hasAuth, err := ClaudeCredentialMaterial(data, filename)
 		if err != nil {
 			return nil, fmt.Errorf("validate Claude backup source %s: %w", spec.Path, err)
 		}
@@ -215,7 +215,7 @@ func prepareClaudeSettingsRestoreIdentity(fileSet AuthFileSet, profileDir string
 			if selected != nil && filename == selected.credentialName && !bytes.Equal(replacement.target, selected.credential) {
 				return nil, fmt.Errorf("claude snapshot changed after identity verification")
 			}
-			hasAuth, err := claudeCredentialMaterial(replacement.target, filename)
+			hasAuth, err := ClaudeCredentialMaterial(replacement.target, filename)
 			if err != nil {
 				return nil, fmt.Errorf("%w: Claude credential snapshot %s: %v", ErrInvalidCredentials, snapshotPath, err)
 			}

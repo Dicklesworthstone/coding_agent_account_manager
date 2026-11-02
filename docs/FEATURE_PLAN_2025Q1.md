@@ -513,6 +513,18 @@ Tests cover modern/legacy source precedence, shared-email organization conflicts
 stale bindings, expired cached proof, concurrent copy/publication changes,
 recovery retention, and read-only previews.
 
+The shared `vaulttransfer` module supplies captured profile inspection,
+normalization and guarded publication to the ZIP bundle path. It streams
+captured files, checks native size bounds before decoding, rejects ambiguous
+native filename casing and pins parent-directory identities. Publication
+retains the complete previous profile; rollback and temporary-stage cleanup
+preserve independently replaced directories. These checks remain offline and
+do not turn expired credentials into evidence of a different owner.
+Credential-bearing settings precede secondary legacy OAuth state; unsupported
+helper/key ownership stays unknown. ZIP import prepares every actionable
+profile before publication or preview success, while continuing to check the
+original extracted sources through publication.
+
 #### 5.4 Explicit setup tokens for a single shallow launch
 
 For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately

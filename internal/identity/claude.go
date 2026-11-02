@@ -24,10 +24,13 @@ const claudeSettingsFile = ".claude.json"
 // refresh cannot accidentally inherit a previous account's cached identity.
 const ClaudeIdentityCacheFile = ".caam-identity.json"
 
+// MaxClaudeIdentityBytes bounds saved identity metadata and provider responses.
+// Transfer readers enforce the same limit before allocating or decoding JSON.
+const MaxClaudeIdentityBytes = 1 << 20
+
 const (
-	claudeProfileURL       = "https://api.anthropic.com/api/oauth/profile"
-	claudeIdentityTimeout  = 3 * time.Second
-	claudeIdentityMaxBytes = 1 << 20
+	claudeProfileURL      = "https://api.anthropic.com/api/oauth/profile"
+	claudeIdentityTimeout = 3 * time.Second
 )
 
 var (
@@ -72,7 +75,7 @@ func InspectClaudeIdentityBinding(metadata, credentials []byte) (ClaudeIdentityA
 		return result, nil
 	}
 	var envelope map[string]json.RawMessage
-	if len(metadata) > claudeIdentityMaxBytes || json.Unmarshal(metadata, &envelope) != nil || envelope == nil {
+	if len(metadata) > MaxClaudeIdentityBytes || json.Unmarshal(metadata, &envelope) != nil || envelope == nil {
 		result.State = ClaudeIdentityInvalidMetadata
 		return result, errors.New("invalid Claude identity metadata")
 	}
@@ -162,7 +165,7 @@ func DecodeClaudeIdentityBinding(metadata, credentials []byte) (*ClaudeIdentityB
 	var envelope struct {
 		Binding *ClaudeIdentityBinding `json:"claude_identity"`
 	}
-	if len(metadata) > claudeIdentityMaxBytes || json.Unmarshal(metadata, &envelope) != nil {
+	if len(metadata) > MaxClaudeIdentityBytes || json.Unmarshal(metadata, &envelope) != nil {
 		return nil, errors.New("invalid Claude identity metadata")
 	}
 	if !envelope.Binding.MatchesCredentials(credentials) {
@@ -205,7 +208,7 @@ func readClaudeIdentityBinding(credentialsPath string, credentials []byte) (*Cla
 		if err != nil {
 			return nil, true, fmt.Errorf("read Claude identity metadata: %w", err)
 		}
-		data, readErr := io.ReadAll(io.LimitReader(f, claudeIdentityMaxBytes+1))
+		data, readErr := io.ReadAll(io.LimitReader(f, MaxClaudeIdentityBytes+1))
 		closeErr := f.Close()
 		if readErr != nil || closeErr != nil {
 			return nil, true, errors.New("cannot read Claude identity metadata")
@@ -286,8 +289,8 @@ func VerifyClaudeCredentials(ctx context.Context, credentials []byte, client *ht
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%w (HTTP %d)", ErrClaudeIdentityUnavailable, resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, claudeIdentityMaxBytes+1))
-	if err != nil || len(data) > claudeIdentityMaxBytes {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxClaudeIdentityBytes+1))
+	if err != nil || len(data) > MaxClaudeIdentityBytes {
 		return nil, ErrClaudeIdentityUnavailable
 	}
 	var profile struct {

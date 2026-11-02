@@ -777,7 +777,7 @@ func TestVerifyClaudeCredentialsFailureIsUncertaintyAndSecretFree(t *testing.T) 
 		{"no org", 200, `{"account":{"uuid":"user","email":"same@example.com"}}`, ErrClaudeIdentityUnavailable},
 		{"no account UUID", 200, `{"account":{"email":"same@example.com"},"organization":{"uuid":"org"}}`, ErrClaudeIdentityUnavailable},
 		{"empty org UUID", 200, `{"account":{"uuid":"user"},"organization":{"uuid":"  "}}`, ErrClaudeIdentityUnavailable},
-		{"oversized body", 200, strings.Repeat("x", claudeIdentityMaxBytes+1), ErrClaudeIdentityUnavailable},
+		{"oversized body", 200, strings.Repeat("x", MaxClaudeIdentityBytes+1), ErrClaudeIdentityUnavailable},
 		{"trailing response", 200, `{"account":{"uuid":"u"},"organization":{"uuid":"o"}} {}`, ErrClaudeIdentityUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

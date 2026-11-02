@@ -14,6 +14,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/vaulttransfer"
 )
 
 // Write raw manifests so recovery tests exercise the importer, including cases
@@ -411,6 +412,115 @@ func TestVaultImporterRejectsInvalidClaudeIdentityBeforeAnyChanges(t *testing.T)
 	}
 }
 
+func TestVaultImporterPreparesAllProfilesBeforePublicationAndPreview(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(fmt.Sprintf("existing=%t/dry=%t", existing, dryRun), func(t *testing.T) {
+				root := t.TempDir()
+				vault := filepath.Join(root, "vault")
+				old := claudeBundleCredentials(t, "synthetic-personal-access", "synthetic-personal-refresh", time.Now().Add(-time.Hour))
+				incoming := claudeBundleCredentials(t, "synthetic-team-access", "synthetic-team-refresh", time.Now().Add(-time.Hour))
+				if !dryRun || existing {
+					// A real import may acquire an existing managed lock. Seed the
+					// normal vault layout so the whole-tree assertion detects any
+					// publication, recovery, or leftover staging directory.
+					writeRecoveryFile(t, filepath.Join(vault, ".caam-mutation.lock"), "")
+					writeRecoveryFile(t, filepath.Join(vault, "codex", "unrelated", "auth.json"), `{"api_key":"synthetic-unrelated"}`)
+				}
+				if existing {
+					profile := filepath.Join(vault, "claude", "a-first")
+					writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), old)
+					writeRecoveryFile(t, filepath.Join(profile, "meta.json"), claudeBundleMetadata(t, old, "shared-account", "personal-org"))
+					writeRecoveryFile(t, filepath.Join(profile, "private", "history.json"), `{"history":"keep-original"}`)
+				}
+				before, err := vaulttransfer.Capture(vault)
+				if err != nil {
+					t.Fatal(err)
+				}
+				config := filepath.Join(root, "config.json")
+				writeRecoveryFile(t, config, `{"config":"keep-original"}`)
+				manifest := NewManifest()
+				manifest.AddProfile("claude", "a-first")
+				manifest.AddProfile("claude", "z-malformed")
+				manifest.SetConfig(true, "config.json")
+				metadata := claudeBundleMetadata(t, incoming, "shared-account", "team-org")
+				bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
+					"vault/claude/a-first/.credentials.json":     incoming,
+					"vault/claude/a-first/meta.json":             metadata,
+					"vault/claude/a-first/.claude.json":          `{"oauthAccount":{"organizationUuid":"stale-personal-org"},"projects":{"project":{"trusted":true}}}`,
+					"vault/claude/z-malformed/.credentials.json": incoming,
+					"vault/claude/z-malformed/meta.json":         metadata,
+					"vault/claude/z-malformed/.claude.json":      `{"oauthAccount":{"synthetic-private-label":`,
+					"config.json":                                `{"config":"incoming"}`,
+				})
+				published := false
+				importer := &VaultImporter{BundlePath: bundlePath, beforeProfilePublish: func(_, _ string) { published = true }}
+				result, err := importer.Import(&ImportOptions{VaultPath: vault, ConfigPath: config, Mode: ImportModeReplace, DryRun: dryRun})
+				if err == nil || !strings.Contains(err.Error(), "invalid Claude account settings") || result == nil {
+					t.Fatalf("malformed later settings were accepted: result=%+v, error=%v", result, err)
+				}
+				if published || result.NewProfiles != 0 || result.UpdatedProfiles != 0 || len(result.Errors) != 1 || len(result.OptionalActions) != 0 {
+					t.Fatalf("invalid import published or previewed a partial success: published=%t result=%+v", published, result)
+				}
+				if len(result.ProfileActions) != 1 || result.ProfileActions[0].Profile != "z-malformed" || result.ProfileActions[0].Action != "error" {
+					t.Fatalf("normalization failure was not reported against its profile: %+v", result.ProfileActions)
+				}
+				if strings.Contains(err.Error(), "synthetic-private-label") || strings.Contains(strings.Join(result.Errors, " "), "synthetic-private-label") {
+					t.Fatal("normalization error exposed private settings")
+				}
+				if err := before.Check(); err != nil {
+					t.Fatalf("failed normalization changed the destination vault: %v", err)
+				}
+				requireRecoveryFile(t, config, `{"config":"keep-original"}`)
+				if dryRun && !existing {
+					if _, err := os.Lstat(vault); !os.IsNotExist(err) {
+						t.Fatalf("dry-run created a vault or managed lock: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestVaultImporterChecksOriginalSourcesAfterPreparingAllProfiles(t *testing.T) {
+	root := t.TempDir()
+	vault := filepath.Join(root, "vault")
+	writeRecoveryFile(t, filepath.Join(vault, ".caam-mutation.lock"), "")
+	writeRecoveryFile(t, filepath.Join(vault, "claude", "unrelated", "auth.json"), `{"api_key":"synthetic-unrelated"}`)
+	before, err := vaulttransfer.Capture(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := claudeBundleCredentials(t, "synthetic-expired-access", "synthetic-expired-refresh", time.Now().Add(-time.Hour))
+	metadata := claudeBundleMetadata(t, credentials, "shared-account", "team-org")
+	manifest := NewManifest()
+	files := make(map[string]string)
+	for _, profile := range []string{"a-first", "z-later"} {
+		manifest.AddProfile("claude", profile)
+		files["vault/claude/"+profile+"/.credentials.json"] = credentials
+		files["vault/claude/"+profile+"/meta.json"] = metadata
+	}
+	changed := false
+	importer := &VaultImporter{BundlePath: writeRecoveryBundle(t, manifest, files)}
+	importer.beforeProfilePublish = func(source, _ string) {
+		if filepath.Base(source) != "a-first" {
+			t.Fatalf("publication hook no longer identifies the original source: %s", source)
+		}
+		writeRecoveryFile(t, filepath.Join(filepath.Dir(source), "z-later", ".credentials.json"), `{"claudeAiOauth":{"accessToken":"synthetic-concurrent","refreshToken":"synthetic-concurrent-refresh"}}`)
+		changed = true
+	}
+	result, err := importer.Import(&ImportOptions{VaultPath: vault, Mode: ImportModeSmart})
+	if !changed || err == nil || !strings.Contains(err.Error(), "changed during transfer") || result == nil || result.NewProfiles != 0 || result.UpdatedProfiles != 0 {
+		t.Fatalf("prepared copy hid a changed original source: changed=%t result=%+v error=%v", changed, result, err)
+	}
+	// Publication may create and remove its private sibling stage, changing
+	// the provider directory's mtime. Every path, mode and payload must remain.
+	after, err := vaulttransfer.Capture(vault)
+	if err != nil || before.Digest() != after.Digest() {
+		t.Fatalf("changed original source partly published the archive: %v", err)
+	}
+}
+
 func TestVaultImporterClaudeReplaceRetainsOldOrganizationAndExpiredProof(t *testing.T) {
 	for _, originalMetadata := range []string{"", `{"description":"keep this description"}`, `{"description":"keep this description","claude_identity":null}`} {
 		t.Run("metadata="+originalMetadata, func(t *testing.T) {
@@ -519,7 +629,7 @@ func TestVaultImporterClaudeReplaceRetainsOldOrganizationAndExpiredProof(t *test
 }
 
 func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
-	for _, scenario := range []string{"incoming changes", "destination rotates", "same bytes replaced", "publication fails", "concurrent login before publication", "concurrent login after publication"} {
+	for _, scenario := range []string{"incoming changes", "incoming changes after publication", "destination rotates", "same bytes replaced", "publication fails", "concurrent login before publication", "concurrent login after publication"} {
 		t.Run(scenario, func(t *testing.T) {
 			vault := filepath.Join(t.TempDir(), "vault")
 			profile := filepath.Join(vault, "claude", "work")
@@ -530,6 +640,7 @@ func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
 			concurrentMetadata := claudeBundleMetadata(t, concurrent, "account-shared", "org-team")
 			writeRecoveryFile(t, filepath.Join(profile, ".credentials.json"), old)
 			writeRecoveryFile(t, filepath.Join(profile, "meta.json"), oldMetadata)
+			writeRecoveryFile(t, filepath.Join(profile, "private", "history.json"), `{"history":"original-profile"}`)
 			manifest := NewManifest()
 			manifest.AddProfile("claude", "work")
 			bundlePath := writeRecoveryBundle(t, manifest, map[string]string{
@@ -537,7 +648,10 @@ func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
 				"vault/claude/work/meta.json":         claudeBundleMetadata(t, incoming, "account-shared", "org-personal"),
 			})
 			importer := &VaultImporter{BundlePath: bundlePath}
+			var incomingSource string
+			changedAfterPublication := false
 			importer.beforeProfilePublish = func(source, destination string) {
+				incomingSource = source
 				switch scenario {
 				case "incoming changes":
 					writeRecoveryFile(t, filepath.Join(source, ".credentials.json"), concurrent)
@@ -563,6 +677,14 @@ func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
 			importer.renameProfile = func(from, to string) error {
 				if strings.HasPrefix(filepath.Base(from), "_caam-vault-backup~import-") {
 					switch scenario {
+					case "incoming changes after publication":
+						if err := os.Rename(from, to); err != nil {
+							return err
+						}
+						writeRecoveryFile(t, filepath.Join(incomingSource, ".credentials.json"), concurrent)
+						writeRecoveryFile(t, filepath.Join(incomingSource, "meta.json"), concurrentMetadata)
+						changedAfterPublication = true
+						return nil
 					case "publication fails":
 						return errors.New("injected publication interruption")
 					case "concurrent login before publication":
@@ -581,6 +703,9 @@ func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
 				return os.Rename(from, to)
 			}
 			result, err := importer.Import(&ImportOptions{VaultPath: vault, Mode: ImportModeReplace})
+			if scenario == "incoming changes after publication" && !changedAfterPublication {
+				t.Fatal("source-change fixture did not reach completed publication")
+			}
 			if err == nil || result == nil || result.UpdatedProfiles != 0 || len(result.ProfileActions) != 1 || result.ProfileActions[0].Action != "error" {
 				t.Fatalf("changed or interrupted transfer reported success: %+v, %v", result, err)
 			}
@@ -600,8 +725,11 @@ func TestVaultImporterDetectsGenerationChangesAndRetainsRecovery(t *testing.T) {
 				}
 				requireRecoveryFile(t, filepath.Join(recovery, ".credentials.json"), old)
 				requireRecoveryFile(t, filepath.Join(recovery, "meta.json"), oldMetadata)
+				requireRecoveryFile(t, filepath.Join(recovery, "private", "history.json"), `{"history":"original-profile"}`)
 			} else if recovery != "" {
 				t.Fatalf("reported recovery path after preserving/restoring original: %s", recovery)
+			} else {
+				requireRecoveryFile(t, filepath.Join(profile, "private", "history.json"), `{"history":"original-profile"}`)
 			}
 		})
 	}

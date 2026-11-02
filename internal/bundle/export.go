@@ -10,13 +10,13 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/vaulttransfer"
 )
 
 // ExportOptions configures the export operation.
@@ -190,7 +190,7 @@ func (e *VaultExporter) export(opts *ExportOptions) (*ExportResult, error) {
 		}
 
 		if f.generation != nil {
-			data, _, err := f.generation.readFile(f.profileRelativePath)
+			data, _, err := f.generation.ReadFile(f.profileRelativePath)
 			if err != nil {
 				return nil, fmt.Errorf("copy %s: %w", f.RelPath, err)
 			}
@@ -274,17 +274,17 @@ type fileEntry struct {
 	SrcPath string
 	RelPath string
 
-	generation          *profileGeneration
+	generation          *vaulttransfer.Snapshot
 	profileRelativePath string
 }
 
 func checkExportGenerations(files []fileEntry) error {
-	checked := make(map[*profileGeneration]bool)
+	checked := make(map[*vaulttransfer.Snapshot]bool)
 	for _, file := range files {
 		if file.generation == nil || checked[file.generation] {
 			continue
 		}
-		if err := file.generation.check(); err != nil {
+		if err := file.generation.Check(); err != nil {
 			return fmt.Errorf("export refused: %w", err)
 		}
 		checked[file.generation] = true
@@ -417,31 +417,27 @@ func (e *VaultExporter) collectVaultFiles(opts *ExportOptions, manifest *Manifes
 // collectProfileFiles collects all files from a profile directory.
 func (e *VaultExporter) collectProfileFiles(profilePath, provider, profile string) ([]fileEntry, error) {
 	var files []fileEntry
-	generation, err := captureProfileGeneration(profilePath)
+	generation, err := vaulttransfer.Capture(profilePath)
 	if err != nil {
 		return nil, err
 	}
-	if !generation.exists() {
+	if !generation.Exists() {
 		return nil, fmt.Errorf("profile disappeared during export")
 	}
 	omittedFile := ""
 	if strings.EqualFold(provider, "claude") {
-		claude, err := inspectClaudeBundleIdentity(generation)
+		claude, err := vaulttransfer.InspectClaude(generation)
 		if err != nil {
 			return nil, err
 		}
-		if claude.bindingFile == "meta.json" {
+		if claude.BindingFile == "meta.json" {
 			omittedFile = identity.ClaudeIdentityCacheFile
 		}
 	}
-	names := make([]string, 0, len(generation.entries))
-	for name, entry := range generation.entries {
-		if entry.info.Mode().IsRegular() && name != omittedFile {
-			names = append(names, name)
+	for _, name := range generation.Files() {
+		if name == omittedFile {
+			continue
 		}
-	}
-	sort.Strings(names)
-	for _, name := range names {
 		bundlePath := filepath.Join("vault", provider, profile, name)
 		files = append(files, fileEntry{
 			SrcPath:             filepath.Join(profilePath, name),

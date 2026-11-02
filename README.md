@@ -1156,6 +1156,11 @@ destination paths before restoring files. A malformed path, a symlink that
 redirects a restore, a missing checksum, or a checksum mismatch stops the
 import. These checks also apply to `--dry-run` and `--force`.
 
+All profiles selected for restoration are privately prepared before any profile
+is published or previewed as successful. A malformed `.claude.json` in a later
+profile therefore stops the import before an earlier profile is installed.
+Filesystem failures during publication still use per-profile recovery.
+
 The default `smart` mode compares credential freshness. For Claude, automatic
 replacement also requires verified matching account **and organization UUIDs**,
 or the exact same access/refresh token pair. A shared email or profile name is
@@ -1186,6 +1191,14 @@ generations while copying and publishing. A detected concurrent change returns
 an error; an independently written login is preserved during recovery.
 `--dry-run` performs the same ownership checks without creating a vault lock or
 changing profiles. These guarantees describe `caam bundle` ZIP transfers.
+
+Profile generation checks also pin the parent directories that identify the
+vault. Replacing or redirecting a parent stops publication even when the
+profile's contents are unchanged. Cleanup removes only a staging directory
+still owned by that operation. Claude account files must use their canonical
+filename casing, and credential, settings and proof limits are checked before
+decoding the selected files. When settings select a helper, API key or environment
+credential, an ignored legacy OAuth file cannot establish that login's ownership.
 
 #### Scheduled vault backups
 

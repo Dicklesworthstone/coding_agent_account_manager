@@ -550,7 +550,7 @@ func HasAuthFilesReadOnly(fileSet AuthFileSet) bool {
 	for _, spec := range fileSet.Files {
 		name := filepath.Base(spec.Path)
 		data, present := live.files[name]
-		hasAuth, err := claudeCredentialMaterial(data, name)
+		hasAuth, err := ClaudeCredentialMaterial(data, name)
 		if err != nil {
 			return false
 		}
@@ -834,7 +834,7 @@ func (s *switchState) identify(fileSet AuthFileSet) {
 			continue
 		}
 		if fileSet.Tool == "claude" && name != claudeCredentialsFile && name != "auth.json" {
-			if ok, _ := claudeCredentialMaterial(data, name); !ok {
+			if ok, _ := ClaudeCredentialMaterial(data, name); !ok {
 				continue
 			}
 		}

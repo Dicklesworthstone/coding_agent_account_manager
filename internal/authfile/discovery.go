@@ -502,7 +502,7 @@ func discoveryMaterial(tool, name string, data []byte) ([]byte, error) {
 		}
 	}
 	if tool == "claude" {
-		ok, err := claudeCredentialMaterial(data, name)
+		ok, err := ClaudeCredentialMaterial(data, name)
 		if err != nil {
 			return nil, err
 		}

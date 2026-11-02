@@ -1035,7 +1035,7 @@ func validateCredentialFiles(fileSet AuthFileSet, profileDir string) error {
 		}
 		hasAuth := len(strings.TrimSpace(string(data))) > 0
 		if fileSet.Tool == "claude" {
-			hasAuth, err = claudeCredentialMaterial(data, filepath.Base(spec.Path))
+			hasAuth, err = ClaudeCredentialMaterial(data, filepath.Base(spec.Path))
 			if err != nil {
 				return fmt.Errorf("%w: %s: %v", ErrInvalidCredentials, path, err)
 			}
@@ -1180,10 +1180,12 @@ func validateCursorCredentialFiles(fileSet AuthFileSet, profileDir string) error
 	return fmt.Errorf("%w: no complete Cursor auth source", ErrNoCredentials)
 }
 
-// claudeCredentialMaterial distinguishes an installed authentication source
+// ClaudeCredentialMaterial distinguishes an installed authentication source
 // from account labels and workflow policy. Keep this list tied to supported
 // Claude file formats; arbitrary fields named "token" are not evidence of auth.
-func claudeCredentialMaterial(data []byte, filename string) (bool, error) {
+// It inspects only the supplied bytes and never reads configuration or executes
+// a credential helper.
+func ClaudeCredentialMaterial(data []byte, filename string) (bool, error) {
 	if data == nil {
 		return false, nil
 	}
