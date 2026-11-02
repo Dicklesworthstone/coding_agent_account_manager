@@ -2,6 +2,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 var validateCmd = &cobra.Command{
@@ -27,6 +29,8 @@ By default, performs passive validation (no network calls):
 
 Provider probing is not supported for saved vault profiles. Requests with
 --active fail explicitly; passive results do not prove provider acceptance.
+For saved Claude account and organization verification, use
+'caam verify identity claude <profile> --online'.
 
 Examples:
   caam validate                    # Validate all profiles (passive)
@@ -60,6 +64,7 @@ type ValidationOutput struct {
 	Error          string    `json:"error,omitempty"`
 	CheckedAt      time.Time `json:"checked_at"`
 	Recommendation string    `json:"recommendation,omitempty"`
+	IdentityState  string    `json:"identity_state,omitempty"`
 	health.Signals
 }
 
@@ -197,6 +202,26 @@ func invalidCredentialSignals() health.Signals {
 	return health.Signals{RefreshDue: &no, LaunchUsable: &no, LoginRequired: &yes}
 }
 
+func claudeIdentitySignals(state string) health.Signals {
+	if state == "invalid_credentials" {
+		return invalidCredentialSignals()
+	}
+	no := false
+	// A broken binding may be a legitimate rotation; it does not establish
+	// that the user must log in again or that refreshing this grant is safe.
+	return health.Signals{LaunchUsable: &no}
+}
+
+func claudeIdentityRecommendation(profileName, state string) string {
+	if state == "invalid_credentials" {
+		return fmt.Sprintf("log in with claude, then run 'caam backup claude %s' to save the credentials", profileName)
+	}
+	if state == identity.ClaudeIdentityInvalidMetadata {
+		return "restore the saved profile's identity metadata from a trusted backup before using it"
+	}
+	return fmt.Sprintf("run 'caam verify identity claude %s --repair' to verify the saved account and organization without activation", profileName)
+}
+
 // validateVaultProfile is shared by the human and robot validation surfaces.
 // Valid describes a passive local check, not a successful provider probe. An
 // expired access token remains valid when the credential is renewable, unless
@@ -207,6 +232,16 @@ func validateVaultProfile(tool, profileName string) (ValidationOutput, *health.P
 		Profile:   profileName,
 		Method:    "passive",
 		CheckedAt: time.Now(),
+	}
+	if tool == "claude" {
+		inspection, err := vault.ClaudeProfileIdentity(context.Background(), profileName, authfile.ClaudeProfileIdentityOptions{})
+		out.IdentityState = inspection.State
+		if err != nil {
+			out.Error = inspection.Detail
+			out.Signals = claudeIdentitySignals(inspection.State)
+			out.Recommendation = claudeIdentityRecommendation(profileName, inspection.State)
+			return out, &health.ProfileHealth{}
+		}
 	}
 
 	ph, err := readVaultProfileHealth(tool, profileName)

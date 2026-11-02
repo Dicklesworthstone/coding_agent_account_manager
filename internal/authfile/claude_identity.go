@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,6 +19,246 @@ import (
 // credential generation with both an account and an organization. Native state
 // files are independently rewritten by running Claude sessions.
 const claudeIdentityUnknownWarning = "Claude account and organization could not be verified; unverified account labels were omitted and saved profiles were not matched by email"
+
+// ClaudeProfileIdentityOptions keeps ordinary diagnostics offline. Repair uses
+// an exact cached proof where possible; Online explicitly requests a fresh
+// provider check, even when a cached proof exists.
+type ClaudeProfileIdentityOptions struct {
+	Online bool
+	Repair bool
+}
+
+// ClaudeProfileIdentityResult describes only a saved vault profile. No native
+// credential, keychain, or isolated profile is consulted by this operation.
+type ClaudeProfileIdentityResult struct {
+	Provider         string             `json:"provider"`
+	Profile          string             `json:"profile"`
+	State            string             `json:"state"`
+	Source           string             `json:"source"`
+	Identity         *identity.Identity `json:"identity,omitempty"`
+	RecordedIdentity *identity.Identity `json:"recorded_identity,omitempty"`
+	VerifiedAt       *time.Time         `json:"verified_at,omitempty"`
+	Repaired         bool               `json:"repaired"`
+	Detail           string             `json:"detail,omitempty"`
+}
+
+// ClaudeProfileIdentity checks or repairs ownership without activating the
+// profile. A changed grant must verify as the recorded account AND organization
+// before its proof can be replaced. Metadata repair never changes tokens.
+func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts ClaudeProfileIdentityOptions) (ClaudeProfileIdentityResult, error) {
+	result := ClaudeProfileIdentityResult{Provider: "claude", Profile: profile, State: identity.ClaudeIdentityUnknown, Source: "none"}
+	if opts.Repair && IsSystemProfile(profile) {
+		err := fmt.Errorf("%w: recovery snapshots cannot be repaired", errProtectedSystemProfile)
+		result.Detail = err.Error()
+		return result, err
+	}
+	operation := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dir, err := v.existingProfileDir("claude", profile)
+		if err != nil {
+			return err
+		}
+		snapshot, err := captureClaudeProfileIdentity(dir)
+		if err != nil {
+			return err
+		}
+		defer snapshot.directory.Close()
+		credentials := snapshot.files[claudeCredentialsFile].data
+		assessment, err := identity.InspectClaudeIdentityBinding(snapshot.files["meta.json"].data, credentials)
+		if err == nil && assessment.State == identity.ClaudeIdentityUnknown {
+			// The same precedence is used by identity extraction: a saved owner
+			// is authoritative, while a cache can establish an unbound profile.
+			assessment, err = identity.InspectClaudeIdentityBinding(snapshot.files[identity.ClaudeIdentityCacheFile].data, credentials)
+		}
+		result.State, result.RecordedIdentity = assessment.State, assessment.RecordedIdentity
+		if err != nil {
+			return err
+		}
+		binding := assessment.Binding
+		if credentials == nil && assessment.State == identity.ClaudeIdentityUnknown {
+			result.Detail = "saved profile has no modern Claude OAuth credential to verify"
+			if opts.Online || opts.Repair {
+				return errors.New(result.Detail)
+			}
+			return nil
+		}
+		if _, err := identity.ClaudeCredentialFingerprint(credentials); err != nil {
+			result.State = "invalid_credentials"
+			return err
+		}
+		if opts.Online || opts.Repair && binding == nil {
+			verify := v.ClaudeIdentityVerifier
+			if verify == nil {
+				verify = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+					return identity.VerifyClaudeCredentials(ctx, data, nil)
+				}
+			}
+			verificationContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			binding, err = verify(verificationContext, bytes.Clone(credentials))
+			if err != nil || binding == nil || !binding.MatchesCredentials(credentials) {
+				// Do not surface transports, response bodies or injected verifier
+				// diagnostics that could contain an Authorization header.
+				result.State = "unavailable"
+				switch {
+				case errors.Is(err, identity.ErrClaudeTokenExpired):
+					result.State = "expired"
+					return identity.ErrClaudeTokenExpired
+				case errors.Is(err, identity.ErrClaudeTokenRejected):
+					result.State = "rejected"
+					return identity.ErrClaudeTokenRejected
+				default:
+					return identity.ErrClaudeIdentityUnavailable
+				}
+			}
+			result.Source = "provider"
+		} else if binding != nil {
+			result.Source = "cache"
+		}
+		if err := snapshot.check(true); err != nil {
+			result.State = "source_changed"
+			return err
+		}
+		if binding == nil {
+			if assessment.State == identity.ClaudeIdentityCredentialChanged {
+				return errors.New("saved Claude credentials changed since identity verification; verify before use")
+			}
+			result.Detail = "saved Claude account and organization have not been verified"
+			return nil
+		}
+		confirmed := binding.Identity
+		confirmed.Verified = true
+		result.Identity, result.VerifiedAt = &confirmed, &binding.VerifiedAt
+		if result.RecordedIdentity != nil && !identity.ClaudeSameAccount(result.RecordedIdentity, &confirmed) {
+			result.State = "conflict"
+			return errors.New("saved Claude credentials belong to a different account or organization; recorded ownership was preserved")
+		}
+		result.State = identity.ClaudeIdentityVerified
+		if !opts.Repair {
+			return nil
+		}
+		verifySource := func() error { return snapshot.check(false) }
+		metadata, err := claudesettings.PrepareIdentityMetadata(filepath.Join(dir, "meta.json"),
+			filepath.Join(dir, claudeCredentialsFile), snapshot.files["meta.json"].data, credentials, binding, verifySource)
+		if err != nil {
+			return err
+		}
+		state, err := claudesettings.PrepareOAuthAccount(filepath.Join(dir, claudeSettingsFile),
+			snapshot.files[claudeSettingsFile].data, claudeOAuthAccount(binding), verifySource)
+		if err != nil {
+			return err
+		}
+		if err := claudesettings.ApplyUpdatesWithFinalizer([]*claudesettings.Update{metadata, state}, nil, verifySource); err != nil {
+			return err
+		}
+		result.Repaired = metadata.Changed() || state.Changed()
+		return nil
+	}
+	var err error
+	if opts.Repair {
+		err = v.WithMutationLock(operation)
+	} else {
+		err = operation()
+	}
+	if err != nil {
+		result.Detail = err.Error()
+	}
+	return result, err
+}
+
+type claudeIdentityFile struct {
+	data []byte
+	info os.FileInfo
+}
+
+type claudeProfileIdentitySnapshot struct {
+	path      string
+	directory *os.Root
+	info      os.FileInfo
+	parent    os.FileInfo
+	files     map[string]claudeIdentityFile
+}
+
+func captureClaudeProfileIdentity(path string) (_ *claudeProfileIdentitySnapshot, resultErr error) {
+	snapshot := &claudeProfileIdentitySnapshot{path: path, files: make(map[string]claudeIdentityFile)}
+	for _, directory := range []string{filepath.Dir(path), path} {
+		info, err := os.Lstat(directory)
+		if err != nil || !info.IsDir() {
+			return nil, errors.New("saved Claude profile must use private directories")
+		}
+		if directory == path {
+			snapshot.info = info
+		} else {
+			snapshot.parent = info
+		}
+	}
+	var err error
+	snapshot.directory, err = os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resultErr != nil {
+			snapshot.directory.Close()
+		}
+	}()
+	for _, name := range []string{claudeCredentialsFile, "meta.json", identity.ClaudeIdentityCacheFile, claudeSettingsFile} {
+		file, err := readClaudeIdentityFile(snapshot.directory, name)
+		if err != nil {
+			return nil, err
+		}
+		snapshot.files[name] = file
+	}
+	return snapshot, snapshot.check(true)
+}
+
+func readClaudeIdentityFile(directory *os.Root, name string) (claudeIdentityFile, error) {
+	var result claudeIdentityFile
+	info, err := directory.Lstat(name)
+	if os.IsNotExist(err) {
+		return result, nil
+	}
+	if err != nil || !info.Mode().IsRegular() {
+		return result, fmt.Errorf("saved Claude %s must be a private regular file", name)
+	}
+	file, err := directory.Open(name)
+	if err != nil {
+		return result, fmt.Errorf("cannot read saved Claude %s", name)
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return result, errors.New("saved Claude identity source changed while opening; retry")
+	}
+	result.data, err = io.ReadAll(file)
+	if err != nil {
+		return result, fmt.Errorf("cannot read saved Claude %s", name)
+	}
+	result.info = info
+	return result, nil
+}
+
+func (snapshot *claudeProfileIdentitySnapshot) check(includeMetadata bool) error {
+	for path, expected := range map[string]os.FileInfo{snapshot.path: snapshot.info, filepath.Dir(snapshot.path): snapshot.parent} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || !os.SameFile(expected, info) {
+			return errors.New("saved Claude profile directory changed during identity verification; retry")
+		}
+	}
+	for name, expected := range snapshot.files {
+		if !includeMetadata && name != claudeCredentialsFile && name != identity.ClaudeIdentityCacheFile {
+			continue
+		}
+		current, err := readClaudeIdentityFile(snapshot.directory, name)
+		if err != nil || (current.info == nil) != (expected.info == nil) || !bytes.Equal(current.data, expected.data) ||
+			current.info != nil && (!os.SameFile(current.info, expected.info) || current.info.Mode() != expected.info.Mode() || !current.info.ModTime().Equal(expected.info.ModTime())) {
+			return errors.New("saved Claude profile changed during identity verification; retry")
+		}
+	}
+	return nil
+}
 
 func (s *switchState) setClaudeIdentity(binding *identity.ClaudeIdentityBinding) {
 	s.claudeIdentity = nil

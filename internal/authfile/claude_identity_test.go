@@ -37,6 +37,265 @@ func issue132WriteProof(t *testing.T, path string, proof *identity.ClaudeIdentit
 	writeFixtureFile(t, path, string(data))
 }
 
+func TestClaudeProfileIdentityRepairsSavedLabelsWithoutActivation(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("work", aliceTeamGen1, aliceSettings(7))
+	f.writeLive(bobGen1, bobSettings(3))
+	writeFixtureFile(t, f.profileFile("work", "meta.json"), `{"description":"keep operator label","tags":["work"],"identity":"stale@example.test"}`)
+	beforeMeta := readFixtureFile(t, f.profileFile("work", "meta.json"))
+	beforeState := readFixtureFile(t, f.profileFile("work", claudeSettingsFile))
+	beforeLive := readFixtureFile(t, f.liveSettings)
+	calls := 0
+	verify := f.vault.ClaudeIdentityVerifier
+	f.vault.ClaudeIdentityVerifier = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		calls++
+		if string(data) != aliceTeamGen1 {
+			t.Fatal("verification selected native credentials instead of the named saved profile")
+		}
+		return verify(ctx, data)
+	}
+	result, err := f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{})
+	if err != nil || result.State != identity.ClaudeIdentityUnknown || result.Identity != nil || calls != 0 {
+		t.Fatalf("offline legacy inspection = %+v, %v; calls=%d", result, err, calls)
+	}
+	result, err = f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Online: true})
+	if err != nil || result.State != identity.ClaudeIdentityVerified || result.Source != "provider" || result.Repaired || result.Identity.OrganizationID != rotTeamOrg || calls != 1 {
+		t.Fatalf("read-only verification = %+v, %v; calls=%d", result, err, calls)
+	}
+	if readFixtureFile(t, f.profileFile("work", "meta.json")) != beforeMeta || readFixtureFile(t, f.profileFile("work", claudeSettingsFile)) != beforeState {
+		t.Fatal("read-only verification modified the saved profile")
+	}
+	result, err = f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Repair: true})
+	if err != nil || !result.Repaired || result.Identity.OrganizationID != rotTeamOrg || calls != 2 {
+		t.Fatalf("repair = %+v, %v; calls=%d", result, err, calls)
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(readFixtureFile(t, f.profileFile("work", "meta.json"))), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if string(meta["description"]) != `"keep operator label"` || string(meta["tags"]) != `["work"]` {
+		t.Fatal("repair lost operator metadata")
+	}
+	var state struct {
+		Account struct {
+			Organization string `json:"organizationUuid"`
+		} `json:"oauthAccount"`
+		NumStartups int `json:"numStartups"`
+	}
+	if err := json.Unmarshal([]byte(readFixtureFile(t, f.profileFile("work", claudeSettingsFile))), &state); err != nil || state.Account.Organization != rotTeamOrg || state.NumStartups != 7 {
+		t.Fatalf("repair did not preserve session state and normalize the verified organization: %+v, %v", state, err)
+	}
+	if readFixtureFile(t, f.liveCreds) != bobGen1 || readFixtureFile(t, f.liveSettings) != beforeLive || readFixtureFile(t, f.profileFile("work", claudeCredentialsFile)) != aliceTeamGen1 {
+		t.Fatal("metadata repair changed a saved credential or active login")
+	}
+	// The saved token is expired. Restart must still recognize exact ownership
+	// without requiring a provider or rewriting already canonical metadata.
+	restarted := NewVault(f.vaultDir)
+	restarted.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+		t.Error("cached expired identity required network after restart")
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+	before := make(map[string]os.FileInfo)
+	for _, name := range []string{claudeCredentialsFile, "meta.json", claudeSettingsFile} {
+		before[name], err = os.Stat(f.profileFile("work", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err = restarted.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Repair: true})
+	if err != nil || result.Repaired || result.Source != "cache" || result.Identity.OrganizationID != rotTeamOrg {
+		t.Fatalf("offline restart repair = %+v, %v", result, err)
+	}
+	for name, info := range before {
+		after, err := os.Stat(f.profileFile("work", name))
+		if err != nil || !os.SameFile(info, after) || !info.ModTime().Equal(after.ModTime()) {
+			t.Fatalf("repeated repair rewrote %s: %v", name, err)
+		}
+	}
+}
+
+func TestClaudeProfileIdentityRefusesRebindingButAcceptsSameOwnerRotation(t *testing.T) {
+	for _, incoming := range []string{aliceGen2, aliceTeamGen1, bobGen1} {
+		t.Run(incoming, func(t *testing.T) {
+			f := newClaudeRotationFixture(t)
+			f.writeProfile("personal", aliceGen1, aliceSettings(1))
+			writeFixtureFile(t, f.profileFile("personal", claudeCredentialsFile), incoming)
+			beforeMeta := readFixtureFile(t, f.profileFile("personal", "meta.json"))
+			beforeState := readFixtureFile(t, f.profileFile("personal", claudeSettingsFile))
+			result, err := f.vault.ClaudeProfileIdentity(context.Background(), "personal", ClaudeProfileIdentityOptions{})
+			if err == nil || result.State != identity.ClaudeIdentityCredentialChanged || result.Identity != nil || result.RecordedIdentity == nil || result.RecordedIdentity.Verified {
+				t.Fatalf("changed token received old ownership: %+v, %v", result, err)
+			}
+			result, err = f.vault.ClaudeProfileIdentity(context.Background(), "personal", ClaudeProfileIdentityOptions{Repair: true})
+			if incoming == aliceGen2 {
+				if err != nil || !result.Repaired || result.Identity.OrganizationID != rotAliceOrg {
+					t.Fatalf("same-owner rotation was not repaired: %+v, %v", result, err)
+				}
+			} else {
+				if err == nil || result.State != "conflict" || result.Repaired || result.Identity == nil || !result.Identity.Verified {
+					t.Fatalf("different owner was rebound: %+v, %v", result, err)
+				}
+				if readFixtureFile(t, f.profileFile("personal", "meta.json")) != beforeMeta || readFixtureFile(t, f.profileFile("personal", claudeSettingsFile)) != beforeState {
+					t.Fatal("ownership conflict modified saved metadata")
+				}
+			}
+			if readFixtureFile(t, f.profileFile("personal", claudeCredentialsFile)) != incoming {
+				t.Fatal("repair replaced saved tokens")
+			}
+		})
+	}
+}
+
+func TestClaudeProfileIdentityRejectsConcurrentSourceReplacement(t *testing.T) {
+	for _, change := range []string{claudeCredentialsFile, "meta.json", claudeSettingsFile, "same token new inode", "directory"} {
+		t.Run(change, func(t *testing.T) {
+			f := newClaudeRotationFixture(t)
+			f.writeProfile("selected", aliceGen1, aliceSettings(1))
+			f.writeLive(bobGen1, bobSettings(3))
+			verify := f.vault.ClaudeIdentityVerifier
+			f.vault.ClaudeIdentityVerifier = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				switch change {
+				case "directory":
+					dir := f.vault.ProfilePath("claude", "selected")
+					if err := os.Rename(dir, dir+"-retained"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(dir, 0700); err != nil {
+						t.Fatal(err)
+					}
+					writeFixtureFile(t, filepath.Join(dir, claudeCredentialsFile), bobGen1)
+					writeFixtureFile(t, filepath.Join(dir, claudeSettingsFile), bobSettings(2))
+				case "same token new inode":
+					path := f.profileFile("selected", claudeCredentialsFile)
+					writeFixtureFile(t, path+".replacement", aliceGen1)
+					if err := os.Rename(path+".replacement", path); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					value := `{"concurrent":"preserve"}`
+					if change == claudeCredentialsFile {
+						value = bobGen1
+					}
+					writeFixtureFile(t, f.profileFile("selected", change), value)
+				}
+				return verify(ctx, data)
+			}
+			result, err := f.vault.ClaudeProfileIdentity(context.Background(), "selected", ClaudeProfileIdentityOptions{Online: true, Repair: true})
+			if err == nil || result.State != "source_changed" || result.Repaired {
+				t.Fatalf("concurrent source was repaired: %+v, %v", result, err)
+			}
+			if readFixtureFile(t, f.liveCreds) != bobGen1 {
+				t.Fatal("failed saved repair changed native tokens")
+			}
+		})
+	}
+}
+
+func TestClaudeProfileIdentityUnavailableAndExpiredAreSafe(t *testing.T) {
+	for _, failure := range []error{identity.ErrClaudeTokenExpired, identity.ErrClaudeTokenRejected, errors.New("Authorization: Bearer SYNTHETIC-DO-NOT-PRINT")} {
+		f := newClaudeRotationFixture(t)
+		f.writeProfile("work", aliceGen1, aliceSettings(1))
+		before := readFixtureFile(t, f.profileFile("work", "meta.json"))
+		f.vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) { return nil, failure }
+		result, err := f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Online: true, Repair: true})
+		if err == nil || result.Repaired || result.Identity != nil || result.Source != "none" || strings.Contains(result.Detail, "SYNTHETIC") {
+			t.Fatalf("unsuccessful provider request claimed cached success or leaked secrets: %+v, %v", result, err)
+		}
+		if readFixtureFile(t, f.profileFile("work", "meta.json")) != before {
+			t.Fatal("provider failure changed saved ownership")
+		}
+	}
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("expired", aliceGen1, aliceSettings(1))
+	f.vault.ClaudeIdentityVerifier = nil
+	result, err := f.vault.ClaudeProfileIdentity(context.Background(), "expired", ClaudeProfileIdentityOptions{Online: true})
+	if !errors.Is(err, identity.ErrClaudeTokenExpired) || result.State != "expired" {
+		t.Fatalf("production verifier did not skip expired token: %+v, %v", result, err)
+	}
+}
+
+func TestClaudeProfileIdentityProtectsMetadataAndRecoverySnapshots(t *testing.T) {
+	for _, malformed := range []string{`{"claude_identity":{}}`, `null`, `{"SYNTHETIC-PRIVATE`} {
+		f := newClaudeRotationFixture(t)
+		f.writeProfile("bad", aliceGen1, aliceSettings(1))
+		writeFixtureFile(t, f.profileFile("bad", "meta.json"), malformed)
+		f.vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+			t.Error("malformed expected owner must not be rebound")
+			return nil, identity.ErrClaudeIdentityUnavailable
+		}
+		result, err := f.vault.ClaudeProfileIdentity(context.Background(), "bad", ClaudeProfileIdentityOptions{Repair: true})
+		if err == nil || result.State != identity.ClaudeIdentityInvalidMetadata || strings.Contains(result.Detail, "SYNTHETIC") || readFixtureFile(t, f.profileFile("bad", "meta.json")) != malformed {
+			t.Fatalf("invalid metadata was overwritten or leaked: %+v, %v", result, err)
+		}
+	}
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("_original", aliceGen1, aliceSettings(1))
+	if result, err := f.vault.ClaudeProfileIdentity(context.Background(), "_original", ClaudeProfileIdentityOptions{}); err != nil || result.State != identity.ClaudeIdentityVerified {
+		t.Fatalf("recovery snapshot inspection failed: %+v, %v", result, err)
+	}
+	if _, err := f.vault.ClaudeProfileIdentity(context.Background(), "_original", ClaudeProfileIdentityOptions{Repair: true}); !errors.Is(err, errProtectedSystemProfile) {
+		t.Fatalf("recovery snapshot was mutable: %v", err)
+	}
+	absent := NewVault(filepath.Join(t.TempDir(), "absent"))
+	if _, err := absent.ClaudeProfileIdentity(context.Background(), "missing", ClaudeProfileIdentityOptions{}); err == nil {
+		t.Fatal("missing profile was treated as verified")
+	}
+	if _, err := os.Stat(absent.basePath); !os.IsNotExist(err) {
+		t.Fatal("read-only inspection created a vault")
+	}
+}
+
+func TestClaudeProfileIdentityPromotesExactCacheWithoutOverridingSavedOwner(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("work", aliceTeamGen1, aliceSettings(1))
+	cache := f.profileFile("work", identity.ClaudeIdentityCacheFile)
+	issue132WriteProof(t, cache, issue132Proof(t, []byte(aliceTeamGen1), "account", "team"))
+	writeFixtureFile(t, f.profileFile("work", "meta.json"), `{"description":"imported cache-only profile"}`)
+	f.vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+		t.Error("matching expired cache required online verification")
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+	result, err := f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Repair: true})
+	if err != nil || !result.Repaired || result.Source != "cache" || result.Identity.OrganizationID != "team" {
+		t.Fatalf("cache-only proof was not promoted offline: %+v, %v", result, err)
+	}
+	// A copied cache may not replace the expected owner of an existing profile,
+	// even though its token bytes match the subsequently substituted grant.
+	issue132WriteProof(t, f.profileFile("work", "meta.json"), issue132Proof(t, []byte(aliceGen1), "account", "personal"))
+	result, err = f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{})
+	if err == nil || result.State != identity.ClaudeIdentityCredentialChanged || result.Identity != nil || result.RecordedIdentity.OrganizationID != "personal" {
+		t.Fatalf("native cache bypassed saved ownership: %+v, %v", result, err)
+	}
+}
+
+func TestClaudeProfileIdentityRejectsLinkedSavedFiles(t *testing.T) {
+	for _, name := range []string{claudeCredentialsFile, "meta.json", identity.ClaudeIdentityCacheFile, claudeSettingsFile} {
+		t.Run(name, func(t *testing.T) {
+			f := newClaudeRotationFixture(t)
+			f.writeProfile("work", aliceGen1, aliceSettings(1))
+			path := f.profileFile("work", name)
+			if _, err := os.Lstat(path); err == nil {
+				if err := os.Rename(path, path+".retained"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			external := filepath.Join(t.TempDir(), "private")
+			writeFixtureFile(t, external, `{"SYNTHETIC-PRIVATE":"never disclose or overwrite"}`)
+			if err := os.Symlink(external, path); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			f.vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+				t.Error("linked saved source was sent to the provider")
+				return nil, identity.ErrClaudeIdentityUnavailable
+			}
+			result, err := f.vault.ClaudeProfileIdentity(context.Background(), "work", ClaudeProfileIdentityOptions{Online: true, Repair: true})
+			if err == nil || result.Repaired || strings.Contains(result.Detail, "SYNTHETIC") || readFixtureFile(t, external) != `{"SYNTHETIC-PRIVATE":"never disclose or overwrite"}` {
+				t.Fatalf("linked saved source accepted or disclosed: %+v, %v", result, err)
+			}
+		})
+	}
+}
+
 func TestClaudeBackupRejectsSourceChangeDuringVerification(t *testing.T) {
 	for _, changed := range []string{"credentials", "settings"} {
 		t.Run(changed, func(t *testing.T) {

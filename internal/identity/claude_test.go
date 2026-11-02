@@ -13,6 +13,63 @@ import (
 	"time"
 )
 
+func TestInspectClaudeIdentityBindingSeparatesMissingAndBrokenProof(t *testing.T) {
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-TEAM-ACCESS","refreshToken":"SYNTHETIC-REFRESH","expiresAt":1}}`)
+	fingerprint, err := ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := ClaudeIdentityBinding{Identity: Identity{Provider: "claude", AccountID: "account", OrganizationID: "team", Email: "shared@example.test", Verified: true}, CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC()}
+	encode := func(binding ClaudeIdentityBinding) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"claude_identity": binding, "description": "operator label"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	for _, test := range []struct {
+		name, state string
+		data        []byte
+		bad         bool
+	}{
+		{"missing", ClaudeIdentityUnknown, nil, false},
+		{"legacy", ClaudeIdentityUnknown, []byte(`{"identity":"shared@example.test"}`), false},
+		{"null proof", ClaudeIdentityUnknown, []byte(`{"claude_identity":null}`), false},
+		{"empty file", ClaudeIdentityInvalidMetadata, []byte{}, true},
+		{"null document", ClaudeIdentityInvalidMetadata, []byte(`null`), true},
+		{"invalid JSON", ClaudeIdentityInvalidMetadata, []byte(`{"SYNTHETIC-SECRET-DO-NOT-PRINT`), true},
+		{"incomplete proof", ClaudeIdentityInvalidMetadata, []byte(`{"claude_identity":{}}`), true},
+		{"bound expired pair", ClaudeIdentityVerified, encode(proof), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := InspectClaudeIdentityBinding(test.data, credentials)
+			if result.State != test.state || (err != nil) != test.bad {
+				t.Fatalf("inspection = %+v, %v", result, err)
+			}
+			if err != nil && strings.Contains(err.Error(), "SYNTHETIC") {
+				t.Fatal("inspection leaked malformed credential metadata")
+			}
+			if result.Binding != nil && (!result.Binding.Identity.Verified || result.RecordedIdentity == nil || result.RecordedIdentity.Verified) {
+				t.Fatal("recorded ownership and current verified ownership were confused")
+			}
+		})
+	}
+	changed := []byte(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-PERSONAL-ACCESS","refreshToken":"SYNTHETIC-REFRESH"}}`)
+	result, err := InspectClaudeIdentityBinding(encode(proof), changed)
+	if err != nil || result.State != ClaudeIdentityCredentialChanged || result.Binding != nil || result.RecordedIdentity == nil || result.RecordedIdentity.Verified || result.RecordedIdentity.OrganizationID != "team" {
+		t.Fatalf("substituted access token inherited a cached proof: %+v, %v", result, err)
+	}
+	for _, badFingerprint := range []string{strings.Repeat("z", 64), strings.Repeat(":", 64), strings.Repeat("F", 64), "short"} {
+		invalid := proof
+		invalid.CredentialFingerprint = badFingerprint
+		result, err := InspectClaudeIdentityBinding(encode(invalid), credentials)
+		if err == nil || result.State != ClaudeIdentityInvalidMetadata || result.RecordedIdentity != nil {
+			t.Fatalf("invalid fingerprint accepted: %+v, %v", result, err)
+		}
+	}
+}
+
 func TestExtractFromClaudeCredentials_AllFields(t *testing.T) {
 	exp := time.Now().Add(90 * time.Minute).UTC()
 	cred := map[string]interface{}{

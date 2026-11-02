@@ -13,6 +13,32 @@ import (
 	"time"
 )
 
+func TestVaultWithMutationLockReleasesAfterOperationFailure(t *testing.T) {
+	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	failed := errors.New("publication stopped")
+	if err := vault.WithMutationLock(nil); err == nil {
+		t.Fatal("nil operation accepted")
+	}
+	if _, err := os.Stat(vault.basePath); !os.IsNotExist(err) {
+		t.Fatal("nil operation created a vault")
+	}
+	if err := vault.WithMutationLock(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		release, err := NewVault(vault.basePath).lockMutationContext(ctx)
+		release()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("operation did not hold cross-process lock: %v", err)
+		}
+		return failed
+	}); !errors.Is(err, failed) {
+		t.Fatalf("operation failure was not returned: %v", err)
+	}
+	if err := vault.WithMutationLock(func() error { return nil }); err != nil {
+		t.Fatalf("failed operation retained the lock: %v", err)
+	}
+}
+
 func TestVaultMutationLockCreatesPrivatePersistentLock(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "nested", "vault")
 	vault := NewVault(base)

@@ -535,6 +535,26 @@ profiles does not call the identity endpoint. `caam ls --json` includes
 `identity.organization_id` and, for a verified binding,
 `identity.identity_verified: true`.
 
+Inspect or repair a suspect **saved vault profile without activating it**:
+
+```bash
+caam verify identity claude work-team                  # offline cached proof
+caam verify identity claude work-team --online --json  # check this saved token
+caam verify identity claude work-team --repair         # persist proof and correct labels
+```
+
+Repair uses an exact cached proof when available, including for an expired
+access token; otherwise it requests provider verification. `--online` always
+requests a fresh check and reports expiry, rejection, or endpoint unavailability
+explicitly. Repair updates only the selected profile's identity metadata and
+`oauthAccount` label, preserving its credentials, other settings, operator
+description and tags. It leaves native sessions and keychains untouched. A
+token that verifies as a different recorded account or organization is reported
+as a conflict and cannot be rebound by repair. Concurrent source changes abort
+publication, and automatic recovery snapshots remain immutable. Passive
+`caam validate` and `caam verify` also report broken saved identity bindings
+without calling the provider or assuming that another login is required.
+
 If verification is unavailable or the access token has expired, CAAM can
 preserve an unverified grant or explicitly activate a legacy snapshot, but
 omits its unverified `oauthAccount` label and reports a warning. Existing

@@ -46,6 +46,65 @@ type ClaudeIdentityBinding struct {
 	VerifiedAt            time.Time `json:"verified_at"`
 }
 
+const (
+	ClaudeIdentityUnknown           = "unknown"
+	ClaudeIdentityVerified          = "verified"
+	ClaudeIdentityCredentialChanged = "credential_changed"
+	ClaudeIdentityInvalidMetadata   = "invalid_metadata"
+)
+
+// ClaudeIdentityAssessment distinguishes absent evidence from a broken prior
+// binding. RecordedIdentity describes the expected owner of the saved profile;
+// it must not be presented as verified ownership of a replacement credential.
+// Binding is returned only when both captured token values still match.
+type ClaudeIdentityAssessment struct {
+	State            string                 `json:"state"`
+	Binding          *ClaudeIdentityBinding `json:"-"`
+	RecordedIdentity *Identity              `json:"recorded_identity,omitempty"`
+}
+
+// InspectClaudeIdentityBinding assesses captured metadata without file or
+// network access. It never treats email, names, or .claude.json as proof, and
+// errors never contain credential bytes or fragments of invalid JSON.
+func InspectClaudeIdentityBinding(metadata, credentials []byte) (ClaudeIdentityAssessment, error) {
+	result := ClaudeIdentityAssessment{State: ClaudeIdentityUnknown}
+	if metadata == nil {
+		return result, nil
+	}
+	var envelope map[string]json.RawMessage
+	if len(metadata) > claudeIdentityMaxBytes || json.Unmarshal(metadata, &envelope) != nil || envelope == nil {
+		result.State = ClaudeIdentityInvalidMetadata
+		return result, errors.New("invalid Claude identity metadata")
+	}
+	raw, present := envelope["claude_identity"]
+	if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return result, nil
+	}
+	var binding ClaudeIdentityBinding
+	if json.Unmarshal(raw, &binding) != nil || binding.Identity.Provider != "claude" || binding.VerifiedAt.IsZero() ||
+		!ClaudeSameAccount(&binding.Identity, &binding.Identity) || len(binding.CredentialFingerprint) != sha256.Size*2 {
+		result.State = ClaudeIdentityInvalidMetadata
+		return result, errors.New("incomplete Claude identity binding")
+	}
+	for _, digit := range binding.CredentialFingerprint {
+		if digit < '0' || digit > '9' && digit < 'a' || digit > 'f' {
+			result.State = ClaudeIdentityInvalidMetadata
+			return result, errors.New("invalid Claude identity fingerprint")
+		}
+	}
+	recorded := binding.Identity
+	recorded.Verified = false
+	result.RecordedIdentity = &recorded
+	if !binding.MatchesCredentials(credentials) {
+		result.State = ClaudeIdentityCredentialChanged
+		return result, nil
+	}
+	binding.Identity.Verified = true
+	result.State = ClaudeIdentityVerified
+	result.Binding = &binding
+	return result, nil
+}
+
 // ClaudeSameAccount requires the account AND organization UUIDs. Email and
 // organization labels are presentation fields, not account-selection keys.
 func ClaudeSameAccount(a, b *Identity) bool {

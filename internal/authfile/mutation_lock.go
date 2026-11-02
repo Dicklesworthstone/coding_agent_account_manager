@@ -15,6 +15,24 @@ const vaultMutationLockName = ".caam-mutation.lock"
 
 var errVaultMutationLockBusy = errors.New("another vault mutation is in progress")
 
+// WithMutationLock coordinates a complete vault operation with managed backup,
+// switching, and synchronization. Exporters may use it to capture a consistent
+// snapshot. The callback must retain generation checks for unmanaged writers
+// and must not call another mutating Vault method or recursively take this lock.
+func (v *Vault) WithMutationLock(operation func() error) error {
+	if operation == nil {
+		return errors.New("vault operation is required")
+	}
+	switchMu.Lock()
+	defer switchMu.Unlock()
+	release, err := v.lockMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return operation()
+}
+
 // lockMutation serializes managed mutations of the same vault across processes.
 // Native clients do not take this lock, so callers must retain their captured
 // credential and settings generation checks. Callers must not nest this lock.

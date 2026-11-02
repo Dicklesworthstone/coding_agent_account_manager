@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
@@ -27,6 +29,7 @@ type VerifyProfileResult struct {
 	Issues             []string      `json:"issues,omitempty"`
 	Score              float64       `json:"score"`
 	Recommendation     string        `json:"recommendation,omitempty"`
+	IdentityState      string        `json:"identity_state,omitempty"`
 	ReloginWarningLead time.Duration `json:"relogin_warning_lead,omitempty"`
 	health.Signals
 }
@@ -70,7 +73,8 @@ Examples:
   caam verify              # Verify all profiles
   caam verify claude       # Verify only Claude profiles
   caam verify --json       # Machine-readable output
-  caam verify --fix        # Auto-refresh expiring tokens`,
+  caam verify --fix        # Auto-refresh expiring tokens
+  caam verify identity claude work --repair # Verify and repair saved identity`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runVerify,
 }
@@ -79,6 +83,66 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().Bool("json", false, "output as JSON")
 	verifyCmd.Flags().Bool("fix", false, "auto-refresh expiring/expired tokens for refreshable profiles")
+	verifyCmd.AddCommand(newVerifyIdentityCommand())
+}
+
+func newVerifyIdentityCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "identity <tool> <profile>",
+		Short: "Check or repair a saved Claude profile's account and organization",
+		Long: `Inspect a saved vault profile's token-bound account and organization.
+
+The default check is offline. --online requests fresh provider verification.
+--repair persists a matching cached proof, or verifies with the provider when
+needed, and corrects the saved account labels. Credentials are never activated
+or replaced. A different recorded account or organization cannot be rebound.
+
+Examples:
+  caam verify identity claude work
+  caam verify identity claude work --online --json
+  caam verify identity claude work --repair`,
+		Args: cobra.ExactArgs(2),
+		RunE: runVerifyIdentity,
+	}
+	command.Flags().Bool("online", false, "verify the saved access token with the provider")
+	command.Flags().Bool("repair", false, "repair saved identity metadata using cached or provider verification")
+	command.Flags().Bool("json", false, "output as JSON")
+	return command
+}
+
+func runVerifyIdentity(cmd *cobra.Command, args []string) error {
+	if strings.ToLower(args[0]) != "claude" {
+		return fmt.Errorf("saved account-and-organization verification is supported for claude")
+	}
+	if vault == nil {
+		vault = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	online, _ := cmd.Flags().GetBool("online")
+	repair, _ := cmd.Flags().GetBool("repair")
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	result, verificationErr := vault.ClaudeProfileIdentity(cmd.Context(), args[1], authfile.ClaudeProfileIdentityOptions{Online: online, Repair: repair})
+	if jsonOutput {
+		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s/%s: %s (source: %s)\n", result.Provider, result.Profile, result.State, result.Source)
+		if result.Identity != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "Account: %s\nOrganization: %s [%s]\nEmail: %s\n",
+				result.Identity.AccountID, result.Identity.Organization, result.Identity.OrganizationID, result.Identity.Email)
+		}
+		if result.State == "conflict" && result.RecordedIdentity != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "Recorded account: %s\nRecorded organization: %s [%s]\n",
+				result.RecordedIdentity.AccountID, result.RecordedIdentity.Organization, result.RecordedIdentity.OrganizationID)
+		}
+		if result.Repaired {
+			fmt.Fprintln(cmd.OutOrStdout(), "Saved identity metadata repaired.")
+		}
+		if result.Detail != "" {
+			fmt.Fprintln(cmd.OutOrStdout(), result.Detail)
+		}
+	}
+	return verificationErr
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
@@ -231,6 +295,17 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 		Profile:  profileName,
 		Status:   "unknown",
 		Issues:   []string{},
+	}
+	if provider == "claude" {
+		inspection, err := vault.ClaudeProfileIdentity(context.Background(), profileName, authfile.ClaudeProfileIdentityOptions{})
+		result.IdentityState = inspection.State
+		if err != nil {
+			result.Status = "critical"
+			result.Issues = append(result.Issues, inspection.Detail)
+			result.Signals = claudeIdentitySignals(inspection.State)
+			result.Recommendation = claudeIdentityRecommendation(profileName, inspection.State)
+			return result
+		}
 	}
 
 	// Get profile health using the existing getProfileHealth function
