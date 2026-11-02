@@ -1447,6 +1447,13 @@ before each refresh pass. It recognizes new profiles, removed profiles and
 replaced credentials without relying on a previously saved pool state. Existing
 cooldowns remain in effect while the inventory changes.
 
+Claude ownership checks stay offline during reconciliation. A saved identity
+proof that is malformed or no longer matches the access/refresh pair makes the
+profile unavailable for selection, including after a pool restart. Inspect it
+with `caam verify identity claude <profile>` before repair. A matching cached
+proof still works after access-token expiry; unverified legacy profiles retain
+their existing credential validation and native-renewal behavior.
+
 ```bash
 caam pool status --json
 caam pool refresh codex/work
@@ -1903,6 +1910,14 @@ Organization-specific Claude recovery is refused when the browser agent has
 only email-based account configuration. It cannot choose between Personal and
 Team organizations sharing an email; use a verified vault profile as described
 under [account and organization identity](#account-and-organization-identity).
+
+The coordinator reports an account only when verified evidence belongs to the
+grant held by that particular running pane. Current host credential files do
+not prove this: another session can switch those files while the pane keeps its
+older grant in memory. The built-in pane backends therefore leave account and
+organization fields unknown. Integrations can provide a pane identity resolver
+with the required process and grant provenance; its result is retained through
+retries of the same rate-limit episode and reconsidered for the next episode.
 
 ```bash
 # One time, on the machine with the browser:

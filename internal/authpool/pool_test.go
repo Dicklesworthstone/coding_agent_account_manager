@@ -13,7 +13,101 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
+
+func TestPoolClaudeOwnershipSurvivesRestartAndRejectsChangedGrant(t *testing.T) {
+	for _, change := range []string{"access", "refresh", "malformed-proof"} {
+		t.Run(change, func(t *testing.T) {
+			root := t.TempDir()
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+				t.Fatal("pool reconciliation must not contact the identity endpoint")
+				return nil, nil
+			}
+			store := health.NewStorage(filepath.Join(root, "health.json"))
+			pool := NewAuthPool(WithVault(vault), WithHealthStorage(store))
+			credentials := map[string]any{"claudeAiOauth": map[string]any{
+				"accessToken": "synthetic-personal-access", "refreshToken": "synthetic-personal-refresh",
+				"expiresAt": time.Now().Add(-time.Hour).UnixMilli(),
+			}}
+			path := writePoolCredential(t, vault.BasePath(), "claude", "personal", ".credentials.json", credentials)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, err := identity.ClaudeCredentialFingerprint(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding := identity.ClaudeIdentityBinding{
+				Identity:              identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: "personal-org", Email: "shared@example.test"},
+				CredentialFingerprint: fingerprint, VerifiedAt: time.Now().Add(-2 * time.Hour),
+			}
+			metadata := map[string]any{"description": "personal", "claude_identity": binding}
+			writePoolCredential(t, vault.BasePath(), "claude", "personal", "meta.json", metadata)
+			// Stale display labels sharing the email cannot replace the bound org.
+			writePoolCredential(t, vault.BasePath(), "claude", "personal", ".claude.json", map[string]any{
+				"oauthAccount": map[string]any{"emailAddress": "shared@example.test", "organizationUuid": "team-org"},
+			})
+			if err := pool.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if pool.GetStatus("claude", "personal") != PoolStatusReady {
+				t.Fatal("expired exact-bound native grant lost offline ownership readiness")
+			}
+			opts := PersistOptions{StatePath: filepath.Join(root, "pool.json")}
+			if err := pool.Save(opts); err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "access":
+				credentials["claudeAiOauth"].(map[string]any)["accessToken"] = "synthetic-team-access"
+			case "refresh":
+				credentials["claudeAiOauth"].(map[string]any)["refreshToken"] = "synthetic-team-refresh"
+			case "malformed-proof":
+				writePoolCredential(t, vault.BasePath(), "claude", "personal", "meta.json", map[string]any{"claude_identity": "invalid"})
+			}
+			writePoolCredential(t, vault.BasePath(), "claude", "personal", ".credentials.json", credentials)
+			restarted := NewAuthPool(WithVault(vault), WithHealthStorage(store))
+			if err := restarted.Load(opts); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			current := restarted.GetProfile("claude", "personal")
+			if current.Status != PoolStatusError || current.ErrorMessage != errClaudePoolIdentity.Error() {
+				t.Fatalf("persisted readiness admitted inconsistent ownership: status=%s message=%q", current.Status, current.ErrorMessage)
+			}
+			if ready := restarted.GetReadyProfiles("claude"); len(ready) != 0 {
+				t.Fatal("known changed grant was selectable")
+			}
+			// A later verified repair restores readiness without new token bytes
+			// or a provider round trip during passive reconciliation.
+			data, err = os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding.CredentialFingerprint, err = identity.ClaudeCredentialFingerprint(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata["claude_identity"] = binding
+			writePoolCredential(t, vault.BasePath(), "claude", "personal", "meta.json", metadata)
+			if err := restarted.LoadFromVault(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if current := restarted.GetProfile("claude", "personal"); current.Status != PoolStatusReady || current.ErrorMessage != "" {
+				t.Fatal("repaired proof did not restore readiness")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(data) {
+				t.Fatal("read-only pool reconciliation changed saved credentials")
+			}
+		})
+	}
+}
 
 func writePoolCredential(t *testing.T, root, provider, name, file string, value any) string {
 	t.Helper()

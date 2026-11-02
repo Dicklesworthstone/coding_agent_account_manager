@@ -19,6 +19,8 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 )
 
+var errClaudePoolIdentity = errors.New("saved Claude identity is inconsistent with credentials; verify identity before use")
+
 // AuthPool manages a pool of authentication profiles and their states.
 // It tracks token freshness, handles refresh coordination, and provides
 // profile selection for rotation.
@@ -653,6 +655,14 @@ func (p *AuthPool) LoadFromVault(ctx context.Context) error {
 			}
 			oldStatus := profile.Status
 			generation, credentialErr := p.vaultCredentialGeneration(fileSet, name)
+			if credentialErr == nil && provider == "claude" {
+				// Shape and expiry do not establish ownership. Reconcile saved
+				// proofs offline, including after restart, so a known substituted
+				// grant never enters the ready pool and fails only at activation.
+				if _, err := p.vault.ClaudeProfileIdentity(ctx, name, authfile.ClaudeProfileIdentityOptions{}); err != nil {
+					credentialErr = errClaudePoolIdentity
+				}
+			}
 			current, healthErr := p.healthStore.GetProfile(provider, name)
 			if credentialErr == nil && healthErr != nil {
 				credentialErr = fmt.Errorf("credential health unavailable")
@@ -671,9 +681,15 @@ func (p *AuthPool) LoadFromVault(ctx context.Context) error {
 				profile.ErrorCount = 0
 				profile.ErrorMessage = ""
 			}
+			if credentialErr == nil && profile.ErrorMessage == errClaudePoolIdentity.Error() {
+				profile.ErrorMessage = ""
+			}
 			if credentialErr != nil {
 				profile.credentialStatus = PoolStatusError
 				profile.ErrorMessage = "saved credentials are missing or invalid"
+				if errors.Is(credentialErr, errClaudePoolIdentity) {
+					profile.ErrorMessage = errClaudePoolIdentity.Error()
+				}
 			} else if current != nil {
 				profile.TokenExpiry = current.TokenExpiresAt
 				profile.refreshable = (provider == "codex" || provider == "gemini") && current.TokenRenewable && !current.SelfRefreshing && !current.ProviderRejected()

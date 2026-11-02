@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -36,6 +34,20 @@ const (
 	// BackendAuto tries WezTerm first, falls back to tmux.
 	BackendAuto Backend = "auto"
 )
+
+// PaneIdentityResolver resolves the Claude identity used by a running pane.
+// It is called once when a new rate-limit episode is observed. A non-nil
+// result must have provider-verified account and organization IDs bound to
+// the exact grant in use by this pane's current process, with Verified set.
+//
+// A verified credential file alone does not establish this relationship:
+// another process may have switched that file while the pane retains an older
+// grant. The coordinator's HOME, a pane's title or working directory, and a
+// PID without its machine and process provenance are not identity evidence.
+// Return nil when the relationship is unknown or no longer valid. Resolvers
+// must honor ctx and keep work bounded; pane polling must not prompt for
+// credentials or keychain access.
+type PaneIdentityResolver func(ctx context.Context, pane Pane) *identity.Identity
 
 // Config configures the coordinator.
 type Config struct {
@@ -98,6 +110,12 @@ type Config struct {
 	// PaneClient allows injecting a custom pane client (useful for tests).
 	// If nil, one is selected based on Backend.
 	PaneClient PaneClient
+
+	// ResolvePaneIdentity optionally supplies verified identity evidence for
+	// an individual running pane. Nil leaves the account and organization
+	// unknown. The built-in pane backends do not prove which grant a process
+	// holds, so there is deliberately no host-credential fallback.
+	ResolvePaneIdentity PaneIdentityResolver
 
 	// CompactionReminderEnabled enables auto-injection of reminder after compaction.
 	CompactionReminderEnabled bool
@@ -269,9 +287,10 @@ type AuthRequest struct {
 	// ClaimedAt is when an agent first fetched the request. AuthTimeout runs
 	// from here: until an agent is around, the request simply waits.
 	ClaimedAt time.Time `json:"claimed_at,omitzero"`
-	// LimitedAccount is the account Claude Code was signed in with when the
-	// pane hit its limit, and LimitReset the banner's reset ("3pm
-	// (America/New_York)"); the agent passes over that account until then.
+	// LimitedAccount identifies the account verified for this pane when it
+	// hit its limit. Account fields are omitted when pane ownership is unknown.
+	// LimitReset is the banner's reset ("3pm (America/New_York)"); the agent
+	// passes over a known account until then.
 	LimitedAccount        string `json:"limited_account,omitempty"`
 	LimitReset            string `json:"limit_reset,omitempty"`
 	LimitedAccountID      string `json:"limited_account_id,omitempty"`
@@ -307,10 +326,6 @@ type Coordinator struct {
 	doneCh     chan struct{}
 	running    bool
 	runID      string // Correlation ID for this coordinator run
-
-	// signedInAccount reports the account Claude Code is signed in with on
-	// this host, so a request can tell the agent which account hit its limit.
-	signedInAccount func() *identity.Identity
 
 	// Callbacks
 	OnAuthRequest  func(req *AuthRequest)
@@ -371,27 +386,7 @@ func New(config Config) *Coordinator {
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		runID:      runID,
-
-		signedInAccount: func() *identity.Identity { return signedInClaudeIdentity(runtime.GOOS) },
 	}
-}
-
-func signedInClaudeIdentity(goos string) *identity.Identity {
-	if goos == "darwin" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil
-		}
-		// A verified file mirror is not evidence that the native keychain
-		// still contains the same grant. Do not prompt for keychain access
-		// during pane polling or infer its identity from a stale mirror.
-		for _, name := range []string{"login.keychain-db", "login.keychain"} {
-			if _, err := os.Stat(filepath.Join(home, "Library", "Keychains", name)); !errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-		}
-	}
-	return identity.ClaudeSignedInIdentity()
 }
 
 // RunID returns the correlation ID for this coordinator run.
@@ -560,7 +555,7 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 	// Handle state-specific logic
 	switch currentState {
 	case StateIdle:
-		c.handleIdleState(ctx, tracker, output)
+		c.handleIdleState(ctx, pane, tracker, output)
 
 	case StateRateLimited:
 		c.handleRateLimitedState(ctx, tracker, output)
@@ -679,7 +674,7 @@ func atBottom(output string, re *regexp.Regexp) bool {
 	return false
 }
 
-func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker, output string) {
+func (c *Coordinator) handleIdleState(ctx context.Context, pane Pane, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
 
 	if detected == StateRateLimited && time.Now().Before(tracker.GetHoldUntil()) {
@@ -703,9 +698,12 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 		// A new rate-limit episode gets a fresh retry budget.
 		tracker.SetRetryCount(0)
 		tracker.SetGaveUp(false)
-		// Tell the agent which account hit its limit, so it is not the one
-		// signed in again.
-		limited := c.signedInAccount()
+		// Only pane-bound evidence can identify the limited account. A host
+		// credential cache may belong to a different pane or a newer login.
+		var limited *identity.Identity
+		if c.config.ResolvePaneIdentity != nil {
+			limited = c.config.ResolvePaneIdentity(ctx, pane)
+		}
 		tracker.SetIdentityLimit(limited, metadata["reset_text"])
 		accountID, organizationID := tracker.GetLimitIdentity()
 		c.logger.Info("usage limit",

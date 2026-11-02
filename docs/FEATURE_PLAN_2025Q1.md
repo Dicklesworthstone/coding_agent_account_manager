@@ -477,7 +477,16 @@ shows organization names and UUIDs, with unverified legacy labels marked.
 The first-use `_original` and automatic recovery snapshots retain captured
 credential bytes while correcting or omitting unsupported account metadata.
 
-Coordinator reports carry stable account and organization IDs when known.
+Coordinator reports carry stable account and organization IDs only when the
+identity is proven for the grant held by that specific running pane. Current
+host files, pane titles, working directories and unqualified process IDs cannot
+establish that relationship. Built-in backends leave ownership unknown; an
+explicit pane resolver can supply verified evidence, captured once per episode
+and retained through its retries. A new episode clears evidence that is no
+longer available. Authentication-pool reconciliation also checks saved Claude
+proof offline: mismatched or malformed ownership is unavailable for selection,
+including after restart; exact-bound expired grants and unverified legacy
+profiles retain their existing native-renewal behavior.
 The browser agent declines organization-specific requests because its email
 configuration cannot select the intended organization. Participating CAAM
 processes serialize managed vault mutations with a private per-vault process

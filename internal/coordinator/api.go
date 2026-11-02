@@ -190,8 +190,9 @@ type PaneStatusResponse struct {
 	Error        string    `json:"error,omitempty"`
 	Retries      int       `json:"retries,omitempty"` // login retries used this rate-limit episode
 	// LimitedAccount hit its usage limit in this pane (LimitReset is the
-	// banner's reset); HoldUntil, when set, is when a login may start
-	// again after the agent found no account free.
+	// banner's reset). Account fields are omitted without verified pane-bound
+	// evidence. HoldUntil, when set, is when a login may start again after the
+	// agent found no account free.
 	LimitedAccount        string     `json:"limited_account,omitempty"`
 	LimitedAccountID      string     `json:"limited_account_id,omitempty"`
 	LimitedOrganizationID string     `json:"limited_organization_id,omitempty"`

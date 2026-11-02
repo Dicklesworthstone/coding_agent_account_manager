@@ -202,7 +202,7 @@ func TestExtractOAuthURLJoinsWrappedLines(t *testing.T) {
 		"wrapped inside a dialog": "│ Use the url below to sign in:" + strings.Repeat(" ", 40) + "│\n" +
 			wrap(72, "│ ", " │") + "│" + strings.Repeat(" ", 74) + "│\n",
 		"prompt right below the URL": wrap(60, "", "") + "Paste code here if prompted > ",
-		"an older URL above": "https://claude.ai/oauth/authorize?code=stale\nLogin failed\n\n" + wrap(90, "", ""),
+		"an older URL above":         "https://claude.ai/oauth/authorize?code=stale\nLogin failed\n\n" + wrap(90, "", ""),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := ExtractOAuthURL(output); got != url {
@@ -516,14 +516,14 @@ Waiting for authentication...`,
 			desc:     "Full URL with multiple query params should be extracted completely",
 		},
 		{
-			name: "URL with complex query params",
-			output: `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
+			name:     "URL with complex query params",
+			output:   `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
 			expected: "https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef",
 			desc:     "URL with special characters in query params",
 		},
 		{
-			name: "URL with URL-encoded values",
-			output: `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
+			name:     "URL with URL-encoded values",
+			output:   `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
 			expected: "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email",
 			desc:     "URL with percent-encoded values preserved",
 		},
@@ -799,11 +799,11 @@ func TestExtractOAuthURL_QueryParamPreservation(t *testing.T) {
 
 func TestDetectState_OAuthURLMetadata(t *testing.T) {
 	tests := []struct {
-		name        string
-		output      string
-		wantState   PaneState
-		wantURL     string
-		desc        string
+		name      string
+		output    string
+		wantState PaneState
+		wantURL   string
+		desc      string
 	}{
 		{
 			name:      "extracts URL to metadata",
@@ -1241,11 +1241,11 @@ func findSubstring(s, substr string) bool {
 
 func TestOAuthURLPattern_Regex(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantMatch  bool
-		wantFull   string
-		desc       string
+		name      string
+		input     string
+		wantMatch bool
+		wantFull  string
+		desc      string
 	}{
 		{
 			name:      "basic authorize URL",
@@ -1335,7 +1335,7 @@ func TestCoordinator_CompactionReminderInjection(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState which should detect compaction and inject
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	// Check that prompt was injected
 	client.mu.Lock()
@@ -1369,7 +1369,7 @@ func TestCoordinator_CompactionReminderDisabled(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState - should NOT inject because feature is disabled
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent
@@ -1401,7 +1401,7 @@ func TestCoordinator_CompactionReminderCooldown(t *testing.T) {
 	ctx := context.Background()
 
 	// First injection should succeed
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	count1 := len(client.sent)
@@ -1412,7 +1412,7 @@ func TestCoordinator_CompactionReminderCooldown(t *testing.T) {
 	}
 
 	// Second call should be blocked by cooldown
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	count2 := len(client.sent)
@@ -1446,7 +1446,7 @@ func TestCoordinator_CompactionReminderSkipsIfAlreadyPresent(t *testing.T) {
 	ctx := context.Background()
 
 	// Should NOT inject because reminder is already in output
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent
@@ -1478,7 +1478,7 @@ func TestCoordinator_CompactionReminderDoesNotTriggerOnRateLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState - rate limit takes precedence
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent

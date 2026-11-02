@@ -1944,10 +1944,10 @@ func TestAuthRequestNamesTheLimitedAccount(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PaneClient = client
 	cfg.LoginCooldown = time.Millisecond
-	coord := New(cfg)
-	coord.signedInAccount = func() *identity.Identity {
+	cfg.ResolvePaneIdentity = func(ctx context.Context, pane Pane) *identity.Identity {
 		return &identity.Identity{Provider: "claude", Email: "limited@example.com", AccountID: "limited-account", OrganizationID: "limited-org", Verified: true}
 	}
+	coord := New(cfg)
 	ctx := context.Background()
 
 	coord.pollPanes(ctx)
@@ -1993,7 +1993,15 @@ func TestLimitIdentityRequiresVerifiedAccountAndOrganization(t *testing.T) {
 	if accountID != "same-account" || orgID != "team" {
 		t.Fatal("same-email Team organization did not survive a retry")
 	}
-	for _, uncertain := range []*identity.Identity{nil, {Provider: "claude", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com"}, {Provider: "claude", AccountID: "same-account", Email: "shared@example.com", Verified: true}} {
+	for _, uncertain := range []*identity.Identity{
+		nil,
+		{Provider: "claude", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com"},
+		{Provider: "claude", AccountID: "same-account", Email: "shared@example.com", Verified: true},
+		{Provider: "claude", OrganizationID: "personal", Email: "shared@example.com", Verified: true},
+		{Provider: "codex", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com", Verified: true},
+		{Provider: "claude", AccountID: " ", OrganizationID: "personal", Email: "shared@example.com", Verified: true},
+		{Provider: "claude", AccountID: "same-account", OrganizationID: "\t", Email: "shared@example.com", Verified: true},
+	} {
 		tracker.SetIdentityLimit(uncertain, "in 1h")
 		accountID, orgID = tracker.GetLimitIdentity()
 		email, _ := tracker.GetLimit()
@@ -2003,35 +2011,90 @@ func TestLimitIdentityRequiresVerifiedAccountAndOrganization(t *testing.T) {
 	}
 }
 
-func TestCoordinatorDoesNotAttributeKeychainIdentityToFileMirror(t *testing.T) {
+// A valid host cache describes files, not the grants held by running panes.
+// This remains true for local and remote panes and after a background login
+// changes the host files or the coordinator's native config directory.
+func TestCoordinatorDoesNotAttributeHostIdentityToPanes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CAAM_KEYCHAIN", "0") // This disables CAAM's bridge, not Claude's lookup.
 	dir := filepath.Join(home, ".claude")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
+	writeHostIdentity := func(configDir, organization string) {
+		t.Helper()
+		if err := os.MkdirAll(configDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		credentials, err := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{
+			"accessToken": "synthetic-access-" + organization, "refreshToken": "synthetic-refresh-" + organization,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentialPath := filepath.Join(configDir, ".credentials.json")
+		if err := os.WriteFile(credentialPath, credentials, 0600); err != nil {
+			t.Fatal(err)
+		}
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta, err := json.Marshal(map[string]any{"claude_identity": identity.ClaudeIdentityBinding{
+			Identity: identity.Identity{
+				Provider: "claude", AccountID: "host-account", OrganizationID: organization, Email: "shared@example.com",
+			},
+			CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(configDir, identity.ClaudeIdentityCacheFile), meta, 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := identity.ExtractFromClaudeCredentials(credentialPath)
+		if err != nil || got == nil || !got.Verified || got.OrganizationID != organization {
+			t.Fatalf("host fixture lacks an exact verified binding: identity=%+v err=%v", got, err)
+		}
 	}
-	credentials := []byte(`{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}}`)
-	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), credentials, 0600); err != nil {
-		t.Fatal(err)
+	writeHostIdentity(dir, "personal")
+
+	client := &fakePaneClient{
+		panes: []Pane{
+			{PaneID: 1, Title: "Claude shared@example.com Personal", CWD: home, ForegroundPID: 101},
+			{PaneID: 2, Title: "Claude shared@example.com Team", CWD: dir, ForegroundPID: 202},
+			{PaneID: 3, Domain: "SSH:remote", Title: "Claude shared@example.com", CWD: "file://remote/work"},
+		},
+		output: "You've hit your limit · resets 3pm (America/New_York)",
 	}
-	fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
-	if err != nil {
-		t.Fatal(err)
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	coord := New(cfg)
+	for _, pane := range client.panes {
+		tracker := NewPaneTracker(pane.PaneID)
+		tracker.SetCooldown("login", time.Hour)
+		coord.trackers[pane.PaneID] = tracker
 	}
-	meta, err := json.Marshal(map[string]any{"claude_identity": identity.ClaudeIdentityBinding{
-		Identity:              identity.Identity{Provider: "claude", AccountID: "file-account", OrganizationID: "file-org"},
-		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
-	}})
-	if err != nil {
-		t.Fatal(err)
+	ctx := context.Background()
+	coord.pollPanes(ctx)
+	assertUnknown := func() {
+		t.Helper()
+		for _, pane := range client.panes {
+			tracker := coord.trackers[pane.PaneID]
+			accountID, orgID := tracker.GetLimitIdentity()
+			email, reset := tracker.GetLimit()
+			if accountID != "" || orgID != "" || email != "" || reset == "" {
+				t.Fatalf("pane %d acquired host identity or lost reset: %q / %q / %q / %q", pane.PaneID, accountID, orgID, email, reset)
+			}
+		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, identity.ClaudeIdentityCacheFile), meta, 0600); err != nil {
+	assertUnknown()
+
+	// Another Claude session can change the host grant without changing
+	// the grants already held by these panes. Alternate auth and keychain
+	// state likewise do not establish the identity of any monitored pane.
+	writeHostIdentity(dir, "team")
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"api_key":"synthetic-legacy-key"}`), 0600); err != nil {
 		t.Fatal(err)
-	}
-	if got := signedInClaudeIdentity("darwin"); got == nil || !got.Verified || got.OrganizationID != "file-org" {
-		t.Fatalf("private file-backed HOME lost its verified identity: %+v", got)
 	}
 	keychainPath := filepath.Join(home, "Library", "Keychains", "login.keychain-db")
 	if err := os.MkdirAll(filepath.Dir(keychainPath), 0700); err != nil {
@@ -2040,8 +2103,143 @@ func TestCoordinatorDoesNotAttributeKeychainIdentityToFileMirror(t *testing.T) {
 	if err := os.WriteFile(keychainPath, []byte("synthetic-native-keychain"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := signedInClaudeIdentity("darwin"); got != nil {
-		t.Fatal("native keychain identity was inferred from a file mirror")
+	client.output = "Browse to https://claude.ai/oauth/authorize?code=true&state=s\nPaste code here if prompted >"
+	coord.pollPanes(ctx)
+	coord.pollPanes(ctx)
+	pending := coord.ClaimPendingRequests()
+	if len(pending) != len(client.panes) {
+		t.Fatalf("pending = %d requests, want %d", len(pending), len(client.panes))
+	}
+	for _, request := range pending {
+		if request.LimitedAccount != "" || request.LimitedAccountID != "" || request.LimitedOrganizationID != "" || request.LimitReset == "" {
+			t.Fatalf("request for pane %d acquired host identity or lost reset", request.PaneID)
+		}
+		data, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), `"limited_account`) || strings.Contains(string(data), `"limited_organization_id"`) {
+			t.Fatalf("unknown pane identity was serialized: %s", data)
+		}
+	}
+	w := httptest.NewRecorder()
+	NewAPIServer(coord, "", 0, nil).handleStatus(w, httptest.NewRequest("GET", "/status", nil))
+	var status StatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Panes) != len(client.panes) {
+		t.Fatalf("status = %d panes, want %d", len(status.Panes), len(client.panes))
+	}
+	for _, pane := range status.Panes {
+		if pane.LimitedAccount != "" || pane.LimitedAccountID != "" || pane.LimitedOrganizationID != "" || pane.LimitReset == "" {
+			t.Fatalf("status for pane %d acquired host identity or lost reset", pane.PaneID)
+		}
+	}
+
+	otherDir := t.TempDir()
+	writeHostIdentity(otherDir, "other-organization")
+	t.Setenv("CLAUDE_CONFIG_DIR", otherDir)
+	for _, tracker := range coord.trackers {
+		tracker.Reset()
+		tracker.SetCooldown("login", time.Hour)
+	}
+	client.output = "You've hit your limit · resets 6pm (America/New_York)"
+	coord.pollPanes(ctx)
+	assertUnknown()
+}
+
+func TestCoordinatorResolvesIdentityForEachPaneAndLimitEpisode(t *testing.T) {
+	panes := []Pane{
+		{PaneID: 11, Title: "Claude", Domain: "local", CWD: "file://host/personal", ForegroundPID: 111},
+		{PaneID: 22, Title: "Claude", Domain: "local", CWD: "file://host/team", ForegroundPID: 222},
+		{PaneID: 33, Title: "Claude", Domain: "SSH:remote", CWD: "file://remote/project"},
+	}
+	personal := &identity.Identity{Provider: "claude", AccountID: "same-account", OrganizationID: "personal", Email: "shared@example.com", Verified: true}
+	team := &identity.Identity{Provider: "claude", AccountID: "same-account", OrganizationID: "team", Email: "shared@example.com", Verified: true}
+	proofs := map[int]*identity.Identity{11: personal, 22: team}
+	want := map[int]*identity.Identity{11: personal, 22: team}
+	expectedPanes := map[int]Pane{11: panes[0], 22: panes[1], 33: panes[2]}
+	client := &fakePaneClient{panes: panes, output: "You've hit your limit · resets 3pm (America/New_York)"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := map[int]int{}
+	cfg := DefaultConfig()
+	cfg.PaneClient = client
+	cfg.ResolvePaneIdentity = func(received context.Context, pane Pane) *identity.Identity {
+		if received != ctx {
+			t.Error("pane resolver did not receive the polling context")
+		}
+		if pane != expectedPanes[pane.PaneID] {
+			t.Errorf("resolver received incorrect pane metadata: %+v", pane)
+		}
+		calls[pane.PaneID]++
+		return proofs[pane.PaneID]
+	}
+	coord := New(cfg)
+	for _, pane := range panes {
+		tracker := NewPaneTracker(pane.PaneID)
+		tracker.SetCooldown("login", time.Hour)
+		coord.trackers[pane.PaneID] = tracker
+	}
+	coord.pollPanes(ctx)
+	for _, pane := range panes {
+		accountID, orgID := coord.trackers[pane.PaneID].GetLimitIdentity()
+		if expected := want[pane.PaneID]; expected != nil {
+			if accountID != expected.AccountID || orgID != expected.OrganizationID {
+				t.Fatalf("pane %d limit = %q/%q, want %q/%q", pane.PaneID, accountID, orgID, expected.AccountID, expected.OrganizationID)
+			}
+		} else if accountID != "" || orgID != "" {
+			t.Fatalf("remote pane acquired another pane's identity: %q/%q", accountID, orgID)
+		}
+	}
+
+	// A login retry belongs to the same rate-limit episode. Changed
+	// resolver evidence must not relabel the account that originally hit
+	// the limit, or fill in an identity that was previously unknown.
+	proofs = map[int]*identity.Identity{11: team, 22: personal, 33: personal}
+	for _, tracker := range coord.trackers {
+		tracker.Reset()
+		tracker.SetState(StateRateLimited)
+	}
+	client.output = "Browse to https://claude.ai/oauth/authorize?code=true&state=s\nPaste code here if prompted >"
+	coord.pollPanes(ctx)
+	coord.pollPanes(ctx)
+	pending := coord.ClaimPendingRequests()
+	if len(pending) != len(panes) {
+		t.Fatalf("pending = %d requests, want %d", len(pending), len(panes))
+	}
+	for _, request := range pending {
+		if expected := want[request.PaneID]; expected != nil {
+			if request.LimitedAccountID != expected.AccountID || request.LimitedOrganizationID != expected.OrganizationID || request.LimitedAccount != expected.Email {
+				t.Fatalf("request for pane %d lost its original account and organization", request.PaneID)
+			}
+		} else if request.LimitedAccountID != "" || request.LimitedOrganizationID != "" || request.LimitedAccount != "" {
+			t.Fatal("retry assigned an identity to the unknown remote pane")
+		}
+		if calls[request.PaneID] != 1 {
+			t.Fatalf("resolved pane %d %d times within one limit episode", request.PaneID, calls[request.PaneID])
+		}
+	}
+
+	// New episodes require fresh proof. Losing that proof clears the old
+	// account instead of treating it as the owner of a replacement process.
+	proofs = nil
+	for _, tracker := range coord.trackers {
+		tracker.Reset()
+		tracker.SetCooldown("login", time.Hour)
+	}
+	client.output = "You've hit your limit · resets 6pm (America/New_York)"
+	coord.pollPanes(ctx)
+	for _, pane := range panes {
+		accountID, orgID := coord.trackers[pane.PaneID].GetLimitIdentity()
+		email, reset := coord.trackers[pane.PaneID].GetLimit()
+		if accountID != "" || orgID != "" || email != "" || reset != "6pm (America/New_York)" {
+			t.Fatalf("new limit episode for pane %d retained an unproven identity or stale reset", pane.PaneID)
+		}
+		if calls[pane.PaneID] != 2 {
+			t.Fatalf("pane %d did not resolve its new limit episode", pane.PaneID)
+		}
 	}
 }
 

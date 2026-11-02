@@ -575,12 +575,25 @@ and `random`.
 
 #### Accounts at their limit
 
-When the coordinator detects a limit, it reads the account Claude Code is
-signed in with on that host: `oauthAccount.emailAddress` in
-`$CLAUDE_CONFIG_DIR/.claude.json`, or `~/.claude.json`. It sends that account
-and the banner's reset (for example `3pm (America/New_York)`) with the auth
-request as `limited_account` and `limit_reset`. The agent holds that account
-until the reset and never chooses it or falls back to it while held.
+When the coordinator detects a limit, it records the banner's reset (for
+example `3pm (America/New_York)`) as `limit_reset`. Account fields are included
+only when verified evidence identifies the grant held by that running pane.
+The coordinator's current credentials and `.claude.json` cannot establish
+this relationship: a separate session can switch the files while a pane keeps
+an older grant in memory. Built-in backends therefore omit `limited_account`,
+`limited_account_id` and `limited_organization_id`.
+
+Integrations can supply `Config.ResolvePaneIdentity` with verified account and
+organization UUIDs bound to the pane's actual process and grant. The resolver
+receives the full pane and context, must return unknown when the relationship
+cannot be proven, and must not prompt for keychain access. Evidence is captured
+once per rate-limit episode, retained through retries, and reconsidered for a
+new episode. The browser agent refuses organization-specific requests while
+its account configuration supports only email selection.
+
+For a known supported account, the agent holds that account until the reset
+and never chooses it or falls back to it while held.
+
 - Resets it can read: a time with an optional date and zone, or `in 2h 13m`.
   A time without a zone is read in the agent's local zone.
 - Otherwise the hold is five hours, Claude's session window. Holds are capped
@@ -599,9 +612,9 @@ hold. The coordinator then:
 Without this, an exhausted set of accounts would be signed in over and over,
 each login hitting the limit again.
 
-A pane running with its own `CLAUDE_CONFIG_DIR` that the coordinator does not
-share is not covered. The coordinator reads its own state file, so it reports
-that file's account, which may not be the one that hit the limit.
+Unknown pane ownership does not create an account-specific hold. Reset and
+recovery state still remain associated with the correct pane, including panes
+with their own `CLAUDE_CONFIG_DIR` and panes on remote machines.
 
 #### Responsibilities
 

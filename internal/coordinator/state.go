@@ -159,15 +159,16 @@ func (t *PaneTracker) SetLimit(account, reset string) {
 	t.LimitedOrganizationID = ""
 }
 
-// SetIdentityLimit captures only a provider-verified, token-bound Claude
-// identity. A shared .claude.json is descriptive metadata and cannot tell us
-// which organization's credentials were being used.
+// SetIdentityLimit captures a verified Claude identity supplied by the pane
+// resolver. The caller must establish that the identity belongs to the grant
+// used by this running pane, not merely to a current credential file.
 func (t *PaneTracker) SetIdentityLimit(account *identity.Identity, reset string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.LimitedAccount, t.LimitedAccountID, t.LimitedOrganizationID = "", "", ""
 	t.LimitReset = reset
-	if account != nil && account.Verified && account.AccountID != "" && account.OrganizationID != "" {
+	if account != nil && account.Provider == "claude" && account.Verified &&
+		strings.TrimSpace(account.AccountID) != "" && strings.TrimSpace(account.OrganizationID) != "" {
 		t.LimitedAccount = account.Email
 		t.LimitedAccountID = account.AccountID
 		t.LimitedOrganizationID = account.OrganizationID
