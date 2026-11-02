@@ -28,6 +28,71 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 )
 
+func waitForDaemonTestCondition(t *testing.T, description string, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", description)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// startDaemonForTest observes actual startup instead of assuming a sleep is
+// long enough. Register PID-path restoration with t.Cleanup before calling it:
+// this cleanup must stop and join Start before any shared path is restored.
+func startDaemonForTest(t *testing.T, d *Daemon) func() {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- d.Start() }()
+
+	var stopOnce sync.Once
+	stop := func() {
+		t.Helper()
+		stopOnce.Do(func() {
+			// Cleanup can run after a startup assertion fails. A late goroutine
+			// must still reach Start before Stop; otherwise it can outlive this
+			// test and acquire the following test's global PID-file path.
+			for !d.IsRunning() {
+				select {
+				case err := <-result:
+					if err != nil {
+						t.Errorf("Start returned error: %v", err)
+					}
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+			if err := d.Stop(); err != nil {
+				t.Errorf("Stop failed: %v", err)
+			}
+			var err error
+			select {
+			case err = <-result:
+			case <-time.After(2 * time.Second):
+				t.Error("Start did not return after Stop")
+				// Keep the test's PID path until Start really exits. The overall
+				// go test timeout bounds a shutdown failure without leaking a
+				// daemon into the following test.
+				err = <-result
+			}
+			if err != nil {
+				t.Errorf("Start returned error: %v", err)
+			}
+		})
+	}
+	t.Cleanup(stop)
+	waitForDaemonTestCondition(t, "daemon startup", d.IsRunning)
+
+	// running is set before Start launches its workers. Consumption of this
+	// existing notification confirms that the run loop is also ready, including
+	// when the auth pool handles refresh and CheckCount does not advance.
+	d.configChanged <- struct{}{}
+	waitForDaemonTestCondition(t, "daemon run loop", func() bool { return len(d.configChanged) == 0 })
+	return stop
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -572,6 +637,10 @@ func TestDaemon_GetProfileHealth_FallbackToParsing(t *testing.T) {
 
 func TestDaemonStartAndStop(t *testing.T) {
 	tmpDir := t.TempDir()
+	originalPath := PIDFilePath()
+	SetPIDFilePath(filepath.Join(tmpDir, "test-daemon.pid"))
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
+
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
@@ -583,19 +652,12 @@ func TestDaemonStartAndStop(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.Start()
-	}()
+	stop := startDaemonForTest(t, d)
 
 	// Wait for the daemon to start and complete at least one check. Poll
 	// instead of a fixed sleep: under heavy machine load the run loop's first
 	// 50ms tick can take well over 100ms to fire.
 	deadline := time.Now().Add(5 * time.Second)
-	for !d.IsRunning() && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	if !d.IsRunning() {
 		t.Error("daemon should be running after Start")
 	}
@@ -608,27 +670,20 @@ func TestDaemonStartAndStop(t *testing.T) {
 	}
 
 	// Stop daemon
-	if err := d.Stop(); err != nil {
-		t.Errorf("Stop failed: %v", err)
-	}
+	stop()
 
 	if d.IsRunning() {
 		t.Error("daemon should not be running after Stop")
 	}
 
-	// Get the result from Start (should be nil after Stop)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Start returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Error("Start did not return after Stop")
-	}
 }
 
 func TestDaemonDoubleStart(t *testing.T) {
 	tmpDir := t.TempDir()
+	originalPath := PIDFilePath()
+	SetPIDFilePath(filepath.Join(tmpDir, "test-daemon.pid"))
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
+
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
@@ -639,14 +694,7 @@ func TestDaemonDoubleStart(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon in goroutine
-	go func() {
-		_ = d.Start()
-	}()
-
-	// Wait for it to start
-	time.Sleep(100 * time.Millisecond)
-	defer d.Stop()
+	startDaemonForTest(t, d)
 
 	// Second start should fail
 	err := d.Start()
@@ -1086,7 +1134,7 @@ func TestDaemon_Start_WithAuthPool(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1100,33 +1148,14 @@ func TestDaemon_Start_WithAuthPool(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.Start()
-	}()
-
-	// Wait a bit for it to start
-	time.Sleep(100 * time.Millisecond)
+	stop := startDaemonForTest(t, d)
 
 	if !d.IsRunning() {
 		t.Error("daemon should be running after Start")
 	}
 
 	// Stop daemon
-	if err := d.Stop(); err != nil {
-		t.Errorf("Stop failed: %v", err)
-	}
-
-	// Wait for Start to return
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Start returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Error("Start did not return after Stop")
-	}
+	stop()
 }
 
 func TestDaemon_RunLoop_MultipleIterations(t *testing.T) {
@@ -1135,7 +1164,7 @@ func TestDaemon_RunLoop_MultipleIterations(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1147,11 +1176,7 @@ func TestDaemon_RunLoop_MultipleIterations(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.Start()
-	}()
+	stop := startDaemonForTest(t, d)
 
 	// Wait for multiple iterations. Poll for the expected tick count instead of
 	// relying on a single fixed sleep: under heavy CPU load (e.g. many parallel
@@ -1172,9 +1197,7 @@ func TestDaemon_RunLoop_MultipleIterations(t *testing.T) {
 	}
 
 	// Stop daemon
-	d.Stop()
-
-	<-errCh
+	stop()
 }
 
 func TestDaemon_GetStats_AfterRunning(t *testing.T) {
@@ -1183,7 +1206,7 @@ func TestDaemon_GetStats_AfterRunning(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1196,8 +1219,7 @@ func TestDaemon_GetStats_AfterRunning(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon
-	go d.Start()
+	stop := startDaemonForTest(t, d)
 
 	// Poll for the first completed check instead of relying on a single fixed
 	// sleep: under heavy CPU load the daemon goroutine can be starved of
@@ -1230,7 +1252,7 @@ func TestDaemon_GetStats_AfterRunning(t *testing.T) {
 		t.Error("LastCheck should be set after running")
 	}
 
-	d.Stop()
+	stop()
 }
 
 func TestDaemon_checkProfile_Concurrent(t *testing.T) {
@@ -1337,7 +1359,7 @@ func TestDaemon_ReloadConfig_WhileRunning(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1350,14 +1372,12 @@ func TestDaemon_ReloadConfig_WhileRunning(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon
-	go d.Start()
-	time.Sleep(100 * time.Millisecond)
+	stop := startDaemonForTest(t, d)
 
 	// ReloadConfig while running should not panic
 	d.ReloadConfig()
 
-	d.Stop()
+	stop()
 }
 
 func TestBackupScheduler_SaveState_ErrorOnWrite(t *testing.T) {
@@ -1393,7 +1413,7 @@ func TestDaemon_Stop_WithPIDFile(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1405,9 +1425,7 @@ func TestDaemon_Stop_WithPIDFile(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	// Start daemon
-	go d.Start()
-	time.Sleep(100 * time.Millisecond)
+	stop := startDaemonForTest(t, d)
 
 	// Verify PID file exists
 	if _, err := os.Stat(pidPath); os.IsNotExist(err) {
@@ -1415,7 +1433,7 @@ func TestDaemon_Stop_WithPIDFile(t *testing.T) {
 	}
 
 	// Stop should clean up PID file
-	d.Stop()
+	stop()
 
 	// PID file should be removed
 	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
@@ -1462,7 +1480,7 @@ func TestDaemon_Start_SignalHandling(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1474,24 +1492,10 @@ func TestDaemon_Start_SignalHandling(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- d.Start()
-	}()
-
-	time.Sleep(100 * time.Millisecond)
+	stop := startDaemonForTest(t, d)
 
 	// Use Stop() to terminate (simulates graceful shutdown)
-	d.Stop()
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Start returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Error("Start did not return after Stop")
-	}
+	stop()
 }
 
 func TestDaemon_Start_ConfigChangedChannel(t *testing.T) {
@@ -1500,7 +1504,7 @@ func TestDaemon_Start_ConfigChangedChannel(t *testing.T) {
 
 	originalPath := PIDFilePath()
 	SetPIDFilePath(pidPath)
-	defer SetPIDFilePath(originalPath)
+	t.Cleanup(func() { SetPIDFilePath(originalPath) })
 
 	v := authfile.NewVault(tmpDir)
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
@@ -1512,14 +1516,13 @@ func TestDaemon_Start_ConfigChangedChannel(t *testing.T) {
 
 	d := New(v, hs, cfg)
 
-	go d.Start()
-	time.Sleep(100 * time.Millisecond)
+	stop := startDaemonForTest(t, d)
 
 	// Trigger config reload (exercises runLoop config change handling)
 	d.ReloadConfig()
-	time.Sleep(50 * time.Millisecond)
+	waitForDaemonTestCondition(t, "configuration reload notification", func() bool { return len(d.configChanged) == 0 })
 
-	d.Stop()
+	stop()
 }
 
 func TestDaemon_getProfileHealth_ParseClaudeExpiry(t *testing.T) {
