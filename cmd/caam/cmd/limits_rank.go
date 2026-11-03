@@ -77,7 +77,7 @@ func anyProfilePublishesScopedWindow(rows []usage.ProfileUsage) bool {
 		if r.Usage == nil {
 			continue
 		}
-		if len(r.Usage.ModelWindows) > 0 || r.Usage.TertiaryWindow != nil {
+		if len(r.Usage.ScopedWindows) > 0 || len(r.Usage.ModelWindows) > 0 || r.Usage.TertiaryWindow != nil {
 			return true
 		}
 	}

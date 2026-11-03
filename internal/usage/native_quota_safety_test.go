@@ -293,6 +293,7 @@ func TestSubscriptionQuotaRequiresMeasuredGeneralWindow(t *testing.T) {
 				{"credits alone", UsageInfo{Credits: &CreditInfo{HasCredits: true, Unlimited: true}}},
 				{"premium alone", UsageInfo{TertiaryWindow: &UsageWindow{UsedPercent: 10}}},
 				{"model alone", UsageInfo{ModelWindows: map[string]*UsageWindow{"Fable": {UsedPercent: 10}}}},
+				{"complete model list alone", UsageInfo{ScopedWindows: []*UsageWindow{{Label: "Fable", UsedPercent: 10}}}},
 				{"fetch error", UsageInfo{Error: "quota request failed", PrimaryWindow: &UsageWindow{}}},
 				{"provider restriction", UsageInfo{LimitStage: "HARD_LIMIT", PrimaryWindow: &UsageWindow{}}},
 			} {
@@ -314,6 +315,7 @@ func TestSubscriptionQuotaRequiresMeasuredGeneralWindow(t *testing.T) {
 				{"weekly only", UsageInfo{SecondaryWindow: &UsageWindow{Utilization: 0.254, UsedPercent: 25}}},
 				{"weekly measured zero", UsageInfo{SecondaryWindow: &UsageWindow{}}},
 				{"optional model absent", UsageInfo{SecondaryWindow: &UsageWindow{}, ModelWindows: map[string]*UsageWindow{"Fable": nil}}},
+				{"optional scoped entry absent", UsageInfo{SecondaryWindow: &UsageWindow{}, ScopedWindows: []*UsageWindow{nil}}},
 			} {
 				t.Run(provider+"/"+status+"/"+tc.name, func(t *testing.T) {
 					info := tc.info
@@ -354,7 +356,7 @@ func TestQuotaValidityChecksEveryPresentWindow(t *testing.T) {
 				{"negative percent", UsageWindow{UsedPercent: -1}},
 				{"percent over cap", UsageWindow{UsedPercent: 101}},
 			} {
-				for _, slot := range []string{"primary", "secondary", "premium", "model"} {
+				for _, slot := range []string{"primary", "secondary", "premium", "model", "complete scoped list"} {
 					t.Run(provider+"/"+status+"/"+slot+"/"+tc.name, func(t *testing.T) {
 						info := &UsageInfo{
 							Provider: provider, QuotaStatus: status,
@@ -371,6 +373,9 @@ func TestQuotaValidityChecksEveryPresentWindow(t *testing.T) {
 							info.TertiaryWindow = &window
 						case "model":
 							info.ModelWindows = map[string]*UsageWindow{"Fable": &window}
+						case "complete scoped list":
+							info.ModelWindows = map[string]*UsageWindow{"Fable": {Label: "Fable", UsedPercent: 10}}
+							info.ScopedWindows = []*UsageWindow{&window}
 						}
 						if info.NumericQuotaKnown() || info.AvailabilityScore() != 0 {
 							t.Fatalf("invalid %s quota became capacity: %+v", slot, info)

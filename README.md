@@ -909,6 +909,19 @@ scope still constrains that model; its duration remains unknown. The documented
 five-hour and seven-day durations are used only for recognized windows and
 compatible groups. A reset timestamp alone never establishes a new duration.
 
+When a measured general window appears both at the top level and in `limits[]`,
+the percentages and any known reset instants must agree. A missing reset can
+be filled from the other representation. Conflicting measured values make the
+result degraded; CAAM does not assume an undocumented rounding rule or silently
+discard the more restrictive value.
+
+Every overlapping model constraint is retained, including a session and weekly
+limit with the same display name. Matching uses the provider's model identifier
+as well as its display name. JSON output adds `scoped_windows` for the complete
+collection and `model_id` when supplied; `model_windows` continues to show the
+most constrained window per display name. Quota checks and reset selection use
+the complete collection, including after a JSON round trip.
+
 #### Offline usage: `caam limits --cached`
 
 `caam limits` answers "which account still has headroom" by querying the
@@ -971,7 +984,11 @@ The ordering is:
 It sorts on the reset time of the **longest** allowance a seat reports — its
 weekly cap, not the five-hour window that rolls over on its own several times a
 day, which is the quota actually at risk of expiring unused. (This is where it
-differs from `--policy drain`, which ranks on the soonest reset of any window.)
+differs from `--policy drain`, which ranks on the soonest applicable reset.)
+Both policies consider every window that constrains the requested model. A
+Sonnet recommendation cannot borrow an Opus reset, and a less-used weekly
+model allowance still contributes its reset even when a busier session window
+is shown as the binding limit. With no model specified, all scopes count.
 
 An ineligible seat stays in the output with the reason it was passed over, and
 when *nothing* is selectable the command exits non-zero with `selected: null`

@@ -6,6 +6,7 @@ package usage
 import (
 	"context"
 	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -28,6 +29,10 @@ type UsageWindow struct {
 	// provider reports it — a model's display name ("Opus", "Fable") for a
 	// scoped window, empty for the general ones.
 	Label string `json:"label,omitempty"`
+
+	// ModelID retains the provider's model identifier alongside its display
+	// label. Either can identify an applicable model restriction.
+	ModelID string `json:"model_id,omitempty"`
 
 	// Kind is the provider's name for the window: for Claude, one of
 	// "session" (5-hour), "weekly_all", or "weekly_scoped".
@@ -99,10 +104,16 @@ type UsageInfo struct {
 	// For Claude: Opus-specific daily/weekly limits.
 	TertiaryWindow *UsageWindow `json:"tertiary_window,omitempty"`
 
-	// ModelWindows contains per-model rate limit windows.
+	// ModelWindows contains the strongest reported window for each model.
 	// Key is model name (e.g., "claude-3-opus", "claude-3-sonnet").
-	// Useful when different models have independent limits.
+	// It remains a compact display projection; quota calculations also use
+	// ScopedWindows so overlapping session and weekly limits are not lost.
 	ModelWindows map[string]*UsageWindow `json:"model_windows,omitempty"`
+
+	// ScopedWindows retains every model-scoped constraint, including several
+	// windows for the same model. The highest usage and the governing reset
+	// need not belong to the same window.
+	ScopedWindows []*UsageWindow `json:"scoped_windows,omitempty"`
 
 	// Credits contains credit balance info (Codex only).
 	Credits *CreditInfo `json:"credits,omitempty"`
@@ -232,6 +243,11 @@ func (u *UsageInfo) NumericQuotaKnown() bool {
 			return false
 		}
 	}
+	for _, w := range u.ScopedWindows {
+		if !valid(w) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -247,17 +263,14 @@ type Fetcher interface {
 	Fetch(ctx context.Context, accessToken string) (*UsageInfo, error)
 }
 
-// windowUtilization returns a window's utilization as a 0-1 fraction, falling
-// back to UsedPercent for windows that only carry the integer percent.
+// windowUtilization returns the stricter numeric representation as a 0-1
+// fraction. Legacy rows can carry either field; a nonzero fraction must not
+// hide an exhausted integer percentage, and fractional precision is retained.
 func windowUtilization(w *UsageWindow) float64 {
 	if w == nil {
 		return 0
 	}
-	util := w.Utilization
-	if util == 0 && w.UsedPercent > 0 {
-		util = float64(w.UsedPercent) / 100.0
-	}
-	return util
+	return math.Max(w.Utilization, float64(w.UsedPercent)/100)
 }
 
 // AvailabilityScore calculates a score for account rotation (0-100).
@@ -271,7 +284,7 @@ func (u *UsageInfo) AvailabilityScore() int {
 }
 
 // AvailabilityScoreForModel is AvailabilityScore narrowed to the work actually
-// about to run: only the scoped window for model constrains the score, so an
+// about to run: only the scoped windows for model constrain the score, so an
 // account out of Fable capacity is still ranked as available for Sonnet work.
 //
 // An empty model means "unknown", and every scoped window is then taken into
@@ -324,31 +337,71 @@ func (u *UsageInfo) premiumWindows(model string) []*UsageWindow {
 	if u.TertiaryWindow != nil && windowAppliesToModel(u.TertiaryWindow, model) {
 		out = append(out, u.TertiaryWindow)
 	}
-	if model != "" {
-		if w := u.scopedWindowForModel(model); w != nil {
-			out = append(out, w)
-		}
-		return out
+	return append(out, u.modelWindowsForModel(model)...)
+}
+
+// modelWindowsForModel keeps every matching scoped constraint, rather than
+// reducing simultaneous session, weekly, family and model-ID limits to one
+// display winner. Older normalized rows may only contain ModelWindows, so
+// both representations count. Sorting makes equal-window diagnostics stable
+// without changing the source collection or the provider's measurements.
+func (u *UsageInfo) modelWindowsForModel(model string) []*UsageWindow {
+	if u == nil {
+		return nil
 	}
-	for _, w := range u.ModelWindows {
-		if w != nil {
-			out = append(out, w)
+	out := make([]*UsageWindow, 0, len(u.ModelWindows)+len(u.ScopedWindows))
+	seen := make(map[*UsageWindow]bool)
+	appendWindow := func(key string, w *UsageWindow) {
+		if !scopedWindowAppliesToModel(key, w, model) || seen[w] {
+			return
 		}
+		seen[w] = true
+		out = append(out, w)
 	}
+	keys := make([]string, 0, len(u.ModelWindows))
+	for key := range u.ModelWindows {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		appendWindow(key, u.ModelWindows[key])
+	}
+	for _, w := range u.ScopedWindows {
+		appendWindow("", w)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return preferScopedWindow(out[i], out[j])
+	})
 	return out
 }
 
-// windowAppliesToModel reports whether a labelled window constrains model. An
-// unlabelled window constrains everything, and so does any window when the
-// model is unknown.
+// applicableWindows is the complete set used for quota and reset decisions.
+// General windows always count; model restrictions are filtered together.
+func (u *UsageInfo) applicableWindows(model string) []*UsageWindow {
+	if u == nil {
+		return nil
+	}
+	return append([]*UsageWindow{u.PrimaryWindow, u.SecondaryWindow}, u.premiumWindows(model)...)
+}
+
+// windowAppliesToModel reports whether a window's label or provider ID
+// constrains model. A window without either identity constrains everything,
+// and so does any window when the requested model is unknown.
 func windowAppliesToModel(w *UsageWindow, model string) bool {
+	return scopedWindowAppliesToModel("", w, model)
+}
+
+func scopedWindowAppliesToModel(key string, w *UsageWindow, model string) bool {
 	if w == nil {
 		return false
 	}
-	if model == "" || w.Label == "" {
+	if model == "" || (key == "" && w.Label == "" && w.ModelID == "") {
 		return true
 	}
-	return modelKeysMatch(NormalizeModelKey(model), NormalizeModelKey(w.Label))
+	want := NormalizeModelKey(model)
+	return modelKeysMatch(want, NormalizeModelKey(key)) ||
+		modelKeysMatch(want, NormalizeModelKey(w.Label)) ||
+		modelKeysMatch(want, NormalizeModelKey(w.ModelID))
 }
 
 // premiumUtilization returns the worst utilization among the per-model windows
@@ -364,7 +417,7 @@ func (u *UsageInfo) premiumUtilization(model string) float64 {
 func (u *UsageInfo) ScopedLimit(model string) *UsageWindow {
 	var worst *UsageWindow
 	for _, w := range u.premiumWindows(model) {
-		if worst == nil || windowUtilization(w) > windowUtilization(worst) {
+		if preferScopedWindow(w, worst) {
 			worst = w
 		}
 	}
@@ -374,32 +427,60 @@ func (u *UsageInfo) ScopedLimit(model string) *UsageWindow {
 // scopedWindowForModel returns the tightest matching model allowance, or nil.
 // An exact identifier and a family/display-name match are simultaneous limits:
 // neither may shadow the other just because its map key is more specific.
-// Unlike WindowForModel this never falls back to the tertiary window.
+// Unlike WindowForModel this only reads the explicit scoped collections.
 func (u *UsageInfo) scopedWindowForModel(model string) *UsageWindow {
-	if u == nil || len(u.ModelWindows) == 0 || model == "" {
+	if model == "" {
 		return nil
 	}
-	want := NormalizeModelKey(model)
 	var worst *UsageWindow
-	var worstKey string
-	for key, w := range u.ModelWindows {
-		if w == nil {
-			continue
-		}
-		if key != model && !modelKeysMatch(want, NormalizeModelKey(key)) &&
-			!modelKeysMatch(want, NormalizeModelKey(w.Label)) {
-			continue
-		}
-		// A display-only window cannot suppress a measured cap. Retain an
-		// unmeasured match only when no matching measurement is available.
-		// Stable key ordering breaks ties without mutating the source map.
-		if worst == nil || (worst.Unmeasured && !w.Unmeasured) ||
-			(worst.Unmeasured == w.Unmeasured && (windowUtilization(w) > windowUtilization(worst) ||
-				(windowUtilization(w) == windowUtilization(worst) && key < worstKey))) {
-			worst, worstKey = w, key
+	for _, w := range u.modelWindowsForModel(model) {
+		if preferScopedWindow(w, worst) {
+			worst = w
 		}
 	}
 	return worst
+}
+
+// preferScopedWindow chooses the compact diagnostic projection without
+// discarding the other constraints. Measurements precede display-only or
+// rolled values; ties have a stable order independent of limits[] ordering.
+// The same preference is used while parsing and when selecting the binding
+// scope from the complete normalized row.
+func preferScopedWindow(candidate, current *UsageWindow) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	candidateMeasured := !candidate.Unmeasured && !candidate.Rolled
+	currentMeasured := !current.Unmeasured && !current.Rolled
+	switch {
+	case candidateMeasured != currentMeasured:
+		return candidateMeasured
+	case windowUtilization(candidate) != windowUtilization(current):
+		return windowUtilization(candidate) > windowUtilization(current)
+	case candidate.WindowDuration != current.WindowDuration:
+		return candidate.WindowDuration > current.WindowDuration
+	case !candidate.ResetsAt.Equal(current.ResetsAt):
+		return candidate.ResetsAt.After(current.ResetsAt)
+	case candidate.Kind != current.Kind:
+		return candidate.Kind < current.Kind
+	case candidate.ModelID != current.ModelID:
+		return candidate.ModelID < current.ModelID
+	case candidate.Label != current.Label:
+		return candidate.Label < current.Label
+	case candidate.Severity != current.Severity:
+		return candidate.Severity < current.Severity
+	case candidate.IsActive != current.IsActive:
+		return candidate.IsActive
+	case candidate.Unmeasured != current.Unmeasured:
+		return !candidate.Unmeasured
+	case candidate.Rolled != current.Rolled:
+		return !candidate.Rolled
+	default:
+		return false
+	}
 }
 
 // NormalizeModelKey reduces a model name to a comparable token: lower case,
@@ -440,8 +521,8 @@ func (u *UsageInfo) IsNearLimit(threshold float64) bool {
 }
 
 // IsNearLimitForModel is IsNearLimit narrowed to the model about to be used:
-// the general windows always count, but of the model-scoped windows only the
-// one covering model does. An empty model means "unknown", and then every
+// the general windows always count, but only model-scoped windows covering
+// model do. An empty model means "unknown", and then every
 // scoped window counts — an omitted scoped limit must never read as capacity
 // (issue #97).
 func (u *UsageInfo) IsNearLimitForModel(threshold float64, model string) bool {
@@ -468,37 +549,20 @@ func (u *UsageInfo) IsNearLimitForModel(threshold float64, model string) bool {
 // EarliestReset returns the earliest known reset time across all windows.
 // Returns the zero time if no window has a reset timestamp.
 func (u *UsageInfo) EarliestReset() time.Time {
-	if u == nil {
-		return time.Time{}
-	}
+	return u.EarliestResetForModel("")
+}
 
+// EarliestResetForModel returns the earliest known reset among the general
+// quotas and all scopes that constrain model. An unrelated model's reset
+// cannot make the requested work a drain candidate. Empty model includes all
+// scopes; zero time means no applicable reset was reported.
+func (u *UsageInfo) EarliestResetForModel(model string) time.Time {
 	var earliest time.Time
-
-	if u.PrimaryWindow != nil && !u.PrimaryWindow.ResetsAt.IsZero() {
-		earliest = u.PrimaryWindow.ResetsAt
-	}
-
-	if u.SecondaryWindow != nil && !u.SecondaryWindow.ResetsAt.IsZero() {
-		if earliest.IsZero() || u.SecondaryWindow.ResetsAt.Before(earliest) {
-			earliest = u.SecondaryWindow.ResetsAt
+	for _, w := range u.applicableWindows(model) {
+		if w != nil && !w.ResetsAt.IsZero() && (earliest.IsZero() || w.ResetsAt.Before(earliest)) {
+			earliest = w.ResetsAt
 		}
 	}
-
-	if u.TertiaryWindow != nil && !u.TertiaryWindow.ResetsAt.IsZero() {
-		if earliest.IsZero() || u.TertiaryWindow.ResetsAt.Before(earliest) {
-			earliest = u.TertiaryWindow.ResetsAt
-		}
-	}
-
-	// Check model-specific windows
-	for _, window := range u.ModelWindows {
-		if window != nil && !window.ResetsAt.IsZero() {
-			if earliest.IsZero() || window.ResetsAt.Before(earliest) {
-				earliest = window.ResetsAt
-			}
-		}
-	}
-
 	return earliest
 }
 
@@ -530,40 +594,25 @@ func (u *UsageInfo) MostConstrainedWindow() *UsageWindow {
 		if w == nil || w.Unmeasured {
 			return
 		}
-		util := w.Utilization
-		if util == 0 && w.UsedPercent > 0 {
-			util = float64(w.UsedPercent) / 100.0
-		}
+		util := windowUtilization(w)
 		if mostConstrained == nil || util > highestUtil {
 			mostConstrained = w
 			highestUtil = util
 		}
 	}
 
-	checkWindow(u.PrimaryWindow)
-	checkWindow(u.SecondaryWindow)
-	checkWindow(u.TertiaryWindow)
-
-	for _, w := range u.ModelWindows {
+	for _, w := range u.applicableWindows("") {
 		checkWindow(w)
 	}
 
 	return mostConstrained
 }
 
-// WindowForModel returns the rate limit window for a specific model.
-// Falls back to TertiaryWindow if no model-specific window exists.
+// WindowForModel returns the most constrained allowance for a specific model,
+// including the legacy tertiary window only when it applies to that model.
+// An empty model considers every scoped allowance.
 func (u *UsageInfo) WindowForModel(model string) *UsageWindow {
-	if u == nil {
-		return nil
-	}
-
-	if w := u.scopedWindowForModel(model); w != nil {
-		return w
-	}
-
-	// Fall back to tertiary (premium model) window
-	return u.TertiaryWindow
+	return u.ScopedLimit(model)
 }
 
 // PredictDepletion calculates when the rate limit will be hit based on burn rate.

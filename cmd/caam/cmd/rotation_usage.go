@@ -58,7 +58,7 @@ func toRotationUsageInfo(name string, u *usage.UsageInfo, model string) *rotatio
 		info.ScopedPercent = percent(scoped)
 		info.ScopedLabel = scoped.Label
 	}
-	if resetsAt := u.EarliestReset(); !resetsAt.IsZero() {
+	if resetsAt := u.EarliestResetForModel(model); !resetsAt.IsZero() {
 		t := resetsAt
 		info.ResetsAt = &t
 	}

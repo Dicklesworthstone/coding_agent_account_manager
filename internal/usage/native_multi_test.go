@@ -409,3 +409,82 @@ func TestCachedSubscriptionQuotaCannotInventZero(t *testing.T) {
 		t.Fatal("cache identity, timestamp or provenance changed")
 	}
 }
+
+// Exercise the full parser-to-selector path: a display map can show only one
+// window per model, but both reset policies need all simultaneous constraints.
+func TestClaudeOverlappingScopedQuotaHorizons(t *testing.T) {
+	now := time.Date(2098, 1, 1, 12, 0, 0, 0, time.UTC)
+	stamp := func(after time.Duration) string { return now.Add(after).Format(time.RFC3339Nano) }
+	for _, weeklyStronger := range []bool{false, true} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(fmt.Sprintf("weekly_stronger=%t/reverse=%t", weeklyStronger, reverse), func(t *testing.T) {
+				sessionPercent, weeklyPercent := 80, 10
+				if weeklyStronger {
+					sessionPercent, weeklyPercent = 20, 80
+				}
+				limits := []string{
+					fmt.Sprintf(`{"kind":"session","percent":%d,"resets_at":%q,"scope":{"model":{"id":"claude-fable-5","display_name":"Premium tier"}}}`, sessionPercent, stamp(2*time.Hour)),
+					fmt.Sprintf(`{"kind":"weekly_scoped","percent":%d,"resets_at":%q,"scope":{"model":{"id":"claude-fable-5","display_name":"Premium tier"}}}`, weeklyPercent, stamp(120*time.Hour)),
+				}
+				if reverse {
+					limits[0], limits[1] = limits[1], limits[0]
+				}
+				body := fmt.Sprintf(`{"seven_day":{"utilization":25,"resets_at":%q},"limits":[%s]}`, stamp(24*time.Hour), strings.Join(limits, ","))
+				cached, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertCachedClaudeCompatibilityMetadata(t, cached)
+				for _, source := range []struct {
+					name string
+					info *UsageInfo
+				}{{"live", fetchFixture(t, body)}, {"cached", cached}} {
+					t.Run(source.name, func(t *testing.T) {
+						encoded, err := json.Marshal(source.info)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var restored UsageInfo
+						if err := json.Unmarshal(encoded, &restored); err != nil {
+							t.Fatal(err)
+						}
+						for _, info := range []*UsageInfo{source.info, &restored} {
+							if !info.NumericQuotaKnown() || info.PrimaryWindow != nil || len(info.ScopedWindows) != 2 {
+								t.Fatalf("weekly-only response lost measured constraints: %+v", info)
+							}
+							if projection := info.ModelWindows["Premium tier"]; projection == nil || projection.UsedPercent != 80 || projection.ModelID != "claude-fable-5" {
+								t.Fatalf("existing display map or provider identity changed: %+v", projection)
+							}
+							for _, model := range []string{"claude-fable-5", "fable", ""} {
+								if scoped := info.ScopedLimit(model); scoped == nil || scoped.UsedPercent != 80 {
+									t.Fatalf("model %q lost the applicable restriction: %+v", model, scoped)
+								}
+								if got := info.EarliestResetForModel(model); !got.Equal(now.Add(2 * time.Hour)) {
+									t.Fatalf("model %q lost the earliest scoped reset: %s", model, got)
+								}
+								if governing := GoverningWindow(info, model); governing == nil || !governing.ResetsAt.Equal(now.Add(120*time.Hour)) || governing.WindowDuration != 7*24*time.Hour {
+									t.Fatalf("model %q lost the longest scoped allowance: %+v", model, governing)
+								}
+							}
+							if info.ScopedLimit("sonnet") != nil || !info.EarliestResetForModel("sonnet").Equal(now.Add(24*time.Hour)) {
+								t.Fatal("unrelated model inherited the Fable restriction or reset")
+							}
+							competitor := &UsageInfo{
+								QuotaStatus:     QuotaOK,
+								SecondaryWindow: &UsageWindow{UsedPercent: 85, WindowDuration: 7 * 24 * time.Hour, ResetsAt: now.Add(48 * time.Hour)},
+								ScopedWindows:   []*UsageWindow{{UsedPercent: 85, ModelID: "claude-fable-5", WindowDuration: 7 * 24 * time.Hour, ResetsAt: now.Add(48 * time.Hour)}},
+							}
+							ranked := RankProfiles([]ProfileUsage{
+								{Provider: "claude", ProfileName: "a-overlapping", Usage: info},
+								{Provider: "claude", ProfileName: "b-earlier-weekly", Usage: competitor},
+							}, RankOptions{Mode: RankEarliestResetHeadroom, Model: "claude-fable-5", RequireModelWindow: true, Now: now})
+							if ranked.Selected == nil || ranked.Selected.Profile != "b-earlier-weekly" {
+								t.Fatalf("discarded model reset changed the account recommendation: %+v", ranked)
+							}
+						}
+					})
+				}
+			})
+		}
+	}
+}

@@ -625,3 +625,175 @@ func TestClaudeUsageCompatibilityNullLegacyPremiumAlias(t *testing.T) {
 		t.Fatalf("null legacy alias hid the measured premium limit: %+v", info)
 	}
 }
+
+type claudeLegacyPremiumCase struct {
+	name, body   string
+	wantPercents []float64
+}
+
+// Coexisting legacy fields are synthetic compatibility cases, not a captured
+// provider document. Neither accepted measurement may erase the other.
+func claudeLegacyPremiumCases() []claudeLegacyPremiumCase {
+	var cases []claudeLegacyPremiumCase
+	for _, tc := range []struct {
+		name, fields string
+		percents     []float64
+	}{
+		{"second alias exhausted", `"opus":{"utilization":0},"seven_day_opus":{"utilization":100}`, []float64{0, 100}},
+		{"first alias exhausted", `"opus":{"utilization":100},"seven_day_opus":{"utilization":0}`, []float64{100, 0}},
+		{"both measured with fractional headroom", `"opus":{"utilization":12.5},"seven_day_opus":{"utilization":50.5}`, []float64{12.5, 50.5}},
+		{"null first alias", `"opus":{"utilization":null,"resets_at":"2020-01-01T00:00:00Z"},"seven_day_opus":{"utilization":100}`, []float64{100}},
+		{"null second alias", `"opus":{"utilization":100},"seven_day_opus":{"utilization":null,"resets_at":"2020-01-01T00:00:00Z"}`, []float64{100}},
+		{"only opus", `"opus":{"utilization":100}`, []float64{100}},
+		{"only seven day opus", `"seven_day_opus":{"utilization":100}`, []float64{100}},
+	} {
+		cases = append(cases, claudeLegacyPremiumCase{tc.name, claudeCompatibilityBody(tc.fields + "," + claudeCompatibilityWeekly), tc.percents})
+	}
+	return cases
+}
+
+func assertClaudeLegacyPremiumConstraints(t *testing.T, info *UsageInfo, tc claudeLegacyPremiumCase) {
+	t.Helper()
+	if info == nil || !info.NumericQuotaKnown() || info.Error != "" || info.PrimaryWindow != nil || info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 25 {
+		t.Fatalf("legacy model fields lost usable weekly quota: %+v", info)
+	}
+	if len(info.ScopedWindows) != len(tc.wantPercents) || info.TertiaryWindow != info.ScopedWindows[0] {
+		t.Fatalf("legacy constraints or first measured display slot lost: %+v", info)
+	}
+	worst := 0.0
+	for i, percent := range tc.wantPercents {
+		w := info.ScopedWindows[i]
+		if w == nil || w.Utilization != percent/100 || w.UsedPercent != int(percent) || w.Label != "Opus" || w.WindowDuration != 0 {
+			t.Fatalf("legacy constraint %d changed its measurement or acquired a duration: %+v", i, w)
+		}
+		worst = max(worst, percent)
+	}
+	if w := info.ScopedLimit("claude-opus-4-1"); w == nil || w.Utilization != worst/100 {
+		t.Fatalf("an applicable legacy model restriction disappeared: %+v", w)
+	}
+	for _, model := range []string{"opus", "claude-opus-4-1", "", "sonnet"} {
+		spent := model != "sonnet" && worst >= 80
+		if info.IsNearLimitForModel(0.8, model) != spent {
+			t.Fatalf("legacy fields changed quota applicability for %q", model)
+		}
+		for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+			result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "legacy-premium", Usage: info}}, RankOptions{
+				Mode: mode, Model: model, Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+			})
+			if (result.Selected == nil) != spent {
+				t.Fatalf("%s rank for %q ignored legacy model constraints: %+v", mode, model, result)
+			}
+		}
+	}
+}
+
+func TestClaudeUsageRetainsAllLegacyPremiumConstraints(t *testing.T) {
+	for _, tc := range claudeLegacyPremiumCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			assertClaudeLegacyPremiumConstraints(t, fetchFixture(t, tc.body), tc)
+		})
+	}
+}
+
+type claudeGeneralReconciliationCase struct {
+	name, body  string
+	primary     bool
+	wantPercent float64
+	wantReset   time.Time
+	conflict    bool
+}
+
+func claudeGeneralReconciliationCases() []claudeGeneralReconciliationCase {
+	const reset = `"2099-01-05T00:00:00Z"`
+	resetTime := time.Date(2099, 1, 5, 0, 0, 0, 0, time.UTC)
+	var cases []claudeGeneralReconciliationCase
+	for _, window := range []struct{ name, field, kind string }{
+		{"session", "five_hour", LimitKindSession},
+		{"weekly", "seven_day", LimitKindWeeklyAll},
+	} {
+		for _, tc := range []struct {
+			name, top, limit, topReset, limitReset string
+			wantPercent                            float64
+			wantReset                              time.Time
+			conflict                               bool
+		}{
+			{"zero versus exhausted", "0", "100", reset, reset, 0, resetTime, true},
+			{"exhausted versus zero", "100", "0", reset, reset, 100, resetTime, true},
+			{"fraction versus lower integer", "12.5", "12", reset, reset, 12.5, resetTime, true},
+			{"integer versus higher fraction", "12", "12.5", reset, reset, 12, resetTime, true},
+			{"fraction versus higher integer", "12.5", "13", reset, reset, 12.5, resetTime, true},
+			{"half percent versus zero", "0.5", "0", reset, reset, 0.5, resetTime, true},
+			{"zero versus half percent", "0", "0.5", reset, reset, 0, resetTime, true},
+			{"equal decimal zero", "0.0", "0", reset, reset, 0, resetTime, false},
+			{"equal fractional values", "12.5", "12.50", reset, reset, 12.5, resetTime, false},
+			{"equal half percent", "0.5", "0.50", reset, reset, 0.5, resetTime, false},
+			{"equal multiplication boundary", "57.0", "57", reset, reset, 57, resetTime, false},
+			{"equal exhausted values", "100", "100.0", reset, reset, 100, resetTime, false},
+			{"top null falls back", "null", "12.5", "null", reset, 12.5, resetTime, false},
+			{"null limit does not contradict", "12.5", "null", reset, `"2020-01-01T00:00:00Z"`, 12.5, resetTime, false},
+			{"same reset different zone", "12.5", "12.5", reset, `"2099-01-04T19:00:00-05:00"`, 12.5, resetTime, false},
+			{"same reset different precision", "12.5", "12.5", `"2099-01-05T00:00:00.000000000Z"`, reset, 12.5, resetTime, false},
+			{"later limit reset", "12.5", "12.5", reset, `"2099-01-05T00:00:01Z"`, 12.5, resetTime, true},
+			{"earlier limit reset", "12.5", "12.5", reset, `"2099-01-04T23:59:59Z"`, 12.5, resetTime, true},
+			{"distinct nanosecond resets", "12.5", "12.5", `"2099-01-05T00:00:00.000000001Z"`, `"2099-01-05T00:00:00.000000002Z"`, 12.5, resetTime.Add(time.Nanosecond), true},
+			{"limit supplies missing reset", "12.5", "12.5", "null", reset, 12.5, resetTime, false},
+			{"top supplies missing reset", "12.5", "12.5", reset, "null", 12.5, resetTime, false},
+			{"both resets absent", "12.5", "12.5", "null", "null", 12.5, time.Time{}, false},
+		} {
+			fields := `"` + window.field + `":{"utilization":` + tc.top + `,"resets_at":` + tc.topReset + `}`
+			primary := window.kind == LimitKindSession
+			if primary {
+				fields += `,` + claudeCompatibilityWeekly
+			} else {
+				fields += `,"five_hour":null`
+			}
+			limit := `{"kind":"` + window.kind + `","percent":` + tc.limit + `,"resets_at":` + tc.limitReset + `}`
+			// Keep the model entry after the general duplicate. Detecting a
+			// conflict must not stop normalization and erase later constraints.
+			body := claudeCompatibilityBody(fields, limit, claudeCompatibilityFableLimit)
+			cases = append(cases, claudeGeneralReconciliationCase{
+				window.name + "/" + tc.name, body, primary, tc.wantPercent, tc.wantReset, tc.conflict,
+			})
+		}
+	}
+	return cases
+}
+
+func assertClaudeGeneralReconciliation(t *testing.T, info *UsageInfo, err error, tc claudeGeneralReconciliationCase) {
+	t.Helper()
+	if info == nil {
+		t.Fatalf("duplicate general quota lost its diagnostic document: %v", err)
+	}
+	w := info.SecondaryWindow
+	if tc.primary {
+		w = info.PrimaryWindow
+		if info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 25 {
+			t.Fatalf("session conflict erased the known weekly allowance: %+v", info.SecondaryWindow)
+		}
+	} else if info.PrimaryWindow != nil {
+		t.Fatalf("weekly-only response invented a session allowance: %+v", info.PrimaryWindow)
+	}
+	if w == nil || w.Utilization != tc.wantPercent/100 || w.UsedPercent != int(tc.wantPercent) || !w.ResetsAt.Equal(tc.wantReset) {
+		t.Fatalf("general measurement lost its precision or reset: got %+v, want %v%% reset %v", w, tc.wantPercent, tc.wantReset)
+	}
+	if model := info.WindowForModel("fable"); model == nil || model.UsedPercent != 100 {
+		t.Fatalf("general conflict erased the later model constraint: %+v", model)
+	}
+	if tc.conflict {
+		if err == nil || info.QuotaStatus != QuotaDegraded || info.Error == "" || !strings.Contains(info.QuotaNote, "conflicting") {
+			t.Fatalf("conflicting duplicate quota was accepted: info=%+v err=%v", info, err)
+		}
+		assertClaudeQuotaNotRoutable(t, info)
+	} else if err != nil || info.Error != "" || !info.NumericQuotaKnown() {
+		t.Fatalf("agreeing or inapplicable duplicate was rejected: info=%+v err=%v", info, err)
+	}
+}
+
+func TestClaudeUsageGeneralDuplicateReconciliation(t *testing.T) {
+	for _, tc := range claudeGeneralReconciliationCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := fetchClaudeFixtureResult(t, tc.body)
+			assertClaudeGeneralReconciliation(t, info, err, tc)
+		})
+	}
+}

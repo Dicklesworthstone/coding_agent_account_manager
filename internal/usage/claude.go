@@ -139,7 +139,7 @@ func (l claudeLimit) modelName() string {
 
 // window renders a limit as a UsageWindow.
 func (l claudeLimit) window(duration time.Duration) *UsageWindow {
-	return &UsageWindow{
+	w := &UsageWindow{
 		Utilization:    *l.Percent / 100.0,
 		UsedPercent:    int(*l.Percent),
 		ResetsAt:       parseISO8601(l.ResetsAt),
@@ -149,6 +149,10 @@ func (l claudeLimit) window(duration time.Duration) *UsageWindow {
 		Severity:       l.Severity,
 		IsActive:       l.IsActive,
 	}
+	if l.Scope != nil && l.Scope.Model != nil {
+		w.ModelID = strings.TrimSpace(l.Scope.Model.ID)
+	}
+	return w
 }
 
 // applyLimits folds the limits[] array into info.
@@ -159,6 +163,7 @@ func (l claudeLimit) window(duration time.Duration) *UsageWindow {
 // unsafe for selection, while recognized windows remain available for display.
 func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error {
 	unsupported := false
+	conflicting := false
 	rolled := false
 	seenSession, seenWeekly := false, false
 	for _, l := range limits {
@@ -186,9 +191,11 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 					rolled = true
 				}
 			}
-			// Several scoped limits can name the same model (a weekly and a
-			// session one); keep the one closest to its cap.
-			if prev, ok := info.ModelWindows[name]; !ok || w.Utilization > prev.Utilization {
+			// Keep every simultaneous constraint. A lower-utilization window
+			// can still supply the longest allowance or the earliest reset.
+			info.ScopedWindows = append(info.ScopedWindows, w)
+			// Preserve the existing strongest-window map for compact display.
+			if preferScopedWindow(w, info.ModelWindows[name]) {
 				info.ModelWindows[name] = w
 			}
 		case l.Kind == LimitKindSession && (l.Group == "" || l.Group == "session"):
@@ -201,8 +208,8 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 			seenSession = true
 			if info.PrimaryWindow == nil {
 				info.PrimaryWindow = l.window(claudeLimitDuration(l))
-			} else {
-				annotateWindow(info.PrimaryWindow, l)
+			} else if !annotateWindow(info.PrimaryWindow, l) {
+				conflicting = true
 			}
 		case l.Kind == LimitKindWeeklyAll && (l.Group == "" || l.Group == "weekly"):
 			if seenWeekly {
@@ -212,8 +219,8 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 			seenWeekly = true
 			if info.SecondaryWindow == nil {
 				info.SecondaryWindow = l.window(claudeLimitDuration(l))
-			} else {
-				annotateWindow(info.SecondaryWindow, l)
+			} else if !annotateWindow(info.SecondaryWindow, l) {
+				conflicting = true
 			}
 		default:
 			unsupported = true
@@ -221,6 +228,9 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 	}
 	if unsupported {
 		return fmt.Errorf("Claude response included an unsupported measured quota limit")
+	}
+	if conflicting {
+		return fmt.Errorf("Claude response included conflicting measurements for a general quota")
 	}
 	if rolled {
 		// A live same-model window can win the display slot without proving
@@ -248,16 +258,27 @@ func claudeLimitDuration(l claudeLimit) time.Duration {
 	return 0
 }
 
-// annotateWindow carries a limit's descriptive fields onto a window already
-// built from the response's top-level field, whose numbers stay authoritative
-// (they are floats, where limits[] rounds to whole percent).
-func annotateWindow(w *UsageWindow, l claudeLimit) {
+// annotateWindow merges a measured general limit only when both representations
+// agree. There is no verified rounding contract for differing percentages or
+// reset instants: retain the top-level measurement for diagnostics and refuse
+// selection rather than silently discarding a possibly binding restriction.
+// Comparing the percentages after the same conversion preserves fractional
+// accuracy without multiplying an already-normalized float back to percent.
+func annotateWindow(w *UsageWindow, l claudeLimit) bool {
+	if w.Utilization != *l.Percent/100.0 {
+		return false
+	}
+	reset := parseISO8601(l.ResetsAt)
+	if !w.ResetsAt.IsZero() && !reset.IsZero() && !w.ResetsAt.Equal(reset) {
+		return false
+	}
 	w.Kind = l.Kind
 	w.Severity = l.Severity
 	w.IsActive = l.IsActive
 	if w.ResetsAt.IsZero() {
-		w.ResetsAt = parseISO8601(l.ResetsAt)
+		w.ResetsAt = reset
 	}
+	return true
 }
 
 // Fetch retrieves usage data from Claude's API.
@@ -354,12 +375,19 @@ func (usage claudeUsageResponse) apply(info *UsageInfo, rollAt time.Time) error 
 		}
 	}
 
-	// The legacy premium-model window, under either of the names the API has
-	// used for it. Newer accounts report it through limits[] instead.
-	if opus := usage.Opus; opus != nil && opus.Utilization != nil {
-		info.TertiaryWindow = legacyOpusWindow(opus)
-	} else if opus := usage.SevenDayOpus; opus != nil && opus.Utilization != nil {
-		info.TertiaryWindow = legacyOpusWindow(opus)
+	// Preserve both accepted legacy fields if they are measured together.
+	// They may report different restrictions; choosing one must not hide an
+	// exhausted or expired allowance. Keep the first measured field in the
+	// legacy display slot and retain every constraint for quota decisions.
+	for _, opus := range []*claudeWindow{usage.Opus, usage.SevenDayOpus} {
+		if opus == nil || opus.Utilization == nil {
+			continue
+		}
+		w := legacyOpusWindow(opus)
+		info.ScopedWindows = append(info.ScopedWindows, w)
+		if info.TertiaryWindow == nil {
+			info.TertiaryWindow = w
+		}
 	}
 
 	// Per-model allowances, and the general windows for accounts that report

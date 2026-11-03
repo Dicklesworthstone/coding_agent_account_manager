@@ -397,8 +397,8 @@ func TestLimitsRankRequiresAProvider(t *testing.T) {
 	}
 }
 
-// TestAnyProfilePublishesScopedWindow covers both response shapes: the
-// current per-model map and the legacy single premium window.
+// TestAnyProfilePublishesScopedWindow covers the complete scoped collection,
+// the per-model display map and the legacy single premium window.
 func TestAnyProfilePublishesScopedWindow(t *testing.T) {
 	tests := []struct {
 		name string
@@ -415,6 +415,13 @@ func TestAnyProfilePublishesScopedWindow(t *testing.T) {
 			name: "general windows only",
 			rows: []usage.ProfileUsage{rankRow("a", 10, time.Hour)},
 			want: false,
+		},
+		{
+			name: "the complete scoped collection",
+			rows: []usage.ProfileUsage{{Provider: "claude", ProfileName: "a", Usage: &usage.UsageInfo{
+				ScopedWindows: []*usage.UsageWindow{{UsedPercent: 10, ModelID: "claude-fable-5"}},
+			}}},
+			want: true,
 		},
 		{
 			name: "the current per-model map",

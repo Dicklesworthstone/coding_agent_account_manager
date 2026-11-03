@@ -311,7 +311,7 @@ func classify(row ProfileUsage, model string, ceiling int, requireModelWindow bo
 	if !u.NumericQuotaKnown() {
 		out.Reason = u.QuotaNote
 		if out.Reason == "" && u.PrimaryWindow == nil && u.SecondaryWindow == nil &&
-			u.TertiaryWindow == nil && len(u.ModelWindows) == 0 {
+			u.TertiaryWindow == nil && len(u.ModelWindows) == 0 && len(u.ScopedWindows) == 0 {
 			out.Reason = "the provider reported no rate limit window for this profile"
 		}
 		if out.Reason == "" && u.Source == SourceCache {
@@ -440,7 +440,9 @@ func bindingUsage(u *UsageInfo, model string) (int, string, bool) {
 
 // GoverningWindow returns the window whose reset time orders a profile under
 // RankEarliestResetHeadroom: the LONGEST allowance the profile reports that
-// still has a known reset time.
+// applies to model and still has a known reset time. Headroom uses the most
+// constrained percentage independently; a less-used overlapping allowance
+// can have the governing duration and reset.
 //
 // The longest window is the included allowance being preserved or spent — a
 // weekly cap, not the five-hour window that rolls over on its own several
@@ -456,19 +458,8 @@ func GoverningWindow(u *UsageInfo, model string) *UsageWindow {
 		return nil
 	}
 
-	windows := []*UsageWindow{u.PrimaryWindow, u.SecondaryWindow, u.TertiaryWindow}
-	if model != "" {
-		if w := u.ScopedLimit(model); w != nil {
-			windows = append(windows, w)
-		}
-	} else {
-		for _, w := range u.ModelWindows {
-			windows = append(windows, w)
-		}
-	}
-
 	var best *UsageWindow
-	for _, w := range windows {
+	for _, w := range u.applicableWindows(model) {
 		if w == nil || w.ResetsAt.IsZero() {
 			continue
 		}
@@ -502,9 +493,26 @@ func governingWindowName(u *UsageInfo, gov *UsageWindow, model string) string {
 	case gov == u.ScopedLimit(model):
 		return "scoped"
 	}
+	var modelName string
 	for name, w := range u.ModelWindows {
 		if w == gov {
-			return "scoped:" + name
+			if modelName == "" || name < modelName {
+				modelName = name
+			}
+		}
+	}
+	if modelName != "" {
+		return "scoped:" + modelName
+	}
+	for _, w := range u.ScopedWindows {
+		if w == gov {
+			if w.Label != "" {
+				return "scoped:" + w.Label
+			}
+			if w.ModelID != "" {
+				return "scoped:" + w.ModelID
+			}
+			return "scoped"
 		}
 	}
 	return "unknown"
@@ -563,10 +571,15 @@ func sortByAvailability(profiles []RankedProfile) {
 // scopedQuotaLabel names the model a scoped window belongs to, for providers
 // that report one without a display name.
 func scopedQuotaLabel(w *UsageWindow) string {
-	if w == nil || w.Label == "" {
-		return "model quota"
+	if w != nil {
+		if w.Label != "" {
+			return w.Label
+		}
+		if w.ModelID != "" {
+			return w.ModelID
+		}
 	}
-	return w.Label
+	return "model quota"
 }
 
 // formatRankDuration renders a reset horizon compactly.

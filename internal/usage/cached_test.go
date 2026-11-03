@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -375,5 +376,67 @@ func TestCachedClaudeUsageRolledConstraintsRequireRefresh(t *testing.T) {
 			t.Fatalf("inapplicable session was mistaken for a stale measurement: %v", err)
 		}
 		assertClaudeWeeklyOnlyCompatibility(t, info, 25)
+	}
+}
+
+func TestCachedClaudeUsageGeneralDuplicateReconciliation(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeGeneralReconciliationCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			assertClaudeGeneralReconciliation(t, info, err, tc)
+			assertCachedClaudeCompatibilityMetadata(t, info)
+		})
+	}
+}
+
+func TestCachedClaudeUsageRetainsAllLegacyPremiumConstraints(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeLegacyPremiumCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err != nil {
+				t.Fatalf("valid legacy constraints rejected: %v", err)
+			}
+			assertClaudeLegacyPremiumConstraints(t, info, tc)
+			assertCachedClaudeCompatibilityMetadata(t, info)
+		})
+	}
+}
+
+func TestCachedClaudeUsageCannotHideRolledLegacyPremiumConstraint(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, expiredField := range []string{"opus", "seven_day_opus"} {
+		t.Run(expiredField, func(t *testing.T) {
+			currentField := "seven_day_opus"
+			if expiredField == currentField {
+				currentField = "opus"
+			}
+			body := claudeCompatibilityBody(claudeCompatibilityWeekly + `,"` + currentField + `":{"utilization":0,"resets_at":"2099-01-05T00:00:00Z"},"` + expiredField + `":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"}`)
+			// A current provider response remains measured even when its reset
+			// is in the past; only stale cached observations are projected.
+			live := fetchFixture(t, body)
+			if len(live.ScopedWindows) != 2 || !live.IsNearLimitForModel(1, "opus") || live.IsNearLimitForModel(1, "sonnet") {
+				t.Fatalf("live legacy constraint disappeared: %+v", live)
+			}
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), now)
+			if err == nil || info == nil || info.QuotaStatus != QuotaDegraded || !strings.Contains(info.QuotaNote, "reset") || len(info.ScopedWindows) != 2 {
+				t.Fatalf("expired legacy constraint became cached capacity: info=%+v err=%v", info, err)
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeQuotaNotRoutable(t, info)
+			rolled := 0
+			for _, w := range info.ScopedWindows {
+				if w.Rolled {
+					rolled++
+					if w.Utilization != 0 || w.UsedPercent != 0 || !w.ResetsAt.Before(now) {
+						t.Fatalf("legacy rollover diagnostics changed: %+v", w)
+					}
+				}
+			}
+			if rolled != 1 {
+				t.Fatalf("retained %d rolled legacy constraints, want 1", rolled)
+			}
+		})
 	}
 }

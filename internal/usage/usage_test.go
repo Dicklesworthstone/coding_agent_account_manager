@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -710,6 +711,132 @@ func TestUsageInfo_WindowForModel(t *testing.T) {
 			if result.Utilization != tc.expectUtil {
 				t.Errorf("WindowForModel(%s).Utilization = %v, expected %v",
 					tc.model, result.Utilization, tc.expectUtil)
+			}
+		})
+	}
+}
+
+func TestUsageInfoScopedWindowsPreserveModelResetHorizons(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	short := &UsageWindow{
+		Label: "Reasoning model", ModelID: "claude-fable-5", Kind: LimitKindSession,
+		UsedPercent: 10, Utilization: 0.1, WindowDuration: 5 * time.Hour, ResetsAt: now.Add(2 * time.Hour),
+	}
+	long := &UsageWindow{
+		Label: "Fable", Kind: LimitKindWeeklyScoped, UsedPercent: 80, Utilization: 0.8,
+		WindowDuration: 7 * 24 * time.Hour, ResetsAt: now.Add(120 * time.Hour),
+	}
+	opus := &UsageWindow{Label: "Opus", UsedPercent: 30, ResetsAt: now.Add(5 * time.Minute)}
+	for _, windows := range [][]*UsageWindow{{short, long}, {long, short}} {
+		info := &UsageInfo{
+			Provider: "claude", SecondaryWindow: &UsageWindow{UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour)},
+			TertiaryWindow: opus, ModelWindows: map[string]*UsageWindow{"Fable": long}, ScopedWindows: windows,
+		}
+		before, err := json.Marshal(info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, model := range []string{"fable", "claude-fable-5", "CLAUDE-FABLE-5-20261103"} {
+			if got := info.EarliestResetForModel(model); !got.Equal(short.ResetsAt) {
+				t.Fatalf("%s lost the less-used model session reset: %s", model, got)
+			}
+			if got := info.ScopedLimit(model); got != long || info.WindowForModel(model) != long {
+				t.Fatalf("%s did not retain the binding weekly quota: %+v", model, got)
+			}
+			if got := GoverningWindow(info, model); got != long {
+				t.Fatalf("%s did not retain the longest allowance: %+v", model, got)
+			}
+		}
+		if got := info.EarliestResetForModel("sonnet"); !got.Equal(info.SecondaryWindow.ResetsAt) {
+			t.Fatalf("Sonnet borrowed another model's reset: %s", got)
+		}
+		if info.ScopedLimit("sonnet") != nil || info.WindowForModel("sonnet") != nil {
+			t.Fatal("Sonnet inherited an unrelated tertiary or scoped restriction")
+		}
+		if !info.EarliestReset().Equal(opus.ResetsAt) || !info.EarliestResetForModel("").Equal(opus.ResetsAt) {
+			t.Fatal("unknown-model work omitted a reported restriction")
+		}
+		after, err := json.Marshal(info)
+		if err != nil || string(before) != string(after) {
+			t.Fatal("quota inspection mutated the provider's window order or measurements")
+		}
+		var restored UsageInfo
+		if err := json.Unmarshal(before, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if len(restored.ScopedWindows) != 2 || restored.ModelWindows["Fable"].UsedPercent != 80 ||
+			!restored.EarliestResetForModel("fable").Equal(short.ResetsAt) {
+			t.Fatalf("normalized JSON lost the complete windows or existing projection: %+v", restored)
+		}
+	}
+	if !(*UsageInfo)(nil).EarliestResetForModel("fable").IsZero() {
+		t.Fatal("nil usage invented a model reset")
+	}
+}
+
+func TestScopedWindowProjectionIsStableAndPreservesExhaustion(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		want, other *UsageWindow
+	}{
+		{
+			name:  "integer exhaustion beats a larger fractional field",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 100, Utilization: 0.2},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 95, Utilization: 0.95},
+		},
+		{
+			name:  "fractional precision remains binding",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 50, Utilization: 0.509},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 50, Utilization: 0.505},
+		},
+		{
+			name:  "equal usage prefers a known longer allowance",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 80, WindowDuration: 7 * 24 * time.Hour},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 80, WindowDuration: 5 * time.Hour},
+		},
+		{
+			name:  "equal duration prefers later reset",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 80, ResetsAt: now.Add(48 * time.Hour)},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 80, ResetsAt: now.Add(24 * time.Hour)},
+		},
+		{
+			name:  "equal usage and horizons order by provider kind",
+			want:  &UsageWindow{Label: "Fable", Kind: "a-scoped", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable", Kind: "z-scoped", UsedPercent: 80},
+		},
+		{
+			name:  "equal kinds order by provider model identifier",
+			want:  &UsageWindow{Label: "Fable", ModelID: "model-a", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable", ModelID: "model-z", UsedPercent: 80},
+		},
+		{
+			name:  "equal identifiers order by display label",
+			want:  &UsageWindow{Label: "Fable A", ModelID: "claude-fable-5", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable Z", ModelID: "claude-fable-5", UsedPercent: 80},
+		},
+		{
+			name:  "display-only scope cannot suppress a measurement",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 20},
+			other: &UsageWindow{Label: "Fable", Utilization: 1, Unmeasured: true},
+		},
+		{
+			name:  "rolled scope cannot suppress a measured zero",
+			want:  &UsageWindow{Label: "Fable"},
+			other: &UsageWindow{Label: "Fable", Rolled: true, WindowDuration: 7 * 24 * time.Hour},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, windows := range [][]*UsageWindow{{tc.want, tc.other}, {tc.other, tc.want}} {
+				info := &UsageInfo{PrimaryWindow: &UsageWindow{}, ScopedWindows: windows}
+				if got := info.ScopedLimit("fable"); got != tc.want || info.WindowForModel("fable") != tc.want {
+					t.Fatalf("scope projection depended on input order: got=%+v want=%+v", got, tc.want)
+				}
+				if tc.want.UsedPercent == 100 {
+					if !info.IsNearLimitForModel(1, "fable") || info.MostConstrainedWindow() != tc.want || info.AvailabilityScoreForModel("fable") != 85 {
+						t.Fatal("the stronger integer measurement disappeared from quota consumers")
+					}
+				}
 			}
 		})
 	}

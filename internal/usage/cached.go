@@ -130,6 +130,11 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 			rolled = true
 		}
 	}
+	for _, w := range info.ScopedWindows {
+		if markRolled(w, now) {
+			rolled = true
+		}
+	}
 	if rolled && quotaErr == nil {
 		// Keep the recorded windows, their projected resets, and the cache's
 		// own timestamp for diagnostics. Selecting new work needs a fresh

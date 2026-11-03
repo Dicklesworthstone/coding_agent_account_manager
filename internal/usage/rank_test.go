@@ -588,6 +588,127 @@ func TestGoverningWindow_PicksTheLongestAllowance(t *testing.T) {
 	})
 }
 
+func TestRankUsesEveryApplicableModelResetHorizon(t *testing.T) {
+	for _, representation := range []string{"complete scoped list", "reversed scoped list", "legacy family and identifier map"} {
+		t.Run(representation, func(t *testing.T) {
+			short := session(80, 2*time.Hour)
+			short.Label, short.ModelID, short.Kind = "Fable", "claude-fable-5", LimitKindSession
+			long := weekly(10, 120*time.Hour)
+			long.Label, long.Kind = "Fable", LimitKindWeeklyScoped
+			info := &UsageInfo{
+				Provider: "claude", SecondaryWindow: weekly(25, 24*time.Hour),
+				ModelWindows:  map[string]*UsageWindow{"Fable": short},
+				ScopedWindows: []*UsageWindow{short, long},
+			}
+			switch representation {
+			case "reversed scoped list":
+				info.ScopedWindows = []*UsageWindow{long, short}
+			case "legacy family and identifier map":
+				info.ScopedWindows = nil
+				info.ModelWindows = map[string]*UsageWindow{"Fable": long, "claude-fable-5": short}
+			}
+			otherScope := weekly(20, 48*time.Hour)
+			otherScope.Label = "Fable"
+			rows := []ProfileUsage{
+				{Provider: "claude", ProfileName: "long-model-allowance", Usage: info},
+				{Provider: "claude", ProfileName: "earlier-allowance", Usage: &UsageInfo{
+					Provider: "claude", SecondaryWindow: weekly(90, 48*time.Hour),
+					ModelWindows: map[string]*UsageWindow{"Fable": otherScope},
+				}},
+			}
+			before, err := json.Marshal(rows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, model := range []string{"", "fable", "claude-fable-5"} {
+				for repeat := 0; repeat < 8; repeat++ {
+					result := rank(t, rows, RankOptions{Model: model, RequireModelWindow: true})
+					if selected(result) != "earlier-allowance" {
+						t.Fatalf("%q ranked on the high-use session and lost the later weekly horizon: %+v", model, result)
+					}
+					later := result.Profiles[1]
+					if later.UsedPercent != 80 || later.BindingWindow != "scoped" || later.ResetsAt == nil ||
+						!later.ResetsAt.Equal(long.ResetsAt) || later.GoverningWindow != "scoped:Fable" {
+						t.Fatalf("headroom and governing reset were incorrectly collapsed: %+v", later)
+					}
+					if !info.EarliestResetForModel(model).Equal(short.ResetsAt) {
+						t.Fatal("longest-allowance ranking changed the earliest-reset drain horizon")
+					}
+				}
+			}
+			after, err := json.Marshal(rows)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("ranking rewrote model constraints or their projection")
+			}
+		})
+	}
+}
+
+func TestRankDoesNotBorrowAnotherModelsReset(t *testing.T) {
+	opus := weekly(10, 24*time.Hour)
+	opus.Label = "Opus"
+	info := &UsageInfo{
+		Provider: "claude", SecondaryWindow: &UsageWindow{UsedPercent: 20, WindowDuration: 7 * 24 * time.Hour},
+		TertiaryWindow: opus,
+		ScopedWindows:  []*UsageWindow{{Label: "Sonnet", UsedPercent: 20, WindowDuration: 7 * 24 * time.Hour}},
+	}
+	rows := []ProfileUsage{{Provider: "claude", ProfileName: "no-sonnet-reset", Usage: info}}
+	for _, mode := range RankModes {
+		result := rank(t, rows, RankOptions{Mode: mode, Model: "sonnet", RequireModelWindow: true})
+		if result.Selected != nil || result.Error == "" || result.Profiles[0].Tier != TierUnknown || result.Profiles[0].ResetsAt != nil {
+			t.Fatalf("%s created Sonnet reset eligibility from the legacy Opus allowance: %+v", mode, result)
+		}
+		if result.Profiles[0].ScopedLimit == nil || result.Profiles[0].ScopedLimit.Label != "Sonnet" {
+			t.Fatal("Sonnet's numeric allowance was lost while refusing its unknown reset")
+		}
+	}
+	if GoverningWindow(info, "sonnet") != nil || !info.EarliestResetForModel("sonnet").IsZero() {
+		t.Fatal("a model-specific horizon included unrelated tertiary data")
+	}
+	for _, model := range []string{"", "opus"} {
+		result := rank(t, rows, RankOptions{Model: model, RequireModelWindow: true})
+		if result.Selected == nil || result.Selected.ResetsAt == nil || !result.Selected.ResetsAt.Equal(opus.ResetsAt) {
+			t.Fatalf("applicable Opus reset disappeared for %q: %+v", model, result)
+		}
+	}
+}
+
+func TestRankCompleteScopedListCannotHideExhaustion(t *testing.T) {
+	projection := weekly(95, 48*time.Hour)
+	projection.Label = "Fable"
+	spent := weekly(100, 120*time.Hour)
+	spent.Label, spent.Utilization = "Fable", 0.2
+	info := &UsageInfo{
+		Provider: "claude", SecondaryWindow: weekly(0, 24*time.Hour),
+		ModelWindows: map[string]*UsageWindow{"Fable": projection}, ScopedWindows: []*UsageWindow{projection, spent},
+	}
+	for _, mode := range RankModes {
+		for _, model := range []string{"", "fable"} {
+			result := rank(t, []ProfileUsage{{Provider: "claude", ProfileName: "spent-model", Usage: info}}, RankOptions{
+				Mode: mode, Model: model, HeadroomCeiling: 100,
+			})
+			if result.Selected != nil || result.Profiles[0].UsedPercent != 100 || result.Profiles[0].Tier != TierExhausted {
+				t.Fatalf("%s/%q hid a full integer quota behind another fraction or the summary map: %+v", mode, model, result)
+			}
+		}
+	}
+}
+
+func TestGoverningWindowFutureScopeKeepsUnknownDuration(t *testing.T) {
+	future := &UsageWindow{ModelID: "claude-fable-5", Kind: "future_scoped", UsedPercent: 20, ResetsAt: rankNow.Add(48 * time.Hour)}
+	info := &UsageInfo{Provider: "claude", SecondaryWindow: &UsageWindow{UsedPercent: 10}, ScopedWindows: []*UsageWindow{future}}
+	if !info.NumericQuotaKnown() || GoverningWindow(info, "fable") != future || !info.EarliestResetForModel("fable").Equal(future.ResetsAt) {
+		t.Fatal("a known model reset required an invented window duration")
+	}
+	result := rank(t, []ProfileUsage{{Provider: "claude", ProfileName: "future-kind", Usage: info}}, RankOptions{Model: "fable", RequireModelWindow: true})
+	if result.Selected == nil || result.Selected.ResetsAt == nil || !result.Selected.ResetsAt.Equal(future.ResetsAt) || future.WindowDuration != 0 {
+		t.Fatalf("future scope lost its reported reset or acquired a guessed duration: %+v", result)
+	}
+	if result.Selected.ScopedLimit == nil || result.Selected.ScopedLimit.Label != future.ModelID {
+		t.Fatal("an identified future scope became an unnamed diagnostic")
+	}
+}
+
 // TestRank_DoesNotMutateInput keeps this a read: a caller may rank the same
 // rows twice, or rank and then render them.
 func TestRank_DoesNotMutateInput(t *testing.T) {
