@@ -940,6 +940,23 @@ will permit work then. Refresh usage before selecting an account after a reset.
 The existing recommendation JSON field `switch_in` also describes the next
 reported reset; it is not a guarantee of future availability.
 
+#### Claude quota credentials
+
+Live quota reads for saved vault profiles use `.credentials.json` first, then
+`auth.json`, then a supported legacy `oauthToken` in `.claude.json`. A present
+primary that is malformed or has no access token is an invalid source; it does
+not permit an older login to supply another account's quota. A legacy file
+containing only account labels, cached usage, or UI state is not a credential.
+Named reads preserve selected-source errors even when a same-name isolated
+profile is healthy; `--source` explicitly chooses another namespace.
+
+Profile settings must also permit the stored subscription OAuth login. A helper,
+environment credential, API key, cloud provider, or gateway override makes its
+subscription quota unavailable, even when an OAuth cache remains. Policy-only
+settings are supported. Inspection never executes helpers or changes credentials.
+Token expiry and renewability come from the selected grant. A saved relative
+lifetime without a recorded issuance time leaves expiry unknown.
+
 #### Offline usage: `caam limits --cached`
 
 `caam limits` answers "which account still has headroom" by querying the

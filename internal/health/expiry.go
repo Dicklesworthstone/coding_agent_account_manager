@@ -113,11 +113,7 @@ func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
 	var info *ExpiryInfo
 	switch fileSet.Tool {
 	case "claude":
-		if name == ".credentials.json" {
-			info, err = parseClaudeCredentialsJSON(data)
-		} else {
-			info, err = parseLiveOAuthJSON(data)
-		}
+		info, err = ParseClaudeCredentialExpiry(name, data)
 	case "codex":
 		if key, selected, modeErr := authfile.CodexSelectedAPIKey(data); modeErr != nil {
 			return nil, modeErr
@@ -189,6 +185,107 @@ func ParseLiveExpiry(fileSet authfile.AuthFileSet) (*ExpiryInfo, error) {
 	for _, spec := range fileSet.Files {
 		if filepath.Base(spec.Path) == name {
 			info.Source = spec.Path
+			break
+		}
+	}
+	return info, nil
+}
+
+// ParseClaudeCredentialExpiry inspects one captured Claude credential. The
+// filename determines the selected grant. It never searches siblings, reads the
+// keychain, or infers a saved grant's issue time from the inspection time.
+func ParseClaudeCredentialExpiry(path string, data []byte) (*ExpiryInfo, error) {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil || root == nil {
+		return nil, fmt.Errorf("invalid selected Claude credential document")
+	}
+	var info *ExpiryInfo
+	var err error
+	switch filepath.Base(path) {
+	case ".credentials.json":
+		if ok, shapeErr := authfile.ClaudeCredentialMaterial(data, ".credentials.json"); shapeErr != nil || !ok {
+			return nil, fmt.Errorf("invalid selected Claude OAuth credentials")
+		}
+		// Modern credentials use explicit Unix milliseconds.
+		info, err = parseClaudeCredentialsJSON(data)
+	case "auth.json":
+		info, err = parseSavedClaudeOAuth(data)
+	case ".claude.json":
+		raw, exists := root["oauthToken"]
+		if !exists {
+			return nil, ErrNoExpiry
+		}
+		var token string
+		if json.Unmarshal(raw, &token) == nil {
+			if strings.TrimSpace(token) == "" {
+				return nil, ErrNoExpiry
+			}
+			// A bare legacy token carries no bound expiry or refresh grant.
+			info = &ExpiryInfo{Fingerprint: credentialFingerprint(token)}
+		} else {
+			info, err = parseSavedClaudeOAuth(raw)
+		}
+	default:
+		return nil, ErrNoExpiry
+	}
+	if err != nil {
+		if errors.Is(err, ErrNoExpiry) {
+			return nil, ErrNoExpiry
+		}
+		return nil, fmt.Errorf("invalid selected Claude credential metadata")
+	}
+	if info == nil {
+		return nil, ErrNoExpiry
+	}
+	info.Renewable, info.SelfRefreshing = info.HasRefreshToken, info.HasRefreshToken
+	info.Source = path
+	return info, nil
+}
+
+// Metadata belongs only to this grant: an auth.json root cannot inherit nested
+// claudeAiOauth metadata, and an oauthToken object cannot inherit its parent's.
+func parseSavedClaudeOAuth(grant []byte) (*ExpiryInfo, error) {
+	var oauth oauthJSON
+	if json.Unmarshal(grant, &oauth) != nil {
+		return nil, fmt.Errorf("invalid selected Claude OAuth grant")
+	}
+	if strings.TrimSpace(oauth.AccessToken) == "" && strings.TrimSpace(oauth.AccessTokenCamel) == "" {
+		return nil, ErrNoExpiry
+	}
+	info := &ExpiryInfo{
+		HasRefreshToken: strings.TrimSpace(oauth.RefreshToken) != "" || strings.TrimSpace(oauth.RefreshTokenCamel) != "",
+		Fingerprint: credentialFingerprint(oauth.RefreshToken, oauth.RefreshTokenCamel,
+			oauth.AccessToken, oauth.AccessTokenCamel),
+	}
+	for _, value := range []any{oauth.ExpiresAt, oauth.ExpiresAtCamel, oauth.Expiry} {
+		if expiry := parseExpiryField(value); !expiry.IsZero() {
+			info.ExpiresAt = expiry
+			return info, nil
+		}
+	}
+	issued := parseExpiryField(oauth.IssuedAt)
+	if issued.IsZero() {
+		issued = parseExpiryField(oauth.IssuedTime)
+	}
+	if issued.IsZero() {
+		return info, nil // A saved lifetime alone is not a deadline.
+	}
+	const maxLifetimeSeconds int64 = (1<<63 - 1) / int64(time.Second)
+	for _, raw := range []any{oauth.ExpiresIn, oauth.ExpiresInCamel} {
+		var seconds int64
+		switch value := raw.(type) {
+		case float64:
+			if value > 0 && value <= float64(maxLifetimeSeconds) && value == float64(int64(value)) {
+				seconds = int64(value)
+			}
+		case string:
+			parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err == nil {
+				seconds = parsed
+			}
+		}
+		if seconds > 0 && seconds <= maxLifetimeSeconds {
+			info.ExpiresAt = issued.Add(time.Duration(seconds) * time.Second)
 			break
 		}
 	}

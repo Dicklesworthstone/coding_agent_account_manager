@@ -373,6 +373,10 @@ func validateIsolatedClaudeMetadata(data []byte, root string) error {
 // exporting an account whose identity describes an ignored OAuth cache. Only
 // known selectors are inspected; unrelated workflow settings remain verbatim.
 func validateIsolatedClaudeOAuthSelection(files map[string][]byte) error {
+	return validateClaudeOAuthSelection(files, false)
+}
+
+func validateClaudeOAuthSelection(files map[string][]byte, allowLegacyToken bool) error {
 	for _, name := range []string{"settings.json", ".claude.json"} {
 		data, present := files[name]
 		if !present {
@@ -383,6 +387,9 @@ func validateIsolatedClaudeOAuthSelection(files map[string][]byte) error {
 			return fmt.Errorf("isolated %s must contain a JSON object", name)
 		}
 		for _, key := range []string{"apiKeyHelper", "apiKey", "api_key", "primaryApiKey", "oauthToken", "sessionKey", "forceLoginGatewayUrl"} {
+			if allowLegacyToken && name == ".claude.json" && key == "oauthToken" {
+				continue // The saved usage reader separately validates its legacy grant.
+			}
 			value, err := isolatedSelectionString(object, key)
 			if err != nil {
 				return fmt.Errorf("isolated %s: %w", name, err)
@@ -446,6 +453,22 @@ func validateIsolatedClaudeOAuthSelection(files map[string][]byte) error {
 		}
 	}
 	return nil
+}
+
+// ValidateClaudeOAuthSettings checks captured settings for credentials or
+// routing that override a stored subscription OAuth login. Use the same known
+// selectors as isolated-profile export; unrelated policy is allowed. It never
+// reads ambient settings, runs a helper, or includes secret values in errors.
+func ValidateClaudeOAuthSettings(data []byte) error {
+	return validateIsolatedClaudeOAuthSelection(map[string][]byte{"settings.json": data})
+}
+
+// ValidateClaudeOAuthState applies the same override checks to captured legacy
+// state, allowing only the supported oauthToken representation as an exception.
+// Other credential and routing selectors survive activation even with a modern
+// primary, so they must not lend that primary's quota to another execution path.
+func ValidateClaudeOAuthState(data []byte) error {
+	return validateClaudeOAuthSelection(map[string][]byte{".claude.json": data}, true)
 }
 
 // Never embed JSON values or decoder errors in diagnostics: selectors may hold

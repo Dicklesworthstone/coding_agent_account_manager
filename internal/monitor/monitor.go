@@ -295,18 +295,8 @@ func (m *Monitor) readAccessToken(provider, name string) (string, error) {
 
 	switch provider {
 	case "claude":
-		profilePath := m.vault.ProfilePath(provider, name)
-		creds := filepath.Join(profilePath, ".credentials.json")
-		token, _, err := usage.ReadClaudeCredentials(creds)
-		if err != nil {
-			oldPath := filepath.Join(profilePath, ".claude.json")
-			token, _, err = usage.ReadClaudeCredentials(oldPath)
-			if err != nil {
-				authPath := filepath.Join(profilePath, "auth.json")
-				token, _, err = usage.ReadClaudeCredentials(authPath)
-			}
-		}
-		return token, err
+		selected, err := usage.ReadClaudeProfileCredentials(m.vault.ProfilePath(provider, name))
+		return selected.AccessToken, err
 	case "codex":
 		authPath := filepath.Join(m.vault.ProfilePath(provider, name), "auth.json")
 		token, _, err := usage.ReadCodexCredentials(authPath)

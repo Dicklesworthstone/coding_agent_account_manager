@@ -3,14 +3,18 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 )
 
@@ -294,7 +298,10 @@ func ReadClaudeCredentials(path string) (accessToken string, accountID string, e
 	if err != nil {
 		return "", "", err
 	}
+	return parseClaudeAccessToken(data)
+}
 
+func parseClaudeAccessToken(data []byte) (accessToken string, accountID string, err error) {
 	var creds struct {
 		ClaudeAiOauth *struct {
 			AccessToken string `json:"accessToken"`
@@ -340,6 +347,186 @@ func ReadClaudeCredentials(path string) (accessToken string, accountID string, e
 	}
 
 	return "", "", fmt.Errorf("no access token found in credentials")
+}
+
+// ClaudeProfileCredential describes the single saved authority selected for
+// a quota read. Expiry belongs to the same captured bytes as the access token;
+// descriptive account fields are not proof of credential ownership.
+type ClaudeProfileCredential struct {
+	Path        string
+	AccessToken string `json:"-"`
+	AccountID   string
+	ExpiresAt   time.Time
+	Renewable   bool
+}
+
+// ReadClaudeProfileCredentials follows the saved Claude authority used by
+// activation: modern credentials, auth.json, then legacy state. Only a genuinely
+// absent primary permits another source. Settings must also permit subscription
+// OAuth, even when a primary exists: activation preserves their auth overrides.
+// Policy-only settings do not select a login. No live files, keychain, or
+// credential helpers are consulted or changed.
+//
+// A present invalid source retains its path in the result. os.ErrNotExist with
+// an empty result means that no supported credential authority was present.
+func ReadClaudeProfileCredentials(profileDir string) (ClaudeProfileCredential, error) {
+	settingsPath := filepath.Join(profileDir, "settings.json")
+	if data, present, err := readClaudeProfileFile(settingsPath); present {
+		selected := ClaudeProfileCredential{Path: settingsPath}
+		if err != nil {
+			return selected, fmt.Errorf("read Claude settings: %w", err)
+		}
+		if err := authfile.ValidateClaudeOAuthSettings(data); err != nil {
+			return selected, fmt.Errorf("Claude settings do not select an unambiguous subscription OAuth login: %w", err)
+		}
+	}
+	// Legacy state also carries settings that activation preserves. Capture it
+	// once so its selectors are checked even when a modern credential wins.
+	legacyPath := filepath.Join(profileDir, ".claude.json")
+	legacyData, legacyPresent, err := readClaudeProfileFile(legacyPath)
+	if legacyPresent {
+		selected := ClaudeProfileCredential{Path: legacyPath}
+		if err != nil {
+			return selected, fmt.Errorf("read Claude legacy state: %w", err)
+		}
+		if err := authfile.ValidateClaudeOAuthState(legacyData); err != nil {
+			return selected, fmt.Errorf("Claude legacy state does not select an unambiguous subscription OAuth login: %w", err)
+		}
+	}
+	for _, name := range []string{".credentials.json", "auth.json", ".claude.json"} {
+		path := filepath.Join(profileDir, name)
+		data, present, err := legacyData, legacyPresent, error(nil)
+		if name != ".claude.json" {
+			data, present, err = readClaudeProfileFile(path)
+		}
+		if !present {
+			continue
+		}
+		selected := ClaudeProfileCredential{Path: path}
+		if err != nil {
+			return selected, fmt.Errorf("read selected Claude %s: %w", name, err)
+		}
+		if name != ".claude.json" {
+			material, err := authfile.ClaudeCredentialMaterial(data, name)
+			if err != nil {
+				return selected, fmt.Errorf("selected Claude %s has invalid authentication data", name)
+			}
+			if !material {
+				return selected, fmt.Errorf("selected Claude %s has no supported access credential", name)
+			}
+		}
+		token, accountID, err := parseSelectedClaudeAccessToken(data, name)
+		if name == ".claude.json" && errors.Is(err, authfile.ErrNoCredentials) {
+			continue // Account labels and cached usage alone do not select a login.
+		}
+		if err != nil || strings.TrimSpace(token) == "" {
+			return selected, fmt.Errorf("selected Claude %s has no valid subscription access token", name)
+		}
+		selected.AccessToken, selected.AccountID = token, accountID
+		if expiry, err := health.ParseClaudeCredentialExpiry(path, data); err == nil && expiry != nil {
+			selected.ExpiresAt, selected.Renewable = expiry.ExpiresAt, expiry.Renewable
+		}
+		return selected, nil
+	}
+	return ClaudeProfileCredential{}, os.ErrNotExist
+}
+
+// Select within the document by its supported native layout, not by whichever
+// token-shaped field a generic decoder happens to prefer. Expiry parsing uses
+// the same grant selection in health.ParseClaudeCredentialExpiry.
+func parseSelectedClaudeAccessToken(data []byte, name string) (string, string, error) {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(data, &root) != nil || root == nil {
+		return "", "", authfile.ErrInvalidCredentials
+	}
+	// API keys and session keys do not prove that an accompanying OAuth cache
+	// is the selected subscription login. Refuse the ambiguous combination.
+	if name != ".credentials.json" {
+		for _, key := range []string{"apiKey", "api_key", "primaryApiKey", "sessionKey", "apiKeyHelper"} {
+			if raw, present := root[key]; present {
+				var value string
+				if json.Unmarshal(raw, &value) != nil || string(raw) == "null" || strings.TrimSpace(value) != "" {
+					return "", "", authfile.ErrInvalidCredentials
+				}
+			}
+		}
+	}
+	grant := data
+	switch name {
+	case ".credentials.json":
+		var oauth struct {
+			AccessToken string `json:"accessToken"`
+			AccountID   string `json:"accountId"`
+		}
+		if json.Unmarshal(root["claudeAiOauth"], &oauth) != nil {
+			return "", "", authfile.ErrInvalidCredentials
+		}
+		return oauth.AccessToken, oauth.AccountID, nil
+	case ".claude.json":
+		var present bool
+		grant, present = root["oauthToken"]
+		if !present {
+			material, err := authfile.ClaudeCredentialMaterial(data, name)
+			if err != nil || material {
+				return "", "", authfile.ErrInvalidCredentials
+			}
+			return "", "", authfile.ErrNoCredentials
+		}
+		var token string
+		if json.Unmarshal(grant, &token) == nil {
+			return token, "", nil
+		}
+	}
+	var oauth struct {
+		AccessToken string `json:"access_token"`
+		AccessCamel string `json:"accessToken"`
+	}
+	if json.Unmarshal(grant, &oauth) != nil {
+		return "", "", authfile.ErrInvalidCredentials
+	}
+	if strings.TrimSpace(oauth.AccessToken) != "" {
+		return oauth.AccessToken, "", nil
+	}
+	return oauth.AccessCamel, "", nil
+}
+
+// Probe existence separately from reading so dangling links, nonregular files,
+// denied reads, and a disappearing selected file never enable a legacy login.
+func readClaudeProfileFile(path string) ([]byte, bool, error) {
+	before, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, true, fmt.Errorf("credential must be a regular file")
+	}
+	limit := authfile.CredentialFileSizeLimit("claude", filepath.Base(path))
+	if before.Size() > limit {
+		return nil, true, fmt.Errorf("credential exceeds its size limit")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, true, err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, true, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, true, fmt.Errorf("credential changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, true, err
+	}
+	if int64(len(data)) > limit {
+		return nil, true, fmt.Errorf("credential exceeds its size limit")
+	}
+	return data, true, nil
 }
 
 // ReadCodexCredentials reads the selected OAuth access token from Codex auth.
@@ -410,19 +597,8 @@ func LoadProfileCredentials(vaultDir, provider string) (map[string]string, error
 
 		switch provider {
 		case "claude":
-			// Try new location first
-			credPath := filepath.Join(profileDir, ".credentials.json")
-			token, _, readErr = ReadClaudeCredentials(credPath)
-			if readErr != nil {
-				// Fall back to old location
-				oldPath := filepath.Join(profileDir, ".claude.json")
-				token, _, readErr = ReadClaudeCredentials(oldPath)
-				if readErr != nil {
-					// Fall back to claude-code auth.json (optional file)
-					authPath := filepath.Join(profileDir, "auth.json")
-					token, _, readErr = ReadClaudeCredentials(authPath)
-				}
-			}
+			selected, err := ReadClaudeProfileCredentials(profileDir)
+			token, readErr = selected.AccessToken, err
 		case "codex":
 			authPath := filepath.Join(profileDir, "auth.json")
 			token, _, readErr = ReadCodexCredentials(authPath)

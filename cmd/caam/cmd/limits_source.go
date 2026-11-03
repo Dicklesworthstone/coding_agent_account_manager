@@ -174,8 +174,9 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 		case "claude":
 			return []string{
 				filepath.Join(dir, ".credentials.json"),
-				filepath.Join(dir, ".claude.json"),
 				filepath.Join(dir, "auth.json"),
+				filepath.Join(dir, "settings.json"),
+				filepath.Join(dir, ".claude.json"),
 			}
 		case "codex":
 			return []string{filepath.Join(dir, "auth.json")}
@@ -284,6 +285,9 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 	if namespace == credNamespaceIsolated && provider == "claude" {
 		return l.inspectIsolatedClaude(name)
 	}
+	if namespace == credNamespaceVault && provider == "claude" {
+		return l.inspectVaultClaude(name)
+	}
 	out := credentialCandidate{Namespace: namespace, State: credStateMissing}
 	paths := l.candidatePaths(namespace, provider, name)
 	if len(paths) == 0 {
@@ -313,6 +317,29 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 		out.State, out.ExpiresAt = l.credentialState(provider, path)
 		return out
 	}
+	return out
+}
+
+func (l credentialLookup) inspectVaultClaude(name string) credentialCandidate {
+	dir := filepath.Join(l.VaultDir, "claude", name)
+	out := credentialCandidate{
+		Namespace: credNamespaceVault, State: credStateMissing,
+		Path:       filepath.Join(dir, ".credentials.json"),
+		ClaudeJSON: l.claudeJSONPath(credNamespaceVault, "claude", name),
+	}
+	selected, err := usage.ReadClaudeProfileCredentials(dir)
+	if selected.Path != "" {
+		out.Path = selected.Path
+	}
+	if err != nil {
+		if selected.Path == "" && errors.Is(err, os.ErrNotExist) {
+			return out
+		}
+		out.State, out.Err = credStateInvalid, err
+		return out
+	}
+	out.Token = selected.AccessToken
+	out.State, out.ExpiresAt = l.credentialExpiryState(selected.ExpiresAt, selected.Renewable)
 	return out
 }
 
@@ -384,7 +411,11 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 	)
 	switch provider {
 	case "claude":
-		info, err = health.ParseClaudeExpiry(filepath.Dir(path))
+		var data []byte
+		data, err = os.ReadFile(path)
+		if err == nil {
+			info, err = health.ParseClaudeCredentialExpiry(path, data)
+		}
 	case "codex":
 		info, err = health.ParseCodexExpiry(path)
 	case "grok":
@@ -395,15 +426,22 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 	if err != nil || info == nil || info.ExpiresAt.IsZero() {
 		return credStateUnknown, time.Time{}
 	}
+	renewable := info.Renewable && provider != "grok" && provider != "cursor"
+	return l.credentialExpiryState(info.ExpiresAt, renewable)
+}
+
+func (l credentialLookup) credentialExpiryState(expiresAt time.Time, renewable bool) (string, time.Time) {
+	if expiresAt.IsZero() {
+		return credStateUnknown, time.Time{}
+	}
 	now := l.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
-	renewable := info.Renewable && provider != "grok" && provider != "cursor"
-	if info.ExpiresAt.After(now) || renewable {
-		return credStateHealthy, info.ExpiresAt
+	if expiresAt.After(now) || renewable {
+		return credStateHealthy, expiresAt
 	}
-	return credStateExpired, info.ExpiresAt
+	return credStateExpired, expiresAt
 }
 
 // resolveProfileCredential picks the namespace to read a named profile from
