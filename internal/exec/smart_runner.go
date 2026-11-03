@@ -37,16 +37,17 @@ var ExecCommand = exec.CommandContext
 type SmartRunner struct {
 	*Runner
 
-	detector      *ratelimit.Detector
-	rotation      *rotation.Selector
-	vault         *authfile.Vault
-	db            *caamdb.DB
-	authPool      *authpool.AuthPool
-	ptyController pty.Controller
-	loginHandler  handoff.LoginHandler
-	handoffConfig *config.HandoffConfig
-	retryConfig   config.WrapConfig
-	notifier      notify.Notifier
+	detector        *ratelimit.Detector
+	rotation        *rotation.Selector
+	vault           *authfile.Vault
+	db              *caamdb.DB
+	authPool        *authpool.AuthPool
+	ptyController   pty.Controller
+	loginHandler    handoff.LoginHandler
+	handoffConfig   *config.HandoffConfig
+	retryConfig     config.WrapConfig
+	notifier        notify.Notifier
+	beforeSelection func(context.Context, []string) error
 
 	// Cooldown duration to apply when rate limit is detected
 	cooldownDuration time.Duration
@@ -87,6 +88,10 @@ type SmartRunnerOptions struct {
 	AuthPool         *authpool.AuthPool
 	Rotation         *rotation.Selector
 	CooldownDuration time.Duration
+	// BeforeSelection refreshes selection evidence for the candidates before
+	// recovery and again after backoff. Errors stop before swapping live auth
+	// or consuming a handoff attempt. Nil keeps ordinary no-fetch behavior.
+	BeforeSelection func(context.Context, []string) error
 }
 
 // NewSmartRunner creates a new SmartRunner.
@@ -119,6 +124,7 @@ func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
 		retryConfig:      retryConfig,
 		notifier:         notifier,
 		cooldownDuration: cooldownDuration,
+		beforeSelection:  opts.BeforeSelection,
 		triedProfiles:    make(map[string]bool),
 		state:            Running,
 		loginDone:        make(chan loginResult, 1),
@@ -456,6 +462,12 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.mu.Unlock()
 
 	// Select best
+	if r.beforeSelection != nil {
+		if err := r.beforeSelection(ctx, available); err != nil {
+			r.failWithManual("refresh backup profile eligibility: %v", err)
+			return
+		}
+	}
 	selection, err := r.rotation.Select(r.loginHandler.Provider(), available, currentProfile)
 	if err != nil {
 		r.failWithManual("no backup available: %v", err)
@@ -476,8 +488,14 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		r.failWithManual("context cancelled before handoff: %v", err)
 		return
 	}
-	// Expiry, provider verdicts, and cooldowns can change during the wait.
+	// Expiry, quota, provider verdicts, and cooldowns can change during the wait.
 	// Recheck the chosen target before consuming a retry or changing live auth.
+	if r.beforeSelection != nil {
+		if err := r.beforeSelection(ctx, []string{nextProfile}); err != nil {
+			r.failWithManual("refresh selected profile eligibility: %v", err)
+			return
+		}
+	}
 	if _, err := r.rotation.Select(r.loginHandler.Provider(), []string{nextProfile}, ""); err != nil {
 		r.failWithManual("selected profile is no longer launchable: %v", err)
 		return

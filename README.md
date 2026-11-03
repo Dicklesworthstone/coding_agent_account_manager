@@ -1169,6 +1169,16 @@ precheck threshold. If the active account cannot be measured, or no replacement
 qualifies, the run keeps the current account and prints a notice. Weekly-only
 accounts remain eligible when their session limit is legitimately absent.
 
+With `--precheck`, automatic recovery also requires fresh, measured quota.
+Headless retries and supported interactive handoffs query the remaining
+candidates before selection, then recheck the chosen account after backoff and
+before changing live authentication. A failed read cannot reuse an earlier
+positive measurement. Exhausted weekly and applicable model limits block a
+retry; the proactive threshold is a preference for the initial switch, not a
+hard ceiling on recovery. If no account is active, automatic initial selection
+also requires measured quota. Runs without `--precheck` make no added quota
+requests.
+
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile
 - `--backup-current` — Backup current auth before switching

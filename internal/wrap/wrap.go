@@ -41,6 +41,12 @@ type Config struct {
 	// Selector carries the caller's rotation policy and usage information.
 	Selector *rotation.Selector
 
+	// BeforeSelection refreshes the caller's selection evidence for exactly
+	// these candidates. It runs for automatic initial selection and recovery,
+	// including after backoff, but not for an explicit first account. An error
+	// stops execution before activation. Nil preserves ordinary no-fetch runs.
+	BeforeSelection func(context.Context, []string) error
+
 	// SwitchOptions are the caller's resolved activation safety settings.
 	// If nil, the standalone wrapper loads the existing SPM safety settings.
 	SwitchOptions *authfile.SwitchOptions
@@ -277,6 +283,11 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 		// Apply the same credential and cooldown eligibility checks without
 		// silently replacing the caller's chosen initial account.
 		profiles = []string{currentProfile}
+	} else if w.config.BeforeSelection != nil {
+		if err := w.config.BeforeSelection(ctx, profiles); err != nil {
+			result.Err = fmt.Errorf("check initial profile eligibility: %w", err)
+			return result
+		}
 	}
 	selection, err := selector.Select(w.config.Provider, profiles, "")
 	if err != nil {
@@ -302,7 +313,15 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 			result.Err = err
 			return result
 		}
-		// A token can expire while waiting; eligibility is checked again
+		// RetryCount is still zero until the second child starts. RateLimitHit
+		// identifies recovery even before its first retry has been launched.
+		if result.RateLimitHit && w.config.BeforeSelection != nil {
+			if err := w.config.BeforeSelection(ctx, []string{currentProfile}); err != nil {
+				result.Err = fmt.Errorf("refresh retry profile eligibility: %w", err)
+				return result
+			}
+		}
+		// A token or quota can change while waiting; eligibility is checked again
 		// immediately before Switch, which validates the actual file bytes.
 		if _, err := selector.Select(w.config.Provider, []string{currentProfile}, ""); err != nil {
 			result.Err = fmt.Errorf("profile is no longer launchable: %w", err)
@@ -358,6 +377,12 @@ func (w *Wrapper) Run(ctx context.Context) *Result {
 		}
 		if len(candidates) == 0 {
 			return result // Preserve the last child status after exhausting accounts.
+		}
+		if w.config.BeforeSelection != nil {
+			if err := w.config.BeforeSelection(ctx, candidates); err != nil {
+				result.Err = fmt.Errorf("refresh backup profile eligibility: %w", err)
+				return result
+			}
 		}
 		selection, err = selector.Select(w.config.Provider, candidates, currentProfile)
 		if err != nil {

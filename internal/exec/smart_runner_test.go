@@ -571,7 +571,7 @@ func smartRetryPolicy(retries int, delay time.Duration) *config.WrapConfig {
 
 // Use real vault switching and login completion with synthetic credentials,
 // without a database to hide missing session-local account exclusion.
-func newSmartRetryRunner(t *testing.T, names []string, cfg *config.WrapConfig) (*SmartRunner, string, map[string][]byte) {
+func newSmartRetryRunner(t *testing.T, names []string, cfg *config.WrapConfig, configure ...func(*SmartRunnerOptions)) (*SmartRunner, string, map[string][]byte) {
 	t.Helper()
 	root := t.TempDir()
 	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
@@ -584,12 +584,16 @@ func newSmartRetryRunner(t *testing.T, names []string, cfg *config.WrapConfig) (
 	}
 	livePath := filepath.Join(root, "codex", "auth.json")
 	writeSmartSwitchFile(t, livePath, credentials[names[0]])
-	sr := NewSmartRunner(&Runner{}, SmartRunnerOptions{
+	opts := SmartRunnerOptions{
 		Vault:       vault,
 		Rotation:    rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil),
 		Notifier:    &mockNotifier{},
 		RetryConfig: cfg,
-	})
+	}
+	for _, apply := range configure {
+		apply(&opts)
+	}
+	sr := NewSmartRunner(&Runner{}, opts)
 	sr.currentProfile = names[0]
 	var err error
 	sr.detector, err = ratelimit.NewDetector(ratelimit.ProviderCodex, nil)
@@ -597,6 +601,128 @@ func newSmartRetryRunner(t *testing.T, names []string, cfg *config.WrapConfig) (
 		t.Fatal(err)
 	}
 	return sr, livePath, credentials
+}
+
+func TestSmartRunner_RefreshesQuotaBeforeRecoveryAndActivation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stopAt  int
+		failure string
+	}{
+		{name: "eligible backup"},
+		{name: "exhausted candidate", stopAt: 1, failure: "quota"},
+		{name: "unmeasured candidate", stopAt: 1, failure: "missing"},
+		{name: "candidate refresh error", stopAt: 1, failure: "error"},
+		{name: "candidate refresh cancellation", stopAt: 1, failure: "cancel"},
+		{name: "exhausted after backoff", stopAt: 2, failure: "quota"},
+		{name: "unmeasured after backoff", stopAt: 2, failure: "missing"},
+		{name: "refresh error after backoff", stopAt: 2, failure: "error"},
+		{name: "refresh cancellation after backoff", stopAt: 2, failure: "cancel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				cfg := smartRetryPolicy(1, time.Minute)
+				cfg.CooldownDuration = 0
+				var refreshes [][]string
+				sr, livePath, credentials := newSmartRetryRunner(
+					t, []string{"alice", "bob", "carol"}, cfg,
+					func(opts *SmartRunnerOptions) {
+						selector := opts.Rotation
+						opts.BeforeSelection = func(ctx context.Context, candidates []string) error {
+							refreshes = append(refreshes, append([]string(nil), candidates...))
+							snapshot := map[string]*rotation.UsageInfo{
+								"bob": {
+									ProfileName:      "bob",
+									SecondaryPercent: 20,
+									AvailScore:       80,
+								},
+								"carol": {
+									ProfileName:      "carol",
+									SecondaryPercent: 100,
+								},
+							}
+							if len(refreshes) == tc.stopAt {
+								switch tc.failure {
+								case "quota":
+									snapshot["bob"].SecondaryPercent = 100
+									snapshot["bob"].AvailScore = 0
+								case "missing":
+									snapshot = make(map[string]*rotation.UsageInfo)
+								case "error":
+									// An earlier successful snapshot must not
+									// excuse ignoring a callback failure.
+									return errors.New("synthetic quota refresh failure")
+								case "cancel":
+									cancel()
+									return ctx.Err()
+								}
+							}
+							selector.SetUsageData(snapshot)
+							return nil
+						}
+					},
+				)
+				var logins []string
+				sr.loginHandler = &smartSwitchLoginHandler{
+					LoginHandler: handoff.GetHandler("codex"),
+					trigger: func() error {
+						logins = append(logins, sr.currentProfile)
+						sr.loginDone <- loginResult{success: true}
+						return nil
+					},
+				}
+
+				start := time.Now()
+				sr.handleRateLimit(ctx)
+				wantRefreshes := [][]string{{"bob", "carol"}, {"bob"}}
+				wantElapsed := time.Minute
+				if tc.stopAt == 1 {
+					wantRefreshes = wantRefreshes[:1]
+					wantElapsed = 0
+				}
+				if !reflect.DeepEqual(refreshes, wantRefreshes) {
+					t.Fatalf("refreshed candidates = %v, want %v", refreshes, wantRefreshes)
+				}
+				if elapsed := time.Since(start); elapsed != wantElapsed {
+					t.Fatalf("handoff elapsed %v, want %v", elapsed, wantElapsed)
+				}
+				if !sr.rateLimitHit || !sr.triedProfiles["alice"] {
+					t.Fatal("the original account's rate limit was lost")
+				}
+
+				if tc.stopAt == 0 {
+					if !reflect.DeepEqual(logins, []string{"bob"}) ||
+						sr.handoffAttempts != 1 || sr.handoffCount != 1 ||
+						sr.currentProfile != "bob" || sr.getState() != Running {
+						t.Fatalf("eligible backup did not complete handoff: logins=%v attempts=%d successes=%d profile=%s state=%s",
+							logins, sr.handoffAttempts, sr.handoffCount, sr.currentProfile, sr.getState())
+					}
+					assertSmartSwitchFile(t, livePath, credentials["bob"])
+					return
+				}
+
+				if len(logins) != 0 || sr.handoffAttempts != 0 || sr.handoffCount != 0 ||
+					sr.triedProfiles["bob"] || sr.triedProfiles["carol"] ||
+					sr.currentProfile != "alice" || sr.getState() != HandoffFailed {
+					t.Fatalf("failed quota refresh advanced handoff: logins=%v attempts=%d successes=%d profile=%s state=%s",
+						logins, sr.handoffAttempts, sr.handoffCount, sr.currentProfile, sr.getState())
+				}
+				if tc.failure == "cancel" && !errors.Is(ctx.Err(), context.Canceled) {
+					t.Fatal("refresh cancellation was lost")
+				}
+				assertSmartSwitchFile(t, livePath, credentials["alice"])
+				for name, want := range credentials {
+					assertSmartSwitchFile(t, sr.vault.BackupPath("codex", name, "auth.json"), want)
+				}
+				profiles, err := sr.vault.List("codex")
+				if err != nil || !reflect.DeepEqual(profiles, []string{"alice", "bob", "carol"}) {
+					t.Fatalf("failed quota refresh changed vault inventory: profiles=%v err=%v", profiles, err)
+				}
+			})
+		})
+	}
 }
 
 func TestSmartRunner_RetryBudgetAndNoAccountReuse(t *testing.T) {

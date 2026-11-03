@@ -466,6 +466,132 @@ func TestWrapperRetryAfterAndBackoffCancellation(t *testing.T) {
 	})
 }
 
+func TestWrapperRefreshesAutomaticInitialSelection(t *testing.T) {
+	for _, measured := range []bool{true, false} {
+		t.Run(fmt.Sprintf("measured=%v", measured), func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+			cfg.InitialProfile = ""
+			cfg.MaxRetries = 0
+			cfg.Selector = rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil)
+			refreshes := 0
+			cfg.BeforeSelection = func(_ context.Context, candidates []string) error {
+				refreshes++
+				if strings.Join(candidates, ",") != "alpha,beta" {
+					t.Fatalf("initial candidates = %v, want alpha and beta", candidates)
+				}
+				snapshot := make(map[string]*rotation.UsageInfo)
+				if measured {
+					snapshot["alpha"] = &rotation.UsageInfo{
+						ProfileName:      "alpha",
+						SecondaryPercent: 100,
+					}
+					snapshot["beta"] = &rotation.UsageInfo{
+						ProfileName:      "beta",
+						SecondaryPercent: 20,
+						AvailScore:       80,
+					}
+				}
+				cfg.Selector.SetUsageData(snapshot)
+				return nil
+			}
+			calls := 0
+			setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				calls++
+				return retryProcess(ctx, 0, "", "", "")
+			})
+
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if refreshes != 1 {
+				t.Fatalf("automatic initial selection refreshed %d times, want 1", refreshes)
+			}
+			if measured {
+				if result.Err != nil || result.ExitCode != 0 || calls != 1 ||
+					strings.Join(result.ProfilesUsed, ",") != "beta" {
+					t.Fatalf("automatic selection ignored measured quota: result=%+v calls=%d", result, calls)
+				}
+				assertWrapSwitchFile(t, livePath, retryCredentials("beta"))
+				return
+			}
+			if result.Err == nil || result.ExitCode == 0 || calls != 0 || len(result.ProfilesUsed) != 0 {
+				t.Fatalf("automatic selection treated missing quota as headroom: result=%+v calls=%d", result, calls)
+			}
+			assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "alpha", "auth.json"), retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "beta", "auth.json"), retryCredentials("beta"))
+		})
+	}
+}
+
+func TestWrapperRefreshFailureAfterBackoffDoesNotActivate(t *testing.T) {
+	for _, cancelRefresh := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%v", cancelRefresh), func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+			cfg.MaxRetries = 1
+			cfg.InitialDelay, cfg.MaxDelay = 5*time.Millisecond, 5*time.Millisecond
+			cfg.Selector = rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			refreshErr := errors.New("synthetic quota refresh failure")
+			calls, refreshes := 0, 0
+			var selectedAt time.Time
+			cfg.BeforeSelection = func(ctx context.Context, candidates []string) error {
+				refreshes++
+				if calls != 1 {
+					t.Fatalf("refresh ran before the explicit first attempt or after a retry: calls=%d", calls)
+				}
+				if strings.Join(candidates, ",") != "beta" {
+					t.Fatalf("retry candidates = %v, want only beta", candidates)
+				}
+				assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+				switch refreshes {
+				case 1:
+					cfg.Selector.SetUsageData(map[string]*rotation.UsageInfo{
+						"beta": {
+							ProfileName:      "beta",
+							SecondaryPercent: 20,
+							AvailScore:       80,
+						},
+					})
+					selectedAt = time.Now()
+					return nil
+				case 2:
+					if time.Since(selectedAt) < cfg.InitialDelay {
+						t.Fatal("selected profile was refreshed before its backoff")
+					}
+					if cancelRefresh {
+						cancel()
+						return ctx.Err()
+					}
+					return refreshErr
+				default:
+					t.Fatalf("unexpected extra refresh: %d", refreshes)
+					return nil
+				}
+			}
+			setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				calls++
+				if calls == 1 {
+					return retryProcess(ctx, 42, "", "rate limit exceeded\n", "")
+				}
+				return retryProcess(ctx, 0, "", "", "")
+			})
+
+			result := NewWrapper(vault, nil, nil, cfg).Run(ctx)
+			wantErr := refreshErr
+			if cancelRefresh {
+				wantErr = context.Canceled
+			}
+			if !errors.Is(result.Err, wantErr) || result.ExitCode == 0 ||
+				calls != 1 || refreshes != 2 || result.RetryCount != 0 ||
+				!result.RateLimitHit || strings.Join(result.ProfilesUsed, ",") != "alpha" {
+				t.Fatalf("refresh failure advanced retry: result=%+v calls=%d refreshes=%d", result, calls, refreshes)
+			}
+			assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "beta", "auth.json"), retryCredentials("beta"))
+		})
+	}
+}
+
 func TestWrapperUsesSuppliedRotationPolicy(t *testing.T) {
 	vault, cfg, _ := newRetryFixture(t, "beta", "alpha", "gamma")
 	cfg.Selector = rotation.NewSelector(rotation.AlgorithmSmart, nil, nil)

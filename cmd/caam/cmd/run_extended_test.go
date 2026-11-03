@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wrap"
 	"github.com/creack/pty"
 	"github.com/spf13/cobra"
@@ -389,6 +392,247 @@ func TestRunCommand_Extended(t *testing.T) {
 			require.NotContains(t, stdout.String(), "Waiting")
 		})
 	}
+}
+
+// Replace only quota HTTP: setupHeadlessRun owns the selected vault, runner,
+// command factory, database, and their cleanup. Per-token read counts allow
+// quota changes between precheck, recovery selection, and activation without
+// wall-clock-dependent responses or real provider traffic.
+func installRunQuotaResponses(
+	t *testing.T,
+	response func(profile string, read int) string,
+) func() map[string]int {
+	t.Helper()
+	oldTransport := http.DefaultTransport
+	var mu sync.Mutex
+	requests := make(map[string]int)
+
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != usage.ClaudeUsageURL {
+			return nil, fmt.Errorf("unexpected quota URL %s", req.URL)
+		}
+		name := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		requests[name]++
+		read := requests[name]
+		mu.Unlock()
+
+		body := response(name, read)
+		status := http.StatusOK
+		if body == "" {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+
+	return func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[string]int, len(requests))
+		for name, count := range requests {
+			out[name] = count
+		}
+		return out
+	}
+}
+
+func TestRunPrecheckEnforcesQuotaThroughoutRetries(t *testing.T) {
+	weekly := func(percent int) string {
+		return subscriptionQuotaResponse("claude", percent)
+	}
+	const scoped = `{"seven_day":{"utilization":20},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, tc := range []struct {
+		name       string
+		backup     string
+		after      string
+		changeAt   int
+		model      string
+		wantBackup bool
+	}{
+		{name: "exhausted weekly quota", backup: weekly(100)},
+		{name: "failed quota read", backup: ""},
+		{name: "malformed percentage", backup: `{"seven_day":{"utilization":true}}`},
+		{
+			name:   "no measured general quota",
+			backup: `{"five_hour":{"utilization":null},"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`,
+		},
+		{
+			name:       "weekly only backup",
+			backup:     `{"five_hour":{"utilization":null},"seven_day":{"utilization":20}}`,
+			wantBackup: true,
+		},
+		{name: "measured zero backup", backup: weekly(0), wantBackup: true},
+		{
+			name:       "recovery may exceed the advisory precheck threshold",
+			backup:     weekly(85),
+			wantBackup: true,
+		},
+		{name: "requested model exhausted", backup: scoped, model: "fable"},
+		{name: "unrelated model remains available", backup: scoped, model: "sonnet", wantBackup: true},
+		{name: "quota changes after precheck", backup: weekly(20), after: weekly(100), changeAt: 2},
+		{name: "read fails after precheck", backup: weekly(20), after: "", changeAt: 2},
+		{name: "quota changes during backoff", backup: weekly(20), after: weekly(100), changeAt: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, _, stderr, _, logPath := setupHeadlessRun(t,
+				`{"max_retries":1,"initial_delay":"1ms","max_delay":"1ms"}`,
+				"all-limited",
+			)
+			counts := installRunQuotaResponses(t, func(name string, read int) string {
+				switch name {
+				case "z-active":
+					return weekly(100)
+				case "a-ready":
+					return weekly(10)
+				case "m-other":
+					if tc.changeAt > 0 && read >= tc.changeAt {
+						return tc.after
+					}
+					return tc.backup
+				default:
+					return ""
+				}
+			})
+			args := []string{
+				"claude", "--precheck", "--quiet",
+				"--algorithm", "round_robin", "--", "-p", "retry fixture",
+			}
+			if tc.model != "" {
+				args = append(args, "--model", tc.model)
+			}
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+
+			// Every launched helper deliberately reports a limit. A blocked
+			// selection may return a selection error rather than exit42.
+			require.NotZero(t, ExitCode(err), "error=%v stderr=%s", err, stderr)
+			calls := readRunInvocations(t, logPath)
+			var accounts []string
+			for _, call := range calls {
+				accounts = append(accounts, call.Account)
+			}
+			want := []string{"a-ready"}
+			if tc.wantBackup {
+				want = append(want, "m-other")
+			}
+			require.Equal(t, want, accounts)
+
+			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+			require.NoError(t, err)
+			require.Equal(t, want[len(want)-1], current)
+
+			requests := counts()
+			require.GreaterOrEqual(t, requests["m-other"], 2,
+				"recovery reused the initial precheck snapshot")
+			if tc.changeAt == 3 {
+				require.GreaterOrEqual(t, requests["m-other"], 3,
+					"chosen backup was not remeasured after backoff")
+			}
+			require.Equal(t, 1, requests["a-ready"],
+				"recovery should measure remaining candidates, not the attempted account")
+		})
+	}
+}
+
+func TestRunPrecheckPreservesAdvisoryFirstAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		current   string
+		alternate string
+	}{
+		{
+			name:      "current quota unknown",
+			current:   `{}`,
+			alternate: subscriptionQuotaResponse("claude", 10),
+		},
+		{
+			name:      "all accounts exhausted",
+			current:   subscriptionQuotaResponse("claude", 100),
+			alternate: subscriptionQuotaResponse("claude", 100),
+		},
+		{
+			name:      "no replacement below threshold",
+			current:   subscriptionQuotaResponse("claude", 90),
+			alternate: subscriptionQuotaResponse("claude", 85),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{}`, "success")
+			counts := installRunQuotaResponses(t, func(name string, _ int) string {
+				if name == "z-active" {
+					return tc.current
+				}
+				return tc.alternate
+			})
+			cmd.SetArgs([]string{"claude", "--precheck", "--quiet", "--", "-p", "fixture"})
+			require.NoError(t, cmd.Execute(), "stderr=%s", stderr)
+			calls := readRunInvocations(t, logPath)
+			require.Len(t, calls, 1)
+			require.Equal(t, "z-active", calls[0].Account)
+			require.Positive(t, counts()["z-active"], "precheck was not exercised")
+		})
+	}
+}
+
+func TestRunWithoutPrecheckDoesNotFetchQuota(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{"max_retries":1}`, "failover")
+	counts := installRunQuotaResponses(t, func(string, int) string { return "" })
+
+	cmd.SetArgs([]string{
+		"claude", "--quiet", "--algorithm", "round_robin",
+		"--", "-p", "fixture",
+	})
+	require.NoError(t, cmd.Execute(), "stderr=%s", stderr)
+	calls := readRunInvocations(t, logPath)
+	require.Len(t, calls, 2)
+	require.Equal(t, "z-active", calls[0].Account)
+	require.Equal(t, "a-ready", calls[1].Account)
+	require.Empty(t, counts(), "ordinary retries unexpectedly fetched subscription quota")
+}
+
+func TestRunPrecheckCancellationDuringRecoveryDoesNotSwitch(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{"max_retries":1}`, "all-limited")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd.SetContext(ctx)
+
+	counts := installRunQuotaResponses(t, func(name string, read int) string {
+		switch name {
+		case "z-active":
+			return subscriptionQuotaResponse("claude", 100)
+		case "a-ready":
+			return subscriptionQuotaResponse("claude", 10)
+		case "m-other":
+			// The first read belongs to initial precheck. Cancel when the
+			// attempted account has failed and recovery remeasures its backup.
+			// Even a successful measurement cannot authorize a cancelled run.
+			if read == 2 {
+				cancel()
+			}
+			return subscriptionQuotaResponse("claude", 20)
+		default:
+			return ""
+		}
+	})
+	cmd.SetArgs([]string{
+		"claude", "--precheck", "--quiet", "--algorithm", "round_robin",
+		"--", "-p", "fixture",
+	})
+	require.ErrorIs(t, cmd.Execute(), context.Canceled, "stderr=%s", stderr)
+	calls := readRunInvocations(t, logPath)
+	require.Len(t, calls, 1)
+	require.Equal(t, "a-ready", calls[0].Account)
+	require.GreaterOrEqual(t, counts()["m-other"], 2,
+		"cancellation did not exercise recovery quota refresh")
+	current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+	require.NoError(t, err)
+	require.Equal(t, "a-ready", current, "cancelled recovery changed the active account")
 }
 
 // A stdin pipe that stays open (ssh without -n, a harness that keeps its

@@ -47,13 +47,15 @@ then explicit CLI flags. --max-retries 0 disables retries. An observable
 Retry-After header sets a minimum wait. Successful commands and other failures
 are not retried. A retry repeats the command; any completed work remains.
 
-Use --precheck for proactive switching:
+Use --precheck for proactive switching and quota-aware recovery:
   When enabled, caam checks real-time usage levels BEFORE running and
   automatically switches to a healthier profile if current usage is near
-  the limit. This prevents rate limit errors before they happen.
-  Supported for claude, codex, grok and cursor. Grok and Cursor only switch
-  to an account whose quota was actually measured; when the current
-  account's quota cannot be measured, caam says so and does not switch.
+  the limit. The explicit initial account remains advisory when quota is
+  unknown or no replacement is below the proactive threshold.
+  Supported for claude, codex, grok and cursor. Automatic retries and supported
+  interactive handoffs require fresh, measured quota with headroom. The chosen
+  backup is checked again after backoff, before changing accounts. Weekly and
+  applicable model limits remain binding when no session limit is reported.
 
 Examples:
   caam run claude -- -p "explain this code"
@@ -87,8 +89,8 @@ func addRunFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
 	cmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
 	cmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
-	cmd.Flags().Bool("precheck", false, "check usage levels before running and switch if near limit")
-	cmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for precheck switching (0-1)")
+	cmd.Flags().Bool("precheck", false, "check usage before running and enforce quota during automatic recovery")
+	cmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for the initial proactive switch (0-1)")
 }
 
 func runWrap(cmd *cobra.Command, args []string) error {
@@ -208,6 +210,10 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	selector := rotation.NewSelector(algorithm, healthStore, db)
 	bindRotationVault(selector)
 	applyRotationPolicy(selector, spmCfg, "")
+	var beforeSelection func(context.Context, []string) error
+	if precheck && isLimitsProvider(tool) {
+		beforeSelection = newRunQuotaRefresher(vault.BasePath(), tool, modelFromArgs(cliArgs), selector)
+	}
 
 	// Initialize Runner
 	if runner == nil {
@@ -234,6 +240,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		Rotation:         selector,
 		CooldownDuration: cooldownDur,
 		RetryConfig:      &retryConfig,
+		BeforeSelection:  beforeSelection,
 	}
 	smartRunner := exec.NewSmartRunner(runner, opts)
 
@@ -272,6 +279,7 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			Algorithm:         algorithm,
 			InitialProfile:    activeProfileName,
 			Selector:          selector,
+			BeforeSelection:   beforeSelection,
 			SwitchOptions:     &switchOptions,
 			Bin:               prov.DefaultBin(),
 			Stdin:             stdin,
@@ -293,6 +301,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		profiles, err := vault.List(tool)
 		if err != nil || len(profiles) == 0 {
 			return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
+		}
+		if beforeSelection != nil {
+			if err := beforeSelection(ctx, profiles); err != nil {
+				return fmt.Errorf("check initial profile quota: %w", err)
+			}
 		}
 		res, err := selector.Select(tool, profiles, "")
 		if err != nil {
@@ -353,6 +366,52 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	}
 
 	return smartRunner.Run(ctx, runOptions)
+}
+
+// Refresh evidence at automatic selection boundaries, including after backoff.
+// Constructing the hook leaves the explicit first attempt advisory. Once called,
+// even an empty or failed read must keep quota checks enabled: nil would opt out.
+func newRunQuotaRefresher(vaultDir, tool, model string, selector *rotation.Selector) func(context.Context, []string) error {
+	fetcher := usage.NewMultiProfileFetcher()
+	return func(ctx context.Context, candidates []string) error {
+		selector.SetUsageData(make(map[string]*rotation.UsageInfo))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
+		if err != nil {
+			return fmt.Errorf("load %s quota credentials: %w", tool, err)
+		}
+		selected := make(map[string]string, len(candidates))
+		for _, name := range candidates {
+			if token := credentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+				selected[name] = token
+			}
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, runQuotaTimeout(tool))
+		defer cancel()
+		results := fetcher.FetchAllProfiles(queryCtx, tool, selected)
+		// Never mutate the map already installed in the selector. Publish the
+		// complete new snapshot once all bounded reads have returned.
+		measured := make(map[string]*rotation.UsageInfo, len(results))
+		for _, result := range results {
+			if result.Usage != nil {
+				measured[result.ProfileName] = toRotationUsageInfo(result.ProfileName, result.Usage, model)
+			}
+		}
+		selector.SetUsageData(measured)
+		return ctx.Err()
+	}
+}
+
+func runQuotaTimeout(tool string) time.Duration {
+	if tool == "grok" || tool == "cursor" {
+		return 30 * time.Second // Native billing probes have their own 25s bound.
+	}
+	return 15 * time.Second
 }
 
 // A recognized owner is not necessarily a usable credential. Global execution
@@ -520,10 +579,6 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 		return false // No active profile
 	}
 
-	// Native billing reads need a longer deadline. Every provider uses the
-	// same measured-quota eligibility check before a switch.
-	native := tool == "grok" || tool == "cursor"
-
 	// Load credentials for current profile
 	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
 	token, ok := credentials[currentProfile]
@@ -534,10 +589,7 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 
 	// Fetch current usage. A Grok billing read starts the grok CLI, which
 	// its own reader bounds at 25s; keep that within reach.
-	timeout := 15 * time.Second
-	if native {
-		timeout = 30 * time.Second
-	}
+	timeout := runQuotaTimeout(tool)
 	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
