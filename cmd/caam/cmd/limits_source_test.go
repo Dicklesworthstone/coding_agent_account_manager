@@ -436,6 +436,122 @@ func TestCachedProfileUsage(t *testing.T) {
 	}
 }
 
+// Issue #133: an inapplicable session must not erase a usable weekly quota,
+// and a decoded but unsafe snapshot must retain its evidence and real age.
+// These are synthetic response shapes, not a captured verified-Ultra payload.
+func TestCachedProfileUsagePreservesPartialQuotaEvidence(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	fetched := now.Add(-3 * time.Hour)
+	for _, tc := range []struct {
+		name, limits          string
+		known, weekly, scoped bool
+	}{
+		{
+			name: "null session with weekly and scoped quotas",
+			limits: `[
+				{"kind":"session","group":"session","percent":null,"resets_at":null},
+				{"kind":"weekly_all","group":"weekly","percent":42,"resets_at":"2099-01-05T00:00:00Z"},
+				{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}
+			]`,
+			known: true, weekly: true, scoped: true,
+		},
+		{
+			name:   "only inapplicable quotas",
+			limits: `[{"kind":"session","percent":null,"resets_at":null}]`,
+		},
+		{
+			name: "only model scoped quota",
+			limits: `[
+				{"kind":"session","percent":null},
+				{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}
+			]`,
+			scoped: true,
+		},
+		{
+			name: "unknown restriction beside weekly quota",
+			limits: `[
+				{"kind":"weekly_all","group":"weekly","percent":42,"resets_at":"2099-01-05T00:00:00Z"},
+				{"kind":"future_general_limit","group":"monthly","percent":100,"resets_at":"2099-02-01T00:00:00Z"}
+			]`,
+			weekly: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".claude.json")
+			body := fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":%d,"accountUuid":"synthetic-account","utilization":{"limits":%s}}}`,
+				fetched.UnixMilli(), tc.limits)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			row := cachedProfileUsage("claude", "cached-seat", path, now)
+			u := row.Usage
+			if u == nil || u.Provider != "claude" || u.ProfileName != "cached-seat" ||
+				u.Source != usage.SourceCache || u.AccountID != "synthetic-account" || !u.FetchedAt.Equal(fetched) {
+				t.Fatalf("cached evidence lost its identity or timestamp: %+v", u)
+			}
+			if u.PrimaryWindow != nil || (u.SecondaryWindow != nil) != tc.weekly || (u.ScopedLimit("fable") != nil) != tc.scoped {
+				t.Fatalf("cache fabricated a session or discarded measured windows: %+v", u)
+			}
+			if tc.weekly && u.SecondaryWindow.UsedPercent != 42 {
+				t.Fatalf("weekly measurement changed: %+v", u.SecondaryWindow)
+			}
+			if tc.scoped && u.ScopedLimit("fable").UsedPercent != 100 {
+				t.Fatalf("scoped measurement changed: %+v", u.ScopedLimit("fable"))
+			}
+			if u.NumericQuotaKnown() != tc.known || (u.Error == "") != tc.known {
+				t.Fatalf("cached quota eligibility = %+v, want known=%v", u, tc.known)
+			}
+			if !tc.known && (u.QuotaStatus != usage.QuotaDegraded || u.QuotaNote == "" || u.AvailabilityScore() != 0) {
+				t.Fatalf("unsafe snapshot was not explicitly degraded: %+v", u)
+			}
+			if got := formatCacheAge(u, now); got != "3h0m ago" {
+				t.Fatalf("partial snapshot age = %q, want the original age", got)
+			}
+
+			rows := []usage.ProfileUsage{row}
+			var output strings.Builder
+			if err := renderLimits(&output, "json", rows, ""); err != nil {
+				t.Fatal(err)
+			}
+			var decoded []usage.ProfileUsage
+			if err := json.Unmarshal([]byte(output.String()), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded) != 1 || decoded[0].Usage == nil || decoded[0].Usage.PrimaryWindow != nil ||
+				decoded[0].Usage.QuotaStatus != u.QuotaStatus || decoded[0].Usage.AccountID != u.AccountID ||
+				!decoded[0].Usage.FetchedAt.Equal(fetched) || (decoded[0].Usage.SecondaryWindow != nil) != tc.weekly {
+				t.Fatalf("JSON lost absent-window or degraded-evidence semantics: %s", output.String())
+			}
+			output.Reset()
+			if err := renderBestProfile(&output, "json", rows, 0.8, "sonnet"); err != nil {
+				t.Fatal(err)
+			}
+			if gotNull := strings.TrimSpace(output.String()) == "null"; gotNull == tc.known {
+				t.Fatalf("best-profile selection ignored quota validity: %s", output.String())
+			}
+			for _, mode := range usage.RankModes {
+				ranked := usage.RankProfiles(rows, usage.RankOptions{Mode: mode, Model: "sonnet", Now: now})
+				if (ranked.Selected != nil) != tc.known {
+					t.Fatalf("%s ranking ignored quota validity: %+v", mode, ranked)
+				}
+				if tc.scoped {
+					forFable := usage.RankProfiles(rows, usage.RankOptions{Mode: mode, Model: "fable", Now: now})
+					if forFable.Selected != nil {
+						t.Fatalf("%s ranking ignored the exhausted scoped quota: %+v", mode, forFable)
+					}
+				}
+			}
+			adapted := toRotationUsageInfo("cached-seat", u, "fable")
+			if (adapted.Error == "") != tc.known || (!tc.known && adapted.AvailScore != 0) {
+				t.Fatalf("rotation adapter treated degraded data as measured: %+v", adapted)
+			}
+			if tc.known && (adapted.SecondaryPercent != 42 || adapted.ScopedPercent != 100 || adapted.ResetsAt == nil) {
+				t.Fatalf("weekly-only rotation lost quota restrictions: %+v", adapted)
+			}
+		})
+	}
+}
+
 // TestRenderLimitsCachedTable pins the offline table: the AS OF column, the
 // "no cached data" status, and the rolled-window marker.
 func TestRenderLimitsCachedTable(t *testing.T) {

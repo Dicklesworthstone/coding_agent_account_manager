@@ -173,3 +173,138 @@ func TestCacheAgeUnknownWithoutTimestamp(t *testing.T) {
 		t.Error("CacheAge reported an age for a live row")
 	}
 }
+
+func cachedClaudeCompatibilityDocument(body string) []byte {
+	return []byte(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":"synthetic-account","utilization":` + body + `}}`)
+}
+
+func assertCachedClaudeCompatibilityMetadata(t *testing.T, info *UsageInfo) {
+	t.Helper()
+	if info == nil || info.Source != SourceCache || info.AccountID != "synthetic-account" || !info.FetchedAt.Equal(time.UnixMilli(1792580400000)) {
+		t.Fatalf("cache identity, source, or original timestamp lost: %+v", info)
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityOptionalSession(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeSessionCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err != nil {
+				t.Fatalf("optional cached session discarded usable quota: %v", err)
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeSessionCompatibility(t, info, tc)
+		})
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityWeeklyOnly(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeWeeklyOnlyCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err != nil {
+				t.Fatalf("weekly-only cached quota failed: %v", err)
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeWeeklyOnlyCompatibility(t, info, tc.wantPercent)
+		})
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityRejectsMalformedMeasurements(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeMalformedCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err == nil || info != nil {
+				t.Fatalf("malformed cached measurement became capacity: info=%+v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityKeepsUnknownRestrictionsConservative(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range claudeDegradedCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err == nil {
+				t.Fatal("incomplete cached quota was reported as a complete response")
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeDegradedCompatibility(t, info, tc)
+		})
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityWeeklyOnlyRollover(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []claudeDocumentCase{
+		{"legacy weekly window", `{"five_hour":{"utilization":null},"seven_day":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"}}`},
+		{"limits weekly window", `{"limits":[{"kind":"session","percent":null},{"kind":"weekly_all","percent":100,"resets_at":"2026-11-03T11:00:00Z"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if err != nil || info == nil {
+				t.Fatalf("valid cached snapshot failed: info=%+v err=%v", info, err)
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			if info.PrimaryWindow != nil || info.SecondaryWindow == nil || !info.SecondaryWindow.Rolled || info.SecondaryWindow.UsedPercent != 0 || info.SecondaryWindow.Utilization != 0 {
+				t.Fatalf("optional session changed rollover provenance: %+v", info)
+			}
+			for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+				result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "rolled-weekly", Usage: info}}, RankOptions{Mode: mode, Now: now})
+				if result.Selected != nil || result.Profiles[0].Eligible {
+					t.Fatalf("%s selected stale weekly quota as an idle account: %+v", mode, result)
+				}
+			}
+		})
+	}
+}
+
+func TestCachedClaudeUsageCompatibilityRolledModelDoesNotHideLiveCap(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	expired := `{"kind":"session","group":"session","percent":100,"resets_at":"2026-11-03T11:00:00Z","scope":{"model":{"display_name":"Fable"}}}`
+	weekly := `{"kind":"weekly_scoped","group":"weekly","percent":80,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}`
+	for _, tc := range []struct {
+		name   string
+		limits []string
+	}{
+		{"expired first", []string{expired, weekly}},
+		{"expired last", []string{weekly, expired}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := claudeCompatibilityBody(claudeCompatibilityWeekly, tc.limits...)
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), now)
+			if err != nil {
+				t.Fatalf("cached model windows failed: %v", err)
+			}
+			w := info.WindowForModel("fable")
+			if w == nil || w.UsedPercent != 80 || w.Utilization != 0.8 || w.Rolled || w.WindowDuration != 7*24*time.Hour || !w.ResetsAt.After(now) {
+				t.Fatalf("expired model session hid the surviving weekly cap: %+v", w)
+			}
+			if !info.IsNearLimitForModel(0.8, "fable") || info.IsNearLimitForModel(0.81, "fable") || info.IsNearLimitForModel(0.8, "sonnet") {
+				t.Fatal("cached weekly model cap changed threshold eligibility")
+			}
+			for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+				result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "cached-model", Usage: info}}, RankOptions{
+					Mode: mode, Model: "fable", HeadroomCeiling: 80, Now: now,
+				})
+				if result.Selected != nil {
+					t.Fatalf("%s selected a model at its headroom ceiling after session rollover: %+v", mode, result)
+				}
+			}
+
+			// Only disk snapshots are rolled forward. A fresh HTTP response's
+			// measured restriction must remain authoritative even if its reset
+			// timestamp is already past the consumer's clock.
+			live := fetchFixture(t, body)
+			w = live.WindowForModel("fable")
+			if w == nil || w.UsedPercent != 100 || w.Utilization != 1 || w.Rolled || !live.IsNearLimitForModel(1, "fable") {
+				t.Fatalf("live response was prematurely rolled forward: %+v", w)
+			}
+		})
+	}
+}

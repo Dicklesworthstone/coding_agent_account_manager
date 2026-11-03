@@ -856,8 +856,8 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 
 ### Smart Profile Management
 
-Claude reports a separate weekly allowance per model (Opus, Fable) alongside the
-5-hour and weekly windows, and an account can exhaust one of those while its
+Claude reports a separate weekly allowance per model (Opus, Fable) alongside its
+applicable session and weekly windows, and an account can exhaust one of those while its
 general windows still read as idle. caam treats a spent per-model allowance as a
 ceiling like any other, so such an account is not offered for work on that
 model. Pass `--model` to `caam limits` or `caam precheck` — or just run
@@ -881,6 +881,33 @@ choice; with no model given, every per-model allowance counts.
 | `caam project set <tool> <profile>` | Associate current directory with a profile |
 | `caam project show [tool]` | Show resolved associations for current directory (`get` is an alias; `--json` for machine-readable output) |
 | `caam project list` | List all project associations (`--json` supported) |
+
+#### Claude accounts without a session limit
+
+[Anthropic documents](https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan)
+that verified Ultra accounts have no five-hour session limit, while weekly
+all-model and Fable limits still apply. Unverified accounts can retain a session
+limit. As of November 3, 2026, [issue #133](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/133)
+has no captured usage API response from a verified Ultra account; the exact
+representation of an inapplicable session remains unconfirmed.
+
+Both live and cached usage parsing accept an omitted or null `five_hour`
+window and skip an explicit null `utilization` or `limits[].percent`.
+Weekly and model-scoped measurements remain available. A numeric zero stays a
+real measurement even when its reset is null. CAAM does not infer unlimited
+usage from a plan name, `is_active: false`, or an absent session window.
+Missing percentage fields inside present objects, wrong JSON types, and values
+outside 0–100 still fail validation.
+
+At least one measured general session or weekly quota is required. Model-only
+data, unfamiliar measured general limits, unrecognized scopes, contradictory
+general groups, and multiple measured entries for the same general window
+produce a degraded result with an error. Known quotas and cache timestamps are
+retained for inspection, but these rows cannot supply `limits --best` or
+`limits --rank` with evidence of headroom. A new kind with an identified model
+scope still constrains that model; its duration remains unknown. The documented
+five-hour and seven-day durations are used only for recognized windows and
+compatible groups. A reset timestamp alone never establishes a new duration.
 
 #### Offline usage: `caam limits --cached`
 

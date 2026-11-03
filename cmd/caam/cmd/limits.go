@@ -432,13 +432,19 @@ func cachedProfileUsage(provider, name, claudeJSON string, now time.Time) usage.
 		if !errors.Is(err, usage.ErrNoCachedUsage) {
 			msg = err.Error()
 		}
-		row.Usage = &usage.UsageInfo{
-			Provider: provider, ProfileName: name, Source: usage.SourceCache,
-			Error: msg,
+		// A decoded snapshot can retain useful measurements and its original
+		// age while refusing quota-based selection. Keep that evidence and its
+		// degraded status rather than replacing the whole row with an error.
+		if info == nil {
+			info = &usage.UsageInfo{}
 		}
-		return row
+		if info.Error == "" {
+			info.Error = msg
+		}
 	}
+	info.Provider = provider
 	info.ProfileName = name
+	info.Source = usage.SourceCache
 	row.Usage = info
 	return row
 }

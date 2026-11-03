@@ -41,8 +41,8 @@ const (
 )
 
 // ErrNoCachedUsage reports that a .claude.json holds no usage snapshot: the
-// file is absent or unreadable, predates the cache, or carries an empty limits
-// array. It is the expected state for a profile that has not run a session
+// file is absent or unreadable, predates the cache, or has no window entries.
+// It is the expected state for a profile that has not run a session
 // since Claude Code started caching, not a fault — and it must be reported as
 // "no cached data", never as 0% used.
 var ErrNoCachedUsage = errors.New("no cached usage data")
@@ -53,11 +53,9 @@ type cachedUsageFile struct {
 }
 
 type cachedUsageBlock struct {
-	FetchedAtMs int64  `json:"fetchedAtMs"`
-	AccountUUID string `json:"accountUuid"`
-	Utilization struct {
-		Limits []claudeLimit `json:"limits"`
-	} `json:"utilization"`
+	FetchedAtMs int64               `json:"fetchedAtMs"`
+	AccountUUID string              `json:"accountUuid"`
+	Utilization claudeUsageResponse `json:"utilization"`
 }
 
 // ReadCachedClaudeUsage reads the usage snapshot out of the .claude.json at
@@ -86,12 +84,19 @@ func ReadCachedClaudeUsage(path string, now time.Time) (*UsageInfo, error) {
 //
 // Malformed JSON is an error. A well-formed file with no snapshot yields
 // ErrNoCachedUsage so the caller can say "no cached data" instead of "0%".
+// An incomplete or unsupported quota returns both diagnostic UsageInfo and an
+// error; callers should retain its measurements and original cache timestamp.
 func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 	var file cachedUsageFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, fmt.Errorf("parse .claude.json: %w", err)
 	}
-	if file.Cached == nil || len(file.Cached.Utilization.Limits) == 0 {
+	if file.Cached == nil {
+		return nil, ErrNoCachedUsage
+	}
+	quota := file.Cached.Utilization
+	if len(quota.Limits) == 0 && quota.FiveHour == nil && quota.SevenDay == nil &&
+		quota.Opus == nil && quota.SevenDayOpus == nil {
 		return nil, ErrNoCachedUsage
 	}
 
@@ -104,10 +109,9 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 		info.FetchedAt = time.UnixMilli(file.Cached.FetchedAtMs)
 	}
 
-	// The cached payload is the same limits[] array the usage API returns, so
-	// it folds in through the same code path — including the per-model
-	// ("weekly_scoped") allowances.
-	applyLimits(info, file.Cached.Utilization.Limits)
+	// Use the live parser's normalization and general-quota guard. A partial
+	// snapshot can retain diagnostic windows without becoming spare capacity.
+	quotaErr := quota.apply(info, now)
 
 	for _, w := range []*UsageWindow{info.PrimaryWindow, info.SecondaryWindow, info.TertiaryWindow} {
 		markRolled(w, now)
@@ -116,7 +120,7 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 		markRolled(w, now)
 	}
 
-	return info, nil
+	return info, quotaErr
 }
 
 // markRolled zeroes a window whose reset time has already passed, recording

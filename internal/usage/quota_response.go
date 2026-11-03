@@ -28,18 +28,32 @@ func decodeUsageResponse(reader io.Reader, target any) error {
 	return nil
 }
 
-// A present window needs an explicit measurement. Unmarshaling a missing or
-// null number into float64/int silently invents zero usage. Check presence and
-// range before either provider converts its response into a routing window.
+// A present window needs an explicit measurement. Providers that do not
+// distinguish inapplicable windows with null must still reject null numbers.
 func requireUsagePercent(data []byte, field string) error {
-	var object map[string]json.RawMessage
-	if json.Unmarshal(data, &object) != nil || object == nil {
-		return fmt.Errorf("usage window must be an object")
+	percent, err := nullableUsagePercent(data, field)
+	if err != nil {
+		return err
 	}
-	var percent *float64
-	if json.Unmarshal(object[field], &percent) != nil || percent == nil ||
-		math.IsNaN(*percent) || math.IsInf(*percent, 0) || *percent < 0 || *percent > 100 {
+	if percent == nil {
 		return fmt.Errorf("usage window %s must be a number between 0 and 100", field)
 	}
 	return nil
+}
+
+// nullableUsagePercent distinguishes an explicit null from a missing or
+// malformed measurement. When accepting null for an inapplicable window,
+// callers must skip that window, never turn it into measured zero usage.
+// Missing fields, strings, and out-of-range numbers remain invalid.
+func nullableUsagePercent(data []byte, field string) (*float64, error) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(data, &object) != nil || object == nil {
+		return nil, fmt.Errorf("usage window must be an object")
+	}
+	var percent *float64
+	if json.Unmarshal(object[field], &percent) != nil || (percent != nil &&
+		(math.IsNaN(*percent) || math.IsInf(*percent, 0) || *percent < 0 || *percent > 100)) {
+		return nil, fmt.Errorf("usage window %s must be a number between 0 and 100", field)
+	}
+	return percent, nil
 }

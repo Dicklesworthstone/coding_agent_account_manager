@@ -207,6 +207,9 @@ func TestSubscriptionQuotaRequiresExplicitMeasurements(t *testing.T) {
 		{"claude", "invalid scoped percentage", `{"five_hour":{"utilization":0},"limits":[{"kind":"weekly_scoped","percent":-1,"scope":{"model":{"display_name":"Opus"}}}]}`},
 		{"claude", "unknown scoped percentage", `{"five_hour":{"utilization":0},"limits":[{"kind":"weekly_scoped","scope":{"model":{"display_name":"Opus"}}}]}`},
 		{"claude", "null limit", `{"five_hour":{"utilization":0},"limits":[null]}`},
+		{"claude", "overlapping sessions", `{"limits":[{"kind":"session","percent":1},{"kind":"session","percent":100}]}`},
+		{"claude", "overlapping weekly limits", `{"five_hour":{"utilization":0},"limits":[{"kind":"weekly_all","percent":1},{"kind":"weekly_all","percent":100}]}`},
+		{"claude", "unrecognized scope", `{"seven_day":{"utilization":1},"limits":[{"kind":"session","percent":100,"scope":{"feature":{"id":"future"}}}]}`},
 		{"claude", "model-only response", `{"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Opus"}}}]}`},
 		{"claude", "second document", `{"five_hour":{"utilization":0}} {"error":"BODY-MUST-NOT-ESCAPE"}`},
 		{"claude", "trailing garbage", `{"five_hour":{"utilization":0}} BODY-MUST-NOT-ESCAPE`},
@@ -389,8 +392,11 @@ func TestCachedSubscriptionQuotaCannotInventZero(t *testing.T) {
 	for _, percent := range []string{"", `,"percent":null`, `,"percent":-1`, `,"percent":101`} {
 		data := []byte(`{"cachedUsageUtilization":{"utilization":{"limits":[{"kind":"session"` + percent + `}]}}}`)
 		info, err := ParseCachedClaudeUsage(data, now)
-		if err == nil || info != nil {
+		if err == nil || (info != nil && (info.NumericQuotaKnown() || info.PrimaryWindow != nil || info.SecondaryWindow != nil)) {
 			t.Fatal("cache parser manufactured zero usage from an invalid measurement")
+		}
+		if info != nil && (info.QuotaStatus != QuotaDegraded || info.Error == "" || info.QuotaNote == "") {
+			t.Fatal("cache without a general measurement lost its degraded status")
 		}
 	}
 	data := []byte(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":"seat","utilization":{"limits":[{"kind":"session","percent":0,"resets_at":"2099-01-01T00:00:00Z"},{"kind":"weekly_all","percent":100,"resets_at":"2020-01-01T00:00:00Z"}]}}}`)
