@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -52,9 +53,12 @@ var ErrNoCachedUsage = errors.New("no cached usage data")
 // reported session or model allowance has spare capacity after its reset.
 var errCachedQuotaRolled = errors.New("cached usage crossed a quota reset; refresh usage before selecting this account")
 
+var errCachedAccountMismatch = errors.New("cached usage belongs to a different Claude account; refresh usage before selecting this account")
+
 // cachedUsageFile is the slice of a .claude.json this package reads.
 type cachedUsageFile struct {
-	Cached *cachedUsageBlock `json:"cachedUsageUtilization"`
+	Cached       *cachedUsageBlock `json:"cachedUsageUtilization"`
+	OAuthAccount json.RawMessage   `json:"oauthAccount"`
 }
 
 type cachedUsageBlock struct {
@@ -118,6 +122,20 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 	// Use the live parser's normalization and general-quota guard. A partial
 	// snapshot can retain diagnostic windows without becoming spare capacity.
 	quotaErr := quota.apply(info, now)
+	// Native account labels are not ownership proof, but an explicit
+	// disagreement makes this snapshot unsafe to attribute to the login.
+	// Legacy files may omit this object or carry an old string label.
+	var account struct {
+		AccountUUID string `json:"accountUuid"`
+	}
+	if quotaErr == nil && json.Unmarshal(file.OAuthAccount, &account) == nil {
+		cachedID, currentID := strings.TrimSpace(info.AccountID), strings.TrimSpace(account.AccountUUID)
+		if cachedID != "" && currentID != "" && cachedID != currentID {
+			quotaErr = errCachedAccountMismatch
+			info.QuotaStatus = QuotaDegraded
+			info.Error, info.QuotaNote = quotaErr.Error(), quotaErr.Error()
+		}
+	}
 
 	rolled := false
 	for _, w := range []*UsageWindow{info.PrimaryWindow, info.SecondaryWindow, info.TertiaryWindow} {

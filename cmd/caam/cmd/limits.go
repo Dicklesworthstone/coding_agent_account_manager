@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -135,6 +136,10 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	format, _ := cmd.Flags().GetString("format")
 	showBest, _ := cmd.Flags().GetBool("best")
 	threshold, _ := cmd.Flags().GetFloat64("threshold")
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 || threshold > 1 {
+		cmd.SilenceUsage = true
+		return fmt.Errorf("--threshold must be a finite number between 0 and 1")
+	}
 	showRecommend, _ := cmd.Flags().GetBool("recommend")
 	showForecast, _ := cmd.Flags().GetBool("forecast")
 	model, _ := cmd.Flags().GetString("model")
@@ -343,7 +348,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	}
 
 	if showForecast {
-		return renderForecast(out, format, allResults)
+		return renderForecast(out, format, allResults, model)
 	}
 
 	return renderLimits(out, format, allResults, model)
@@ -684,10 +689,15 @@ func formatScopedLimit(w *usage.UsageWindow) string {
 // scopedLabel names the model a window is scoped to, for windows the provider
 // reported without a display name.
 func scopedLabel(w *usage.UsageWindow) string {
-	if w == nil || w.Label == "" {
-		return "model quota"
+	if w != nil {
+		if w.Label != "" {
+			return w.Label
+		}
+		if w.ModelID != "" {
+			return w.ModelID
+		}
 	}
-	return w.Label
+	return "model quota"
 }
 
 // formatBurnRate formats tokens per hour in a compact way.
@@ -704,21 +714,26 @@ func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage,
 	// Filter to profiles that are available. A degraded or unavailable row is
 	// not available: its percentage was not measured, so it is not the best
 	// seat and it is not a reason to switch.
-	var available []usage.ProfileUsage
+	var usable, available []usage.ProfileUsage
 	for _, r := range results {
-		if r.Usage != nil && r.Usage.NumericQuotaKnown() && !r.Usage.IsNearLimitForModel(threshold, model) {
+		if r.Usage == nil || !r.Usage.NumericQuotaKnown() || r.Usage.IsNearLimitForModel(1, model) {
+			continue
+		}
+		usable = append(usable, r)
+		if !r.Usage.IsNearLimitForModel(threshold, model) {
 			available = append(available, r)
 		}
 	}
 
 	if len(available) == 0 {
-		// Fall back to best score even if above threshold. Still require a
-		// measured quota — falling through to an unmeasured row would switch
-		// onto an account whose remaining allowance is unknown.
-		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.NumericQuotaKnown() {
-			available = results[:1]
-		}
+		// The threshold is advisory. A hard provider cap is not: fallback
+		// may choose a busy account only while every applicable quota remains.
+		available = usable
 	}
+	// Cached and explicit-source reads arrive in profile-name order. Sort
+	// this owned candidate slice rather than relying on a fetcher's ordering
+	// or changing the caller's rows.
+	sortResultsForModel(available, model)
 
 	format = strings.ToLower(strings.TrimSpace(format))
 
@@ -808,12 +823,45 @@ type Recommendation struct {
 // Forecast represents a usage forecast for a profile.
 type Forecast struct {
 	Profile           string `json:"profile"`
-	CurrentPrimary    int    `json:"current_primary_percent"`
-	CurrentSecondary  int    `json:"current_secondary_percent"`
+	CurrentPrimary    *int   `json:"current_primary_percent"`
+	CurrentSecondary  *int   `json:"current_secondary_percent"`
+	CurrentScoped     *int   `json:"current_scoped_percent,omitempty"`
+	ScopedLabel       string `json:"scoped_label,omitempty"`
+	CurrentLoad       int    `json:"current_load_percent"`
+	BindingWindow     string `json:"binding_window"`
 	PrimaryResetsIn   string `json:"primary_resets_in"`
 	SecondaryResetsIn string `json:"secondary_resets_in"`
-	SafeToUseIn       string `json:"safe_to_use_in,omitempty"`
+	ScopedResetsIn    string `json:"scoped_resets_in,omitempty"`
+	NextResetIn       string `json:"next_reset_in,omitempty"`
 	Recommendation    string `json:"recommendation"`
+}
+
+// limitsBindingWindow identifies the measured restriction relevant to this
+// work. ScopedLimit already considers every overlapping model allowance.
+func limitsBindingWindow(u *usage.UsageInfo, model string) (*usage.UsageWindow, string) {
+	if u == nil {
+		return nil, ""
+	}
+	scoped := u.ScopedLimit(model)
+	var binding *usage.UsageWindow
+	var label string
+	for _, candidate := range []struct {
+		window *usage.UsageWindow
+		label  string
+	}{{u.PrimaryWindow, "Primary"}, {u.SecondaryWindow, "Secondary"}, {scoped, scopedLabel(scoped)}} {
+		w := candidate.window
+		if w == nil || w.Unmeasured {
+			continue
+		}
+		if binding == nil || max(w.Utilization, float64(w.UsedPercent)/100) > max(binding.Utilization, float64(binding.UsedPercent)/100) {
+			binding, label = w, candidate.label
+		}
+	}
+	return binding, label
+}
+
+func limitsWindowPercent(w *usage.UsageWindow) int {
+	return max(w.UsedPercent, int(w.Utilization*100))
 }
 
 func renderRecommendations(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
@@ -832,7 +880,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 
 	case "table", "":
 		if len(recs) == 0 {
-			fmt.Fprintln(w, "No recommendations - all profiles are healthy.")
+			fmt.Fprintln(w, "No rotation recommendations from the available quota measurements.")
 			return nil
 		}
 
@@ -853,7 +901,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 			fmt.Fprintf(w, "%s %s: %s\n", urgencyIcon, rec.Action, rec.Profile)
 			fmt.Fprintf(w, "   Reason: %s\n", rec.Reason)
 			if rec.SwitchIn != "" {
-				fmt.Fprintf(w, "   Switch in: %s\n", rec.SwitchIn)
+				fmt.Fprintf(w, "   Next reported reset in: %s (refresh usage before selecting)\n", rec.SwitchIn)
 			}
 			fmt.Fprintln(w)
 		}
@@ -880,10 +928,10 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 		// Find profiles that need attention
 		var nearLimit, healthy []usage.ProfileUsage
 		for _, p := range profiles {
-			if p.Usage == nil || p.Usage.Error != "" {
+			if p.Usage == nil || !p.Usage.NumericQuotaKnown() {
 				continue
 			}
-			if p.Usage.IsNearLimitForModel(threshold, model) {
+			if p.Usage.IsNearLimitForModel(1, model) || p.Usage.IsNearLimitForModel(threshold, model) {
 				nearLimit = append(nearLimit, p)
 			} else {
 				healthy = append(healthy, p)
@@ -892,36 +940,20 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 
 		// Generate recommendations
 		for _, p := range nearLimit {
-			primary := 0
-			if p.Usage.PrimaryWindow != nil {
-				primary = p.Usage.PrimaryWindow.UsedPercent
-			}
+			binding, label := limitsBindingWindow(p.Usage, model)
+			load := limitsWindowPercent(binding)
 
 			urgency := "soon"
-			if primary >= 90 {
+			if load >= 90 {
 				urgency = "now"
-			} else if primary >= thresholdPct {
-				urgency = "soon"
 			}
 
 			switchIn := ""
-			if ttl := p.Usage.TimeUntilReset(); ttl > 0 {
+			if ttl := time.Until(p.Usage.EarliestResetForModel(model)); ttl > 0 {
 				switchIn = formatLimitsDuration(ttl)
 			}
 
-			reason := fmt.Sprintf("Primary usage at %d%% (threshold: %d%%)", primary, thresholdPct)
-			if p.Usage.SecondaryWindow != nil && p.Usage.SecondaryWindow.UsedPercent >= thresholdPct {
-				reason += fmt.Sprintf(", secondary at %d%%", p.Usage.SecondaryWindow.UsedPercent)
-			}
-			// Say so when a per-model quota is what makes the profile
-			// unusable: at 0% general usage the primary figure alone reads as
-			// "plenty left" (issue #97).
-			if scoped := p.Usage.ScopedLimit(model); scoped != nil && scoped.UsedPercent >= thresholdPct {
-				reason += fmt.Sprintf(", %s exhausted at %d%%", scopedLabel(scoped), scoped.UsedPercent)
-				if primary < thresholdPct {
-					urgency = "now"
-				}
-			}
+			reason := fmt.Sprintf("%s usage at %d%% (threshold: %d%%)", label, load, thresholdPct)
 
 			rec := Recommendation{
 				Action:      "Switch from",
@@ -929,7 +961,7 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 				Reason:      reason,
 				Urgency:     urgency,
 				SwitchIn:    switchIn,
-				CurrentLoad: primary,
+				CurrentLoad: load,
 			}
 			recs = append(recs, rec)
 		}
@@ -944,17 +976,15 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 				}
 			}
 
-			bestPrimary := 0
-			if best.Usage.PrimaryWindow != nil {
-				bestPrimary = best.Usage.PrimaryWindow.UsedPercent
-			}
+			binding, label := limitsBindingWindow(best.Usage, model)
+			load := limitsWindowPercent(binding)
 
 			rec := Recommendation{
 				Action:      "Switch to",
 				Profile:     fmt.Sprintf("%s/%s", provider, best.ProfileName),
-				Reason:      fmt.Sprintf("Has %d%% availability (primary at %d%%)", best.Usage.AvailabilityScoreForModel(model), bestPrimary),
+				Reason:      fmt.Sprintf("Measured %s usage at %d%% (availability score: %d)", label, load, best.Usage.AvailabilityScoreForModel(model)),
 				Urgency:     "none",
-				CurrentLoad: bestPrimary,
+				CurrentLoad: load,
 			}
 			recs = append(recs, rec)
 		}
@@ -963,10 +993,10 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 	return recs
 }
 
-func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) error {
+func renderForecast(w io.Writer, format string, results []usage.ProfileUsage, model string) error {
 	format = strings.ToLower(strings.TrimSpace(format))
 
-	forecasts := generateForecasts(results)
+	forecasts := generateForecasts(results, model)
 
 	switch format {
 	case "json":
@@ -985,13 +1015,27 @@ func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) er
 
 		fmt.Fprintln(w, "Usage Forecasts")
 		fmt.Fprintln(w, "────────────────────────────────────────────────────────────────")
+		percent := func(p *int) string {
+			if p == nil {
+				return "not reported"
+			}
+			return fmt.Sprintf("%d%%", *p)
+		}
 
 		for _, f := range forecasts {
 			fmt.Fprintf(w, "%s\n", f.Profile)
-			fmt.Fprintf(w, "  Current: Primary %d%%, Secondary %d%%\n", f.CurrentPrimary, f.CurrentSecondary)
-			fmt.Fprintf(w, "  Resets:  Primary in %s, Secondary in %s\n", f.PrimaryResetsIn, f.SecondaryResetsIn)
-			if f.SafeToUseIn != "" {
-				fmt.Fprintf(w, "  Safe to use in: %s\n", f.SafeToUseIn)
+			fmt.Fprintf(w, "  Current: Primary %s, Secondary %s\n", percent(f.CurrentPrimary), percent(f.CurrentSecondary))
+			if f.CurrentPrimary != nil {
+				fmt.Fprintf(w, "  Primary reset: %s\n", f.PrimaryResetsIn)
+			}
+			if f.CurrentSecondary != nil {
+				fmt.Fprintf(w, "  Secondary reset: %s\n", f.SecondaryResetsIn)
+			}
+			if f.CurrentScoped != nil {
+				fmt.Fprintf(w, "  %s: %s, reset: %s\n", f.ScopedLabel, percent(f.CurrentScoped), f.ScopedResetsIn)
+			}
+			if f.NextResetIn != "" {
+				fmt.Fprintf(w, "  Next reported reset in: %s (refresh usage before selecting)\n", f.NextResetIn)
 			}
 			fmt.Fprintf(w, "  Recommendation: %s\n", f.Recommendation)
 			fmt.Fprintln(w)
@@ -1004,11 +1048,17 @@ func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) er
 	}
 }
 
-func generateForecasts(results []usage.ProfileUsage) []Forecast {
+func generateForecasts(results []usage.ProfileUsage, model string) []Forecast {
 	var forecasts []Forecast
+	reset := func(w *usage.UsageWindow) string {
+		if w.ResetsAt.IsZero() || !w.ResetsAt.After(time.Now()) {
+			return "unknown; refresh usage"
+		}
+		return formatLimitsDuration(time.Until(w.ResetsAt))
+	}
 
 	for _, r := range results {
-		if r.Usage == nil || r.Usage.Error != "" {
+		if r.Usage == nil || !r.Usage.NumericQuotaKnown() {
 			continue
 		}
 
@@ -1017,31 +1067,41 @@ func generateForecasts(results []usage.ProfileUsage) []Forecast {
 		}
 
 		if r.Usage.PrimaryWindow != nil {
-			f.CurrentPrimary = r.Usage.PrimaryWindow.UsedPercent
-			f.PrimaryResetsIn = formatLimitsDuration(time.Until(r.Usage.PrimaryWindow.ResetsAt))
+			percent := limitsWindowPercent(r.Usage.PrimaryWindow)
+			f.CurrentPrimary = &percent
+			f.PrimaryResetsIn = reset(r.Usage.PrimaryWindow)
 		}
 
 		if r.Usage.SecondaryWindow != nil {
-			f.CurrentSecondary = r.Usage.SecondaryWindow.UsedPercent
-			f.SecondaryResetsIn = formatLimitsDuration(time.Until(r.Usage.SecondaryWindow.ResetsAt))
+			percent := limitsWindowPercent(r.Usage.SecondaryWindow)
+			f.CurrentSecondary = &percent
+			f.SecondaryResetsIn = reset(r.Usage.SecondaryWindow)
+		}
+		if scoped := r.Usage.ScopedLimit(model); scoped != nil {
+			percent := limitsWindowPercent(scoped)
+			f.CurrentScoped = &percent
+			f.ScopedLabel = scopedLabel(scoped)
+			f.ScopedResetsIn = reset(scoped)
+		}
+		binding, label := limitsBindingWindow(r.Usage, model)
+		f.CurrentLoad, f.BindingWindow = limitsWindowPercent(binding), label
+		if ttl := time.Until(r.Usage.EarliestResetForModel(model)); ttl > 0 {
+			f.NextResetIn = formatLimitsDuration(ttl)
 		}
 
-		// Determine when safe to use
-		if f.CurrentPrimary >= 80 {
-			// Need to wait for reset
-			f.SafeToUseIn = f.PrimaryResetsIn
-			f.Recommendation = fmt.Sprintf("Wait for primary window reset (%s)", f.PrimaryResetsIn)
-		} else if f.CurrentPrimary >= 50 {
-			f.Recommendation = "Use sparingly - approaching limit"
-		} else if f.CurrentPrimary >= 30 {
-			f.Recommendation = "Good availability - moderate usage"
-		} else {
-			f.Recommendation = "Excellent availability - safe for heavy usage"
-		}
-
-		// Adjust for secondary window
-		if f.CurrentSecondary >= 80 {
-			f.Recommendation += " (watch secondary limit)"
+		// A reported reset is not proof that every overlapping restriction
+		// will permit new work then. Report current evidence, not readiness.
+		switch {
+		case f.CurrentLoad >= 100:
+			f.Recommendation = "Quota exhausted; refresh usage before starting new work"
+		case f.CurrentLoad >= 80:
+			f.Recommendation = "Limited headroom; prefer another measured account and refresh after a reset"
+		case f.CurrentLoad >= 50:
+			f.Recommendation = "Some headroom; monitor usage closely"
+		case f.CurrentLoad >= 30:
+			f.Recommendation = "Measured quota has moderate headroom"
+		default:
+			f.Recommendation = "Measured quota has substantial headroom"
 		}
 
 		forecasts = append(forecasts, f)

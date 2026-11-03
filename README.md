@@ -922,12 +922,40 @@ collection and `model_id` when supplied; `model_windows` continues to show the
 most constrained window per display name. Quota checks and reset selection use
 the complete collection, including after a JSON round trip.
 
+`limits --best` chooses the highest-scoring usable account, including for
+cached and explicit-source reads. `--threshold` is a finite fraction from 0 to
+1 and expresses a preference: if every account is busy, the command can still
+choose a measured account above that threshold. It never falls back to an
+account exhausted in any applicable general or model quota. With no usable
+account, JSON output is `null`.
+
+`--recommend` and `--forecast` use the most constrained applicable measurement,
+including a weekly quota when no session limit is reported. Forecast JSON keeps
+`current_primary_percent` and `current_secondary_percent` numeric for measured
+windows, including real zero usage, and uses `null` for an absent window. It
+also reports applicable model usage and the binding load. Forecast consumers
+should use the informational `next_reset_in` field instead of the former
+`safe_to_use_in`: a reported reset does not prove that every overlapping limit
+will permit work then. Refresh usage before selecting an account after a reset.
+The existing recommendation JSON field `switch_in` also describes the next
+reported reset; it is not a guarantee of future availability.
+
 #### Offline usage: `caam limits --cached`
 
 `caam limits` answers "which account still has headroom" by querying the
 provider. Claude Code also caches the figures it last received in each
 account's own `.claude.json`, and `--cached` reads those files instead: no
 request is made and no token is presented.
+
+For the active vault profile, the cache comes from
+`$CLAUDE_CONFIG_DIR/.claude.json` when that directory is explicitly configured,
+otherwise from the current HOME. A missing or malformed selected cache does
+not fall back to a different host login's state. Explicit disagreement between
+the snapshot's account UUID and account metadata in the same file degrades the
+row and excludes it from recommendations, while preserving its recorded quotas
+and timestamp for inspection. Legacy caches without account metadata remain
+supported; descriptive metadata never fills a missing snapshot identity or
+establishes verified ownership.
 
 ```bash
 caam limits claude --cached

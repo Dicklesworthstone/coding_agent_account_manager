@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,305 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
 )
+
+func quotaAdviceCommand(mode, model string, cached bool) *cobra.Command {
+	cmd := &cobra.Command{Use: "limits"}
+	cmd.Flags().String("profile", "", "")
+	cmd.Flags().String("format", "json", "")
+	cmd.Flags().Bool("best", mode == "best", "")
+	cmd.Flags().Float64("threshold", 0.8, "")
+	cmd.Flags().Bool("recommend", mode == "recommend", "")
+	cmd.Flags().Bool("forecast", mode == "forecast", "")
+	cmd.Flags().String("model", model, "")
+	cmd.Flags().String("source", credNamespaceVault, "")
+	cmd.Flags().Bool("cached", cached, "")
+	cmd.Flags().String("rank", "", "")
+	return cmd
+}
+
+func setupLimitsAdviceProfiles(t *testing.T, cached bool, responses map[string]string) {
+	t.Helper()
+	setupSubscriptionQuotaProfiles(t, "claude", responses)
+	for name, body := range responses {
+		dir := filepath.Join(getVaultDir(), "claude", name)
+		if cached {
+			writeNativeTestCredential(t, filepath.Join(dir, ".claude.json"), fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":%q,"utilization":%s}}`, name, body))
+		} else {
+			writeNativeTestCredential(t, filepath.Join(dir, ".credentials.json"), fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, name, "synthetic-refresh-"+name, time.Now().Add(time.Hour).UnixMilli()))
+		}
+	}
+}
+
+func TestLimitsBestNeverFallsBackToAnExhaustedQuota(t *testing.T) {
+	const modelSpent = `{"five_hour":null,"seven_day":{"utilization":0},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, cached := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, model, want string
+			responses         map[string]string
+		}{
+			{"weekly exhausted", "", "", map[string]string{"seat": `{"five_hour":null,"seven_day":{"utilization":100}}`}},
+			{"session exhausted", "", "", map[string]string{"seat": `{"five_hour":{"utilization":100},"seven_day":{"utilization":0}}`}},
+			{"model exhausted", "fable", "", map[string]string{"seat": modelSpent}},
+			{"unknown model includes every cap", "", "", map[string]string{"seat": modelSpent}},
+			{"different model remains usable", "sonnet", "seat", map[string]string{"seat": modelSpent}},
+			{"busy usable fallback", "", "seat", map[string]string{"seat": `{"seven_day":{"utilization":85}}`}},
+			{"best ignores alphabetical input order", "", "z-idle", map[string]string{
+				"a-busy": `{"seven_day":{"utilization":70}}`, "z-idle": `{"seven_day":{"utilization":10}}`,
+			}},
+			{"fallback ignores alphabetical input order", "", "z-usable", map[string]string{
+				"a-busy": `{"seven_day":{"utilization":95}}`, "z-usable": `{"seven_day":{"utilization":85}}`,
+			}},
+			{"advisory headroom precedes a higher score", "fable", "under-threshold", map[string]string{
+				"high-score":      `{"seven_day":{"utilization":0},"limits":[{"kind":"weekly_scoped","percent":85,"scope":{"model":{"display_name":"Fable"}}}]}`,
+				"under-threshold": `{"five_hour":{"utilization":70},"seven_day":{"utilization":70}}`,
+			}},
+			{"fallback searches past a higher scoring exhausted seat", "fable", "usable", map[string]string{
+				"tempting": modelSpent, "usable": `{"seven_day":{"utilization":85}}`,
+			}},
+			{"measured zero", "", "seat", map[string]string{"seat": `{"five_hour":{"utilization":null},"seven_day":{"utilization":0}}`}},
+			{"unmeasured", "", "", map[string]string{"seat": `{}`}},
+		} {
+			t.Run(fmt.Sprintf("cached=%t/%s", cached, tc.name), func(t *testing.T) {
+				setupLimitsAdviceProfiles(t, cached, tc.responses)
+				for _, format := range []string{"json", "table"} {
+					cmd := quotaAdviceCommand("best", tc.model, cached)
+					if err := cmd.Flags().Set("format", format); err != nil {
+						t.Fatal(err)
+					}
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					cmd.SetErr(&output)
+					if err := runLimits(cmd, []string{"claude"}); err != nil {
+						t.Fatalf("%s: %v\n%s", format, err, output.String())
+					}
+					if format == "json" {
+						var selected *usage.ProfileUsage
+						if err := json.Unmarshal(output.Bytes(), &selected); err != nil {
+							t.Fatal(err)
+						}
+						if tc.want == "" && selected != nil || tc.want != "" && (selected == nil || selected.ProfileName != tc.want) {
+							t.Fatalf("selected %+v, want %q\n%s", selected, tc.want, output.String())
+						}
+					} else if tc.want == "" {
+						if !strings.Contains(output.String(), "No available profiles") || strings.Contains(output.String(), "Best profile:") {
+							t.Fatalf("table recommended unusable quota: %s", output.String())
+						}
+					} else if !strings.Contains(output.String(), "Best profile: claude/"+tc.want) {
+						t.Fatalf("table chose another profile: %s", output.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLimitsThresholdValidationPrecedesProviderRequests(t *testing.T) {
+	setupLimitsAdviceProfiles(t, false, map[string]string{"spent": `{"seven_day":{"utilization":100}}`})
+	transport := http.DefaultTransport
+	requests := 0
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return transport.RoundTrip(req)
+	})
+	for _, threshold := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.1, 1.1} {
+		cmd := quotaAdviceCommand("best", "", false)
+		if err := cmd.Flags().Set("threshold", fmt.Sprint(threshold)); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		cmd.SetOut(&output)
+		cmd.SetErr(&output)
+		if err := runLimits(cmd, []string{"claude"}); err == nil || !strings.Contains(err.Error(), "--threshold") || output.Len() != 0 {
+			t.Fatalf("threshold %v: error=%v output=%s", threshold, err, output.String())
+		}
+		// The consumer keeps the hard guard even when called without the CLI.
+		rows := []usage.ProfileUsage{{Provider: "claude", ProfileName: "spent", Usage: &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{UsedPercent: 100}}}}
+		if err := renderBestProfile(&output, "json", rows, threshold, ""); err != nil || strings.TrimSpace(output.String()) != "null" {
+			t.Fatalf("threshold %v bypassed the hard cap: %s, %v", threshold, output.String(), err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("invalid thresholds caused %d provider requests", requests)
+	}
+}
+
+func TestLimitsForecastUsesApplicableMeasuredWindows(t *testing.T) {
+	const scoped = `{"seven_day":{"utilization":25},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, cached := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, body, model string
+			load              int
+			primary           bool
+			exhausted         bool
+		}{
+			{"weekly exhausted", `{"five_hour":null,"seven_day":{"utilization":100}}`, "", 100, false, true},
+			{"weekly measured zero", `{"five_hour":{"utilization":null},"seven_day":{"utilization":0}}`, "", 0, false, false},
+			{"conventional measured zero", `{"five_hour":{"utilization":0},"seven_day":{"utilization":20}}`, "", 20, true, false},
+			{"requested model exhausted", scoped, "fable", 100, false, true},
+			{"unknown model includes every cap", scoped, "", 100, false, true},
+			{"unrelated model remains usable", scoped, "sonnet", 25, false, false},
+			{"another reset cannot clear unknown weekly cap", `{"five_hour":{"utilization":90,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":100,"resets_at":null}}`, "", 100, true, true},
+		} {
+			t.Run(fmt.Sprintf("cached=%t/%s", cached, tc.name), func(t *testing.T) {
+				setupLimitsAdviceProfiles(t, cached, map[string]string{"seat": tc.body})
+				for _, format := range []string{"json", "table"} {
+					cmd := quotaAdviceCommand("forecast", tc.model, cached)
+					if err := cmd.Flags().Set("format", format); err != nil {
+						t.Fatal(err)
+					}
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					cmd.SetErr(&output)
+					if err := runLimits(cmd, []string{"claude"}); err != nil {
+						t.Fatal(err)
+					}
+					if strings.Contains(output.String(), "safe_to_use_in") || strings.Contains(output.String(), "safe for heavy usage") || strings.Contains(output.String(), "Safe to use in") {
+						t.Fatalf("forecast invented future readiness: %s", output.String())
+					}
+					if strings.Contains(output.String(), "Quota exhausted") != tc.exhausted {
+						t.Fatalf("forecast lost an applicable cap: %s", output.String())
+					}
+					if format == "json" {
+						var rows []map[string]any
+						if err := json.Unmarshal(output.Bytes(), &rows); err != nil || len(rows) != 1 {
+							t.Fatalf("forecast JSON: %v\n%s", err, output.String())
+						}
+						row := rows[0]
+						primary, present := row["current_primary_percent"]
+						if !present || (primary != nil) != tc.primary || row["current_load_percent"] != float64(tc.load) {
+							t.Fatalf("forecast invented an absent measurement or lost the binding load: %v", row)
+						}
+						if tc.load == 0 && row["current_secondary_percent"] != float64(0) {
+							t.Fatalf("measured weekly zero became absent: %v", row)
+						}
+						if tc.model == "sonnet" && row["current_scoped_percent"] != nil {
+							t.Fatalf("Sonnet inherited a Fable restriction: %v", row)
+						}
+					} else if !tc.primary && !strings.Contains(output.String(), "Primary not reported") {
+						t.Fatalf("table fabricated primary zero: %s", output.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLimitsRecommendationsUseMeasuredWeeklyAndModelLoad(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, modelQuota := range []bool{false, true} {
+			t.Run(fmt.Sprintf("cached=%t/model_quota=%t", cached, modelQuota), func(t *testing.T) {
+				spent := `{"five_hour":null,"seven_day":{"utilization":100}}`
+				label := "Secondary"
+				if modelQuota {
+					spent = `{"seven_day":{"utilization":0},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+					label = "Fable"
+				}
+				setupLimitsAdviceProfiles(t, cached, map[string]string{
+					"spent": spent, "usable": `{"seven_day":{"utilization":25}}`, "unknown": `{}`,
+				})
+				cmd := quotaAdviceCommand("recommend", "fable", cached)
+				var output bytes.Buffer
+				cmd.SetOut(&output)
+				cmd.SetErr(&output)
+				if err := runLimits(cmd, []string{"claude"}); err != nil {
+					t.Fatal(err)
+				}
+				var recs []Recommendation
+				if err := json.Unmarshal(output.Bytes(), &recs); err != nil || len(recs) != 2 {
+					t.Fatalf("recommendations: %v\n%s", err, output.String())
+				}
+				for _, rec := range recs {
+					switch rec.Action {
+					case "Switch from":
+						if rec.Profile != "claude/spent" || rec.CurrentLoad != 100 || rec.Urgency != "now" || !strings.Contains(rec.Reason, label+" usage at 100%") {
+							t.Fatalf("recommendation fabricated primary zero or missed urgency: %+v", rec)
+						}
+					case "Switch to":
+						if rec.Profile != "claude/usable" || rec.CurrentLoad != 25 || !strings.Contains(rec.Reason, "Secondary usage at 25%") {
+							t.Fatalf("recommendation did not use measured weekly headroom: %+v", rec)
+						}
+					default:
+						t.Fatalf("unexpected recommendation: %+v", rec)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLimitsAdviceRequiresUsableMeasurements(t *testing.T) {
+	spent := usage.ProfileUsage{Provider: "claude", ProfileName: "spent", Usage: &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{UsedPercent: 100}}}
+	for _, tc := range []struct {
+		name string
+		info *usage.UsageInfo
+	}{
+		{"no windows", &usage.UsageInfo{}},
+		{"unavailable status", &usage.UsageInfo{QuotaStatus: usage.QuotaUnavailable, SecondaryWindow: &usage.UsageWindow{}}},
+		{"degraded status", &usage.UsageInfo{QuotaStatus: usage.QuotaDegraded, SecondaryWindow: &usage.UsageWindow{}}},
+		{"rolled window", &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{Rolled: true}}},
+		{"display-only window", &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{Unmeasured: true}}},
+		{"nonfinite measurement", &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{Utilization: math.NaN()}}},
+		{"model-only measurement", &usage.UsageInfo{ScopedWindows: []*usage.UsageWindow{{Label: "Fable"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unknown := usage.ProfileUsage{Provider: "claude", ProfileName: "unknown", Usage: tc.info}
+			rows := []usage.ProfileUsage{unknown, spent}
+			if recs := generateLimitsRecommendations(rows, 0.8, ""); len(recs) != 1 || recs[0].Action != "Switch from" || recs[0].Profile != "claude/spent" {
+				t.Fatalf("unknown capacity became a switch target: %+v", recs)
+			}
+			if forecasts := generateForecasts(rows, ""); len(forecasts) != 1 || forecasts[0].Profile != "claude/spent" {
+				t.Fatalf("unusable data became a numeric forecast: %+v", forecasts)
+			}
+			var output bytes.Buffer
+			if err := renderRecommendations(&output, "table", []usage.ProfileUsage{unknown}, 0.8, ""); err != nil || strings.Contains(output.String(), "healthy") {
+				t.Fatalf("unknown usage became healthy: %s, %v", output.String(), err)
+			}
+		})
+	}
+	// Legacy normalized rows can expose only a fraction. Advice must enforce
+	// that restriction as strongly as selection does.
+	fractional := usage.ProfileUsage{Provider: "claude", ProfileName: "fractional", Usage: &usage.UsageInfo{
+		SecondaryWindow: &usage.UsageWindow{Utilization: 1},
+	}}
+	if recs := generateLimitsRecommendations([]usage.ProfileUsage{fractional}, 0.8, ""); len(recs) != 1 || recs[0].CurrentLoad != 100 || recs[0].Urgency != "now" {
+		t.Fatalf("fraction-only hard cap lost its recommendation: %+v", recs)
+	}
+	if forecasts := generateForecasts([]usage.ProfileUsage{fractional}, ""); len(forecasts) != 1 || forecasts[0].CurrentLoad != 100 || forecasts[0].CurrentSecondary == nil || *forecasts[0].CurrentSecondary != 100 {
+		t.Fatalf("fraction-only hard cap became zero: %+v", forecasts)
+	}
+}
+
+func TestLimitsAdviceUsesOnlyApplicableResetTimes(t *testing.T) {
+	now := time.Now()
+	rows := []usage.ProfileUsage{{Provider: "claude", ProfileName: "seat", Usage: &usage.UsageInfo{
+		SecondaryWindow: &usage.UsageWindow{UsedPercent: 95, ResetsAt: now.Add(48 * time.Hour)},
+		TertiaryWindow:  &usage.UsageWindow{Label: "Opus", UsedPercent: 10, ResetsAt: now.Add(5 * time.Minute)},
+	}}}
+	recs := generateLimitsRecommendations(rows, 0.8, "sonnet")
+	forecasts := generateForecasts(rows, "sonnet")
+	if len(recs) != 1 || !strings.Contains(recs[0].SwitchIn, "d") || len(forecasts) != 1 || !strings.Contains(forecasts[0].NextResetIn, "d") || forecasts[0].CurrentScoped != nil {
+		t.Fatalf("Sonnet borrowed the Opus reset: recommendations=%+v forecasts=%+v", recs, forecasts)
+	}
+}
+
+func TestLimitsCachedAdviceRejectsContradictedAccount(t *testing.T) {
+	setupLimitsAdviceProfiles(t, true, map[string]string{"seat": `{"seven_day":{"utilization":0}}`})
+	path := filepath.Join(getVaultDir(), "claude", "seat", ".claude.json")
+	body := `{"oauthAccount":{"accountUuid":"current-account"},"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":"previous-account","utilization":{"seven_day":{"utilization":0}}}}`
+	writeNativeTestCredential(t, path, body)
+	for _, mode := range []string{"best", "recommend", "forecast"} {
+		cmd := quotaAdviceCommand(mode, "", true)
+		var output bytes.Buffer
+		cmd.SetOut(&output)
+		cmd.SetErr(&output)
+		if err := runLimits(cmd, []string{"claude"}); err != nil || strings.TrimSpace(output.String()) != "null" {
+			t.Fatalf("%s attributed another account's quota to this login: %s, %v", mode, output.String(), err)
+		}
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != body {
+		t.Fatal("cached advice modified the source state")
+	}
+}
 
 func TestLimitsAcceptsGrokAndCursor(t *testing.T) {
 	cmd := &cobra.Command{Use: "limits"}

@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ## [Unreleased]
 
+### Fixed
+
+- **`limits` advice enforces weekly and model quotas throughout (#133).** `--best` excludes exhausted accounts even during its advisory-threshold fallback, then chooses by availability instead of cached or explicit-source profile order. Invalid thresholds fail before provider requests. Recommendations and forecasts use the actual applicable binding load, reject unusable quota data, and honor `--model`. Forecast JSON represents absent primary/secondary windows as `null`, preserves measured zero, and replaces the misleading `safe_to_use_in` promise with informational `next_reset_in`.
+- **Offline Claude quota reads follow the selected active account.** Active vault reads honor `CLAUDE_CONFIG_DIR` and do not borrow HOME state when that selected cache is missing or malformed. A snapshot whose account UUID explicitly contradicts the same file's account metadata remains available for inspection but cannot supply quota-based advice. Old caches with absent metadata retain their existing support; no account identity is invented.
+
 ## [0.1.25] - 2026-11-03
 
 ### Security

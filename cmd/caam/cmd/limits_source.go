@@ -238,8 +238,19 @@ func (l credentialLookup) claudeJSONPath(namespace, provider, name string) strin
 	}
 	switch namespace {
 	case credNamespaceVault:
-		if l.ActiveName != nil && l.LiveHome != "" && l.ActiveName(provider) == name {
-			return filepath.Join(l.LiveHome, ".claude.json")
+		if l.ActiveName != nil && l.ActiveName(provider) == name {
+			getenv := l.LiveEnv
+			if getenv == nil {
+				getenv = os.Getenv
+			}
+			if dir := getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+				// The selected credentials and cached state share one directory.
+				// A missing cache cannot borrow a different host login's state.
+				return filepath.Join(dir, ".claude.json")
+			}
+			if l.LiveHome != "" {
+				return filepath.Join(l.LiveHome, ".claude.json")
+			}
 		}
 		return filepath.Join(l.VaultDir, provider, name, ".claude.json")
 	case credNamespaceIsolated:

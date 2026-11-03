@@ -440,3 +440,41 @@ func TestCachedClaudeUsageCannotHideRolledLegacyPremiumConstraint(t *testing.T) 
 		})
 	}
 }
+
+func TestCachedClaudeUsageRejectsContradictedAccount(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, cached, account, wantID string
+		mismatch                      bool
+	}{
+		{"same account", `"accountUuid":"seat-a",`, `"oauthAccount":{"accountUuid":"seat-a"},`, "seat-a", false},
+		{"different account", `"accountUuid":"seat-a",`, `"oauthAccount":{"accountUuid":"seat-b"},`, "seat-a", true},
+		{"trimmed identities", `"accountUuid":" seat-a ",`, `"oauthAccount":{"accountUuid":"seat-a"},`, " seat-a ", false},
+		{"no account object", `"accountUuid":"seat-a",`, "", "seat-a", false},
+		{"null account object", `"accountUuid":"seat-a",`, `"oauthAccount":null,`, "seat-a", false},
+		{"legacy account label", `"accountUuid":"seat-a",`, `"oauthAccount":"old@example.test",`, "seat-a", false},
+		{"missing current ID", `"accountUuid":"seat-a",`, `"oauthAccount":{},`, "seat-a", false},
+		{"null current ID", `"accountUuid":"seat-a",`, `"oauthAccount":{"accountUuid":null},`, "seat-a", false},
+		{"missing cached ID", "", `"oauthAccount":{"accountUuid":"seat-b"},`, "", false},
+		{"null cached ID", `"accountUuid":null,`, `"oauthAccount":{"accountUuid":"seat-b"},`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{` + tc.account + `"cachedUsageUtilization":{"fetchedAtMs":1792580400000,` + tc.cached + `"utilization":{"five_hour":{"utilization":null},"seven_day":{"utilization":0,"resets_at":"2099-01-05T00:00:00Z"},"limits":[{"kind":"weekly_scoped","percent":80,"scope":{"model":{"display_name":"Fable"}}}]}}}`
+			info, err := ParseCachedClaudeUsage([]byte(body), now)
+			if info == nil || info.AccountID != tc.wantID || info.Source != SourceCache || !info.FetchedAt.Equal(time.UnixMilli(1792580400000)) || info.PrimaryWindow != nil || info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 0 {
+				t.Fatalf("cache identity, age, or weekly-only evidence changed: %+v %v", info, err)
+			}
+			if scoped := info.ScopedLimit("fable"); scoped == nil || scoped.UsedPercent != 80 {
+				t.Fatalf("account disagreement erased the model measurement: %+v", scoped)
+			}
+			if tc.mismatch {
+				if !errors.Is(err, errCachedAccountMismatch) || info.QuotaStatus != QuotaDegraded || info.Error == "" || info.QuotaNote == "" {
+					t.Fatalf("contradicted cached account remained eligible: %+v %v", info, err)
+				}
+				assertClaudeQuotaNotRoutable(t, info)
+			} else if err != nil || !info.NumericQuotaKnown() {
+				t.Fatalf("compatible legacy account metadata rejected: %+v %v", info, err)
+			}
+		})
+	}
+}

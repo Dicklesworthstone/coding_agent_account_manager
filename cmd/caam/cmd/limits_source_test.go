@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,113 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
+
+func TestCachedVaultUsageFollowsActiveClaudeConfigDirectory(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	cache := func(account string, percent int) string {
+		return fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":%q,"utilization":{"five_hour":null,"seven_day":{"utilization":%d,"resets_at":"2099-01-05T00:00:00Z"}}}}`, account, percent)
+	}
+	for _, tc := range []struct {
+		name                                  string
+		explicit, ambient, missing, malformed bool
+	}{
+		{"injected explicit directory", true, false, false, false},
+		{"ambient explicit directory", true, true, false, false},
+		{"missing selected cache", true, false, true, false},
+		{"malformed selected cache", true, false, false, true},
+		{"default home state", false, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNamespaceFixture(t)
+			f.lookup.Now = now
+			f.vaultClaude(t, "work", now.Add(time.Hour), true)
+			f.vaultClaude(t, "inactive", now.Add(time.Hour), true)
+			f.lookup.ActiveName = func(string) string { return "work" }
+			dir := ""
+			selected := filepath.Join(f.lookup.LiveHome, ".claude.json")
+			if tc.explicit {
+				dir = filepath.Join(f.root, "explicit-config")
+				selected = filepath.Join(dir, ".claude.json")
+				writeQuotaSelectionFile(t, filepath.Join(f.lookup.LiveHome, ".claude.json"), cache("unrelated-home", 0))
+			}
+			f.lookup.LiveEnv = func(key string) string {
+				if key == "CLAUDE_CONFIG_DIR" {
+					return dir
+				}
+				return ""
+			}
+			if tc.ambient {
+				t.Setenv("CLAUDE_CONFIG_DIR", dir)
+				f.lookup.LiveEnv = nil
+			}
+			if !tc.missing {
+				body := cache("selected-account", 100)
+				if tc.malformed {
+					body = "{"
+				}
+				writeQuotaSelectionFile(t, selected, body)
+			}
+			writeQuotaSelectionFile(t, filepath.Join(f.vaultDir, "claude", "work", ".claude.json"), cache("saved-account", 25))
+			inactive := filepath.Join(f.vaultDir, "claude", "inactive", ".claude.json")
+			writeQuotaSelectionFile(t, inactive, cache("inactive-account", 50))
+			before := captureQuotaSelectionTree(t, f.root)
+			resolved, err := resolveProfileCredential(f.lookup, "claude", "work", credNamespaceVault)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for source, path := range map[string]string{
+				"named": resolved.Selected.ClaudeJSON,
+				"bulk":  f.lookup.claudeJSONPath(credNamespaceVault, "claude", "work"),
+			} {
+				if path != selected {
+					t.Fatalf("%s selected %s, want %s", source, path, selected)
+				}
+				row := cachedProfileUsage("claude", "work", path, now)
+				if row.Usage == nil {
+					t.Fatal("missing cached diagnostic row")
+				}
+				if tc.missing || tc.malformed {
+					if row.Usage.Error == "" || row.Usage.NumericQuotaKnown() {
+						t.Fatalf("%s borrowed unselected cache capacity: %+v", source, row.Usage)
+					}
+				} else if row.Usage.AccountID != "selected-account" || !row.Usage.NumericQuotaKnown() || !row.Usage.IsNearLimit(1) || row.Usage.PrimaryWindow != nil {
+					t.Fatalf("%s read another account or lost the weekly-only cap: %+v", source, row.Usage)
+				}
+				var best bytes.Buffer
+				if err := renderBestProfile(&best, "json", []usage.ProfileUsage{row}, 0.8, ""); err != nil || strings.TrimSpace(best.String()) != "null" {
+					t.Fatalf("%s recommended an exhausted or unmeasured active account: %s, %v", source, best.String(), err)
+				}
+			}
+			if got := f.lookup.claudeJSONPath(credNamespaceVault, "claude", "inactive"); got != inactive {
+				t.Fatalf("inactive profile borrowed live state: %s", got)
+			}
+			assertQuotaSelectionTree(t, f.root, before)
+		})
+	}
+}
+
+func TestClaudeJSONPathExplicitDirectoryWithoutHome(t *testing.T) {
+	root := t.TempDir()
+	vaultDir := filepath.Join(root, "vault")
+	selected := filepath.Join(root, "selected")
+	lookup := credentialLookup{
+		VaultDir: vaultDir,
+		LiveEnv: func(key string) string {
+			if key == "CLAUDE_CONFIG_DIR" {
+				return selected
+			}
+			return ""
+		},
+		ActiveName: func(string) string { return "work" },
+	}
+	if got, want := lookup.claudeJSONPath(credNamespaceVault, "claude", "work"), filepath.Join(selected, ".claude.json"); got != want {
+		t.Fatalf("explicit directory without HOME: got %q, want %q", got, want)
+	}
+	lookup.LiveEnv = func(string) string { return "" }
+	if got, want := lookup.claudeJSONPath(credNamespaceVault, "claude", "work"), filepath.Join(vaultDir, "claude", "work", ".claude.json"); got != want {
+		t.Fatalf("missing directory and HOME: got %q, want %q", got, want)
+	}
+}
 
 // Issue #100: `caam limits --profile NAME` read <vault>/<provider>/<name> and
 // said nothing about it, so a healthy Claude account whose isolated-profile
