@@ -870,7 +870,16 @@ func allProviderReservedTops() map[string]bool {
 			continue
 		}
 		for _, d := range layout.realDirs {
-			tops[topComponent(d)] = true
+			top := topComponent(d)
+			// Library is an OS-shared top, not a provider data dir. #130 makes it
+			// a private directory only for macOS Claude, and claude's own layout
+			// already keeps it out of a claude profile's farm. Withholding it
+			// across providers would also strip the host ~/Library passthrough
+			// that codex and agy profiles have always had.
+			if top == "Library" {
+				continue
+			}
+			tops[top] = true
 		}
 		for _, e := range layout.realEntries {
 			tops[topComponent(e)] = true
