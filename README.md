@@ -903,8 +903,8 @@ At least one measured general session or weekly quota is required. Model-only
 data, unfamiliar measured general limits, unrecognized scopes, contradictory
 general groups, and multiple measured entries for the same general window
 produce a degraded result with an error. Known quotas and cache timestamps are
-retained for inspection, but these rows cannot supply `limits --best` or
-`limits --rank` with evidence of headroom. A new kind with an identified model
+retained for inspection, but these rows cannot supply quota-aware selection,
+`limits --best`, or `limits --rank` with evidence of headroom. A new kind with an identified model
 scope still constrains that model; its duration remains unknown. The documented
 five-hour and seven-day durations are used only for recognized windows and
 compatible groups. A reset timestamp alone never establishes a new duration.
@@ -932,8 +932,11 @@ both:
 - a profile with nothing cached reads `no cached data`, not `0%`, and is
   excluded from `--best` and from the recommendations. An account caam knows
   nothing about is never offered as the one with room;
-- a window whose reset time had already passed when the snapshot was written
-  reads `0% (rolled)`, so a stale zero is not mistaken for a measured one.
+- a measured window whose recorded reset has passed is marked `rolled`.
+  Its projected zero remains distinguishable from a measured zero, and the
+  account is degraded and excluded from quota-based recommendations until a
+  fresh read establishes its usage. A still-current weekly measurement cannot
+  establish how much of a new session or model allowance has since been used.
 
 In `--format json` these appear as `source: "cache"`, the window-level `rolled`
 flag, and `fetched_at` set to the snapshot's own timestamp rather than the time
@@ -1078,8 +1081,8 @@ copied behind your back is how two lanes end up invalidating each other.
 
 **Rotation policies** (`--policy` on `caam precheck`, `caam next`, and `caam run`, or `stealth.rotation.policy` in `~/.caam/spm_config.yaml`):
 
-- `availability` (default) — maximize immediate headroom; this is the existing behavior and remains unchanged unless you opt in to another policy.
-- `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Profiles at/above the ceiling or without a known reset time are held in reserve, ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
+- `availability` (default) — maximize immediate headroom among eligible profiles.
+- `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Measured profiles at/above the ceiling but below their provider caps, or without a known reset time, are held in reserve and ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
 
 Rotation policies decide which profile `caam` *switches the host to*. To rank seats for a new session without switching anything, use [`caam limits --rank`](#picking-a-seat-for-new-work-caam-limits---rank) instead — it is a read, and it ranks on the weekly allowance rather than the soonest window.
 
@@ -1090,6 +1093,19 @@ rejected, cannot become the fallback merely because it is the only account.
 Selection fails before changing live auth when every candidate needs a new
 login. Cooldown overrides do not bypass this check. Renewable access tokens
 remain eligible after their cached expiry; unknown expiry remains unknown.
+
+When quota data is requested, every algorithm and policy also requires a
+successful measurement and unspent general and applicable model quotas. This
+applies to Claude, Codex, Grok, and Cursor, including sole candidates and forced
+round-robin retries. Failed reads cannot silently turn a quota-aware request
+into selection without quota data. Reads use the same vault and candidate
+profiles that will be activated. Commands run without `--usage-aware`, and the
+session planner's explicit `--no-fetch`, retain their existing offline behavior.
+
+`caam run --precheck` switches only to another measured account below the
+precheck threshold. If the active account cannot be measured, or no replacement
+qualifies, the run keeps the current account and prints a notice. Weekly-only
+accounts remain eligible when their session limit is legitimately absent.
 
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile
@@ -1164,7 +1180,7 @@ Rotation applies cooldown and policy checks even when only one user profile
 exists. System snapshots are never automatic rotation candidates. `next --force`
 and `activate --auto --force` can explicitly override cooldown filtering; they do
 not admit system backups. With `next --usage-aware`, force also retains the
-requirement for measured, available Grok or Cursor quota. `next --dry-run`
+requirement for measured, available quota from every supported provider. `next --dry-run`
 performs selection without switching or saving credentials.
 
 ### Transferring Saved Profiles with Tar Archives

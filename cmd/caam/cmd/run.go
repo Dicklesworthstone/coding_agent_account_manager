@@ -520,19 +520,15 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 		return false // No active profile
 	}
 
-	// Grok and Cursor quota reads are fail-closed (docs/native-quotas.md):
-	// an unmeasured row is not capacity, and a reported limit stage is
-	// exhaustion even without a percentage. Their credentials are read from
-	// the same vault the switch will restore from.
+	// Native billing reads need a longer deadline. Every provider uses the
+	// same measured-quota eligibility check before a switch.
 	native := tool == "grok" || tool == "cursor"
 
 	// Load credentials for current profile
 	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
 	token, ok := credentials[currentProfile]
 	if err != nil || !ok {
-		if native {
-			fmt.Fprintf(os.Stderr, "caam: precheck found no readable %s credential for %s; running without switching\n", tool, currentProfile)
-		}
+		fmt.Fprintf(os.Stderr, "caam: precheck found no readable %s credential for %s; running without switching\n", tool, currentProfile)
 		return false
 	}
 
@@ -549,9 +545,7 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 	results := fetcher.FetchAllProfiles(queryCtx, tool, map[string]string{currentProfile: token})
 
 	if len(results) == 0 || results[0].Usage == nil {
-		if native {
-			fmt.Fprintf(os.Stderr, "caam: precheck could not read %s/%s quota; running without switching\n", tool, currentProfile)
-		}
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read %s/%s quota; running without switching\n", tool, currentProfile)
 		return false
 	}
 
@@ -563,7 +557,7 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 		// account (the historical behaviour) but say so, rather than letting
 		// the flag look like it checked something.
 		fmt.Fprintf(os.Stderr, "caam: precheck could not measure %s/%s quota (status %s); running without switching\n",
-			tool, currentProfile, nativeQuotaStatus(currentUsage))
+			tool, currentProfile, precheckQuotaStatus(currentUsage))
 		return false
 	}
 	if !nearLimit {
@@ -579,14 +573,21 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 	// Find best alternative using usage-aware selection
 	allCredentials, err := usage.LoadProfileCredentials(vaultDir, tool)
 	if err != nil || len(allCredentials) == 0 {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read alternative %s credentials; running without switching\n", tool)
 		return false
+	}
+	selectedCredentials := make(map[string]string, len(allProfiles))
+	for _, name := range allProfiles {
+		if token := allCredentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+			selectedCredentials[name] = token
+		}
 	}
 
 	// Fetch usage for all profiles, on a fresh deadline: the read above may
 	// have used most of the first one.
 	allCtx, allCancel := context.WithTimeout(ctx, timeout)
 	defer allCancel()
-	allResults := fetcher.FetchAllProfiles(allCtx, tool, allCredentials)
+	allResults := fetcher.FetchAllProfiles(allCtx, tool, selectedCredentials)
 
 	// Convert to rotation.UsageInfo format
 	usageData := make(map[string]*rotation.UsageInfo)
@@ -599,28 +600,25 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 		rawUsage[r.ProfileName] = r.Usage
 	}
 
-	// A native switch may only land on another account whose quota was
+	// A switch may only land on another account whose quota was
 	// measured, is not spent, and is itself below the precheck threshold;
 	// the selector's scoring alone would still pick an unknown one. If
 	// nothing qualifies, stay put and say so.
-	candidates := allProfiles
-	if native {
-		eligible, _ := rotation.NativeQuotaCandidates(tool, allProfiles, usageData)
-		candidates = make([]string, 0, len(eligible))
-		for _, name := range eligible {
-			if name == currentProfile {
-				continue
-			}
-			if near, measured := precheckNearLimit(tool, rawUsage[name], threshold, model); near || !measured {
-				continue
-			}
-			candidates = append(candidates, name)
+	eligible, _ := rotation.QuotaCandidates(tool, allProfiles, usageData)
+	candidates := make([]string, 0, len(eligible))
+	for _, name := range eligible {
+		if name == currentProfile {
+			continue
 		}
-		if len(candidates) == 0 {
-			fmt.Fprintf(os.Stderr, "caam: %s/%s is near its quota limit, but no other %s profile has measured available quota; not switching\n",
-				tool, currentProfile, tool)
-			return false
+		if near, measured := precheckNearLimit(tool, rawUsage[name], threshold, model); near || !measured {
+			continue
 		}
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintf(os.Stderr, "caam: %s/%s is near its quota limit, but no other %s profile has measured quota below the precheck threshold; not switching\n",
+			tool, currentProfile, tool)
+		return false
 	}
 
 	// Use rotation selector with usage data
@@ -654,30 +652,21 @@ func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool
 }
 
 // precheckNearLimit decides whether the account about to run is near its
-// limit. measured is false only for a Grok or Cursor row whose quota could
-// not be measured: those readers are fail-closed, so such a row is neither
-// near the limit nor known to be fine. A reported Grok/Cursor limit stage is
-// exhaustion even without a percentage. Claude and Codex keep the historical
-// percentage-only rule.
+// limit. Unmeasured quota is neither near the limit nor known to be fine.
+// A reported Grok/Cursor limit stage is exhaustion even without a percentage.
 func precheckNearLimit(tool string, u *usage.UsageInfo, threshold float64, model string) (nearLimit, measured bool) {
-	if u.IsNearLimitForModel(threshold, model) {
-		return true, true
-	}
-	if tool != "grok" && tool != "cursor" {
-		return false, true
-	}
-	if u.LimitStage != "" {
+	if u != nil && (tool == "grok" || tool == "cursor") && u.LimitStage != "" {
 		return true, true
 	}
 	if !u.NumericQuotaKnown() {
 		return false, false
 	}
-	return false, true
+	return u.IsNearLimitForModel(threshold, model), true
 }
 
-// nativeQuotaStatus names a native quota row's state for a notice without
+// precheckQuotaStatus names a quota row's state for a notice without
 // repeating provider error text, which can carry credential material.
-func nativeQuotaStatus(u *usage.UsageInfo) string {
+func precheckQuotaStatus(u *usage.UsageInfo) string {
 	if u == nil || u.QuotaStatus == "" {
 		return usage.QuotaUnavailable
 	}

@@ -105,14 +105,15 @@ recommendation and forecast consumers while retaining the detailed status.
 Drain and availability ranking both check row eligibility before considering
 headroom. Reset-based ranking still requires a future reset time.
 
-`next --usage-aware` rejects native accounts with missing, invalid, failed,
+`next --usage-aware` rejects accounts with missing, invalid, failed,
 or exhausted quota before any selection algorithm runs. This applies to a
 sole candidate and to the forced round-robin retry. When every quota read
 fails, selection fails before activation instead of falling back to an
-unmeasured account. Selection without `--usage-aware` and legacy Claude/Codex
-fallback behavior are unchanged.
+unmeasured account. The same eligibility rule applies to Claude and Codex,
+including weekly-only accounts with no applicable session limit. Selection
+without `--usage-aware` retains its existing behavior.
 
-`caam run grok|cursor --precheck` reads the active account's quota from the
+`caam run <provider> --precheck` reads the active account's quota from the
 same vault it would switch within. A reported limit stage, or a measured
 window at the threshold, counts as near the limit. The switch target must be
 another account that passes the same measured-and-unspent eligibility check
@@ -120,7 +121,8 @@ that `next --usage-aware` uses and is itself below the threshold. If no other
 account qualifies, the run proceeds on the current account with a stderr
 notice. When the current account's quota cannot be measured, the
 precheck prints a notice and does not switch. It never treats unknown quota as
-capacity.
+capacity. Grok and Cursor report restriction stages independently of numeric
+percentages; those stages also trigger the precheck.
 
 The `caam precheck` session planner still fetches live usage for Claude and
 Codex only. This integration does not replace main's Cursor login, expiry,

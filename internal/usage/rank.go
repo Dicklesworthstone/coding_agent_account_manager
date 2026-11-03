@@ -310,6 +310,15 @@ func classify(row ProfileUsage, model string, ceiling int, requireModelWindow bo
 	// Check the whole row before deriving headroom or considering credits.
 	if !u.NumericQuotaKnown() {
 		out.Reason = u.QuotaNote
+		if out.Reason == "" && u.PrimaryWindow == nil && u.SecondaryWindow == nil &&
+			u.TertiaryWindow == nil && len(u.ModelWindows) == 0 {
+			out.Reason = "the provider reported no rate limit window for this profile"
+		}
+		if out.Reason == "" && u.Source == SourceCache {
+			if gov := GoverningWindow(u, model); gov == nil || !gov.ResetsAt.After(now) {
+				out.Reason = "cached quota has no future reset time; refresh usage before selecting this account"
+			}
+		}
 		if out.Reason == "" {
 			out.Reason = "numeric quota unavailable"
 		}
@@ -407,8 +416,21 @@ func bindingUsage(u *UsageInfo, model string) (int, string, bool) {
 		if c.w == nil || c.w.Unmeasured {
 			continue
 		}
-		if !found || c.w.UsedPercent > used {
-			used = c.w.UsedPercent
+		// Legacy normalized rows can carry either numeric representation.
+		// Retain the stricter one so a fractional 1.0 is never read as 0%.
+		percent := c.w.UsedPercent
+		fractionPercent := int(c.w.Utilization * 100)
+		// Multiplication can round an exact integer boundary downward (for
+		// example 0.57*100). Compare the next boundary on the fraction scale
+		// before truncating, without rounding genuinely sub-boundary usage up.
+		if fractionPercent < 100 && c.w.Utilization >= float64(fractionPercent+1)/100 {
+			fractionPercent++
+		}
+		if fractionPercent > percent {
+			percent = fractionPercent
+		}
+		if !found || percent > used {
+			used = percent
 			name = c.name
 			found = true
 		}

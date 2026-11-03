@@ -255,6 +255,9 @@ func pluralize(n int) string {
 // fetchUsageDataForProfiles fetches real-time usage data for all profiles.
 func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotation.UsageInfo {
 	vaultDir := authfile.DefaultVaultPath()
+	if vault != nil {
+		vaultDir = vault.BasePath()
+	}
 	var credentials map[string]string
 	var err error
 	if tool == "grok" || tool == "cursor" {
@@ -263,19 +266,24 @@ func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotat
 		credentials, err = usage.LoadProfileCredentials(vaultDir, tool)
 	}
 	if err != nil || len(credentials) == 0 {
-		if tool == "grok" || tool == "cursor" {
-			// Non-nil means usage was requested but no account was measured.
-			// A nil map would silently opt out of fail-closed selection.
-			return map[string]*rotation.UsageInfo{}
+		// Non-nil means usage was requested but no account was measured.
+		// A nil map would silently opt out of quota eligibility checks.
+		return map[string]*rotation.UsageInfo{}
+	}
+	// Query only the candidates in the vault that will actually be activated.
+	// Other profiles (including recovery snapshots) cannot supply their quota.
+	selectedCredentials := make(map[string]string, len(profiles))
+	for _, name := range profiles {
+		if token := credentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+			selectedCredentials[name] = token
 		}
-		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	fetcher := usage.NewMultiProfileFetcher()
-	results := fetcher.FetchAllProfiles(ctx, tool, credentials)
+	results := fetcher.FetchAllProfiles(ctx, tool, selectedCredentials)
 
 	usageData := make(map[string]*rotation.UsageInfo)
 	for _, r := range results {
@@ -316,15 +324,6 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
-	// Apply eligibility before every algorithm, including sole candidates and
-	// runNext's forced round-robin retry. Scoring penalties alone
-	// do not stop an unknown account from being selected.
-	var err error
-	profiles, err = rotation.NativeQuotaCandidates(tool, profiles, usageData)
-	if err != nil {
-		return nil, err
-	}
-
 	primePlanTypes(tool, profiles)
 
 	algorithm := rotation.AlgorithmSmart
@@ -339,10 +338,10 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	selector.SetIgnoreCooldown(ignoreCooldown)
 	applyRotationPolicy(selector, spmCfg, "")
 
-	// Set usage data if available
-	if usageData != nil {
-		selector.SetUsageData(usageData)
-	}
+	// The selector enforces quota eligibility before every algorithm, including
+	// sole candidates and runNext's forced round-robin retry. Nil explicitly
+	// means this invocation did not request quota data.
+	selector.SetUsageData(usageData)
 
 	result, err := selector.Select(tool, profiles, currentProfile)
 	if err != nil {

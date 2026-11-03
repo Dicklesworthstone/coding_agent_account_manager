@@ -1,6 +1,7 @@
 package rotation
 
 import (
+	"encoding/json"
 	"math/rand"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,115 @@ func TestNewSelector(t *testing.T) {
 	}
 	if s.algorithm != AlgorithmSmart {
 		t.Errorf("expected algorithm %q, got %q", AlgorithmSmart, s.algorithm)
+	}
+}
+
+// Quota-aware selection must reject unsafe candidates before ranking. A lone
+// candidate, a random choice, or a forced rotation cannot turn an unsuccessful
+// read or a spent weekly/model allowance into a usable backup.
+func TestQuotaEligibilityPrecedesEveryAlgorithmAndPolicy(t *testing.T) {
+	now := time.Now()
+	soon, later := now.Add(time.Minute), now.Add(time.Hour)
+	data := map[string]*UsageInfo{
+		"nil-row":          nil,
+		"failed":           {Error: "synthetic private quota diagnostic", AvailScore: 100, ResetsAt: &soon},
+		"primary-spent":    {PrimaryPercent: 100, AvailScore: 100, ResetsAt: &soon},
+		"weekly-spent":     {SecondaryPercent: 100, AvailScore: 100, ResetsAt: &soon},
+		"scoped-spent":     {ScopedPercent: 100, ScopedLabel: "Fable", AvailScore: 100, ResetsAt: &soon},
+		"negative-primary": {PrimaryPercent: -1},
+		"negative-weekly":  {SecondaryPercent: -1},
+		"negative-scoped":  {ScopedPercent: -1},
+		"excess-primary":   {PrimaryPercent: 101},
+		"excess-weekly":    {SecondaryPercent: 101},
+		"excess-scoped":    {ScopedPercent: 101},
+		"invalid-score":    {AvailScore: 101},
+		"weekly-only":      {SecondaryPercent: 42, AvailScore: 89, ResetsAt: &later},
+	}
+	blockedNames := []string{"missing", "nil-row", "failed", "primary-spent", "weekly-spent", "scoped-spent",
+		"negative-primary", "negative-weekly", "negative-scoped", "excess-primary", "excess-weekly", "excess-scoped", "invalid-score"}
+	profiles := append(append([]string(nil), blockedNames...), "weekly-only")
+	before, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range []string{"claude", "codex", "grok", "cursor"} {
+		for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+			for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+				t.Run(provider+"/"+string(algorithm)+"/"+string(policy), func(t *testing.T) {
+					s := NewSelector(algorithm, nil, nil)
+					s.SetPolicy(policy)
+					s.SetIgnoreCooldown(true)
+					s.SetRNG(rand.New(rand.NewSource(42)))
+					s.SetUsageData(data)
+					// Strong credential/plan bonuses and the earliest reset must
+					// never promote a quota-blocked seat over a measured account.
+					healthData := map[string]*health.ProfileHealth{}
+					for _, name := range blockedNames {
+						healthData[name] = &health.ProfileHealth{TokenExpiresAt: now.Add(24 * time.Hour), PlanType: "enterprise"}
+					}
+					s.SetProfileHealth(healthData)
+					result, err := s.Select(provider, profiles, "weekly-only")
+					if err != nil || result == nil || result.Selected != "weekly-only" {
+						t.Fatalf("unsafe quota won selection: %+v, %v", result, err)
+					}
+					if len(result.Alternatives) != len(profiles) {
+						t.Fatalf("blocked profiles disappeared from diagnostics: %+v", result.Alternatives)
+					}
+					formatted := FormatResult(result)
+					if !strings.Contains(formatted, "Unavailable:") || strings.Contains(formatted, "In cooldown:") ||
+						strings.Contains(formatted, "Primary limit 0%") {
+						t.Fatalf("selection fabricated a cooldown or absent session measurement: %s", formatted)
+					}
+					for _, alt := range result.Alternatives {
+						if alt.Name == "weekly-only" {
+							continue
+						}
+						if alt.Score > -9000 || len(alt.Reasons) != 1 || alt.Reasons[0].Positive || alt.Reasons[0].Text == "" {
+							t.Fatalf("blocked account advertised as a ready backup: %+v", alt)
+						}
+						if strings.Contains(alt.Reasons[0].Text, "synthetic private quota diagnostic") {
+							t.Fatal("selection repeated provider-controlled failure text")
+						}
+						if alt.Name == "scoped-spent" && !strings.Contains(alt.Reasons[0].Text, "Fable limit 100% used") {
+							t.Fatalf("exhausted model quota lost its explanation: %+v", alt)
+						}
+					}
+					for _, name := range blockedNames {
+						if result, err := s.Select(provider, []string{name}, ""); err == nil || result != nil {
+							t.Fatalf("sole blocked profile %s was selected: %+v, %v", name, result, err)
+						}
+					}
+					if result, err := s.Select(provider, blockedNames, ""); err == nil || result != nil {
+						t.Fatalf("all-blocked pool supplied a fallback: %+v, %v", result, err)
+					}
+				})
+			}
+		}
+	}
+	after, err := json.Marshal(data)
+	if err != nil || string(before) != string(after) || profiles[0] != "missing" || profiles[len(profiles)-1] != "weekly-only" {
+		t.Fatal("quota eligibility changed caller measurements or candidate ordering")
+	}
+}
+
+func TestQuotaSelectionDistinguishesRequestedReadFromOptOut(t *testing.T) {
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			s := NewSelector(algorithm, nil, nil)
+			s.SetPolicy(policy)
+			s.SetUsageData(map[string]*UsageInfo{})
+			if result, err := s.Select("claude", []string{"only"}, ""); err == nil || result != nil {
+				t.Fatalf("%s/%s treated an empty requested read as capacity: %+v, %v", algorithm, policy, result, err)
+			}
+			s.SetUsageData(map[string]*UsageInfo{"only": {AvailScore: 100}})
+			if result, err := s.Select("claude", []string{"only"}, ""); err != nil || result == nil || result.Selected != "only" {
+				t.Fatalf("%s/%s rejected measured zero: %+v, %v", algorithm, policy, result, err)
+			}
+			s.SetUsageData(nil)
+			if result, err := s.Select("claude", []string{"offline"}, ""); err != nil || result == nil || result.Selected != "offline" {
+				t.Fatalf("%s/%s changed explicit no-quota selection: %+v, %v", algorithm, policy, result, err)
+			}
+		}
 	}
 }
 
@@ -547,8 +657,8 @@ func TestFormatResult(t *testing.T) {
 		}
 
 		output := FormatResult(result)
-		if !strings.Contains(output, "In cooldown:") {
-			t.Errorf("output missing cooldown section: %q", output)
+		if !strings.Contains(output, "Unavailable:") || !strings.Contains(output, "In cooldown (2h remaining)") {
+			t.Errorf("output missing unavailable section or actual cooldown reason: %q", output)
 		}
 		if !strings.Contains(output, "blocked") {
 			t.Errorf("output missing cooldown profile: %q", output)

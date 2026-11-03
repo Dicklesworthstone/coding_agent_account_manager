@@ -733,3 +733,48 @@ func TestRankProfiles_NormalizesTheModeItReports(t *testing.T) {
 		t.Errorf("rank = %q, want %q", res.Rank, RankAvailability)
 	}
 }
+
+func TestRank_FractionOnlyQuotaCannotBecomeIdle(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		utilization float64
+		percent     int
+		ceiling     int
+		eligible    bool
+		wantPercent int
+	}{
+		{"fraction-only exhausted", 1, 0, 100, false, 100},
+		{"fraction at default ceiling", 0.95, 0, 95, false, 95},
+		{"fraction below ceiling", 0.949, 0, 95, true, 94},
+		{"fraction at multiplication rounding boundary", 0.57, 0, 57, false, 57},
+		{"integer-only exhausted", 0, 100, 100, false, 100},
+		{"stricter integer retained", 0.5, 100, 100, false, 100},
+	} {
+		for _, scoped := range []bool{false, true} {
+			name := tc.name + "/general"
+			if scoped {
+				name = tc.name + "/model"
+			}
+			t.Run(name, func(t *testing.T) {
+				w := &UsageWindow{Utilization: tc.utilization, UsedPercent: tc.percent, ResetsAt: rankNow.Add(48 * time.Hour)}
+				row := seat("legacy-measurement", w, weekly(10, 24*time.Hour), nil)
+				model := ""
+				if scoped {
+					row.Usage.PrimaryWindow = nil
+					w.Label = "Fable"
+					row.Usage.ModelWindows = map[string]*UsageWindow{"Fable": w}
+					model = "fable"
+				}
+				if !row.Usage.NumericQuotaKnown() {
+					t.Fatal("legacy fractional/integer measurement should retain its supported contract")
+				}
+				for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+					result := rank(t, []ProfileUsage{row}, RankOptions{Mode: mode, Model: model, HeadroomCeiling: tc.ceiling})
+					if (result.Selected != nil) != tc.eligible || result.Profiles[0].UsedPercent != tc.wantPercent {
+						t.Fatalf("%s treated a fractional cap as idle or changed its boundary: %+v", mode, result.Profiles[0])
+					}
+				}
+			})
+		}
+	}
+}

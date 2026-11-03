@@ -473,6 +473,7 @@ func TestWrapperUsesSuppliedRotationPolicy(t *testing.T) {
 	soon, later := time.Now().Add(time.Hour), time.Now().Add(24*time.Hour)
 	cfg.Selector.SetUsageData(map[string]*rotation.UsageInfo{
 		"alpha": {ProfileName: "alpha", PrimaryPercent: 20, AvailScore: 80, ResetsAt: &later},
+		"beta":  {ProfileName: "beta", PrimaryPercent: 90, AvailScore: 10, ResetsAt: &later},
 		"gamma": {ProfileName: "gamma", PrimaryPercent: 80, AvailScore: 20, ResetsAt: &soon},
 	})
 	calls := 0

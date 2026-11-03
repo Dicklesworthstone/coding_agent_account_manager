@@ -7,6 +7,8 @@ package cmd
 import (
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
 
@@ -29,6 +31,35 @@ func TestModelFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := modelFromArgs(tc.args); got != tc.want {
 				t.Errorf("modelFromArgs(%q) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRotationAdapterEnforcesFractionOnlyAndWeeklyQuotas(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		info    *usage.UsageInfo
+		allowed bool
+	}{
+		{"missing general quota", &usage.UsageInfo{Provider: "claude"}, false},
+		{"weekly-only measured zero", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{}}, true},
+		{"fraction-only exhausted weekly", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{Utilization: 1}}, false},
+		{"fraction-only exhausted model", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{}, ModelWindows: map[string]*usage.UsageWindow{"fable": {Utilization: 1, Label: "Fable"}}}, false},
+		{"unmeasured session", &usage.UsageInfo{Provider: "claude", PrimaryWindow: &usage.UsageWindow{Unmeasured: true}, SecondaryWindow: &usage.UsageWindow{}}, false},
+		{"degraded partial response", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{}, QuotaStatus: usage.QuotaDegraded}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := map[string]*rotation.UsageInfo{"seat": toRotationUsageInfo("seat", tc.info, "fable")}
+			cfg := config.DefaultSPMConfig()
+			cfg.Stealth.Rotation.Algorithm = "random"
+			result, err := selectProfileWithRotationAndUsage("claude", []string{"seat"}, "", cfg, nil, data, true)
+			if tc.allowed {
+				if err != nil || result == nil || result.Selected != "seat" {
+					t.Fatalf("measured weekly-only quota was rejected: %+v, %v", result, err)
+				}
+			} else if err == nil || result != nil {
+				t.Fatalf("unusable quota became a selection: %+v, %v", result, err)
 			}
 		})
 	}

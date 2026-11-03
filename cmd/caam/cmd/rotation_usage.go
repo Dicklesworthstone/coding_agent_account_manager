@@ -29,26 +29,33 @@ func toRotationUsageInfo(name string, u *usage.UsageInfo, model string) *rotatio
 	}
 
 	// Mark incomplete measurements before converting their zero-valued fields.
-	// NativeQuotaCandidates excludes these errors before native usage-aware
-	// selection; a generic scoring penalty would not be a sufficient guard.
-	if !u.NumericQuotaKnown() && info.Error == "" {
-		if u.QuotaNote != "" {
-			info.Error = u.QuotaNote
-		} else {
-			info.Error = "numeric quota unavailable"
+	// The selector excludes these rows before every usage-aware algorithm;
+	// a scoring penalty would not be a sufficient guard.
+	if !u.NumericQuotaKnown() {
+		if info.Error == "" {
+			if u.QuotaNote != "" {
+				info.Error = u.QuotaNote
+			} else {
+				info.Error = "numeric quota unavailable"
+			}
 		}
 		info.AvailScore = 0
 		return info
 	}
 
+	// Some readers provide only the utilization fraction, others an integer
+	// percentage. Neither representation may hide an exhausted allowance.
+	percent := func(w *usage.UsageWindow) int {
+		return max(w.UsedPercent, int(w.Utilization*100))
+	}
 	if u.PrimaryWindow != nil && !u.PrimaryWindow.Unmeasured {
-		info.PrimaryPercent = u.PrimaryWindow.UsedPercent
+		info.PrimaryPercent = percent(u.PrimaryWindow)
 	}
 	if u.SecondaryWindow != nil && !u.SecondaryWindow.Unmeasured {
-		info.SecondaryPercent = u.SecondaryWindow.UsedPercent
+		info.SecondaryPercent = percent(u.SecondaryWindow)
 	}
 	if scoped := u.ScopedLimit(model); scoped != nil && !scoped.Unmeasured {
-		info.ScopedPercent = scoped.UsedPercent
+		info.ScopedPercent = percent(scoped)
 		info.ScopedLabel = scoped.Label
 	}
 	if resetsAt := u.EarliestReset(); !resetsAt.IsZero() {

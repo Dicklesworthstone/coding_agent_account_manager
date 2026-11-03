@@ -159,6 +159,7 @@ func (l claudeLimit) window(duration time.Duration) *UsageWindow {
 // unsafe for selection, while recognized windows remain available for display.
 func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error {
 	unsupported := false
+	rolled := false
 	seenSession, seenWeekly := false, false
 	for _, l := range limits {
 		if l.Percent == nil {
@@ -181,7 +182,9 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 			if !rollAt.IsZero() {
 				// Project cached candidates before choosing the binding one:
 				// a spent but expired session must not hide a live weekly cap.
-				markRolled(w, rollAt)
+				if markRolled(w, rollAt) {
+					rolled = true
+				}
 			}
 			// Several scoped limits can name the same model (a weekly and a
 			// session one); keep the one closest to its cap.
@@ -218,6 +221,11 @@ func applyLimits(info *UsageInfo, limits []claudeLimit, rollAt time.Time) error 
 	}
 	if unsupported {
 		return fmt.Errorf("Claude response included an unsupported measured quota limit")
+	}
+	if rolled {
+		// A live same-model window can win the display slot without proving
+		// the capacity of a different window whose old measurement expired.
+		return errCachedQuotaRolled
 	}
 	return nil
 }

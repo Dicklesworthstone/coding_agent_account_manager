@@ -86,7 +86,10 @@ type Result struct {
 	Explanation  string         // One-line explanation of the choice (drain policy only)
 }
 
-// UsageInfo represents real-time rate limit usage for a profile.
+// UsageInfo represents validated real-time rate limit usage for a profile.
+// An error-free row requires a measured general quota. Optional absent windows
+// may have zero percentages here; callers must mark incomplete reads with Error
+// instead of constructing an unmeasured all-zero row.
 type UsageInfo struct {
 	ProfileName      string
 	PrimaryPercent   int        // Primary window usage (0-100)
@@ -178,7 +181,10 @@ func (s *Selector) SetIgnoreCooldown(ignore bool) {
 	s.ignoreCooldown = ignore
 }
 
-// SetUsageData sets real-time usage data for consideration in smart selection.
+// SetUsageData sets the quota evidence for every selection algorithm and policy.
+// A nil map opts out of quota checks. Any non-nil map means quota was requested:
+// missing, invalid, failed, or exhausted measurements are ineligible, including
+// when every account failed or only a single candidate remains.
 func (s *Selector) SetUsageData(usage map[string]*UsageInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -227,7 +233,8 @@ func (s *Selector) healthFor(tool, name string) *health.ProfileHealth {
 }
 
 // Select chooses a profile from the given list using the configured algorithm.
-// Returns an error if no profiles are available or all are in cooldown.
+// Returns an error if no profiles have eligible credentials and, when requested,
+// measured available quota, or if all eligible profiles are in cooldown.
 func (s *Selector) Select(tool string, profiles []string, currentProfile string) (*Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,6 +279,22 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 		return nil, fmt.Errorf("no launchable profiles for %s: login required for %s; log in again and save the replacement credentials before rotating", tool, strings.Join(blockedNames, ", "))
 	}
 
+	// Quota is an eligibility condition whenever it was requested, not a
+	// scoring hint. Apply it centrally so random/round-robin choices, drain
+	// reserves, singleton rechecks, and cooldown overrides cannot bypass it.
+	if s.usageData != nil {
+		measured, err := QuotaCandidates(tool, eligible, s.usageData)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range eligible {
+			if reason := quotaIneligibilityReason(s.usageData[name]); reason != "" {
+				blocked = append(blocked, ProfileScore{Name: name, Score: -10000, Reasons: []Reason{{Text: reason}}})
+			}
+		}
+		eligible = measured
+	}
+
 	// Opt-in drain policy overrides algorithm scoring (issue #81):
 	// drain quota that resets soonest before it expires unused.
 	var result *Result
@@ -300,8 +323,9 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 // configured headroom ceiling, and have a known future reset time, it prefers
 // the profile whose quota resets SOONEST — draining included quota that would
 // otherwise expire unused. Profiles at/above the ceiling, with unknown reset
-// times, or with failed usage fetches are held in reserve, ranked by
-// availability so the fallback order stays sensible.
+// times are held in reserve, ranked by availability so the fallback order
+// stays sensible. When quota was requested, failed or exhausted measurements
+// have already been excluded by Select; reserves still have measured headroom.
 func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) {
 	now := time.Now()
 	var scores []ProfileScore
@@ -369,12 +393,6 @@ func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) 
 					Positive: false,
 				})
 			}
-		case usage != nil && usage.Error != "":
-			score.Score = -10
-			score.Reasons = append(score.Reasons, Reason{
-				Text:     "Usage data unavailable; held in reserve",
-				Positive: false,
-			})
 		default:
 			score.Score = 0
 			score.Reasons = append(score.Reasons, Reason{
@@ -670,7 +688,9 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 					})
 				} else if usage.PrimaryPercent <= 30 {
 					score.Reasons = append(score.Reasons, Reason{
-						Text:     fmt.Sprintf("Primary limit %d%% used (plenty available)", usage.PrimaryPercent),
+						// Zero can mean an absent optional session. Describe
+						// the validated quota score rather than invent a window.
+						Text:     fmt.Sprintf("Quota availability score %d/100", usage.AvailScore),
 						Positive: true,
 					})
 				} else {
@@ -698,13 +718,6 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 						Positive: false,
 					})
 				}
-			} else if usage != nil && usage.Error != "" {
-				// Fetching failed - slight penalty but don't disqualify
-				score.Score -= 10
-				score.Reasons = append(score.Reasons, Reason{
-					Text:     "Usage data unavailable",
-					Positive: false,
-				})
 			}
 		}
 
@@ -852,7 +865,7 @@ func FormatResult(r *Result) string {
 		}
 	}
 
-	// Show alternatives (excluding selected and cooldown profiles)
+	// Show eligible alternatives (excluding the selected profile).
 	var alts []ProfileScore
 	for _, ps := range r.Alternatives {
 		if ps.Name != r.Selected && ps.Score > -9000 {
@@ -882,17 +895,18 @@ func FormatResult(r *Result) string {
 		}
 	}
 
-	// Show cooldown profiles
-	var cooldowns []ProfileScore
+	// Credential, quota, and cooldown restrictions are all disqualifying. Keep
+	// their actual reasons rather than labelling every blocked row a cooldown.
+	var unavailable []ProfileScore
 	for _, ps := range r.Alternatives {
 		if ps.Score <= -9000 {
-			cooldowns = append(cooldowns, ps)
+			unavailable = append(unavailable, ps)
 		}
 	}
 
-	if len(cooldowns) > 0 {
-		sb.WriteString("\nIn cooldown:\n")
-		for _, ps := range cooldowns {
+	if len(unavailable) > 0 {
+		sb.WriteString("\nUnavailable:\n")
+		for _, ps := range unavailable {
 			sb.WriteString(fmt.Sprintf("  %s", ps.Name))
 			if len(ps.Reasons) > 0 {
 				sb.WriteString(fmt.Sprintf(" - %s", ps.Reasons[0].Text))

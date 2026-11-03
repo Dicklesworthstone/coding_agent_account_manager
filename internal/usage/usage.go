@@ -138,7 +138,8 @@ type UsageInfo struct {
 	// QuotaStatus is "ok" when a numeric utilization was derived from the
 	// provider's figures, "degraded" when the provider responded but did not
 	// include enough to compute one, and "unavailable" when the fetch failed.
-	// Empty means ok, which is what Claude and Codex rows have always been.
+	// Empty is the legacy Claude/Codex status; the windows must still contain
+	// usable measurements before the row can be used for selection.
 	QuotaStatus string `json:"quota_status,omitempty"`
 
 	// QuotaNote explains a degraded or unavailable read. It is not a percentage.
@@ -198,35 +199,40 @@ type GrantSnapshot struct {
 }
 
 // NumericQuotaKnown reports whether the row is safe to use for routing.
-// Preserve the legacy empty-status contract for Claude/Codex, but native
-// sources must explicitly report valid measurements, not just an "ok" label.
+// Claude/Codex may omit the status or an inapplicable general window. They
+// still need at least one measured general quota, and every present window
+// must be usable. Native sources retain their explicit status/primary-window
+// requirement. A projected cache rollover is not a fresh measurement.
 func (u *UsageInfo) NumericQuotaKnown() bool {
-	if u == nil || u.Error != "" {
+	if u == nil || u.Error != "" || u.LimitStage != "" {
 		return false
 	}
+	legacy := u.Provider == "" || u.Provider == "claude" || u.Provider == "codex"
 	switch u.QuotaStatus {
 	case "":
-		return u.Provider != "cursor" && u.Provider != "grok"
+		if !legacy {
+			return false
+		}
 	case QuotaOK:
-		if u.PrimaryWindow == nil || u.LimitStage != "" {
-			return false
-		}
-		valid := func(w *UsageWindow) bool {
-			return w == nil || (!w.Unmeasured && !math.IsNaN(w.Utilization) && !math.IsInf(w.Utilization, 0) &&
-				w.Utilization >= 0 && w.Utilization <= 1 && w.UsedPercent >= 0 && w.UsedPercent <= 100)
-		}
-		if !valid(u.PrimaryWindow) || !valid(u.SecondaryWindow) || !valid(u.TertiaryWindow) {
-			return false
-		}
-		for _, w := range u.ModelWindows {
-			if !valid(w) {
-				return false
-			}
-		}
-		return true
 	default:
 		return false
 	}
+	if u.PrimaryWindow == nil && (!legacy || u.SecondaryWindow == nil) {
+		return false
+	}
+	valid := func(w *UsageWindow) bool {
+		return w == nil || (!w.Unmeasured && !w.Rolled && !math.IsNaN(w.Utilization) && !math.IsInf(w.Utilization, 0) &&
+			w.Utilization >= 0 && w.Utilization <= 1 && w.UsedPercent >= 0 && w.UsedPercent <= 100)
+	}
+	if !valid(u.PrimaryWindow) || !valid(u.SecondaryWindow) || !valid(u.TertiaryWindow) {
+		return false
+	}
+	for _, w := range u.ModelWindows {
+		if !valid(w) {
+			return false
+		}
+	}
+	return true
 }
 
 // CreditInfo contains credit/balance information (primarily for Codex).

@@ -263,6 +263,7 @@ func TestNativeQuotaRequiresMeasuredWindow(t *testing.T) {
 			{Provider: provider, QuotaStatus: QuotaOK, PrimaryWindow: &UsageWindow{Utilization: math.Inf(1)}},
 			{Provider: provider, QuotaStatus: QuotaOK, PrimaryWindow: &UsageWindow{UsedPercent: -1}},
 			{Provider: provider, QuotaStatus: QuotaOK, PrimaryWindow: &UsageWindow{}, SecondaryWindow: &UsageWindow{Unmeasured: true}},
+			{Provider: provider, QuotaStatus: QuotaOK, SecondaryWindow: &UsageWindow{}},
 		} {
 			if row.NumericQuotaKnown() || row.AvailabilityScore() != 0 {
 				t.Errorf("unmeasured row ranked as capacity: %+v", row)
@@ -277,6 +278,106 @@ func TestNativeQuotaRequiresMeasuredWindow(t *testing.T) {
 		row := &UsageInfo{Provider: provider, PrimaryWindow: &UsageWindow{UsedPercent: 25}}
 		if !row.NumericQuotaKnown() {
 			t.Errorf("legacy %s quota changed", provider)
+		}
+	}
+}
+
+func TestSubscriptionQuotaRequiresMeasuredGeneralWindow(t *testing.T) {
+	for _, provider := range []string{"", "claude", "codex"} {
+		for _, status := range []string{"", QuotaOK} {
+			for _, tc := range []struct {
+				name string
+				info UsageInfo
+			}{
+				{"absent windows", UsageInfo{}},
+				{"credits alone", UsageInfo{Credits: &CreditInfo{HasCredits: true, Unlimited: true}}},
+				{"premium alone", UsageInfo{TertiaryWindow: &UsageWindow{UsedPercent: 10}}},
+				{"model alone", UsageInfo{ModelWindows: map[string]*UsageWindow{"Fable": {UsedPercent: 10}}}},
+				{"fetch error", UsageInfo{Error: "quota request failed", PrimaryWindow: &UsageWindow{}}},
+				{"provider restriction", UsageInfo{LimitStage: "HARD_LIMIT", PrimaryWindow: &UsageWindow{}}},
+			} {
+				t.Run(provider+"/"+status+"/"+tc.name, func(t *testing.T) {
+					info := tc.info
+					info.Provider, info.QuotaStatus = provider, status
+					if info.NumericQuotaKnown() || info.AvailabilityScore() != 0 {
+						t.Fatalf("incomplete subscription quota became capacity: %+v", info)
+					}
+				})
+			}
+			for _, tc := range []struct {
+				name string
+				info UsageInfo
+			}{
+				{"measured zero", UsageInfo{PrimaryWindow: &UsageWindow{}}},
+				{"percent only", UsageInfo{PrimaryWindow: &UsageWindow{UsedPercent: 25}}},
+				{"fraction only", UsageInfo{PrimaryWindow: &UsageWindow{Utilization: 0.254}}},
+				{"weekly only", UsageInfo{SecondaryWindow: &UsageWindow{Utilization: 0.254, UsedPercent: 25}}},
+				{"weekly measured zero", UsageInfo{SecondaryWindow: &UsageWindow{}}},
+				{"optional model absent", UsageInfo{SecondaryWindow: &UsageWindow{}, ModelWindows: map[string]*UsageWindow{"Fable": nil}}},
+			} {
+				t.Run(provider+"/"+status+"/"+tc.name, func(t *testing.T) {
+					info := tc.info
+					info.Provider, info.QuotaStatus = provider, status
+					if !info.NumericQuotaKnown() || info.AvailabilityScore() == 0 {
+						t.Fatalf("valid subscription measurement was rejected: %+v", info)
+					}
+				})
+			}
+		}
+		for _, status := range []string{QuotaDegraded, QuotaUnavailable, "future-status"} {
+			info := &UsageInfo{Provider: provider, QuotaStatus: status, PrimaryWindow: &UsageWindow{}}
+			if info.NumericQuotaKnown() || info.AvailabilityScore() != 0 {
+				t.Errorf("%s/%s treated status as permission to select: %+v", provider, status, info)
+			}
+		}
+	}
+}
+
+func TestQuotaValidityChecksEveryPresentWindow(t *testing.T) {
+	for _, provider := range []string{"", "claude", "codex", "cursor", "grok"} {
+		statuses := []string{QuotaOK}
+		if provider == "" || provider == "claude" || provider == "codex" {
+			statuses = append(statuses, "")
+		}
+		for _, status := range statuses {
+			for _, tc := range []struct {
+				name   string
+				window UsageWindow
+			}{
+				{"unmeasured", UsageWindow{Unmeasured: true}},
+				{"projected rollover", UsageWindow{Rolled: true}},
+				{"NaN", UsageWindow{Utilization: math.NaN()}},
+				{"positive infinity", UsageWindow{Utilization: math.Inf(1)}},
+				{"negative infinity", UsageWindow{Utilization: math.Inf(-1)}},
+				{"negative fraction", UsageWindow{Utilization: -0.1}},
+				{"fraction over cap", UsageWindow{Utilization: 1.01}},
+				{"negative percent", UsageWindow{UsedPercent: -1}},
+				{"percent over cap", UsageWindow{UsedPercent: 101}},
+			} {
+				for _, slot := range []string{"primary", "secondary", "premium", "model"} {
+					t.Run(provider+"/"+status+"/"+slot+"/"+tc.name, func(t *testing.T) {
+						info := &UsageInfo{
+							Provider: provider, QuotaStatus: status,
+							PrimaryWindow: &UsageWindow{}, SecondaryWindow: &UsageWindow{},
+							Credits: &CreditInfo{HasCredits: true, Unlimited: true},
+						}
+						window := tc.window
+						switch slot {
+						case "primary":
+							info.PrimaryWindow = &window
+						case "secondary":
+							info.SecondaryWindow = &window
+						case "premium":
+							info.TertiaryWindow = &window
+						case "model":
+							info.ModelWindows = map[string]*UsageWindow{"Fable": &window}
+						}
+						if info.NumericQuotaKnown() || info.AvailabilityScore() != 0 {
+							t.Fatalf("invalid %s quota became capacity: %+v", slot, info)
+						}
+					})
+				}
+			}
 		}
 	}
 }

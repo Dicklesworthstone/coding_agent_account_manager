@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,8 +83,8 @@ func TestParseCachedClaudeUsageMarksRolledWindows(t *testing.T) {
 	    {"kind":"session","group":"session","percent":88,"resets_at":"2020-01-01T00:00:00Z"},
 	    {"kind":"weekly_all","group":"weekly","percent":40,"resets_at":"2099-01-01T00:00:00Z"}]}}}`
 	info, err := ParseCachedClaudeUsage([]byte(body), time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC))
-	if err != nil {
-		t.Fatalf("ParseCachedClaudeUsage: %v", err)
+	if !errors.Is(err, errCachedQuotaRolled) || info == nil {
+		t.Fatalf("rolled cache should retain diagnostics and require refresh: info=%+v err=%v", info, err)
 	}
 	if info.PrimaryWindow == nil || !info.PrimaryWindow.Rolled {
 		t.Fatalf("PrimaryWindow = %+v, want Rolled", info.PrimaryWindow)
@@ -97,6 +98,7 @@ func TestParseCachedClaudeUsageMarksRolledWindows(t *testing.T) {
 	if info.SecondaryWindow.UsedPercent != 40 {
 		t.Errorf("live window = %d%%, want 40", info.SecondaryWindow.UsedPercent)
 	}
+	assertClaudeQuotaNotRoutable(t, info)
 }
 
 // TestParseCachedClaudeUsageNoSnapshot: absent, empty and legacy files are all
@@ -247,10 +249,11 @@ func TestCachedClaudeUsageCompatibilityWeeklyOnlyRollover(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
-			if err != nil || info == nil {
-				t.Fatalf("valid cached snapshot failed: info=%+v err=%v", info, err)
+			if !errors.Is(err, errCachedQuotaRolled) || info == nil {
+				t.Fatalf("rolled cache should retain diagnostics and require refresh: info=%+v err=%v", info, err)
 			}
 			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeQuotaNotRoutable(t, info)
 			if info.PrimaryWindow != nil || info.SecondaryWindow == nil || !info.SecondaryWindow.Rolled || info.SecondaryWindow.UsedPercent != 0 || info.SecondaryWindow.Utilization != 0 {
 				t.Fatalf("optional session changed rollover provenance: %+v", info)
 			}
@@ -278,9 +281,11 @@ func TestCachedClaudeUsageCompatibilityRolledModelDoesNotHideLiveCap(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			body := claudeCompatibilityBody(claudeCompatibilityWeekly, tc.limits...)
 			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), now)
-			if err != nil {
-				t.Fatalf("cached model windows failed: %v", err)
+			if !errors.Is(err, errCachedQuotaRolled) || info == nil {
+				t.Fatalf("discarded rolled model constraint must require refresh: info=%+v err=%v", info, err)
 			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeQuotaNotRoutable(t, info)
 			w := info.WindowForModel("fable")
 			if w == nil || w.UsedPercent != 80 || w.Utilization != 0.8 || w.Rolled || w.WindowDuration != 7*24*time.Hour || !w.ResetsAt.After(now) {
 				t.Fatalf("expired model session hid the surviving weekly cap: %+v", w)
@@ -288,12 +293,14 @@ func TestCachedClaudeUsageCompatibilityRolledModelDoesNotHideLiveCap(t *testing.
 			if !info.IsNearLimitForModel(0.8, "fable") || info.IsNearLimitForModel(0.81, "fable") || info.IsNearLimitForModel(0.8, "sonnet") {
 				t.Fatal("cached weekly model cap changed threshold eligibility")
 			}
-			for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
-				result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "cached-model", Usage: info}}, RankOptions{
-					Mode: mode, Model: "fable", HeadroomCeiling: 80, Now: now,
-				})
-				if result.Selected != nil {
-					t.Fatalf("%s selected a model at its headroom ceiling after session rollover: %+v", mode, result)
+			for _, ceiling := range []int{80, 95, 100} {
+				for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+					result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "cached-model", Usage: info}}, RankOptions{
+						Mode: mode, Model: "fable", HeadroomCeiling: ceiling, Now: now,
+					})
+					if result.Selected != nil {
+						t.Fatalf("%s selected unmeasured model capacity after session rollover at ceiling %d: %+v", mode, ceiling, result)
+					}
 				}
 			}
 
@@ -306,5 +313,67 @@ func TestCachedClaudeUsageCompatibilityRolledModelDoesNotHideLiveCap(t *testing.
 				t.Fatalf("live response was prematurely rolled forward: %+v", w)
 			}
 		})
+	}
+}
+
+func TestCachedClaudeUsageRolledConstraintsRequireRefresh(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []claudeDocumentCase{
+		{"session with live weekly", claudeCompatibilityBody(`"five_hour":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"},` + claudeCompatibilityWeekly)},
+		{"zero session at reset boundary", claudeCompatibilityBody(`"five_hour":{"utilization":0,"resets_at":"2026-11-03T12:00:00Z"},` + claudeCompatibilityWeekly)},
+		{"session limit with live weekly", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"session","percent":100,"resets_at":"2026-11-03T11:00:00Z"}`)},
+		{"weekly with live session", `{"five_hour":{"utilization":0,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"}}`},
+		{"legacy premium with live weekly", claudeCompatibilityBody(`"opus":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"},` + claudeCompatibilityWeekly)},
+		{"premium alias with live weekly", claudeCompatibilityBody(`"seven_day_opus":{"utilization":100,"resets_at":"2026-11-03T11:00:00Z"},` + claudeCompatibilityWeekly)},
+		{"model with live weekly", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"weekly_scoped","percent":100,"resets_at":"2026-11-03T11:00:00Z","scope":{"model":{"display_name":"Fable"}}}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(tc.body), now)
+			if !errors.Is(err, errCachedQuotaRolled) || info == nil || info.QuotaStatus != QuotaDegraded || info.Error == "" || info.QuotaNote == "" {
+				t.Fatalf("expired quota was treated as a fresh measurement: info=%+v err=%v", info, err)
+			}
+			assertCachedClaudeCompatibilityMetadata(t, info)
+			assertClaudeQuotaNotRoutable(t, info)
+			var rolled bool
+			windows := []*UsageWindow{info.PrimaryWindow, info.SecondaryWindow, info.TertiaryWindow}
+			for _, w := range info.ModelWindows {
+				windows = append(windows, w)
+			}
+			for _, w := range windows {
+				if w != nil && w.Rolled {
+					rolled = true
+					if w.UsedPercent != 0 || w.Utilization != 0 || w.ResetsAt.IsZero() {
+						t.Fatalf("diagnostic rolled window changed its display representation: %+v", w)
+					}
+				}
+			}
+			if !rolled {
+				t.Fatal("expired diagnostic window disappeared")
+			}
+		})
+	}
+
+	// A new provider read can legitimately remove the session window entirely.
+	// Cache degradation must not be sticky or turn its absence into a required
+	// restriction after the provider supplies fresh weekly-only quota.
+	freshBody := `{"five_hour":null,` + claudeCompatibilityWeekly + `}`
+	live := fetchFixture(t, freshBody)
+	if live.Source != SourceAPI || live.Error != "" || live.QuotaNote != "" {
+		t.Fatalf("new provider read retained stale cache diagnostics: %+v", live)
+	}
+	assertClaudeWeeklyOnlyCompatibility(t, live, 25)
+
+	// A null measurement is explicitly inapplicable, even if the provider
+	// retains an old reset timestamp alongside it. It must not trigger this
+	// stale-measurement guard.
+	for _, body := range []string{
+		claudeCompatibilityBody(`"five_hour":{"utilization":null,"resets_at":"2026-11-03T11:00:00Z"},` + claudeCompatibilityWeekly),
+		claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"session","percent":null,"resets_at":"2026-11-03T11:00:00Z"}`),
+	} {
+		info, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), now)
+		if err != nil {
+			t.Fatalf("inapplicable session was mistaken for a stale measurement: %v", err)
+		}
+		assertClaudeWeeklyOnlyCompatibility(t, info, 25)
 	}
 }

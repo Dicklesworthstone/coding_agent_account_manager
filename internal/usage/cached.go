@@ -47,6 +47,11 @@ const (
 // "no cached data", never as 0% used.
 var ErrNoCachedUsage = errors.New("no cached usage data")
 
+// A projected reset is useful for display but does not measure any usage in
+// the new window. A live weekly allowance cannot establish that a previously
+// reported session or model allowance has spare capacity after its reset.
+var errCachedQuotaRolled = errors.New("cached usage crossed a quota reset; refresh usage before selecting this account")
+
 // cachedUsageFile is the slice of a .claude.json this package reads.
 type cachedUsageFile struct {
 	Cached *cachedUsageBlock `json:"cachedUsageUtilization"`
@@ -84,8 +89,9 @@ func ReadCachedClaudeUsage(path string, now time.Time) (*UsageInfo, error) {
 //
 // Malformed JSON is an error. A well-formed file with no snapshot yields
 // ErrNoCachedUsage so the caller can say "no cached data" instead of "0%".
-// An incomplete or unsupported quota returns both diagnostic UsageInfo and an
-// error; callers should retain its measurements and original cache timestamp.
+// An incomplete, unsupported, or rolled quota returns diagnostic UsageInfo
+// and an error; callers should retain the windows and original cache timestamp
+// for display, then refresh usage before selecting the account for new work.
 func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 	var file cachedUsageFile
 	if err := json.Unmarshal(data, &file); err != nil {
@@ -113,25 +119,40 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 	// snapshot can retain diagnostic windows without becoming spare capacity.
 	quotaErr := quota.apply(info, now)
 
+	rolled := false
 	for _, w := range []*UsageWindow{info.PrimaryWindow, info.SecondaryWindow, info.TertiaryWindow} {
-		markRolled(w, now)
+		if markRolled(w, now) {
+			rolled = true
+		}
 	}
 	for _, w := range info.ModelWindows {
-		markRolled(w, now)
+		if markRolled(w, now) {
+			rolled = true
+		}
+	}
+	if rolled && quotaErr == nil {
+		// Keep the recorded windows, their projected resets, and the cache's
+		// own timestamp for diagnostics. Selecting new work needs a fresh
+		// measurement of every restriction, not this synthetic zero.
+		quotaErr = errCachedQuotaRolled
+		info.QuotaStatus = QuotaDegraded
+		info.Error, info.QuotaNote = quotaErr.Error(), quotaErr.Error()
 	}
 
 	return info, quotaErr
 }
 
 // markRolled zeroes a window whose reset time has already passed, recording
-// that it did so.
-func markRolled(w *UsageWindow, now time.Time) {
+// that it did so. The result also marks the snapshot unsafe for selection,
+// including when another same-model window later replaces this candidate.
+func markRolled(w *UsageWindow, now time.Time) bool {
 	if w == nil || w.ResetsAt.IsZero() || w.ResetsAt.After(now) {
-		return
+		return false
 	}
 	w.Rolled = true
 	w.Utilization = 0
 	w.UsedPercent = 0
+	return true
 }
 
 // CacheAge reports how stale a cached snapshot is. It returns false when the

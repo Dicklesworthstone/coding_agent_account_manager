@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -38,6 +39,56 @@ func TestNativeRankingAcceptsMeasuredZeroAndRejectsLimitStage(t *testing.T) {
 			}, RankOptions{Mode: mode, Now: now})
 			if result.Selected == nil || result.Selected.Profile != "known" || result.Profiles[1].Eligible {
 				t.Errorf("%s/%s ranking = %+v", provider, mode, result)
+			}
+		}
+	}
+}
+
+func TestSubscriptionRankingRequiresUsableGeneralQuota(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, provider := range []string{"claude", "codex"} {
+		for _, status := range []string{"", QuotaOK} {
+			for _, mode := range RankModes {
+				t.Run(provider+"/"+status+"/"+string(mode), func(t *testing.T) {
+					future := now.Add(24 * time.Hour)
+					unknown := []*UsageInfo{
+						{},
+						{PrimaryWindow: &UsageWindow{Unmeasured: true, ResetsAt: future}},
+						{PrimaryWindow: &UsageWindow{Utilization: math.NaN(), ResetsAt: future}},
+						{PrimaryWindow: &UsageWindow{UsedPercent: -1, ResetsAt: future}},
+						{PrimaryWindow: &UsageWindow{Rolled: true}, SecondaryWindow: &UsageWindow{UsedPercent: 10, ResetsAt: future}},
+						{ModelWindows: map[string]*UsageWindow{"Fable": {UsedPercent: 10, ResetsAt: future}}},
+						{LimitStage: "HARD_LIMIT", PrimaryWindow: &UsageWindow{ResetsAt: future}},
+					}
+					rows := make([]ProfileUsage, 0, len(unknown)+1)
+					for i, info := range unknown {
+						info.Provider, info.QuotaStatus = provider, status
+						info.Credits = &CreditInfo{HasCredits: true, Unlimited: true}
+						rows = append(rows, ProfileUsage{Provider: provider, ProfileName: string(rune('a' + i)), Usage: info})
+					}
+					assertUnknown := func(result *RankResult) {
+						t.Helper()
+						for _, row := range result.Profiles {
+							if row.Profile != "weekly" && (row.Eligible || row.AvailabilityScore != 0) {
+								t.Fatalf("unknown quota entered ranking: %+v", row)
+							}
+						}
+					}
+					result := RankProfiles(rows, RankOptions{Mode: mode, Now: now})
+					if result.Selected != nil || result.Error == "" {
+						t.Fatalf("ranking selected an account without usable general quota: %+v", result)
+					}
+					assertUnknown(result)
+					rows = append(rows, ProfileUsage{Provider: provider, ProfileName: "weekly", Usage: &UsageInfo{
+						Provider: provider, QuotaStatus: status,
+						SecondaryWindow: &UsageWindow{UsedPercent: 10, ResetsAt: future},
+					}})
+					result = RankProfiles(rows, RankOptions{Mode: mode, Now: now})
+					if result.Selected == nil || result.Selected.Profile != "weekly" {
+						t.Fatalf("ranking rejected valid weekly-only quota: %+v", result)
+					}
+					assertUnknown(result)
+				})
 			}
 		}
 	}

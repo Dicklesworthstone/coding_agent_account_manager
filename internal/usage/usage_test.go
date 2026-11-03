@@ -32,9 +32,9 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 			expected: 0,
 		},
 		{
-			name:     "empty info returns 100",
+			name:     "empty info has no measured capacity",
 			info:     &UsageInfo{},
-			expected: 100,
+			expected: 0,
 		},
 		{
 			name: "primary 50% used",
@@ -79,7 +79,8 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 		{
 			name: "unlimited credits don't penalize",
 			info: &UsageInfo{
-				Credits: &CreditInfo{HasCredits: false, Unlimited: true},
+				PrimaryWindow: &UsageWindow{},
+				Credits:       &CreditInfo{HasCredits: false, Unlimited: true},
 			},
 			expected: 100,
 		},
@@ -717,7 +718,8 @@ func TestUsageInfo_WindowForModel(t *testing.T) {
 func TestCreditInfo(t *testing.T) {
 	t.Run("has credits", func(t *testing.T) {
 		info := &UsageInfo{
-			Credits: &CreditInfo{HasCredits: true},
+			PrimaryWindow: &UsageWindow{},
+			Credits:       &CreditInfo{HasCredits: true},
 		}
 		// Should not penalize score
 		score := info.AvailabilityScore()
@@ -728,7 +730,8 @@ func TestCreditInfo(t *testing.T) {
 
 	t.Run("no credits penalizes", func(t *testing.T) {
 		info := &UsageInfo{
-			Credits: &CreditInfo{HasCredits: false, Unlimited: false},
+			PrimaryWindow: &UsageWindow{},
+			Credits:       &CreditInfo{HasCredits: false, Unlimited: false},
 		}
 		score := info.AvailabilityScore()
 		if score != 90 {

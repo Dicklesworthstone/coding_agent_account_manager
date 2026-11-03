@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -84,6 +85,109 @@ func TestPrecheckUsesActualVaultAndRejectionStore(t *testing.T) {
 	c.SetErr(&output)
 	if err := runPrecheckCmd(c, []string{"cursor"}); err == nil || !strings.Contains(err.Error(), "login required") {
 		t.Fatalf("planner ignored selected-vault rejection metadata: %v, output=%s", err, output.String())
+	}
+}
+
+func TestPrecheckRequestedQuotaDoesNotFallBackToUnmeasured(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, provider, map[string]string{"unreadable": ""})
+			for _, noFetch := range []bool{false, true} {
+				c := &cobra.Command{}
+				c.Flags().String("format", "json", "")
+				c.Flags().Bool("no-fetch", noFetch, "")
+				c.Flags().Duration("timeout", time.Second, "")
+				c.Flags().String("algorithm", "random", "")
+				c.Flags().String("policy", "drain", "")
+				c.Flags().String("model", "", "")
+				var output bytes.Buffer
+				c.SetOut(&output)
+				c.SetErr(&output)
+				err := runPrecheckCmd(c, []string{provider})
+				if noFetch {
+					if err != nil {
+						t.Fatalf("explicit no-fetch selection changed: %v", err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "measured available quota") {
+					t.Fatalf("failed requested read recommended unknown capacity: %v, output=%s", err, output.String())
+				}
+			}
+		})
+	}
+}
+
+func TestPrecheckOnlyCountsQuotaEligibleProfilesAsReady(t *testing.T) {
+	setupSubscriptionQuotaProfiles(t, "claude", map[string]string{
+		"weekly-only": `{"five_hour":{"utilization":null},"seven_day":{"utilization":20}}`,
+		"spent":       subscriptionQuotaResponse("claude", 100), "unreadable": "",
+	})
+	c := &cobra.Command{}
+	c.Flags().String("format", "json", "")
+	c.Flags().Bool("no-fetch", false, "")
+	c.Flags().Duration("timeout", time.Second, "")
+	c.Flags().String("algorithm", "round_robin", "")
+	c.Flags().String("policy", "availability", "")
+	c.Flags().String("model", "", "")
+	var output bytes.Buffer
+	c.SetOut(&output)
+	c.SetErr(&output)
+	if err := runPrecheckCmd(c, []string{"claude"}); err != nil {
+		t.Fatal(err)
+	}
+	var result PrecheckResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatalf("invalid planner JSON: %v, %s", err, output.String())
+	}
+	if result.Recommended == nil || result.Recommended.Name != "weekly-only" || len(result.Backups) != 0 || result.Summary.ReadyProfiles != 1 {
+		t.Fatalf("planner advertised blocked quotas as ready: %+v", result)
+	}
+	if result.Recommended.UsagePercent != 20 {
+		t.Fatalf("absent session hid measured weekly usage: %+v", result.Recommended)
+	}
+}
+
+func TestPrecheckCooldownDoesNotReviveUnusableQuota(t *testing.T) {
+	setupSubscriptionQuotaProfiles(t, "claude", map[string]string{
+		"cooled": subscriptionQuotaResponse("claude", 20),
+		"spent":  subscriptionQuotaResponse("claude", 100), "unreadable": "",
+	})
+	db, err := caamdb.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cooldownErr := db.SetCooldown("claude", "cooled", time.Now(), time.Hour, "synthetic rate limit")
+	closeErr := db.Close()
+	if cooldownErr != nil || closeErr != nil {
+		t.Fatalf("could not establish cooldown: %v, %v", cooldownErr, closeErr)
+	}
+	c := &cobra.Command{}
+	c.Flags().String("format", "json", "")
+	c.Flags().Bool("no-fetch", false, "")
+	c.Flags().Duration("timeout", time.Second, "")
+	c.Flags().String("algorithm", "random", "")
+	c.Flags().String("policy", "drain", "")
+	c.Flags().String("model", "", "")
+	var output bytes.Buffer
+	c.SetOut(&output)
+	c.SetErr(&output)
+	if err := runPrecheckCmd(c, []string{"claude"}); err != nil {
+		t.Fatal(err)
+	}
+	var result PrecheckResult
+	if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+		t.Fatalf("invalid planner JSON: %v, %s", err, output.String())
+	}
+	if result.Recommended != nil || len(result.Backups) != 0 || result.Summary.ReadyProfiles != 0 || result.Summary.CooldownCount != 1 {
+		t.Fatalf("nil selection revived an exhausted or unmeasured backup: %+v", result)
+	}
+	quotaAlerts := 0
+	for _, alert := range result.Alerts {
+		if alert.Type == "quota_unavailable" {
+			quotaAlerts++
+		}
+	}
+	if quotaAlerts != 2 {
+		t.Fatalf("unusable backups lack quota explanations: %+v", result.Alerts)
 	}
 }
 

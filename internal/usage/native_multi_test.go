@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -401,8 +402,8 @@ func TestCachedSubscriptionQuotaCannotInventZero(t *testing.T) {
 	}
 	data := []byte(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":"seat","utilization":{"limits":[{"kind":"session","percent":0,"resets_at":"2099-01-01T00:00:00Z"},{"kind":"weekly_all","percent":100,"resets_at":"2020-01-01T00:00:00Z"}]}}}`)
 	info, err := ParseCachedClaudeUsage(data, now)
-	if err != nil || !info.NumericQuotaKnown() || info.PrimaryWindow.UsedPercent != 0 || info.PrimaryWindow.Rolled || !info.SecondaryWindow.Rolled || info.SecondaryWindow.UsedPercent != 0 {
-		t.Fatalf("valid cached zero or recorded rollover changed: %+v %v", info, err)
+	if !errors.Is(err, errCachedQuotaRolled) || info == nil || info.NumericQuotaKnown() || info.QuotaStatus != QuotaDegraded || info.PrimaryWindow == nil || info.SecondaryWindow == nil || info.PrimaryWindow.UsedPercent != 0 || info.PrimaryWindow.Rolled || !info.SecondaryWindow.Rolled || info.SecondaryWindow.UsedPercent != 0 {
+		t.Fatalf("cached zero or recorded rollover lost its selection guard: %+v %v", info, err)
 	}
 	if info.Source != SourceCache || info.AccountID != "seat" || info.FetchedAt.IsZero() {
 		t.Fatal("cache identity, timestamp or provenance changed")

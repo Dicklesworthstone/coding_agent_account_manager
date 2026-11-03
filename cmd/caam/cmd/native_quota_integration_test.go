@@ -198,7 +198,7 @@ func TestNativeQuotaAdapterPreservesMeasuredZero(t *testing.T) {
 	for _, provider := range []string{"cursor", "grok"} {
 		known := &usage.UsageInfo{Provider: provider, QuotaStatus: usage.QuotaOK, PrimaryWindow: &usage.UsageWindow{}}
 		data := map[string]*rotation.UsageInfo{"known": toRotationUsageInfo("known", known, "")}
-		got, err := rotation.NativeQuotaCandidates(provider, []string{"missing", "known"}, data)
+		got, err := rotation.QuotaCandidates(provider, []string{"missing", "known"}, data)
 		if err != nil || !reflect.DeepEqual(got, []string{"known"}) {
 			t.Errorf("measured zero was rejected: %v, %v", got, err)
 		}

@@ -220,15 +220,23 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	var usageMap map[string]*usage.UsageInfo
 
 	if !noFetch && (provider == "claude" || provider == "codex") {
+		// Keep a failed requested read distinct from --no-fetch. An empty map
+		// must not disable quota checks and recommend an unmeasured account.
+		usageMap = make(map[string]*usage.UsageInfo)
 		credentials, err := usage.LoadProfileCredentials(vaultInst.BasePath(), provider)
 		if err == nil && len(credentials) > 0 {
+			selectedCredentials := make(map[string]string, len(userProfiles))
+			for _, name := range userProfiles {
+				if token := credentials[name]; token != "" {
+					selectedCredentials[name] = token
+				}
+			}
 			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
 			fetcher := usage.NewMultiProfileFetcher()
-			usageResults = fetcher.FetchAllProfiles(fetchCtx, provider, credentials)
+			usageResults = fetcher.FetchAllProfiles(fetchCtx, provider, selectedCredentials)
 
-			usageMap = make(map[string]*usage.UsageInfo)
 			for _, r := range usageResults {
 				if r.Usage != nil {
 					usageMap[r.ProfileName] = r.Usage
@@ -247,8 +255,8 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	selector.SetVaultPath(vaultInst.BasePath())
 	applyRotationPolicy(selector, spmCfg, policyOverride)
 
-	// Set usage data for smart selection
-	if len(usageMap) > 0 {
+	// A requested quota read constrains every selection algorithm.
+	if usageMap != nil {
 		rotationUsage := make(map[string]*rotation.UsageInfo)
 		for name, info := range usageMap {
 			rotationUsage[name] = toRotationUsageInfo(name, info, model)
@@ -338,8 +346,12 @@ func buildPrecheckResult(
 						})
 					}
 				}
-				if info.PrimaryWindow != nil {
-					rec.UsagePercent = info.PrimaryWindow.UsedPercent
+				general := info.PrimaryWindow
+				if general == nil {
+					general = info.SecondaryWindow
+				}
+				if general != nil && !general.Unmeasured && !general.Rolled {
+					rec.UsagePercent = max(general.UsedPercent, int(general.Utilization*100))
 					totalUsage += rec.UsagePercent
 					usageCount++
 				}
@@ -401,6 +413,21 @@ func buildPrecheckResult(
 					summary.CooldownCount++
 					continue // Don't add to backups
 				}
+			}
+		}
+
+		// Selection can be nil when every usable account is in cooldown. Check
+		// quota independently so a failed or spent account cannot then acquire
+		// the default zero score and be advertised as a ready backup.
+		if usageMap != nil {
+			data := map[string]*rotation.UsageInfo{profileName: toRotationUsageInfo(profileName, usageMap[profileName], model)}
+			if _, err := rotation.QuotaCandidates(provider, []string{profileName}, data); err != nil {
+				result.Alerts = append(result.Alerts, PrecheckAlert{
+					Type: "quota_unavailable", Profile: profileName, Urgency: "high",
+					Message: "No measured available quota",
+					Action:  "refresh usage data or choose a profile with available quota",
+				})
+				continue
 			}
 		}
 
