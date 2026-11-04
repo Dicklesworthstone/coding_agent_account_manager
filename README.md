@@ -2414,20 +2414,78 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 The same public key is embedded in the `caam` binary itself, so `caam update`
 performs this verification in pure Go — fail-closed, with no external tools
-required for releases v0.1.18 and later. The shell installer requires the
-`minisign` command for these releases, including in CI and noninteractive
-sessions. Install it with `brew install minisign` on macOS or
-`sudo apt install minisign` on Debian/Ubuntu. Missing verification tools stop
-installation; setting `CI` or `NONINTERACTIVE` never disables verification.
+required for releases v0.1.18 and later. The shell installer uses an existing
+`minisign` command when available. On Linux x86-64 and ARM64, if it is missing,
+the installer downloads a temporary copy of upstream Minisign 0.12. It checks
+the archive against a SHA-256 pinned in `install.sh` **before extracting or
+executing it**, then uses that verifier with CAAM's public key above. No sudo,
+package-manager changes, or permanent Minisign installation are needed.
+
+This acquisition path works on **Ubuntu 22.04**, which has no `minisign` apt
+package, and on minimal newer Ubuntu and Debian installations. If you prefer
+a system package, Ubuntu 24.04+ provides `minisign` in `universe` and Debian
+12+ provides it through `sudo apt install minisign`. On macOS, install it with
+`brew install minisign` before running the installer. See the
+[Ubuntu package](https://packages.ubuntu.com/noble/minisign) and
+[Debian package](https://packages.debian.org/bookworm/minisign) details.
+
+The bootstrap archive is
+[`minisign-0.12-linux.tar.gz`](https://github.com/jedisct1/minisign/releases/tag/0.12),
+with SHA-256:
+
+```text
+9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+```
+
+That pin was checked against upstream's release signature using the public key
+published in [Minisign's documentation](https://jedisct1.github.io/minisign/):
+`RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3`.
+The installer authenticates the bootstrap with its embedded pin, rather than
+running an unauthenticated verifier to authenticate itself. Updating the pin
+requires authenticating the new upstream archive first; neither release
+metadata nor environment variables can replace it.
+
+For a manual installation on Ubuntu 22.04, download that exact archive,
+compare its SHA-256 with the pin above using `sha256sum`, and only after it
+matches extract `minisign-linux/x86_64/minisign` or
+`minisign-linux/aarch64/minisign` onto your PATH. An already trusted Minisign
+on another machine can also verify the archive's `.minisig` with upstream's
+key. Re-run the ordinary CAAM installer after placing the authenticated
+verifier on PATH. If the bootstrap cannot be authenticated, installation
+stops without executing it or falling back to a source build.
+
+Release authentication is mandatory, including in CI and noninteractive
+sessions. `--verify` adds an executable self-test after installation; it does
+not enable or disable signature verification. The former `CAAM_SKIP_VERIFY`
+setting is rejected with a verification error and must be unset.
+The previous binary's backup is retained until this self-test passes, so a
+failed binary or source-build self-test can restore the working installation.
 
 The installer and updater bind the selected archive and its signed checksum
 entry to the release version. An explicit `--version` also requires matching
 release metadata. A missing modern signature cannot fall back to the legacy
 signing policy, and invalid release names are rejected. Verification failures
 leave the installed binary untouched; the installer does not turn them into
-a source-build fallback. The installer's explicit `CAAM_SKIP_VERIFY` escape
-hatch still warns that verification was skipped and never reports it as
-verified.
+a source-build fallback.
+
+Download, verifier, source-build, and Go-bootstrap directories are registered
+in the installer's parent shell. Normal exits, failures, and HUP/INT/TERM
+remove only its registered directories. Cleanup checks directory identities,
+preserves replaced paths and unrelated files in `TMPDIR`, and reports removal
+failures without hiding the original installation error. As with any process,
+an uncatchable SIGKILL or host crash cannot run its exit handler.
+
+Installer regressions live in `internal/installscript`. The ordinary suite uses
+local archives and checks both CPU mappings, authentication failures, source
+builds, interruptions, and temporary-directory ownership. With `minisign` on
+PATH it also exercises the real maintainer-signed fixtures. For the live
+distribution matrix, configure a DSR check to run
+`CAAM_INSTALLER_DISTRIBUTION_TESTS=1 go test ./internal/installscript -run TestInstallerLinuxDistributionMatrix -v -timeout 45m`.
+It requires Docker or Podman with amd64 and arm64 execution support and network
+access. The matrix installs the signed v0.1.25 release on Ubuntu 22.04/24.04 and
+Debian 12/13, tests automatic verifier acquisition, reuses distro Minisign
+packages where available, and checks verification refusal and cleanup. An
+explicitly enabled matrix fails if its execution prerequisites are unavailable.
 
 **Trust model.** Releases up to v0.1.17 were built by GitHub Actions and
 signed keylessly with cosign, pinned to the release workflow's OIDC identity
@@ -2438,7 +2496,7 @@ release could ever verify (see issue #77). From v0.1.18, releases are built on
 maintainer-controlled hosts and signed with the maintainer-held minisign key
 above; what you trust is that key (and this README/binary pinning it) rather
 than GitHub's CI identity chain. Verification is strictly fail-closed in both
-the updater and the install script by default. For old releases (≤ v0.1.17)
+the updater and the install script. For old releases (≤ v0.1.17)
 the legacy cosign verification still applies and requires `cosign` to be
 installed:
 

@@ -8,6 +8,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const releaseJSON = `{
@@ -468,6 +470,346 @@ func TestReleaseSignatureKind(t *testing.T) {
 	}
 }
 
+const minisignBootstrapSHA256 = "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+
+// minisignBootstrapArchive builds a deliberately synthetic verifier, not a
+// cryptographic fixture. The real SHA-256 and tar programs must authenticate
+// and extract it before it can run. The existing release-verification tests
+// and maintainer-signed updater fixtures cover CAAM's signature policy.
+func minisignBootstrapArchive(t *testing.T, kind string) ([]byte, string) {
+	t.Helper()
+	var archive bytes.Buffer
+	gz := gzip.NewWriter(&archive)
+	tw := tar.NewWriter(gz)
+	for _, arch := range []string{"x86_64", "aarch64"} {
+		if kind == "missing member" && arch == "x86_64" {
+			continue
+		}
+		program := []byte(`#!/bin/sh
+printf 'exec ` + arch + ` %s\n' "${1:-}" >> "$BOOTSTRAP_TRACE"
+if [ "${1:-}" = -v ]; then printf 'minisign 0.12\n'; exit 0; fi
+[ "$#" -eq 7 ] && [ "$1" = -V ] && [ "$2" = -p ] && [ "$4" = -m ] && [ "$6" = -x ] || exit 1
+grep -Fx 'RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70' "$3" >/dev/null || exit 1
+[ -f "$5" ] && [ "$(cat "$7")" = 'synthetic minisign signature' ] || exit 1
+[ "${BOOTSTRAP_BAD_SIGNATURE:-}" != 1 ]
+`)
+		hdr := &tar.Header{Name: "minisign-linux/" + arch + "/minisign", Mode: 0755, Size: int64(len(program))}
+		if arch == "x86_64" {
+			switch kind {
+			case "empty executable":
+				hdr.Size = 0
+				program = nil
+			case "directory":
+				hdr.Typeflag = tar.TypeDir
+				hdr.Size = 0
+				program = nil
+			case "symlink":
+				hdr.Typeflag = tar.TypeSymlink
+				hdr.Linkname = "../aarch64/minisign"
+				hdr.Size = 0
+				program = nil
+			}
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(program); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Selecting one executable must not extract unrelated archive members.
+	if err := tw.WriteHeader(&tar.Header{Name: "minisign-linux/unrelated", Mode: 0644, Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := archive.Bytes()
+	if kind == "invalid tar" {
+		data = []byte("this is an authenticated fixture, but not a gzip archive\n")
+	}
+	sum := sha256.Sum256(data)
+	return data, hex.EncodeToString(sum[:])
+}
+
+// runMinisignBootstrap uses an isolated copy of install.sh with ONLY its literal
+// archive digest changed to the generated fixture's digest. Production has no
+// environment override for its trust anchor. Tests that reject tampering and
+// environment overrides can retain the production pin by setting fixturePin=false.
+// Every invocation also checks that EXIT cleans up its own directory while
+// preserving unrelated contents of the same TMPDIR.
+func runMinisignBootstrap(t *testing.T, kind string, fixturePin bool, extraEnv []string, body string) (string, string, int, string) {
+	t.Helper()
+	for _, tool := range []string{"tar", "gzip", "awk", "cp", "tr", "grep", "cat", "mkdir", "mktemp", "rm", "chmod", "stat"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("Minisign bootstrap test requires %s", tool)
+		}
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("Minisign bootstrap test requires sha256sum")
+	}
+	dir := t.TempDir()
+	tmpRoot := filepath.Join(dir, "temporary directories")
+	if err := os.Mkdir(tmpRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(tmpRoot, "preexisting")
+	if err := os.WriteFile(unrelated, []byte("must survive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, digest := minisignBootstrapArchive(t, kind)
+	archive := filepath.Join(dir, "bootstrap.tar.gz")
+	if err := os.WriteFile(archive, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	script := repoInstallScript(t)
+	if fixturePin {
+		source, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pin := `readonly MINISIGN_BOOTSTRAP_SHA256="` + minisignBootstrapSHA256 + `"`
+		if strings.Count(string(source), pin) != 1 {
+			t.Fatal("bootstrap must have exactly one literal readonly SHA-256 pin; update fixture only after authenticating a new upstream release")
+		}
+		script = filepath.Join(dir, "install-fixture.sh")
+		fixture := strings.Replace(string(source), pin, `readonly MINISIGN_BOOTSTRAP_SHA256="`+digest+`"`, 1)
+		if err := os.WriteFile(script, []byte(fixture), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tracePath := filepath.Join(dir, "trace")
+	env := []string{
+		"INSTALL_SH=" + script, "TMPDIR=" + tmpRoot,
+		"BOOTSTRAP_ARCHIVE=" + archive, "BOOTSTRAP_TRACE=" + tracePath,
+		"BOOTSTRAP_UNAME_S=Linux", "BOOTSTRAP_UNAME_M=x86_64", "BOOTSTRAP_HASH=sha256sum",
+	}
+	env = append(env, extraEnv...)
+	setup := `
+uname() {
+    case "$1" in -s) printf '%s\n' "$BOOTSTRAP_UNAME_S" ;; -m) printf '%s\n' "$BOOTSTRAP_UNAME_M" ;; *) return 1 ;; esac
+}
+command() {
+    if [ "${1:-}" = -v ]; then
+        case "${2:-}" in
+            minisign) [ "${BOOTSTRAP_INSTALLED:-}" = 1 ] || return 1 ;;
+            sha256sum) [ "$BOOTSTRAP_HASH" != none ] && [ "$BOOTSTRAP_HASH" != shasum ] && [ "$BOOTSTRAP_HASH" != shasum-error ] || return 1 ;;
+            shasum) [ "$BOOTSTRAP_HASH" != none ] || return 1 ;;
+        esac
+    fi
+    builtin command "$@"
+}
+download_file() {
+    printf 'download %s\n' "$1" >> "$BOOTSTRAP_TRACE"
+    case "$1" in
+        https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz)
+            if [ "${BOOTSTRAP_DOWNLOAD_FAIL:-}" = 1 ]; then printf partial > "$2"; return 22; fi
+            cp "$BOOTSTRAP_ARCHIVE" "$2" || return
+            if [ "${BOOTSTRAP_TAMPER:-}" = 1 ]; then printf tampered >> "$2"; fi ;;
+        https://example.test/SHA256SUMS)
+            printf '%s  caam_0.1.25_linux_amd64.tar.gz\n' "$BOOTSTRAP_RELEASE_SUM" > "$2" ;;
+        https://example.test/SHA256SUMS.minisig)
+            printf 'synthetic minisign signature\n' > "$2" ;;
+        *) return 99 ;;
+    esac
+}
+sha256sum() {
+    printf 'sha256sum\n' >> "$BOOTSTRAP_TRACE"
+    if [ "$BOOTSTRAP_HASH" = malformed ]; then printf 'not-a-digest\n'; return 0; fi
+    builtin command sha256sum "$@" || return
+    [ "$BOOTSTRAP_HASH" != sha256sum-error ]
+}
+shasum() {
+    printf 'shasum\n' >> "$BOOTSTRAP_TRACE"
+    builtin command shasum "$@" || return
+    [ "$BOOTSTRAP_HASH" != shasum-error ]
+}
+tar() { printf 'extract\n' >> "$BOOTSTRAP_TRACE"; builtin command tar "$@"; }
+chmod() { [ "${BOOTSTRAP_CHMOD_FAIL:-}" != 1 ] || return 1; builtin command chmod "$@"; }
+minisign() { printf 'installed verifier\n' >> "$BOOTSTRAP_TRACE"; printf 'minisign 0.11\n'; }
+sudo() { printf 'PACKAGE sudo\n' >> "$BOOTSTRAP_TRACE"; return 99; }
+apt() { printf 'PACKAGE apt\n' >> "$BOOTSTRAP_TRACE"; return 99; }
+apt-get() { printf 'PACKAGE apt-get\n' >> "$BOOTSTRAP_TRACE"; return 99; }
+brew() { printf 'PACKAGE brew\n' >> "$BOOTSTRAP_TRACE"; return 99; }
+`
+	if body == "" {
+		body = `
+make_tmp_dir bootstrap_tmp || exit "$?"
+ensure_minisign "$bootstrap_tmp" || exit "$?"
+printf 'selected %s\n' "$MINISIGN_BIN"
+[ ! -e "$bootstrap_tmp/minisign-bootstrap/minisign-linux/unrelated" ] || exit 91
+"$MINISIGN_BIN" -v
+`
+	}
+	stdout, stderr, code := runInstallFunc(t, env, setup, body, "")
+	entries, err := os.ReadDir(tmpRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "preexisting" {
+		t.Errorf("bootstrap left owned temporary files or deleted unrelated data: %v; stdout=%s stderr=%s", entries, stdout, stderr)
+	}
+	if preserved, err := os.ReadFile(unrelated); err != nil || string(preserved) != "must survive" {
+		t.Errorf("bootstrap changed unrelated TMPDIR data: %q, %v", preserved, err)
+	}
+	trace, err := os.ReadFile(tracePath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(trace), "PACKAGE ") {
+		t.Errorf("bootstrap attempted system package changes: %s", trace)
+	}
+	return stdout, stderr, code, string(trace)
+}
+
+// The fallback is distribution-independent Linux code. These are the missing-
+// package/tool scenarios on Ubuntu 22.04 and on minimal Ubuntu 24.04+/Debian 12+
+// systems, not simulated executions of those distributions' package managers.
+func TestMinisignBootstrapArchitecture(t *testing.T) {
+	for _, tc := range []struct{ uname, member string }{
+		{"x86_64", "x86_64"}, {"amd64", "x86_64"}, {"aarch64", "aarch64"}, {"arm64", "aarch64"},
+	} {
+		t.Run(tc.uname, func(t *testing.T) {
+			stdout, stderr, code, trace := runMinisignBootstrap(t, "valid", true, []string{"BOOTSTRAP_UNAME_M=" + tc.uname}, "")
+			if code != 0 || !strings.Contains(stdout, "/minisign-bootstrap/minisign") || !strings.Contains(stdout, "minisign 0.12") {
+				t.Fatalf("bootstrap did not acquire the correct executable: exit=%d stdout=%s stderr=%s trace=%s", code, stdout, stderr, trace)
+			}
+			want := "download https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz\nsha256sum\nextract\nexec " + tc.member + " -v\n"
+			if trace != want {
+				t.Errorf("bootstrap authentication/execution order: got %q, want %q", trace, want)
+			}
+		})
+	}
+}
+
+// Ubuntu 24.04+ and Debian 12+ can provide Minisign 0.11 via their authenticated
+// package repositories. An installed verifier must be reused without bootstrap
+// downloads, extraction, privilege escalation, or package-manager invocations.
+func TestMinisignAcquisitionUsesInstalledVerifier(t *testing.T) {
+	for _, arch := range []string{"x86_64", "aarch64"} {
+		t.Run(arch, func(t *testing.T) {
+			stdout, stderr, code, trace := runMinisignBootstrap(t, "valid", false,
+				[]string{"BOOTSTRAP_INSTALLED=1", "BOOTSTRAP_UNAME_M=" + arch, "BOOTSTRAP_HASH=none"}, "")
+			if code != 0 || !strings.Contains(stdout, "selected minisign\n") || trace != "installed verifier\n" {
+				t.Fatalf("installed verifier not reused: exit=%d stdout=%s stderr=%s trace=%q", code, stdout, stderr, trace)
+			}
+		})
+	}
+}
+
+func TestMinisignBootstrapFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, setting, wantError string
+		extracted                      bool
+	}{
+		{"changed archive", "valid", "BOOTSTRAP_TAMPER=1", "Minisign archive checksum verification failed", false},
+		{"missing hash utilities", "valid", "BOOTSTRAP_HASH=none", "sha256sum or shasum is required", false},
+		{"hash process fails despite correct output", "valid", "BOOTSTRAP_HASH=sha256sum-error", "Could not authenticate the Minisign download", false},
+		{"malformed hash output", "valid", "BOOTSTRAP_HASH=malformed", "Minisign archive checksum verification failed", false},
+		{"download failure", "valid", "BOOTSTRAP_DOWNLOAD_FAIL=1", "Failed to download Minisign", false},
+		{"wrong archive member", "missing member", "", "Failed to extract Minisign", true},
+		{"invalid archive", "invalid tar", "", "Failed to extract Minisign", true},
+		{"empty executable member", "empty executable", "", "Minisign archive does not contain the expected executable", true},
+		{"cannot set executable mode", "valid", "BOOTSTRAP_CHMOD_FAIL=1", "", true},
+		{"directory instead of executable", "directory", "", "Minisign archive does not contain the expected executable", true},
+		{"symlink instead of executable", "symlink", "", "Minisign archive does not contain the expected executable", true},
+		{"unsupported operating system", "valid", "BOOTSTRAP_UNAME_S=Darwin", "Automatic Minisign acquisition is only supported", false},
+		{"unsupported CPU", "valid", "BOOTSTRAP_UNAME_M=riscv64", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var env []string
+			if tc.setting != "" {
+				env = append(env, tc.setting)
+			}
+			stdout, stderr, code, trace := runMinisignBootstrap(t, tc.kind, true, env, "")
+			if code == 0 || (tc.wantError != "" && !strings.Contains(stdout+stderr, tc.wantError)) {
+				t.Fatalf("bootstrap did not fail closed: exit=%d stdout=%s stderr=%s trace=%s", code, stdout, stderr, trace)
+			}
+			if strings.Contains(trace, "exec ") || strings.Contains(trace, "installed verifier") || strings.Contains(stdout, "selected ") {
+				t.Errorf("failed bootstrap selected/executed a verifier: stdout=%s trace=%s", stdout, trace)
+			}
+			if strings.Contains(trace, "extract\n") != tc.extracted {
+				t.Errorf("unexpected extraction (want %t): %s", tc.extracted, trace)
+			}
+			if strings.Contains(stdout+stderr, "CAAM_SKIP_VERIFY=1") {
+				t.Errorf("failure recommended bypassing authentication: stdout=%s stderr=%s", stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestMinisignBootstrapShasumFallback(t *testing.T) {
+	if _, err := exec.LookPath("shasum"); err != nil {
+		t.Skip("shasum not available")
+	}
+	for _, mode := range []string{"shasum", "shasum-error"} {
+		t.Run(mode, func(t *testing.T) {
+			stdout, stderr, code, trace := runMinisignBootstrap(t, "valid", true, []string{"BOOTSTRAP_HASH=" + mode}, "")
+			if (code == 0) != (mode == "shasum") || !strings.Contains(trace, "shasum\n") || strings.Contains(trace, "sha256sum\n") {
+				t.Fatalf("shasum fallback: exit=%d stdout=%s stderr=%s trace=%s", code, stdout, stderr, trace)
+			}
+			if mode == "shasum-error" && (strings.Contains(trace, "extract\n") || strings.Contains(trace, "exec ")) {
+				t.Errorf("failed shasum authenticated an executable: %s", trace)
+			}
+		})
+	}
+}
+
+func TestMinisignBootstrapTrustAnchorsCannotBeOverriddenByEnvironment(t *testing.T) {
+	_, digest := minisignBootstrapArchive(t, "valid")
+	stdout, stderr, code, trace := runMinisignBootstrap(t, "valid", false, []string{
+		"MINISIGN_BOOTSTRAP_SHA256=" + digest,
+		"MINISIGN_BOOTSTRAP_VERSION=attacker-controlled",
+		"MINISIGN_BOOTSTRAP_URL=https://example.test/untrusted",
+		"MINISIGN_BIN=minisign",
+	}, "")
+	if code == 0 || !strings.Contains(stdout+stderr, "Minisign archive checksum verification failed") {
+		t.Fatalf("environment replaced a production trust anchor: exit=%d stdout=%s stderr=%s trace=%s", code, stdout, stderr, trace)
+	}
+	if strings.Contains(trace, "extract\n") || strings.Contains(trace, "exec ") || strings.Contains(trace, "installed verifier") || strings.Contains(trace, "example.test") {
+		t.Errorf("untrusted environment steered acquisition or execution: %s", trace)
+	}
+}
+
+func TestBootstrappedMinisignVerifiesCAAMRelease(t *testing.T) {
+	for _, badSignature := range []bool{false, true} {
+		name := "valid signature"
+		if badSignature {
+			name = "invalid signature"
+		}
+		t.Run(name, func(t *testing.T) {
+			sum := sha256.Sum256([]byte("release payload\n"))
+			env := []string{"BOOTSTRAP_RELEASE_SUM=" + hex.EncodeToString(sum[:])}
+			if badSignature {
+				env = append(env, "BOOTSTRAP_BAD_SIGNATURE=1")
+			}
+			body := `
+make_tmp_dir bootstrap_tmp || exit "$?"
+printf 'release payload\n' > "$bootstrap_tmp/release.tar.gz"
+release_json='{"tag_name":"v0.1.25","assets":[{"name":"SHA256SUMS","browser_download_url":"https://example.test/SHA256SUMS"},{"name":"SHA256SUMS.minisig","browser_download_url":"https://example.test/SHA256SUMS.minisig"}]}'
+verify_release_assets "$release_json" v0.1.25 caam_0.1.25_linux_amd64.tar.gz "$bootstrap_tmp/release.tar.gz" "$bootstrap_tmp"
+`
+			stdout, stderr, code, trace := runMinisignBootstrap(t, "valid", true, env, body)
+			wantCode := 0
+			if badSignature {
+				wantCode = 1
+			}
+			if code != wantCode || !strings.Contains(trace, "exec x86_64 -V\n") {
+				t.Fatalf("bootstrapped verifier was not used for CAAM authentication: exit=%d stdout=%s stderr=%s trace=%s", code, stdout, stderr, trace)
+			}
+			if badSignature && (!strings.Contains(stdout+stderr, "Signature verification failed") || strings.Contains(stdout+stderr, "Verified release signature and checksum")) {
+				t.Errorf("bootstrapped verifier failure bypassed authentication: stdout=%s stderr=%s", stdout, stderr)
+			}
+		})
+	}
+}
+
 // These tests run the real installer through metadata selection, verification,
 // extraction, replacement and its optional executable check. Network reads and
 // external signature tools are synthetic; real hash checks and filesystem
@@ -496,6 +838,8 @@ func TestInstallerReleaseVerification(t *testing.T) {
 			checksums        string
 			badSignature     bool
 			skipVerification bool
+			hashFailure      bool
+			missingHash      bool
 			wantOK           bool
 			wantError        string
 			wantVerifier     string
@@ -523,9 +867,12 @@ func TestInstallerReleaseVerification(t *testing.T) {
 			{name: "invalid minisign cannot fall back to cosign", signatures: "both", badSignature: true, wantError: "Signature verification failed", wantVerifier: "minisign"},
 			{name: "invalid cosign signature", version: "v0.1.17", signatures: "cosign", badSignature: true, wantError: "Signature verification failed", wantVerifier: "cosign"},
 			{name: "missing signature assets", wantError: "required for releases >= v0.1.18"},
-			{name: "explicit verification opt out", missingVerifier: "both", mode: "CI=true", skipVerification: true, wantOK: true},
-			{name: "opt out preserves requested version", requested: "v0.1.25", skipVerification: true, wantError: "does not match the requested version"},
-			{name: "opt out preserves archive version", archiveVersion: "0.1.17", skipVerification: true, wantError: "archive name does not match its release version"},
+			{name: "verification bypass refused", missingVerifier: "both", mode: "CI=true", skipVerification: true, wantError: "Release verification cannot be disabled"},
+			{name: "bypass cannot ignore invalid signature", signatures: "minisign", skipVerification: true, badSignature: true, wantError: "Release verification cannot be disabled"},
+			{name: "bypass cannot ignore requested version", requested: "v0.1.25", skipVerification: true, wantError: "does not match the requested version"},
+			{name: "bypass cannot ignore archive version", archiveVersion: "0.1.17", skipVerification: true, wantError: "archive name does not match its release version"},
+			{name: "missing archive hash tool", signatures: "minisign", missingHash: true, wantError: "sha256sum or shasum is required", wantVerifier: "minisign"},
+			{name: "failed hash command with correct output", signatures: "minisign", hashFailure: true, wantError: "Could not compute the release archive checksum", wantVerifier: "minisign"},
 		} {
 			t.Run(backend+"/"+tc.name, func(t *testing.T) {
 				version := tc.version
@@ -604,6 +951,12 @@ func TestInstallerReleaseVerification(t *testing.T) {
 				if tc.skipVerification {
 					env = append(env, "CAAM_SKIP_VERIFY=1")
 				}
+				if tc.missingHash {
+					env = append(env, "MISSING_HASH=1")
+				}
+				if tc.hashFailure {
+					env = append(env, "HASH_FAILURE=1")
+				}
 				setup := backendSetup + `
 INSTALL_VERSION="$REQUESTED_VERSION"
 VERIFY_AFTER_INSTALL=true
@@ -617,9 +970,19 @@ command() {
         case "${2:-}" in
             minisign|cosign)
                 if [ "$MISSING_VERIFIER" = "$2" ] || [ "$MISSING_VERIFIER" = both ]; then return 1; fi ;;
+            sha256sum|shasum)
+                if [ "${MISSING_HASH:-}" = 1 ]; then return 1; fi ;;
         esac
     fi
     builtin command "$@"
+}
+sha256sum() {
+    if [ "${HASH_FAILURE:-}" = 1 ]; then printf '%s  %s\n' "$FIXTURE_SUM" "$1"; return 1; fi
+    command sha256sum "$@"
+}
+shasum() {
+    if [ "${HASH_FAILURE:-}" = 1 ]; then printf '%s  archive\n' "$FIXTURE_SUM"; return 1; fi
+    command shasum "$@"
 }
 download_file() {
     case "$1" in
@@ -668,8 +1031,8 @@ cosign() {
 				if (!tc.wantOK || tc.skipVerification) && strings.Contains(stdout+stderr, "Verified release signature and checksum") {
 					t.Errorf("installer falsely claimed verification: stdout=%s stderr=%s", stdout, stderr)
 				}
-				if tc.skipVerification && tc.wantOK && !strings.Contains(stderr, "Skipping release verification (CAAM_SKIP_VERIFY set)") {
-					t.Errorf("explicit opt-out was not reported: stderr=%s", stderr)
+				if strings.Contains(stdout+stderr, "CAAM_SKIP_VERIFY=1") || strings.Contains(stdout+stderr, "Skipping release verification") {
+					t.Errorf("installer recommended or accepted a verification bypass: stdout=%s stderr=%s", stdout, stderr)
 				}
 				gotBinary, err := os.ReadFile(filepath.Join(installed, "caam"))
 				if err != nil {
@@ -712,6 +1075,249 @@ cosign() {
 	}
 }
 
+// Exercise the shell verifier with the same real maintainer-signed fixtures as
+// the Go updater. Network access is replaced with local copies; Minisign,
+// SHA-256, extraction, installation, and cleanup all run normally. This is an
+// additional cryptographic gate when Minisign is installed, not a substitute
+// for the always-running hermetic acquisition and failure tests above.
+func TestInstallerRealMinisignFixture(t *testing.T) {
+	if _, err := exec.LookPath("minisign"); err != nil {
+		t.Skip("real Minisign executable required for cryptographic fixture tests")
+	}
+	fixtureDir := filepath.Join(filepath.Dir(repoInstallScript(t)), "internal", "update", "testdata")
+	for _, platform := range []string{"linux_amd64", "linux_arm64"} {
+		for _, scenario := range []string{"ordinary install", "install with self-test", "tampered manifest", "tampered signature", "tampered archive", "verification bypass"} {
+			t.Run(platform+"/"+scenario, func(t *testing.T) {
+				dir := t.TempDir()
+				tmp := filepath.Join(dir, "tmp")
+				installed := filepath.Join(dir, "installed")
+				for _, path := range []string{tmp, installed} {
+					if err := os.Mkdir(path, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				previous := []byte("previous installed binary\n")
+				if err := os.WriteFile(filepath.Join(installed, "caam"), previous, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(tmp, "unrelated"), []byte("preserve"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range []string{"archive.tar.gz", "SHA256SUMS", "SHA256SUMS.minisig"} {
+					data, err := os.ReadFile(filepath.Join(fixtureDir, name))
+					if err != nil {
+						t.Fatal(err)
+					}
+					switch {
+					case scenario == "tampered manifest" && name == "SHA256SUMS":
+						data = append(data, []byte("unsigned extra entry\n")...)
+					case scenario == "tampered signature" && name == "SHA256SUMS.minisig":
+						// Change signature bytes, not the deliberately untrusted comment.
+						lines := strings.Split(string(data), "\n")
+						lines[1] = lines[1][:20] + "AAAA" + lines[1][24:]
+						data = []byte(strings.Join(lines, "\n"))
+					case scenario == "tampered archive" && name == "archive.tar.gz":
+						data[0] ^= 1
+					}
+					if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				asset := "caam_9.9.9_" + platform + ".tar.gz"
+				release, err := json.Marshal(map[string]any{
+					"tag_name": "v9.9.9",
+					"assets": []map[string]string{
+						{"name": asset, "browser_download_url": "https://example.test/" + asset},
+						{"name": "SHA256SUMS", "browser_download_url": "https://example.test/SHA256SUMS"},
+						{"name": "SHA256SUMS.minisig", "browser_download_url": "https://example.test/SHA256SUMS.minisig"},
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				env := []string{
+					"INSTALL_DIR=" + installed, "TMPDIR=" + tmp, "FIXTURE_DIR=" + dir,
+					"RELEASE_JSON=" + string(release), "FIXTURE_PLATFORM=" + platform,
+					"CI=true", "NONINTERACTIVE=1",
+				}
+				if scenario == "verification bypass" {
+					env = append(env, "CAAM_SKIP_VERIFY=1")
+				}
+				setup := `
+INSTALL_VERSION=v9.9.9
+detect_terminal_features() { USE_COLOR=false; HAS_GUM=false; IS_TTY=false; }
+detect_platform() { printf '%s\n' "$FIXTURE_PLATFORM"; }
+get_installed_version() { :; }
+get_release() { printf '%s' "$RELEASE_JSON"; }
+download_file() {
+    case "$1" in
+        https://example.test/caam_*) cp "$FIXTURE_DIR/archive.tar.gz" "$2" ;;
+        https://example.test/SHA256SUMS) cp "$FIXTURE_DIR/SHA256SUMS" "$2" ;;
+        https://example.test/SHA256SUMS.minisig) cp "$FIXTURE_DIR/SHA256SUMS.minisig" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+try_go_install() { printf 'unexpected fallback' > "$FIXTURE_DIR/fallback"; return 0; }
+`
+				body := "main"
+				if scenario == "install with self-test" {
+					body += " --verify"
+				}
+				stdout, stderr, code := runInstallFunc(t, env, setup, body, "")
+				wantOK := scenario == "ordinary install" || scenario == "install with self-test"
+				wantCode := 3
+				if wantOK {
+					wantCode = 0
+				}
+				if code != wantCode {
+					t.Fatalf("exit=%d want %d; stdout=%s stderr=%s", code, wantCode, stdout, stderr)
+				}
+				reportedVerification := strings.Contains(stdout+stderr, "Verified release signature and checksum")
+				if reportedVerification != wantOK {
+					t.Errorf("incorrect verification claim: stdout=%s stderr=%s", stdout, stderr)
+				}
+				got, err := os.ReadFile(filepath.Join(installed, "caam"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if wantOK {
+					if !bytes.Contains(got, []byte("caam-fixture-9.9.9")) {
+						t.Errorf("signed fixture was not installed: %q", got)
+					}
+				} else if !bytes.Equal(got, previous) {
+					t.Error("failed verification replaced the installed binary")
+				}
+				if _, err := os.Stat(filepath.Join(dir, "fallback")); !os.IsNotExist(err) {
+					t.Errorf("verification path fell back to unsigned source: %v", err)
+				}
+				if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 1 || entries[0].Name() != "unrelated" {
+					t.Errorf("installer temporary files remain: %v; err=%v", entries, err)
+				}
+				if data, err := os.ReadFile(filepath.Join(tmp, "unrelated")); err != nil || string(data) != "preserve" {
+					t.Errorf("unrelated temporary content changed: %q; err=%v", data, err)
+				}
+			})
+		}
+	}
+}
+
+// Opt in through a DSR check with CAAM_INSTALLER_DISTRIBUTION_TESTS=1. These
+// are actual userspaces and release downloads, not os-release fixtures. The
+// engine must support both platforms (native workers or configured emulation).
+// Keep the ordinary suite offline; explicitly requested matrix runs fail if
+// their engine, architecture support, network, or package setup is unavailable.
+func TestInstallerLinuxDistributionMatrix(t *testing.T) {
+	if os.Getenv("CAAM_INSTALLER_DISTRIBUTION_TESTS") != "1" {
+		t.Skip("set CAAM_INSTALLER_DISTRIBUTION_TESTS=1 for the live Ubuntu/Debian matrix")
+	}
+	engine := ""
+	for _, candidate := range []string{"docker", "podman"} {
+		if path, err := exec.LookPath(candidate); err == nil {
+			engine = path
+			break
+		}
+	}
+	if engine == "" {
+		t.Fatal("live distribution tests require Docker or Podman with amd64 and arm64 support")
+	}
+	const script = `
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl jq
+if command -v minisign >/dev/null; then
+    echo 'base image unexpectedly includes Minisign; missing-tool coverage would be lost' >&2
+    exit 1
+fi
+export INSTALL_DIR=/caam-test/bin TMPDIR=/caam-test/tmp CI=true NO_COLOR=1
+mkdir -p "$INSTALL_DIR" "$TMPDIR" /caam-test/transport
+printf 'foreign\n' > "$TMPDIR/keep"
+cat > /caam-test/transport/curl <<'CURL'
+#!/bin/sh
+exec /usr/bin/curl -A 'coding_agent_account_manager-agent (+https://github.com/Dicklesworthstone/coding_agent_account_manager)' "$@"
+CURL
+chmod 700 /caam-test/transport/curl
+export PATH="/caam-test/transport:$PATH"
+check_cleanup() {
+    [ "$(cat "$TMPDIR/keep")" = foreign ]
+    [ "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ]
+}
+bash /install.sh --version=v0.1.25 --verify > /caam-test/bootstrap.log 2>&1 || {
+    cat /caam-test/bootstrap.log; exit 1;
+}
+cat /caam-test/bootstrap.log
+grep -F 'Acquiring authenticated temporary Minisign 0.12' /caam-test/bootstrap.log
+grep -F 'Verified release signature and checksum.' /caam-test/bootstrap.log
+"$INSTALL_DIR/caam" --version
+check_cleanup
+
+# Package availability is deliberately different on Jammy. Newer Ubuntu and
+# Debian must also exercise the installed verifier path, with no bootstrap.
+if [ "$TEST_SYSTEM_PACKAGE" = yes ]; then
+    apt-get install -y --no-install-recommends minisign
+    bash /install.sh --version=v0.1.25 --force --verify > /caam-test/package.log 2>&1 || {
+        cat /caam-test/package.log; exit 1;
+    }
+    cat /caam-test/package.log
+    grep -F 'Verified release signature and checksum.' /caam-test/package.log
+    if grep -F 'Acquiring authenticated temporary Minisign' /caam-test/package.log; then exit 1; fi
+    check_cleanup
+fi
+
+# Even in CI, a former bypass request must fail and preserve the installation.
+before=$(sha256sum "$INSTALL_DIR/caam")
+status=0
+CAAM_SKIP_VERIFY=1 bash /install.sh --version=v0.1.25 --force > /caam-test/refusal.log 2>&1 || status=$?
+cat /caam-test/refusal.log
+[ "$status" -eq 3 ]
+grep -F 'Release verification cannot be disabled' /caam-test/refusal.log
+[ "$(sha256sum "$INSTALL_DIR/caam")" = "$before" ]
+check_cleanup
+`
+	for _, image := range []string{"ubuntu:22.04", "ubuntu:24.04", "debian:12-slim", "debian:13-slim"} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			t.Run(image+"/"+arch, func(t *testing.T) {
+				packageAvailable := "yes"
+				if image == "ubuntu:22.04" {
+					packageAvailable = "no"
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				cidFile := filepath.Join(t.TempDir(), "container-id")
+				t.Cleanup(func() {
+					data, err := os.ReadFile(cidFile)
+					if os.IsNotExist(err) {
+						return // The engine never created a container.
+					}
+					id := strings.TrimSpace(string(data))
+					decoded, decodeErr := hex.DecodeString(id)
+					if err != nil || decodeErr != nil || len(decoded) != 32 {
+						t.Errorf("cannot identify this test's container for cleanup: read=%v decode=%v", err, decodeErr)
+						return
+					}
+					// Killing the attached CLI on a timeout does not necessarily stop
+					// its container. Remove only the ID written by this invocation.
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cleanupCancel()
+					output, cleanupErr := exec.CommandContext(cleanupCtx, engine, "rm", "--force", id).CombinedOutput()
+					if cleanupErr != nil && !strings.Contains(string(output), "No such container") && !strings.Contains(string(output), "no container with") {
+						t.Errorf("container cleanup: %v: %s", cleanupErr, output)
+					}
+				})
+				cmd := exec.CommandContext(ctx, engine, "run", "--rm", "--platform", "linux/"+arch,
+					"--cidfile", cidFile,
+					"--mount", "type=bind,source="+repoInstallScript(t)+",target=/install.sh,readonly",
+					"-e", "TEST_SYSTEM_PACKAGE="+packageAvailable, image, "bash", "-c", script)
+				output, err := cmd.CombinedOutput()
+				t.Logf("%s/%s:\n%s", image, arch, output)
+				if err != nil {
+					t.Fatalf("distribution installation failed: %v (context: %v)", err, ctx.Err())
+				}
+			})
+		}
+	}
+}
+
 // Exercise the real installation paths, including their EXIT traps, with
 // local archives and synthetic build/network tools. The unrelated sibling
 // deliberately shares TMPDIR with the installer and must survive every exit.
@@ -727,12 +1333,15 @@ func TestInstallerTemporaryDirectoryLifecycle(t *testing.T) {
 	}{
 		{name: "binary success", method: "binary"},
 		{name: "binary verification failure", method: "binary", failure: "verify", wantCode: 3},
+		{name: "binary self-test failure", method: "binary", failure: "self-test", wantCode: 3},
 		{name: "binary download and source failure", method: "binary", source: "tar", failure: "download", wantCode: 4},
 		{name: "git source success", source: "git"},
 		{name: "git source build failure", source: "git", failure: "build", wantCode: 5},
+		{name: "git source self-test failure", source: "git", failure: "self-test", wantCode: 3},
 		{name: "git missing tag", source: "git", failure: "checkout", wantCode: 5},
 		{name: "tar source success", source: "tar"},
 		{name: "tar source build failure", source: "tar", failure: "build", wantCode: 5},
+		{name: "tar source self-test failure", source: "tar", failure: "self-test", wantCode: 3},
 		{name: "tar source download failure", source: "tar", failure: "download", wantCode: 5},
 		{name: "binary HUP", method: "binary", signal: "HUP", stage: "download", wantCode: 129},
 		{name: "binary INT", method: "binary", signal: "INT", stage: "download", wantCode: 130},
@@ -758,7 +1367,7 @@ func TestInstallerTemporaryDirectoryLifecycle(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(installed, "caam"), old, 0600); err != nil {
 				t.Fatal(err)
 			}
-			program := []byte("#!/bin/sh\nprintf 'caam v0.1.24\\n'\n")
+			program := []byte("#!/bin/sh\n[ \"$TEST_FAILURE\" != self-test ] || exit 1\nprintf 'caam v0.1.24\\n'\n")
 			programPath := filepath.Join(dir, "program")
 			if err := os.WriteFile(programPath, program, 0700); err != nil {
 				t.Fatal(err)

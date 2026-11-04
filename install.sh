@@ -9,14 +9,13 @@ set -euo pipefail
 # Options (via env vars or arguments):
 #   --version=VERSION   Install specific version (e.g., v1.2.3)
 #   --channel=CHANNEL   Release channel: stable (default) or beta
-#   --verify            Run self-test after install (caam --version)
+#   --verify            Run self-test after install (release signatures always required)
 #   --force             Force reinstall even if same version exists
 #   --dry-run           Show what would be done without installing
 #   --help              Show this help message
 #
 # Environment variables:
 #   INSTALL_DIR         Override install directory (default: auto-detect)
-#   CAAM_SKIP_VERIFY    Skip signature/checksum verification (not recommended)
 #   CAAM_NO_CACHE_BUST  Disable cache-busting query params
 #   NO_COLOR            Disable colored output
 #   CI                  Enable non-interactive mode (implies NO_COLOR)
@@ -26,6 +25,15 @@ readonly SCRIPT_VERSION="2.0.0"
 readonly REPO_OWNER="Dicklesworthstone"
 readonly REPO_NAME="coding_agent_account_manager"
 readonly BIN_NAME="caam"
+
+# Bootstrap trust is pinned in this installer, never fetched alongside the
+# download. The 0.12 Linux archive was independently authenticated against
+# upstream's release signature and public key:
+# https://github.com/jedisct1/minisign/releases/tag/0.12
+# RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+readonly MINISIGN_BOOTSTRAP_VERSION="0.12"
+readonly MINISIGN_BOOTSTRAP_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+MINISIGN_BIN=""
 
 # Exit codes for CI/automation
 # (0 covers both "installed" and "already up to date".)
@@ -101,14 +109,13 @@ Usage:
 Options:
   --version=VERSION   Install specific version (e.g., v1.2.3)
   --channel=CHANNEL   Release channel: stable (default) or beta
-  --verify            Run self-test after install
+  --verify            Run self-test after install (release signatures always required)
   --force             Force reinstall even if same version exists
   --dry-run           Show what would be done without installing
   --help              Show this help message
 
 Environment Variables:
   INSTALL_DIR         Override install directory
-  CAAM_SKIP_VERIFY    Skip signature/checksum verification
   CAAM_NO_CACHE_BUST  Disable cache-busting query params
   NO_COLOR            Disable colored output
   CI                  Enable non-interactive mode
@@ -974,6 +981,105 @@ if __name__ == "__main__":
 PY
 }
 
+# Prefer a verifier already trusted by the host. Otherwise use a temporary,
+# authenticated upstream binary on Linux; this also works on Ubuntu 22.04,
+# which has no minisign package. Do not install packages, require sudo, change
+# PATH, or trust a checksum downloaded from the same place as the executable.
+# The caller owns tmp_dir and invokes this function in the parent shell.
+ensure_minisign() {
+    local tmp_dir="$1"
+    MINISIGN_BIN=""
+    if command -v minisign >/dev/null 2>&1; then
+        MINISIGN_BIN="minisign"
+        return 0
+    fi
+
+    local os arch
+    os=$(uname -s) || return 1
+    arch=$(uname -m) || return 1
+    if [ "$os" != Linux ]; then
+        print_error "Automatic Minisign acquisition is only supported on Linux x86_64 and aarch64."
+        return 1
+    fi
+    case "$arch" in
+        x86_64|amd64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *)
+            print_error "Automatic Minisign acquisition is only supported on Linux x86_64 and aarch64."
+            return 1
+            ;;
+    esac
+
+    # Check the authenticator before downloading anything. A failed hash
+    # command is an authentication failure even if it printed a matching hash.
+    local hash_tool
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash_tool=sha256sum
+    elif command -v shasum >/dev/null 2>&1; then
+        hash_tool=shasum
+    else
+        print_error "sha256sum or shasum is required to authenticate the Minisign download."
+        return 1
+    fi
+
+    local bootstrap_dir="$tmp_dir/minisign-bootstrap"
+    if ! mkdir -m 700 "$bootstrap_dir"; then
+        print_error "Could not prepare the temporary Minisign directory."
+        return 1
+    fi
+    local archive_path="$bootstrap_dir/minisign.tar.gz"
+    local url="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_BOOTSTRAP_VERSION}/minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+    print_info "Acquiring authenticated temporary Minisign $MINISIGN_BOOTSTRAP_VERSION for Linux $arch..."
+    if ! download_file "$url" "$archive_path" false; then
+        print_error "Failed to download Minisign."
+        return 1
+    fi
+
+    local actual
+    if [ "$hash_tool" = sha256sum ]; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}') || {
+            print_error "Could not authenticate the Minisign download."
+            return 1
+        }
+    else
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}') || {
+            print_error "Could not authenticate the Minisign download."
+            return 1
+        }
+    fi
+    if [ "$actual" != "$MINISIGN_BOOTSTRAP_SHA256" ]; then
+        print_error "Minisign archive checksum verification failed."
+        return 1
+    fi
+
+    # Stream only the authenticated architecture-specific executable into a
+    # file we own. Do not restore upstream archive ownership or other members.
+    local candidate="$bootstrap_dir/minisign"
+    if ! tar -xzOf "$archive_path" "minisign-linux/$arch/minisign" > "$candidate"; then
+        print_error "Failed to extract Minisign."
+        return 1
+    fi
+    if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -s "$candidate" ]; then
+        print_error "Minisign archive does not contain the expected executable."
+        return 1
+    fi
+    if ! chmod 700 "$candidate"; then
+        print_error "Could not make the authenticated Minisign executable."
+        return 1
+    fi
+    MINISIGN_BIN="$candidate"
+}
+
+minisign_install_help() {
+    error "minisign is required to verify release signatures, including in CI/non-interactive mode."
+    error "Linux x86_64/aarch64: resolve the acquisition error above and re-run for an authenticated temporary verifier."
+    error "Ubuntu 22.04 has no minisign apt package; the temporary upstream verifier supports it."
+    error "To install Minisign separately from an authenticated package repository:"
+    error "  Ubuntu 24.04+ (universe) / Debian 12+: sudo apt install minisign"
+    error "  macOS: brew install minisign"
+    error "Manual authentication instructions: https://github.com/${REPO_OWNER}/${REPO_NAME}#verify-release-artifacts"
+}
+
 verify_release_assets() {
     local release_json="$1"
     local version="$2"
@@ -993,8 +1099,8 @@ verify_release_assets() {
     fi
 
     if [ -n "${CAAM_SKIP_VERIFY:-}" ]; then
-        print_warn "Skipping release verification (CAAM_SKIP_VERIFY set)."
-        return 0
+        print_error "Release verification cannot be disabled. Unset CAAM_SKIP_VERIFY and re-run."
+        return 1
     fi
 
     local checksums_url signature_url minisig_url
@@ -1033,13 +1139,8 @@ verify_release_assets() {
             print_error "Failed to download SHA256SUMS.minisig."
             return 1
         fi
-        if ! command -v minisign >/dev/null 2>&1; then
-            error "minisign is required to verify release signatures, including in CI/non-interactive mode."
-            error ""
-            error "Install minisign:"
-            error "  macOS:         brew install minisign"
-            error "  Ubuntu/Debian: sudo apt install minisign"
-            error "  Other:         https://jedisct1.github.io/minisign/"
+        if ! ensure_minisign "$tmp_dir"; then
+            minisign_install_help
             return 1
         else
             local minisign_pub="$tmp_dir/caam-release-minisign.pub"
@@ -1048,7 +1149,7 @@ untrusted comment: caam release signing key (minisign key 1BBD79B28BF718D0)
 RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
 CAAM_MINISIGN_PUB
             local minisign_out=""
-            if ! minisign_out=$(minisign -V -p "$minisign_pub" -m "$checksums_path" -x "$minisig_path" 2>&1); then
+            if ! minisign_out=$("$MINISIGN_BIN" -V -p "$minisign_pub" -m "$checksums_path" -x "$minisig_path" 2>&1); then
                 print_error "Signature verification failed."
                 if [ -n "$minisign_out" ]; then
                     printf '%s\n' "$minisign_out" | while IFS= read -r line; do
@@ -1163,9 +1264,15 @@ CAAM_COSIGN_PUB
     }
 
     if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+        actual=$(sha256sum "$archive_path" | awk '{print $1}') || {
+            print_error "Could not compute the release archive checksum."
+            return 1
+        }
     elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}') || {
+            print_error "Could not compute the release archive checksum."
+            return 1
+        }
     else
         print_error "sha256sum or shasum is required for checksum verification."
         return 1
@@ -1280,7 +1387,6 @@ try_binary_install() {
         release_json=$(get_release) || {
             error "Failed to fetch release information from GitHub"
             error "Check your internet connection or try again later"
-            error "You can also try: CAAM_SKIP_VERIFY=1 to skip verification"
             return 1
         }
     fi
@@ -1360,8 +1466,7 @@ try_binary_install() {
         error "A verification failure must never silently downgrade into installing"
         error "unsigned code (supply-chain safety). See issue #59."
         error ""
-        error "If you understand and accept the risk, re-run with:"
-        error "  curl -fsSL ... | CAAM_SKIP_VERIFY=1 bash"
+        error "Resolve the verification error above and re-run. Release authentication is mandatory."
         # Fail CLOSED: exit the whole installer rather than returning non-zero,
         # which the caller would treat as "no prebuilt binary" and fall through
         # to try_go_install (an unsigned build of main HEAD).
@@ -1618,9 +1723,6 @@ main() {
 
     # First, try to download pre-built binary
     if try_binary_install "$platform"; then
-        # Cleanup backup on success
-        cleanup_backup
-
         # Run verification if requested
         if [ "$VERIFY_AFTER_INSTALL" = true ]; then
             if ! verify_installation; then
@@ -1629,6 +1731,8 @@ main() {
             fi
         fi
 
+        # Keep the previous binary until the optional executable check passes.
+        cleanup_backup
         show_quick_start
         exit $EXIT_SUCCESS
     fi
@@ -1644,9 +1748,6 @@ main() {
         die "Failed to install $BIN_NAME" $EXIT_BUILD_FAILED
     fi
 
-    # Cleanup backup on success
-    cleanup_backup
-
     # Run verification if requested
     if [ "$VERIFY_AFTER_INSTALL" = true ]; then
         if ! verify_installation; then
@@ -1655,6 +1756,7 @@ main() {
         fi
     fi
 
+    cleanup_backup
     show_quick_start
     exit $EXIT_SUCCESS
 }
