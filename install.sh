@@ -45,6 +45,11 @@ DRY_RUN=false
 SHOW_HELP=false
 
 TMP_DIRS=()
+TMP_DIR_IDENTITIES=()
+readonly TMP_OWNER_SUBSHELL=$BASH_SUBSHELL
+TMP_CREATION_IN_PROGRESS=false
+TMP_PENDING_SIGNAL=0
+SOURCE_GO_VERSION=""
 
 # Set when a release asset was selected but could not be downloaded, so a
 # failed source-build fallback exits with EXIT_DOWNLOAD_FAILED.
@@ -237,20 +242,94 @@ confirm() {
 }
 
 cleanup_tmp_dirs() {
-    local dir
+    # Never let a child shell clean up its parent's active downloads/builds.
+    [ "$BASH_SUBSHELL" -eq "$TMP_OWNER_SUBSHELL" ] || return 0
+    local dir identity index=0 failed=0
     for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
-        [ -n "$dir" ] && rm -rf "$dir"
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            identity=$(tmp_dir_identity "$dir") || identity=""
+            if [ -n "$identity" ] && [ "$identity" = "${TMP_DIR_IDENTITIES[$index]}" ] && [ ! -L "$dir" ]; then
+                if ! rm -rf -- "$dir"; then
+                    error "Could not remove installer temporary directory: $dir"
+                    failed=1
+                fi
+            else
+                warn "Preserving replaced temporary path: $dir"
+                failed=1
+            fi
+        fi
+        index=$((index + 1))
     done
+    # Retire the authority even after a failed removal. A later pathname or
+    # inode reuse must never authorize deleting another invocation's files.
+    TMP_DIRS=()
+    TMP_DIR_IDENTITIES=()
+    return "$failed"
+}
+
+tmp_dir_identity() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    # GNU/BusyBox stat on Linux; BSD stat on macOS.
+    stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
 make_tmp_dir() {
-    local dir
-    dir=$(mktemp -d)
-    TMP_DIRS+=("$dir")
-    printf '%s\n' "$dir"
+    # Assign into the caller's variable, not stdout: command substitution
+    # loses the cleanup registration in a subshell (issue #136).
+    [ "$BASH_SUBSHELL" -eq "$TMP_OWNER_SUBSHELL" ] || {
+        error "Temporary directories must be created in the installer shell."
+        return 1
+    }
+    local created_tmp_dir tmp_parent identity
+    tmp_parent=$(cd -- "${TMPDIR:-/tmp}" && pwd -P) || return 1
+    if ! tmp_dir_identity "$tmp_parent" >/dev/null; then
+        error "stat is required to identify installer temporary directories."
+        return 1
+    fi
+    TMP_CREATION_IN_PROGRESS=true
+    if created_tmp_dir=$(mktemp -d "$tmp_parent/caam-install.XXXXXXXXXX"); then
+        TMP_DIRS+=("$created_tmp_dir")
+        identity=$(tmp_dir_identity "$created_tmp_dir") || identity=""
+        TMP_DIR_IDENTITIES+=("$identity")
+    else
+        TMP_CREATION_IN_PROGRESS=false
+        [ "$TMP_PENDING_SIGNAL" -eq 0 ] || exit "$TMP_PENDING_SIGNAL"
+        error "Could not create installer temporary directory."
+        return 1
+    fi
+    TMP_CREATION_IN_PROGRESS=false
+    [ "$TMP_PENDING_SIGNAL" -eq 0 ] || exit "$TMP_PENDING_SIGNAL"
+    if [ -z "$identity" ]; then
+        error "Could not identify installer temporary directory: $created_tmp_dir"
+        return 1
+    fi
+    printf -v "$1" '%s' "$created_tmp_dir"
 }
 
-trap cleanup_tmp_dirs EXIT
+handle_install_signal() {
+    # A trap may run between mktemp's return and registration. Finish that
+    # critical section first so the EXIT handler owns the resulting path.
+    if [ "$TMP_CREATION_IN_PROGRESS" = true ]; then
+        TMP_PENDING_SIGNAL=$1
+    else
+        exit "$1"
+    fi
+}
+
+finish_install() {
+    local status=$1
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! cleanup_tmp_dirs && [ "$status" -eq 0 ]; then
+        status=$EXIT_ERROR
+    fi
+    exit "$status"
+}
+
+trap 'finish_install $?' EXIT
+trap 'handle_install_signal 129' HUP
+trap 'handle_install_signal 130' INT
+trap 'handle_install_signal 143' TERM
 
 # Returns 0 if the given directory is a version-manager shim/managed dir that
 # tools like pyenv/asdf/rbenv/nvm rehash and wipe. Installing into these would
@@ -679,12 +758,11 @@ install_go_from_pkg() {
     fi
 
     print_info "Downloading Go $version (.pkg)..."
-    tmpdir=$(mktemp -d)
+    make_tmp_dir tmpdir || return 1
     pkg_path="$tmpdir/go.pkg"
 
     if ! curl -fsSL "$url" -o "$pkg_path"; then
         print_error "Failed to download Go installer from $url"
-        rm -rf "$tmpdir"
         return 1
     fi
 
@@ -696,19 +774,16 @@ install_go_from_pkg() {
     fi
     if [ -z "$actual_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
         print_error "Go installer checksum mismatch (expected $expected_sha, got ${actual_sha:-none}); not installing"
-        rm -rf "$tmpdir"
         return 1
     fi
 
     print_info "Installing Go $version (requires sudo)..."
     if sudo installer -pkg "$pkg_path" -target / >/dev/null; then
         print_success "Installed Go $version"
-        rm -rf "$tmpdir"
         return 0
     fi
 
     print_error "Go installer failed"
-    rm -rf "$tmpdir"
     return 1
 }
 
@@ -1117,7 +1192,7 @@ ensure_go() {
     if command -v go >/dev/null 2>&1; then
         go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
         if version_ge "$go_version" "$min_version"; then
-            printf '%s' "$go_version"
+            SOURCE_GO_VERSION="$go_version"
             return 0
         fi
         print_warn "Go $min_version or later is required. Found: go$go_version"
@@ -1141,7 +1216,7 @@ ensure_go() {
             go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
             if version_ge "$go_version" "$min_version"; then
                 print_success "Installed Go $go_version via Homebrew"
-                printf '%s' "$go_version"
+                SOURCE_GO_VERSION="$go_version"
                 return 0
             fi
         else
@@ -1170,7 +1245,7 @@ ensure_go() {
                     go_version=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
                     if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
                         print_success "Detected Go $go_version after pkg install"
-                        printf '%s' "$go_version"
+                        SOURCE_GO_VERSION="$go_version"
                         return 0
                     fi
                 fi
@@ -1251,7 +1326,7 @@ try_binary_install() {
 
     info "Downloading from GitHub..."
 
-    tmp_dir=$(make_tmp_dir)
+    make_tmp_dir tmp_dir || die "Could not prepare binary download directory." $EXIT_ERROR
 
     local ext=".tar.gz"
     if [[ "$download_url" == *.zip ]]; then
@@ -1347,8 +1422,7 @@ try_binary_install() {
 try_go_install() {
     info "Attempting to build from source with go build..."
 
-    local go_version
-    if ! go_version=$(ensure_go); then
+    if ! ensure_go; then
         error "Go 1.26.10 or later is required for building from source."
         error ""
         error "Install Go:"
@@ -1358,10 +1432,10 @@ try_go_install() {
         return 1
     fi
 
-    info "Using Go $go_version"
+    info "Using Go $SOURCE_GO_VERSION"
 
     local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
-    tmp_dir=$(make_tmp_dir)
+    make_tmp_dir tmp_dir || return 1
     src_dir="$tmp_dir/src"
     repo_url="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 

@@ -327,8 +327,8 @@ func TestSourceTarballRefHonorsRequestedVersion(t *testing.T) {
 func TestTryGoInstallRefusesRequestedTagCheckoutFailure(t *testing.T) {
 	tmp := t.TempDir()
 	setup := `
-ensure_go() { printf '1.26.10'; }
-make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
+ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+make_tmp_dir() { printf -v "$1" '%s' "$TEST_TMP"; }
 git() {
     if [ "$1" = "clone" ]; then
         mkdir -p "${@: -1}"
@@ -350,8 +350,8 @@ func TestTryGoInstallTarballFallbackUsesRequestedTag(t *testing.T) {
 	tmp := t.TempDir()
 	capture := filepath.Join(t.TempDir(), "url")
 	setup := `
-ensure_go() { printf '1.26.10'; }
-make_tmp_dir() { printf '%s\n' "$TEST_TMP"; }
+ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+make_tmp_dir() { printf -v "$1" '%s' "$TEST_TMP"; }
 git() { return 1; }
 download_file() {
     printf '%s\n' "$1" > "$CAPTURE"
@@ -709,5 +709,251 @@ cosign() {
 				}
 			})
 		}
+	}
+}
+
+// Exercise the real installation paths, including their EXIT traps, with
+// local archives and synthetic build/network tools. The unrelated sibling
+// deliberately shares TMPDIR with the installer and must survive every exit.
+func TestInstallerTemporaryDirectoryLifecycle(t *testing.T) {
+	for _, tool := range []string{"tar", "find", "chmod", "mv", "cp", "stat", "mktemp"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("installer test requires %s", tool)
+		}
+	}
+	for _, tc := range []struct {
+		name, method, source, failure, signal, stage string
+		wantCode                                     int
+	}{
+		{name: "binary success", method: "binary"},
+		{name: "binary verification failure", method: "binary", failure: "verify", wantCode: 3},
+		{name: "binary download and source failure", method: "binary", source: "tar", failure: "download", wantCode: 4},
+		{name: "git source success", source: "git"},
+		{name: "git source build failure", source: "git", failure: "build", wantCode: 5},
+		{name: "git missing tag", source: "git", failure: "checkout", wantCode: 5},
+		{name: "tar source success", source: "tar"},
+		{name: "tar source build failure", source: "tar", failure: "build", wantCode: 5},
+		{name: "tar source download failure", source: "tar", failure: "download", wantCode: 5},
+		{name: "binary HUP", method: "binary", signal: "HUP", stage: "download", wantCode: 129},
+		{name: "binary INT", method: "binary", signal: "INT", stage: "download", wantCode: 130},
+		{name: "binary TERM", method: "binary", signal: "TERM", stage: "download", wantCode: 143},
+		{name: "source download TERM", source: "tar", signal: "TERM", stage: "download", wantCode: 143},
+		{name: "source build INT", source: "git", signal: "INT", stage: "build", wantCode: 130},
+		{name: "mktemp failure", method: "binary", failure: "mktemp", wantCode: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tmp := filepath.Join(dir, "temporary files")
+			installed := filepath.Join(dir, "installed")
+			for _, path := range []string{tmp, installed, filepath.Join(tmp, "unrelated")} {
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			foreign := filepath.Join(tmp, "unrelated", "keep")
+			if err := os.WriteFile(foreign, []byte("must survive"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			old := []byte("previous installation")
+			if err := os.WriteFile(filepath.Join(installed, "caam"), old, 0600); err != nil {
+				t.Fatal(err)
+			}
+			program := []byte("#!/bin/sh\nprintf 'caam v0.1.24\\n'\n")
+			programPath := filepath.Join(dir, "program")
+			if err := os.WriteFile(programPath, program, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeArchive := func(path, name string) {
+				t.Helper()
+				var buf bytes.Buffer
+				gz := gzip.NewWriter(&buf)
+				tarWriter := tar.NewWriter(gz)
+				if err := tarWriter.WriteHeader(&tar.Header{Name: name, Mode: 0755, Size: int64(len(program))}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tarWriter.Write(program); err != nil {
+					t.Fatal(err)
+				}
+				if err := tarWriter.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := gz.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			binaryArchive := filepath.Join(dir, "binary.tar.gz")
+			sourceArchive := filepath.Join(dir, "source.tar.gz")
+			writeArchive(binaryArchive, "caam")
+			writeArchive(sourceArchive, "coding_agent_account_manager-0.1.24/source.txt")
+			setup := `
+INSTALL_VERSION=v0.1.24
+VERIFY_AFTER_INSTALL=true
+detect_terminal_features() { USE_COLOR=false; HAS_GUM=false; IS_TTY=false; }
+detect_platform() { printf 'linux_amd64\n'; }
+get_installed_version() { :; }
+ensure_json_tool() { :; }
+get_release() { printf '{}'; }
+select_release_asset() {
+    [ "$TEST_METHOD" = binary ] || return 1
+    printf 'v0.1.24\nhttps://example.test/binary.tar.gz\ncaam_0.1.24_linux_amd64.tar.gz\n'
+}
+verify_release_assets() { [ "$TEST_FAILURE" != verify ]; }
+ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+mktemp() {
+    [ "$TEST_FAILURE" != mktemp ] || return 1
+    command mktemp "$@"
+}
+download_file() {
+    if [ "$TEST_STAGE" = download ]; then kill -s "$TEST_SIGNAL" "$$"; return 1; fi
+    [ "$TEST_FAILURE" != download ] || return 1
+    case "$1" in
+        https://example.test/binary.tar.gz) cp "$BINARY_ARCHIVE" "$2" ;;
+        https://codeload.github.com/*) cp "$SOURCE_ARCHIVE" "$2" ;;
+        *) return 1 ;;
+    esac
+}
+git() {
+    [ "$TEST_SOURCE" != tar ] || return 1
+    if [ "$1" = clone ]; then mkdir -p "${@: -1}"; return; fi
+    [ "$TEST_FAILURE" != checkout ] || return 1
+    return 0
+}
+go() {
+    if [ "$TEST_STAGE" = build ]; then kill -s "$TEST_SIGNAL" "$$"; return 1; fi
+    [ "$TEST_FAILURE" != build ] || return 1
+    local output=""
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -o ]; then output=$2; break; fi
+        shift
+    done
+    [ -n "$output" ] || return 1
+    cp "$PROGRAM" "$output"
+}
+`
+			stdout, stderr, code := runInstallFunc(t, []string{
+				"TMPDIR=" + tmp, "INSTALL_DIR=" + installed, "PROGRAM=" + programPath,
+				"BINARY_ARCHIVE=" + binaryArchive, "SOURCE_ARCHIVE=" + sourceArchive,
+				"TEST_METHOD=" + tc.method, "TEST_SOURCE=" + tc.source, "TEST_FAILURE=" + tc.failure,
+				"TEST_SIGNAL=" + tc.signal, "TEST_STAGE=" + tc.stage,
+			}, setup, `main`, "")
+			if code != tc.wantCode {
+				t.Fatalf("installer exit=%d want %d; stdout=%s stderr=%s", code, tc.wantCode, stdout, stderr)
+			}
+			entries, err := os.ReadDir(tmp)
+			if err != nil || len(entries) != 1 || entries[0].Name() != "unrelated" {
+				t.Errorf("temporary root was not cleaned: entries=%v err=%v; stdout=%s stderr=%s", entries, err, stdout, stderr)
+			}
+			if content, err := os.ReadFile(foreign); err != nil || string(content) != "must survive" {
+				t.Errorf("unrelated directory changed: content=%q err=%v", content, err)
+			}
+			want := old
+			if tc.wantCode == 0 {
+				want = program
+			}
+			if content, err := os.ReadFile(filepath.Join(installed, "caam")); err != nil || !bytes.Equal(content, want) {
+				t.Errorf("installed binary changed incorrectly: content=%q err=%v", content, err)
+			}
+		})
+	}
+}
+
+func TestTemporaryDirectoryRegistrationAndOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name, setup, body string
+		wantCode          int
+	}{
+		{name: "subshell rejected", body: `captured=$(make_tmp_dir candidate); exit $?`, wantCode: 1},
+		{name: "signal during registration", setup: `mktemp() { command mktemp "$@"; kill -TERM "$$"; }`, body: `make_tmp_dir candidate`, wantCode: 143},
+		{name: "subshell cannot remove parent directory", body: `make_tmp_dir candidate; (cleanup_tmp_dirs); test -d "$candidate"`},
+		{name: "another invocation preserves active directory", body: `make_tmp_dir candidate; bash -c 'source "$INSTALL_SH"; make_tmp_dir other'; test -d "$candidate"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			stdout, stderr, code := runInstallFunc(t, []string{"TMPDIR=" + tmp}, tc.setup, tc.body, "")
+			if code != tc.wantCode {
+				t.Fatalf("exit=%d want %d; stdout=%s stderr=%s", code, tc.wantCode, stdout, stderr)
+			}
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+				t.Errorf("temporary root was not cleaned: entries=%v err=%v; stdout=%s stderr=%s", entries, err, stdout, stderr)
+			}
+		})
+	}
+	for _, replacement := range []string{"directory", "symlink"} {
+		t.Run("preserve replaced "+replacement, func(t *testing.T) {
+			tmp := t.TempDir()
+			body := `make_tmp_dir candidate
+mv "$candidate" "$candidate.original"
+if [ "$REPLACEMENT" = directory ]; then mkdir "$candidate"; else ln -s "$candidate.original" "$candidate"; fi
+printf 'foreign\n' > "$candidate/keep"
+printf '%s' "$candidate"`
+			stdout, stderr, code := runInstallFunc(t, []string{"TMPDIR=" + tmp, "REPLACEMENT=" + replacement}, "", body, "")
+			if code != 1 || !strings.Contains(stderr, "Preserving replaced temporary path") {
+				t.Fatalf("replacement not reported: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+			if content, err := os.ReadFile(filepath.Join(stdout, "keep")); err != nil || string(content) != "foreign\n" {
+				t.Errorf("replaced path was removed: content=%q err=%v", content, err)
+			}
+		})
+	}
+}
+
+func TestGoBootstrapTemporaryDirectoryCleanup(t *testing.T) {
+	for _, failure := range []string{"", "download", "checksum", "install", "interrupt"} {
+		t.Run(failure, func(t *testing.T) {
+			tmp := t.TempDir()
+			setup := `
+GO_READY=false
+IS_TTY=false
+USE_COLOR=false
+go() { if [ "$GO_READY" = true ]; then printf 'go version go1.26.10 darwin/arm64\n'; else printf 'go version go1.26.9 darwin/arm64\n'; fi; }
+brew() { return 1; }
+uname() { printf 'Darwin\n'; }
+fetch_latest_go_pkg() { printf 'go1.26.10\nhttps://example.test/go.pkg\n%s\n' "$PKG_SUM"; }
+curl() {
+    [ "$TEST_FAILURE" != download ] || return 1
+    if [ "$TEST_FAILURE" = interrupt ]; then kill -TERM "$$"; return 1; fi
+    local output=""
+    while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then output=$2; break; fi; shift; done
+    if [ "$TEST_FAILURE" = checksum ]; then printf 'tampered' > "$output"; else printf 'verified-pkg' > "$output"; fi
+}
+sudo() { [ "$TEST_FAILURE" != install ] || return 1; GO_READY=true; }
+`
+			sum := sha256.Sum256([]byte("verified-pkg"))
+			stdout, stderr, code := runInstallFunc(t, []string{
+				"TMPDIR=" + tmp, "TEST_FAILURE=" + failure, "PKG_SUM=" + hex.EncodeToString(sum[:]),
+			}, setup, `if ensure_go; then [ "$SOURCE_GO_VERSION" = 1.26.10 ]; else exit 1; fi`, "")
+			wantCode := 1
+			if failure == "" {
+				wantCode = 0
+			} else if failure == "interrupt" {
+				wantCode = 143
+			}
+			if code != wantCode {
+				t.Fatalf("exit=%d want %d; stdout=%s stderr=%s", code, wantCode, stdout, stderr)
+			}
+			if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+				t.Errorf("Go package directory was not cleaned: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestTemporaryCleanupErrorsPreserveInstallStatus(t *testing.T) {
+	for _, status := range []string{"0", "7"} {
+		t.Run(status, func(t *testing.T) {
+			tmp := t.TempDir()
+			stdout, stderr, code := runInstallFunc(t, []string{"TMPDIR=" + tmp, "TEST_STATUS=" + status}, "",
+				`make_tmp_dir candidate; rm() { return 1; }; exit "$TEST_STATUS"`, "")
+			wantCode := 1
+			if status == "7" {
+				wantCode = 7
+			}
+			if code != wantCode || !strings.Contains(stderr, "Could not remove installer temporary directory") {
+				t.Fatalf("cleanup error hidden or original status lost: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+		})
 	}
 }
