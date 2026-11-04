@@ -2,14 +2,18 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +23,7 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
 )
 
@@ -187,6 +192,11 @@ type robotCredentialResponse struct {
 // flags and output buffers so these tests do not mutate the global commands.
 func runRobotCredentialCommand(t *testing.T, source *cobra.Command, args ...string) (robotCredentialResponse, error) {
 	t.Helper()
+	return runRobotCredentialCommandContext(t, context.Background(), source, args...)
+}
+
+func runRobotCredentialCommandContext(t *testing.T, ctx context.Context, source *cobra.Command, args ...string) (robotCredentialResponse, error) {
+	t.Helper()
 	cmd := &cobra.Command{
 		Use:           source.Use,
 		Args:          source.Args,
@@ -198,7 +208,12 @@ func runRobotCredentialCommand(t *testing.T, source *cobra.Command, args ...stri
 	cmd.Flags().Bool("compact", false, "")
 	cmd.Flags().String("strategy", "smart", "")
 	cmd.Flags().Bool("include-cooldown", false, "")
+	cmd.Flags().Bool("no-fetch", false, "")
+	cmd.Flags().Bool("forecast", false, "")
+	cmd.Flags().String("model", "", "")
+	cmd.Flags().Duration("timeout", 30*time.Second, "")
 	var stdout, stderr bytes.Buffer
+	cmd.SetContext(ctx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs(args)
@@ -266,6 +281,579 @@ func writeRobotCredentialProfile(t *testing.T, provider, name string, files map[
 	writeNativeTestCredential(t, filepath.Join(dir, "meta.json"), `{}`)
 	for filename, content := range files {
 		writeNativeTestCredential(t, filepath.Join(dir, filename), content)
+	}
+}
+
+type robotQuotaFileState struct {
+	contents string
+	mode     fs.FileMode
+	modified time.Time
+}
+
+func snapshotRobotQuotaFiles(t *testing.T, roots ...string) map[string]robotQuotaFileState {
+	t.Helper()
+	files := make(map[string]robotQuotaFileState)
+	for _, root := range roots {
+		if err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			state := robotQuotaFileState{mode: info.Mode(), modified: info.ModTime()}
+			if !entry.IsDir() {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				state.contents = string(data)
+			}
+			files[path] = state
+			return nil
+		}); err != nil {
+			t.Fatalf("snapshot quota command inputs: %v", err)
+		}
+	}
+	return files
+}
+
+func requireRobotQuotaFilesUnchanged(t *testing.T, before map[string]robotQuotaFileState, roots ...string) {
+	t.Helper()
+	if after := snapshotRobotQuotaFiles(t, roots...); !reflect.DeepEqual(before, after) {
+		t.Error("read-only robot quota command changed saved profiles or live credentials")
+	}
+}
+
+func TestRobotPrecheckRequiresMeasuredAvailableQuota(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			setupRobotCredentialEnv(t)
+			_, live := setupSubscriptionQuotaProfiles(t, provider, map[string]string{
+				"a-exhausted":  subscriptionQuotaResponse(provider, 100),
+				"b-ready":      subscriptionQuotaResponse(provider, 0),
+				"c-unreadable": "",
+				"_original":    subscriptionQuotaResponse(provider, 0),
+			})
+			liveCredential := `{"access_token":"SYNTHETIC-LIVE-CREDENTIAL"}`
+			if provider == "claude" {
+				liveCredential = `{"claudeAiOauth":{"accessToken":"SYNTHETIC-LIVE-CREDENTIAL"}}`
+			}
+			writeNativeTestCredential(t, live, liveCredential)
+			roots := []string{vault.BasePath(), filepath.Dir(live)}
+			before := snapshotRobotQuotaFiles(t, roots...)
+			transport := http.DefaultTransport
+			var requests atomic.Int32
+			http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return transport.RoundTrip(req)
+			})
+
+			out, err := runRobotCredentialCommand(t, robotPrecheckCmd, provider)
+			if err != nil || !out.Success {
+				t.Fatalf("weekly-only measured account was not usable: output=%+v error=%v", out, err)
+			}
+			var data RobotPrecheckData
+			if err := json.Unmarshal(out.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if requests.Load() != 3 || !data.QuotaChecked || data.Summary.Total != 3 || data.Summary.Ready != 1 || data.Recommended == nil || data.Recommended.Name != "b-ready" || len(data.Backups) != 0 || len(data.Blocked) != 2 {
+				t.Fatalf("quota planner routed to unmeasured/exhausted/system profiles: requests=%d data=%+v", requests.Load(), data)
+			}
+			quota := data.Recommended.Quota
+			if quota == nil || !quota.QuotaKnown || !quota.QuotaAvailable || quota.PrimaryPct != nil || quota.SecondaryPct == nil || *quota.SecondaryPct != 0 {
+				t.Errorf("planner lost a real weekly zero without a session: %+v", quota)
+			}
+			if data.Commands.Activate != "caam robot act activate "+provider+" b-ready" {
+				t.Errorf("activation command does not use the measured candidate: %q", data.Commands.Activate)
+			}
+			if data.Commands.Next != "caam robot precheck "+provider || data.Commands.Run != "caam run "+provider+" --precheck -- <args>" {
+				t.Errorf("quota planning hints lost read-only planning or launch precheck: %+v", data.Commands)
+			}
+			for _, blocked := range data.Blocked {
+				if blocked.Quota == nil || blocked.Quota.QuotaAvailable || blocked.Name == "b-ready" || len(blocked.Reasons) == 0 {
+					t.Errorf("blocked quota lacks a restrictive verdict: %+v", blocked)
+				}
+			}
+			requireRobotQuotaFilesUnchanged(t, before, roots...)
+		})
+	}
+}
+
+func TestRobotPrecheckAppliesRequestedModelAndGeneralQuota(t *testing.T) {
+	const scoped = `{"seven_day":{"utilization":20},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, tc := range []struct {
+		name, model, body, want string
+		ready                   int
+	}{
+		{"unknown model", "", scoped, "b-ready", 1},
+		{"matching model", "fable", scoped, "b-ready", 1},
+		{"unrelated model", "sonnet", scoped, "a-scoped", 2},
+		{"general quota still applies", "sonnet", `{"seven_day":{"utilization":100},"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`, "b-ready", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRobotCredentialEnv(t)
+			setupSubscriptionQuotaProfiles(t, "claude", map[string]string{
+				"a-scoped": tc.body, "b-ready": subscriptionQuotaResponse("claude", 50),
+			})
+			before := snapshotRobotQuotaFiles(t, vault.BasePath())
+			out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude", "--model", tc.model)
+			if err != nil || !out.Success {
+				t.Fatalf("model-aware precheck failed: %+v, %v", out, err)
+			}
+			var data RobotPrecheckData
+			if err := json.Unmarshal(out.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if !data.QuotaChecked || data.Summary.Ready != tc.ready || data.Recommended == nil || data.Recommended.Name != tc.want || len(data.Backups) != tc.ready-1 || len(data.Blocked) != 2-tc.ready {
+				t.Fatalf("model scope or general quota lost during planning: %+v", data)
+			}
+			if data.Recommended.Quota == nil || !data.Recommended.Quota.QuotaAvailable {
+				t.Error("recommended profile lacks measured applicable headroom")
+			}
+			if data.Model != tc.model || (tc.model != "" && (data.Commands.Next != "caam robot precheck claude --model "+tc.model || data.Commands.Run != "caam run claude --precheck -- --model "+tc.model+" <args>")) {
+				t.Errorf("model choice was lost in quota-checked follow-up commands: model=%q commands=%+v", data.Model, data.Commands)
+			}
+			requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+		})
+	}
+}
+
+func TestRobotPrecheckUnavailableQuotaCannotBecomeReady(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, body string
+	}{
+		{"exhausted weekly", "claude", `{"five_hour":null,"seven_day":{"utilization":100}}`},
+		{"missing general quota", "claude", `{"five_hour":null,"seven_day":null}`},
+		{"model only", "claude", `{"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`},
+		{"unknown measured kind", "claude", `{"seven_day":{"utilization":0},"limits":[{"kind":"future_general","percent":50}]}`},
+		{"malformed percentage", "claude", `{"seven_day":{"utilization":false}}`},
+		{"failed request", "claude", ""},
+		{"codex null measurement", "codex", `{"rate_limit":{"secondary_window":{"used_percent":null}}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRobotCredentialEnv(t)
+			setupSubscriptionQuotaProfiles(t, tc.provider, map[string]string{"only": tc.body})
+			before := snapshotRobotQuotaFiles(t, vault.BasePath())
+			out, err := runRobotCredentialCommand(t, robotPrecheckCmd, tc.provider)
+			if err == nil || out.Success {
+				t.Fatalf("unavailable quota was advertised as ready: %+v, error=%v", out, err)
+			}
+			var data RobotPrecheckData
+			if err := json.Unmarshal(out.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if !data.QuotaChecked || data.Summary.Ready != 0 || data.Recommended != nil || len(data.Backups) != 0 || len(data.Blocked) != 1 || data.Commands.Activate != "" || data.Commands.Run != "" {
+				t.Fatalf("quota failure fell back to credential-health routing: %+v", data)
+			}
+			if quota := data.Blocked[0].Quota; quota == nil || quota.QuotaAvailable {
+				t.Errorf("blocked profile lost quota refusal: %+v", quota)
+			}
+			requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+		})
+	}
+}
+
+func TestRobotPrecheckNoFetchIsExplicitOfflineAdvice(t *testing.T) {
+	setupRobotCredentialEnv(t)
+	setupSubscriptionQuotaProfiles(t, "claude", map[string]string{"only": ""})
+	var requests atomic.Int32
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, fmt.Errorf("offline precheck must not request quota")
+	})
+	before := snapshotRobotQuotaFiles(t, vault.BasePath())
+	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude", "--no-fetch", "--timeout=0s")
+	if err != nil || !out.Success {
+		t.Fatalf("explicit offline credential advice failed: %+v, %v", out, err)
+	}
+	var data RobotPrecheckData
+	if err := json.Unmarshal(out.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 0 || data.QuotaChecked || data.Summary.Ready != 1 || data.Recommended == nil || data.Recommended.Name != "only" || data.Recommended.Quota != nil {
+		t.Errorf("offline advice claimed or fetched quota: requests=%d, data=%+v", requests.Load(), data)
+	}
+	requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+}
+
+func TestRobotLimitsUsesMeasuredQuota(t *testing.T) {
+	pct := func(value float64) *float64 { return &value }
+	const scoped = `{"seven_day":{"utilization":0},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, tc := range []struct {
+		name, provider, body, model string
+		known, available, scoped    bool
+		primary, secondary, binding *float64
+	}{
+		{name: "weekly zero without session", provider: "claude", body: `{"seven_day":{"utilization":0}}`, known: true, available: true, secondary: pct(0), binding: pct(0)},
+		{name: "null session", provider: "claude", body: `{"five_hour":null,"seven_day":{"utilization":17.5}}`, known: true, available: true, secondary: pct(17.5), binding: pct(17.5)},
+		{name: "null session measurement", provider: "claude", body: `{"five_hour":{"utilization":null},"seven_day":{"utilization":25}}`, known: true, available: true, secondary: pct(25), binding: pct(25)},
+		{name: "null session entry", provider: "claude", body: `{"limits":[{"kind":"session","percent":null},{"kind":"weekly_all","percent":0}]}`, known: true, available: true, secondary: pct(0), binding: pct(0)},
+		{name: "conventional session", provider: "claude", body: `{"five_hour":{"utilization":42},"seven_day":{"utilization":10}}`, known: true, available: true, primary: pct(42), secondary: pct(10), binding: pct(42)},
+		{name: "weekly exhausted beside measured session zero", provider: "claude", body: `{"five_hour":{"utilization":0},"seven_day":{"utilization":100}}`, known: true, primary: pct(0), secondary: pct(100), binding: pct(100)},
+		{name: "unknown model keeps every restriction", provider: "claude", body: scoped, known: true, scoped: true, secondary: pct(0), binding: pct(100)},
+		{name: "matching model exhausted", provider: "claude", body: scoped, model: "fable", known: true, scoped: true, secondary: pct(0), binding: pct(100)},
+		{name: "unrelated model available", provider: "claude", body: scoped, model: "sonnet", known: true, available: true, scoped: true, secondary: pct(0), binding: pct(0)},
+		{name: "model only remains unknown", provider: "claude", body: `{"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`, scoped: true},
+		{name: "unrepresented general constraint", provider: "claude", body: `{"seven_day":{"utilization":0},"limits":[{"kind":"future_general","percent":50}]}`},
+		{name: "malformed measurement", provider: "claude", body: `{"seven_day":{"utilization":"0"}}`},
+		{name: "missing quota", provider: "claude", body: `{}`},
+		{name: "null document", provider: "claude", body: `null`},
+		{name: "provider failure", provider: "claude"},
+		{name: "codex weekly zero", provider: "codex", body: `{"rate_limit":{"secondary_window":{"used_percent":0}}}`, known: true, available: true, secondary: pct(0), binding: pct(0)},
+		{name: "codex credits without quota", provider: "codex", body: `{"credits":{"has_credits":true,"balance":"12.50"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupRobotCredentialEnv(t)
+			_, live := setupSubscriptionQuotaProfiles(t, tc.provider, map[string]string{
+				"candidate": tc.body, "_original": subscriptionQuotaResponse(tc.provider, 0),
+			})
+			liveCredential := `{"access_token":"SYNTHETIC-LIVE-CREDENTIAL"}`
+			if tc.provider == "claude" {
+				liveCredential = `{"claudeAiOauth":{"accessToken":"SYNTHETIC-LIVE-CREDENTIAL"}}`
+			}
+			writeNativeTestCredential(t, live, liveCredential)
+			credentialFile, shadow := "auth.json", `{"access_token":"SYNTHETIC-OTHER-VAULT"}`
+			if tc.provider == "claude" {
+				credentialFile, shadow = ".credentials.json", `{"claudeAiOauth":{"accessToken":"SYNTHETIC-OTHER-VAULT"}}`
+			}
+			writeNativeTestCredential(t, filepath.Join(authfile.DefaultVaultPath(), tc.provider, "candidate", credentialFile), shadow)
+			roots := []string{vault.BasePath(), authfile.DefaultVaultPath(), filepath.Dir(live)}
+			before := snapshotRobotQuotaFiles(t, roots...)
+			transport := http.DefaultTransport
+			var requests atomic.Int32
+			http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return transport.RoundTrip(req)
+			})
+
+			out, err := runRobotCredentialCommand(t, robotLimitsCmd, tc.provider, "--forecast", "--model", tc.model)
+			if out.Success != tc.known || (err == nil) != tc.known {
+				t.Fatalf("limits success=%v error=%v; quota known=%v", out.Success, err, tc.known)
+			}
+			if !tc.known && (out.Error == nil || out.Error.Code != "QUOTA_UNAVAILABLE") {
+				t.Errorf("unmeasured limits need an explicit error: %+v", out.Error)
+			}
+			if requests.Load() != 1 {
+				t.Errorf("usage requests=%d, want exactly the selected user profile", requests.Load())
+			}
+			var data RobotLimitsData
+			if err := json.Unmarshal(out.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if !data.QuotaChecked || len(data.Profiles) != 1 {
+				t.Fatalf("limits omitted the requested check or admitted a system snapshot: %+v", data)
+			}
+			got := data.Profiles[0]
+			if got.Name != "candidate" || got.QuotaKnown != tc.known || got.QuotaAvailable != tc.available {
+				t.Errorf("quota verdict disagrees with provider measurements: %+v", got)
+			}
+			if !reflect.DeepEqual(got.PrimaryPct, tc.primary) || !reflect.DeepEqual(got.SecondaryPct, tc.secondary) || !reflect.DeepEqual(got.BindingPct, tc.binding) {
+				t.Errorf("optional or measured-zero quota was lost: primary=%v secondary=%v binding=%v", got.PrimaryPct, got.SecondaryPct, got.BindingPct)
+			}
+			var raw struct {
+				Profiles []map[string]json.RawMessage `json:"profiles"`
+			}
+			if err := json.Unmarshal(out.Data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]*float64{"primary_percent": tc.primary, "secondary_percent": tc.secondary, "binding_percent": tc.binding} {
+				_, present := raw.Profiles[0][key]
+				if present != (want != nil) {
+					t.Errorf("JSON %s presence=%v, want %v; unknown must be omitted and measured zero retained", key, present, want != nil)
+				}
+			}
+			if !tc.known && (got.AvailScore != 0 || got.Error == "") {
+				t.Errorf("unknown quota was promoted to an availability score: %+v", got)
+			}
+			if !tc.available && strings.Contains(got.Recommendation, "ready to use") {
+				t.Errorf("unavailable quota received ready advice: %+v", got)
+			}
+			if got.Usage == nil || got.Usage.Provider != tc.provider {
+				t.Fatalf("nested provider evidence is missing: %+v", got)
+			}
+			if tc.scoped && (got.Usage.ModelWindows["Fable"] == nil || len(got.Usage.ScopedWindows) == 0) {
+				t.Error("model filtering discarded the underlying model quota evidence")
+			}
+			if tc.name == "codex credits without quota" && (got.Usage.Credits == nil || got.Usage.Credits.Balance == nil || *got.Usage.Credits.Balance != 12.5) {
+				t.Error("unknown numeric quota discarded the credit balance")
+			}
+			if got.DepletesIn != "" || got.BurnRate != "" {
+				t.Errorf("--forecast invented a rate or ETA from percentages alone: %+v", got)
+			}
+			if tc.known && tc.binding != nil && *tc.binding < 100 && (got.ForecastError == "" || got.Error != "") {
+				t.Errorf("missing forecast data invalidated a measured quota or concealed uncertainty: %+v", got)
+			}
+			requireRobotQuotaFilesUnchanged(t, before, roots...)
+		})
+	}
+}
+
+func TestRobotQuotaFailuresAndCancellationStayUnknown(t *testing.T) {
+	for _, source := range []*cobra.Command{robotLimitsCmd, robotPrecheckCmd} {
+		for _, provider := range []string{"claude", "codex"} {
+			for _, failure := range []string{"unauthorized", "network", "timeout", "caller canceled"} {
+				t.Run(source.Name()+"/"+provider+"/"+failure, func(t *testing.T) {
+					setupRobotCredentialEnv(t)
+					setupSubscriptionQuotaProfiles(t, provider, map[string]string{"only": subscriptionQuotaResponse(provider, 0)})
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					var requests atomic.Int32
+					var contextObserved atomic.Bool
+					http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+						requests.Add(1)
+						switch failure {
+						case "unauthorized":
+							return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader(`{"error":"invalid token"}`)), Header: make(http.Header), Request: req}, nil
+						case "network":
+							return nil, errors.New("quota transport unavailable")
+						case "timeout":
+							deadline, ok := req.Context().Deadline()
+							if !ok || time.Until(deadline) > 200*time.Millisecond {
+								return nil, errors.New("requested quota timeout was not propagated")
+							}
+							<-req.Context().Done()
+							contextObserved.Store(errors.Is(req.Context().Err(), context.DeadlineExceeded))
+							return nil, req.Context().Err()
+						default:
+							cancel()
+							contextObserved.Store(errors.Is(req.Context().Err(), context.Canceled))
+							return nil, errors.New("quota request canceled")
+						}
+					})
+					before := snapshotRobotQuotaFiles(t, vault.BasePath())
+					out, err := runRobotCredentialCommandContext(t, ctx, source, provider, "--timeout=50ms")
+					if err == nil || out.Success || out.Error == nil || requests.Load() != 1 {
+						t.Fatalf("failed quota request was not refused: requests=%d output=%+v error=%v", requests.Load(), out, err)
+					}
+					if (failure == "timeout" || failure == "caller canceled") && !contextObserved.Load() {
+						t.Error("quota transport did not receive the caller cancellation or requested deadline")
+					}
+					if failure == "caller canceled" && out.Error.Code != "REQUEST_CANCELED" {
+						t.Errorf("caller cancellation was hidden: %+v", out.Error)
+					}
+					var quota *RobotProfileLimits
+					if source == robotLimitsCmd {
+						var data RobotLimitsData
+						if err := json.Unmarshal(out.Data, &data); err != nil {
+							t.Fatal(err)
+						}
+						if !data.QuotaChecked || len(data.Profiles) != 1 {
+							t.Fatalf("failed quota request lost its diagnostic row: %+v", data)
+						}
+						quota = &data.Profiles[0]
+					} else {
+						var data RobotPrecheckData
+						if err := json.Unmarshal(out.Data, &data); err != nil {
+							t.Fatal(err)
+						}
+						if !data.QuotaChecked || data.Summary.Ready != 0 || data.Recommended != nil || len(data.Backups) != 0 || len(data.Blocked) != 1 || data.Commands.Activate != "" || data.Commands.Run != "" {
+							t.Fatalf("failed quota request still supplied a launch recommendation: %+v", data)
+						}
+						quota = data.Blocked[0].Quota
+					}
+					if quota == nil || quota.QuotaKnown || quota.QuotaAvailable || quota.AvailScore != 0 || quota.PrimaryPct != nil || quota.SecondaryPct != nil || quota.BindingPct != nil || quota.Error == "" {
+						t.Errorf("failed request became numeric quota or readiness: %+v", quota)
+					}
+					requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+				})
+			}
+		}
+	}
+}
+
+func TestRobotQuotaHonorsSavedCredentialSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider string
+		files          map[string]string
+	}{
+		{"malformed primary blocks legacy", "claude", map[string]string{
+			".credentials.json": `{"claudeAiOauth":`,
+			".claude.json":      `{"oauthToken":"SYNTHETIC-UNSELECTED-LEGACY"}`,
+		}},
+		{"settings select helper instead of cached OAuth", "claude", map[string]string{
+			"settings.json":     `{"apiKeyHelper":"SYNTHETIC-HELPER-MUST-NOT-RUN"}`,
+			".credentials.json": `{"claudeAiOauth":{"accessToken":"SYNTHETIC-UNSELECTED-OAUTH"}}`,
+		}},
+		{"API key mode blocks cached subscription OAuth", "codex", map[string]string{
+			"auth.json": `{"auth_mode":"apikey","OPENAI_API_KEY":"SYNTHETIC-SELECTED-KEY","tokens":{"access_token":"SYNTHETIC-UNSELECTED-OAUTH"}}`,
+		}},
+	} {
+		for _, source := range []*cobra.Command{robotLimitsCmd, robotPrecheckCmd} {
+			t.Run(tc.name+"/"+source.Name(), func(t *testing.T) {
+				setupRobotCredentialEnv(t)
+				writeRobotCredentialProfile(t, tc.provider, "only", tc.files)
+				oldTransport := http.DefaultTransport
+				t.Cleanup(func() { http.DefaultTransport = oldTransport })
+				var requests atomic.Int32
+				http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					return nil, errors.New("unselected credential must not be queried")
+				})
+				before := snapshotRobotQuotaFiles(t, vault.BasePath())
+				out, err := runRobotCredentialCommand(t, source, tc.provider)
+				if err == nil || out.Success || requests.Load() != 0 {
+					t.Fatalf("unselected credential established subscription availability: requests=%d output=%+v error=%v", requests.Load(), out, err)
+				}
+				if source == robotLimitsCmd {
+					var data RobotLimitsData
+					if err := json.Unmarshal(out.Data, &data); err != nil {
+						t.Fatal(err)
+					}
+					if len(data.Profiles) != 1 || data.Profiles[0].QuotaKnown || data.Profiles[0].QuotaAvailable || data.Profiles[0].AvailScore != 0 || data.Profiles[0].Error == "" {
+						t.Errorf("unreadable subscription credentials were silently omitted or counted as available: %+v", data)
+					}
+				} else {
+					var data RobotPrecheckData
+					if err := json.Unmarshal(out.Data, &data); err != nil {
+						t.Fatal(err)
+					}
+					if !data.QuotaChecked || data.Summary.Ready != 0 || data.Recommended != nil || len(data.Backups) != 0 || len(data.Blocked) != 1 || data.Commands.Activate != "" || data.Commands.Run != "" {
+						t.Errorf("credential selection refusal fell back to unchecked planning: %+v", data)
+					}
+				}
+				requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+			})
+		}
+	}
+}
+
+func TestRobotQuotaUnsupportedProviderNeedsExplicitOfflineAdvice(t *testing.T) {
+	setupRobotCredentialEnv(t)
+	writeRobotCredentialProfile(t, "opencode", "only", map[string]string{
+		"auth.json": `{"anthropic":{"type":"api","key":"SYNTHETIC-OPENCODE-KEY"}}`,
+	})
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	var requests atomic.Int32
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, errors.New("unsupported provider must not be queried")
+	})
+	before := snapshotRobotQuotaFiles(t, vault.BasePath())
+	for _, source := range []*cobra.Command{robotLimitsCmd, robotPrecheckCmd} {
+		out, err := runRobotCredentialCommand(t, source, "opencode")
+		if err == nil || out.Success {
+			t.Errorf("%s claimed unsupported quota was available: %+v, %v", source.Name(), out, err)
+		}
+		if source == robotPrecheckCmd {
+			var data RobotPrecheckData
+			if err := json.Unmarshal(out.Data, &data); err != nil {
+				t.Fatal(err)
+			}
+			if !data.QuotaChecked || data.Summary.Ready != 0 || data.Recommended != nil || len(data.Blocked) != 1 || data.Commands.Activate != "" || data.Commands.Run != "" || data.Commands.Next != "caam robot precheck opencode" {
+				t.Errorf("unsupported quota was disguised as guarded launch advice: %+v", data)
+			}
+		}
+	}
+	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "opencode", "--no-fetch")
+	if err != nil || !out.Success {
+		t.Fatalf("explicit credential-only planning was not retained: %+v, %v", out, err)
+	}
+	var data RobotPrecheckData
+	if err := json.Unmarshal(out.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.QuotaChecked || data.Summary.Ready != 1 || data.Recommended == nil || data.Recommended.Quota != nil || requests.Load() != 0 {
+		t.Errorf("offline advice claimed provider quota: requests=%d data=%+v", requests.Load(), data)
+	}
+	requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+}
+
+func TestRobotPrecheckQuotaCannotOverrideCredentialOrCooldownBlocks(t *testing.T) {
+	setupRobotCredentialEnv(t)
+	setupSubscriptionQuotaProfiles(t, "codex", map[string]string{
+		"a-rejected": subscriptionQuotaResponse("codex", 0),
+		"b-cooled":   subscriptionQuotaResponse("codex", 0),
+		"c-ready":    subscriptionQuotaResponse("codex", 20),
+	})
+	healthStore = health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	healthStore.SetVaultPath(vault.BasePath())
+	credential, err := os.ReadFile(filepath.Join(vault.ProfilePath("codex", "a-rejected"), "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := healthStore.RecordProviderVerification("codex", "a-rejected", health.ProviderVerification{
+		Reason: "refresh_token_invalidated", Fingerprint: health.CodexCredentialFingerprint(credential),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := caamdb.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cooldownErr := db.SetCooldown("codex", "b-cooled", time.Now(), time.Hour, "synthetic provider restriction")
+	closeErr := db.Close()
+	if cooldownErr != nil || closeErr != nil {
+		t.Fatalf("could not establish cooldown: %v, %v", cooldownErr, closeErr)
+	}
+	transport := http.DefaultTransport
+	var requests atomic.Int32
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return transport.RoundTrip(req)
+	})
+	before := snapshotRobotQuotaFiles(t, vault.BasePath())
+	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "codex")
+	if err != nil || !out.Success {
+		t.Fatalf("remaining usable account was not recommended: %+v, %v", out, err)
+	}
+	var data RobotPrecheckData
+	if err := json.Unmarshal(out.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.QuotaChecked || data.Summary.Total != 3 || data.Summary.Ready != 1 || data.Recommended == nil || data.Recommended.Name != "c-ready" || len(data.Backups) != 0 || len(data.Blocked) != 1 || data.Blocked[0].Name != "a-rejected" || len(data.InCooldown) != 1 || data.InCooldown[0].Name != "b-cooled" {
+		t.Errorf("numeric headroom overrode credential rejection or cooldown: %+v", data)
+	}
+	if requests.Load() != 1 {
+		t.Errorf("quota requested %d profiles; only the launchable candidate should be queried", requests.Load())
+	}
+	requireRobotQuotaFilesUnchanged(t, before, vault.BasePath())
+}
+
+func TestRobotLimitForecastKeepsModelAndResetBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, model           string
+		forecast, resetsFirst bool
+		available, wantETA    bool
+	}{
+		{"forecast not requested", "sonnet", false, false, true, false},
+		{"unrelated model leaves weekly forecast", "sonnet", true, false, true, true},
+		{"matching model already exhausted", "fable", true, false, false, false},
+		{"unspecified model keeps exhaustion", "", true, false, false, false},
+		{"weekly reset ends forecast horizon", "sonnet", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &usage.UsageInfo{
+				Provider: "claude", ProfileName: "candidate",
+				SecondaryWindow: &usage.UsageWindow{UsedPercent: 20},
+				ModelWindows: map[string]*usage.UsageWindow{
+					"fable": {Label: "Fable", UsedPercent: 100},
+				},
+				BurnRate: &usage.BurnRateInfo{PercentPerHour: 20, Confidence: 0.9, SampleSize: 10},
+			}
+			if tc.resetsFirst {
+				info.SecondaryWindow.ResetsAt = time.Now().Add(time.Hour)
+			}
+			got := buildRobotProfileLimits("candidate", info, tc.model, tc.forecast)
+			if !got.QuotaKnown || got.QuotaAvailable != tc.available || got.Error != "" || got.Usage != info || got.SecondaryPct == nil || *got.SecondaryPct != 20 {
+				t.Fatalf("forecast handling altered the measured quota verdict: %+v", got)
+			}
+			if tc.wantETA {
+				if got.DepletesIn != robotFormatDuration(4*time.Hour) || got.BurnRate != "20.00%/hour" || got.ForecastConfidence == nil || got.ForecastError != "" {
+					t.Errorf("valid model-aware forecast missing: %+v", got)
+				}
+			} else if got.DepletesIn != "" || got.BurnRate != "" || got.ForecastConfidence != nil {
+				t.Errorf("forecast advertised beyond the requested model/window: %+v", got)
+			}
+			if tc.resetsFirst && got.ForecastError == "" {
+				t.Error("reset-before-depletion uncertainty was omitted")
+			}
+		})
 	}
 }
 
@@ -395,7 +983,8 @@ func TestRobotCredentialSelectionExcludesUnusableProfiles(t *testing.T) {
 		}
 	}
 
-	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude")
+	// This test covers offline credential admission, independently of quota.
+	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude", "--no-fetch")
 	if err != nil || !out.Success {
 		t.Fatalf("precheck failed with usable credentials: %+v, %v", out, err)
 	}
@@ -432,7 +1021,7 @@ func TestRobotCredentialSelectionFailsWhenNoAccountCanLaunch(t *testing.T) {
 			t.Errorf("next should reject an unusable pool: %+v, error=%v", out, err)
 		}
 	}
-	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude")
+	out, err := runRobotCredentialCommand(t, robotPrecheckCmd, "claude", "--no-fetch")
 	if err == nil || out.Success {
 		t.Errorf("precheck should report no launchable accounts: %+v, error=%v", out, err)
 	}
@@ -604,7 +1193,7 @@ func TestRobotCredentialProviderRejectionBlocksRenewableAccount(t *testing.T) {
 		t.Errorf("revoked credential remained a routing candidate: %+v", selected)
 	}
 
-	out, err = runRobotCredentialCommand(t, robotPrecheckCmd, "codex")
+	out, err = runRobotCredentialCommand(t, robotPrecheckCmd, "codex", "--no-fetch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +1252,7 @@ func TestRobotCredentialUnnamedBackupPreservesNamedActiveAccount(t *testing.T) {
 	if next.Profile != "work" || next.AlternateChoice != nil {
 		t.Errorf("safety snapshot became a routing candidate: %+v", next)
 	}
-	out, err = runRobotCredentialCommand(t, robotPrecheckCmd, "claude")
+	out, err = runRobotCredentialCommand(t, robotPrecheckCmd, "claude", "--no-fetch")
 	if err != nil {
 		t.Fatal(err)
 	}

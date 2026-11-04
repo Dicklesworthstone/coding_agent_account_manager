@@ -42,7 +42,9 @@ The `robot` commands emit JSON without a `--json` flag:
 
 ```bash
 caam robot validate claude work        # Check saved credentials locally
-caam robot precheck claude             # Plan a session from usable profiles
+caam robot limits claude --model opus  # Read measured quotas for saved profiles
+caam robot precheck claude             # Plan from usable credentials and measured quota
+caam robot precheck claude --no-fetch  # Explicit credential/cooldown-only advice
 caam robot act activate claude work    # Install the selected credentials
 caam robot act refresh codex work      # Refresh through CAAM when supported
 caam robot docs                        # Every command and flag, exit/error codes, JSON Schemas
@@ -66,6 +68,29 @@ Robot `next` and `precheck` exclude unusable credentials and system snapshots.
 creates an `_backup_*` snapshot without replacing a matching named account as
 the active profile. A failed validation or a precheck with no usable account
 returns `success: false` and a nonzero exit status.
+
+Robot `limits` and default `precheck` fetch quotas for the selected vault's
+saved profiles. Both accept `--model` and a positive `--timeout` (default
+`30s`); omitting the model conservatively includes every scoped restriction.
+Precheck recommendations require available measured quota as well as usable
+credentials. Failed reads, unsupported providers, and exhausted general or
+applicable model quotas stay blocked. `--no-fetch` explicitly skips quota
+checks and reports `quota_checked: false`; it does not read a quota cache.
+
+Robot quota rows distinguish `quota_known` from `quota_available`. Numeric
+`primary_percent`, `secondary_percent`, and `binding_percent` are present only
+for usable measurements, including real zero usage. A weekly-only account
+therefore has no `primary_percent`. The nested `usage` object preserves quota
+details and diagnostics. `availability_score` is a ranking score, not a
+remaining-quota percentage; consumers must check the quota flags. When no
+profile can be measured, `robot limits` returns `QUOTA_UNAVAILABLE` with its
+diagnostic rows. Measured exhausted accounts are still valid limits results.
+
+`robot limits --forecast` keeps forecast failure separate from quota failure.
+Without an attributable percentage burn rate, it reports `forecast_error`
+and omits depletion timing; shared machine logs cannot supply a saved account's
+rate. `resets_in` is informational and does not promise that all restrictions
+will lift then. Refresh measurements before making a later selection.
 
 Passive validation does not prove provider acceptance. `--active` explicitly
 fails for saved vault profiles. Robot refresh reports `REFRESH_UNSUPPORTED`
