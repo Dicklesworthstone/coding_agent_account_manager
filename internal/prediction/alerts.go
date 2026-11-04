@@ -75,26 +75,26 @@ func GenerateAlerts(predictions []*Prediction, opts AlertOptions) []*Alert {
 	}
 
 	var alerts []*Alert
-	var considered int
-	allLow := true
+	allLow := len(predictions) > 0
 
 	for _, pred := range predictions {
-		if pred == nil {
+		if !pred.hasCurrentPercent() {
+			// Unknown accounts cannot establish that all monitored accounts
+			// are low, nor can their zero values stand in for healthy usage.
+			allLow = false
 			continue
 		}
 
-		timeUntil := pred.TimeToDepletion
-		percent := pred.CurrentPercent
-
-		if pred.Warning != WarningNone || percent > 0 {
-			considered++
-			if pred.Warning < WarningApproaching && percent < opts.WarningPercent {
-				allLow = false
-			}
+		var timeUntil time.Duration
+		if pred.IsValid() {
+			timeUntil = pred.TimeToDepletion
 		}
 
 		alertType, urgency := classifyAlert(pred, opts)
-		if alertType != nil {
+		if alertType == nil {
+			// A known zero is just as much healthy evidence as a known 20%.
+			allLow = false
+		} else {
 			alerts = append(alerts, &Alert{
 				Type:            *alertType,
 				Provider:        pred.Provider,
@@ -121,7 +121,7 @@ func GenerateAlerts(predictions []*Prediction, opts AlertOptions) []*Alert {
 		}
 	}
 
-	if considered > 0 && allLow {
+	if allLow {
 		alerts = append(alerts, &Alert{
 			Type:            AlertAllProfilesLow,
 			Message:         "All monitored profiles are near rate limits",
@@ -170,13 +170,14 @@ func ToNotifyAlert(a *Alert) *notify.Alert {
 }
 
 func classifyAlert(pred *Prediction, opts AlertOptions) (*AlertType, Urgency) {
-	if pred == nil {
+	if !pred.hasCurrentPercent() {
 		return nil, UrgencyLow
 	}
 
 	percent := pred.CurrentPercent
-	imminent := pred.Warning >= WarningImminent || (opts.CriticalPercent > 0 && percent >= opts.CriticalPercent)
-	approaching := pred.Warning >= WarningApproaching || (opts.WarningPercent > 0 && percent >= opts.WarningPercent)
+	forecastValid := pred.IsValid()
+	imminent := (forecastValid && pred.Warning >= WarningImminent) || (opts.CriticalPercent > 0 && percent >= opts.CriticalPercent)
+	approaching := (forecastValid && pred.Warning >= WarningApproaching) || (opts.WarningPercent > 0 && percent >= opts.WarningPercent)
 
 	switch {
 	case imminent:
@@ -191,7 +192,7 @@ func classifyAlert(pred *Prediction, opts AlertOptions) (*AlertType, Urgency) {
 }
 
 func shouldRecommendSwitch(pred *Prediction, opts AlertOptions) bool {
-	if pred == nil || pred.TimeToDepletion <= 0 {
+	if !pred.IsValid() || pred.TimeToDepletion <= 0 {
 		return false
 	}
 	if pred.Confidence < opts.MinConfidence {
@@ -201,17 +202,14 @@ func shouldRecommendSwitch(pred *Prediction, opts AlertOptions) bool {
 }
 
 func buildMessage(pred *Prediction) string {
-	if pred == nil {
+	if !pred.hasCurrentPercent() {
 		return "Rate limit status unknown"
 	}
 
-	if pred.TimeToDepletion > 0 {
+	if pred.IsValid() && pred.TimeToDepletion > 0 {
 		return fmt.Sprintf("Will hit limit in ~%s (%.0f%% used)", pred.TimeToDepletion.Round(time.Minute), pred.CurrentPercent)
 	}
-	if pred.CurrentPercent > 0 {
-		return fmt.Sprintf("Usage at %.0f%%", pred.CurrentPercent)
-	}
-	return "Rate limit status unknown"
+	return fmt.Sprintf("Usage at %.0f%%", pred.CurrentPercent)
 }
 
 func buildAction(pred *Prediction) string {

@@ -319,9 +319,21 @@ func buildPrecheckResult(
 	now := time.Now()
 	var totalUsage int
 	var usageCount int
+	engine := prediction.NewPredictionEngine(prediction.WithModel(model))
+	var predictions []*prediction.Prediction
 
 	// Process each profile
 	for _, profileName := range profiles {
+		var pred *prediction.Prediction
+		if usageMap != nil {
+			// Keep every monitored profile, including missing measurements and
+			// known quota without a burn rate. Dropping either makes an "all
+			// profiles" warning describe only the forecastable subset.
+			pred = engine.Predict(context.Background(), usageMap[profileName])
+			pred.Profile = profileName
+			pred.Provider = provider
+			predictions = append(predictions, pred)
+		}
 		rec := ProfileRecommendation{
 			Name:       profileName,
 			PoolStatus: "unknown",
@@ -329,7 +341,7 @@ func buildPrecheckResult(
 
 		// Get usage data
 		if usageMap != nil {
-			if info, ok := usageMap[profileName]; ok && info != nil {
+			if info, ok := usageMap[profileName]; ok && info.NumericQuotaKnown() {
 				rec.AvailScore = info.AvailabilityScoreForModel(model)
 				if scoped := info.ScopedLimit(model); scoped != nil {
 					rec.ScopedLimit = formatScopedLimit(scoped)
@@ -355,10 +367,12 @@ func buildPrecheckResult(
 					totalUsage += rec.UsagePercent
 					usageCount++
 				}
-				if info.TimeToDepletion() > 0 {
-					rec.TimeToDepletion = formatDurationShort(info.TimeToDepletion())
-				}
 			}
+		}
+		// An unscoped or stale estimate on the input row is not a forecast
+		// for this session's model. Only use the validated prediction above.
+		if pred != nil && pred.IsValid() && pred.TimeToDepletion > 0 {
+			rec.TimeToDepletion = formatDurationShort(pred.TimeToDepletion)
 		}
 
 		// Get health status
@@ -470,22 +484,7 @@ func buildPrecheckResult(
 	result.Summary = summary
 
 	// Generate alerts using prediction package
-	if len(usageMap) > 0 {
-		// Convert usage map to predictions
-		var usageInfos []*usage.UsageInfo
-		for _, info := range usageMap {
-			usageInfos = append(usageInfos, info)
-		}
-
-		engine := prediction.NewPredictionEngine()
-		var predictions []*prediction.Prediction
-		for _, info := range usageInfos {
-			pred := engine.Predict(context.Background(), info)
-			if pred != nil && pred.Error == "" {
-				predictions = append(predictions, pred)
-			}
-		}
-
+	if len(predictions) > 0 {
 		alertOpts := prediction.DefaultAlertOptions()
 		alerts := prediction.GenerateAlerts(predictions, alertOpts)
 		for _, a := range alerts {

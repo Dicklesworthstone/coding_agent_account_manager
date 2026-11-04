@@ -144,9 +144,82 @@ func TestUsageUnavailable(t *testing.T) {
 	if r := usageUnavailable(withWindow); r != "" {
 		t.Errorf("with window: got %q, want empty", r)
 	}
+	// A balance alone never established a measured percentage. The previous
+	// expectation accepted it as numeric data and fabricated a zero-usage bar.
 	withCredits := &usage.UsageInfo{Credits: &usage.CreditInfo{HasCredits: true}}
-	if r := usageUnavailable(withCredits); r != "" {
-		t.Errorf("with credits: got %q, want empty", r)
+	if r := usageUnavailable(withCredits); r != "no usage: numeric quota unavailable" {
+		t.Errorf("with credits: got %q, want numeric quota unavailable", r)
+	}
+}
+
+func TestMonitorRenderRejectsPartialAndProjectedMeasurements(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info *usage.UsageInfo
+	}{
+		{name: "nil"},
+		{name: "empty", info: &usage.UsageInfo{}},
+		{name: "error with window", info: &usage.UsageInfo{Error: "partial response", PrimaryWindow: &usage.UsageWindow{UsedPercent: 100}}},
+		{name: "rolled cache", info: &usage.UsageInfo{PrimaryWindow: &usage.UsageWindow{Rolled: true}}},
+		{name: "unmeasured model", info: &usage.UsageInfo{SecondaryWindow: &usage.UsageWindow{}, ModelWindows: map[string]*usage.UsageWindow{"Fable": {Unmeasured: true}}}},
+		{name: "invalid percentage", info: &usage.UsageInfo{PrimaryWindow: &usage.UsageWindow{UsedPercent: 101}}},
+		{name: "invalid fraction", info: &usage.UsageInfo{PrimaryWindow: &usage.UsageWindow{Utilization: -0.1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := buildTestState(0)
+			state.Profiles["claude/alice"].Usage = tc.info
+			if got := NewBriefRenderer().Render(state); got != "claude:?" {
+				t.Errorf("unknown measurement brief=%q", got)
+			}
+			if got := NewTableRenderer().Render(state); !strings.Contains(got, "no usage") || strings.Contains(got, "  0%") {
+				t.Errorf("unknown measurement table:\n%s", got)
+			}
+			if got := NewJSONRenderer(false).Render(state); !json.Valid([]byte(got)) || strings.Contains(got, `"usage_percent"`) {
+				t.Errorf("unknown measurement JSON=%q", got)
+			}
+			if got := NewAlertRenderer(80).Render(state); got != "" {
+				t.Errorf("unknown measurement alert=%q", got)
+			}
+		})
+	}
+}
+
+func TestMonitorRenderPreservesStricterMeasurement(t *testing.T) {
+	state := buildTestState(100)
+	state.Profiles["claude/alice"].Usage.PrimaryWindow.Utilization = 0.5
+	state.Profiles["claude/unknown"] = &ProfileState{
+		Provider: "claude", ProfileName: "unknown", Usage: &usage.UsageInfo{Provider: "claude", Error: "request failed"},
+	}
+	if got := NewBriefRenderer().Render(state); got != "claude:100%^" {
+		t.Errorf("brief understated measured restriction: %q", got)
+	}
+	if got := NewTableRenderer().Render(state); !strings.Contains(got, "100%") || !strings.Contains(got, "no usage: request failed") {
+		t.Errorf("table lost measured restriction or error reason:\n%s", got)
+	}
+	if got := NewAlertRenderer(80).Render(state); !strings.Contains(got, "claude/alice at 100%") || strings.Contains(got, "claude/unknown") {
+		t.Errorf("alerts understated measured restriction: %q", got)
+	}
+}
+
+func TestMonitorRenderCreditsWithoutNumericQuota(t *testing.T) {
+	zero := 0.0
+	for _, tc := range []struct {
+		name    string
+		credits *usage.CreditInfo
+		want    string
+	}{
+		{name: "available", credits: &usage.CreditInfo{HasCredits: true}, want: "Credits: available"},
+		{name: "unlimited", credits: &usage.CreditInfo{Unlimited: true}, want: "Credits: unlimited"},
+		{name: "zero balance", credits: &usage.CreditInfo{Balance: &zero}, want: "Credit balance: 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := buildTestState(0)
+			state.Profiles["claude/alice"].Usage = &usage.UsageInfo{Credits: tc.credits}
+			out := NewTableRenderer().Render(state)
+			if !strings.Contains(out, tc.want) || !strings.Contains(out, "no usage:") || strings.Contains(out, "  0%") {
+				t.Errorf("credit-only table:\n%s", out)
+			}
+		})
 	}
 }
 

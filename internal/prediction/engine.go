@@ -47,6 +47,10 @@ type Prediction struct {
 	// CurrentPercent is the current utilization percentage (0-100).
 	CurrentPercent float64 `json:"current_percent"`
 
+	// CurrentPercentKnown distinguishes measured zero usage from missing quota.
+	// A measurement can be known even when no depletion forecast is possible.
+	CurrentPercentKnown bool `json:"current_percent_known"`
+
 	// BurnRate contains token consumption rate data.
 	BurnRate *usage.BurnRateInfo `json:"burn_rate,omitempty"`
 
@@ -63,21 +67,31 @@ type Prediction struct {
 	Warning WarningLevel `json:"warning"`
 
 	// DataSources lists where burn rate data came from.
-	// Values: "session", "logs", "api"
+	// Values: "session", "logs", "api", "current_usage" (already exhausted).
 	DataSources []string `json:"data_sources"`
 
 	// Error contains any error message from prediction.
 	Error string `json:"error,omitempty"`
 }
 
-// IsValid returns true if the prediction has useful data.
+// hasCurrentPercent reports whether the current measurement is usable,
+// independently of whether the burn rate supports a forecast.
+func (p *Prediction) hasCurrentPercent() bool {
+	return p != nil && p.CurrentPercentKnown && !math.IsNaN(p.CurrentPercent) &&
+		!math.IsInf(p.CurrentPercent, 0) && p.CurrentPercent >= 0 && p.CurrentPercent <= 100
+}
+
+// IsValid reports whether a forecast or observed exhaustion has usable evidence.
+// CurrentPercentKnown remains available when only the forecast is unavailable.
 func (p *Prediction) IsValid() bool {
-	return p != nil && p.Error == "" && len(p.DataSources) > 0
+	return p.hasCurrentPercent() && p.Error == "" && len(p.DataSources) > 0 &&
+		!math.IsNaN(p.Confidence) && !math.IsInf(p.Confidence, 0) && p.Confidence >= 0 && p.Confidence <= 1 &&
+		p.TimeToDepletion >= 0
 }
 
 // ShouldRotate returns true if rotation is recommended based on prediction.
 func (p *Prediction) ShouldRotate(threshold time.Duration) bool {
-	if p == nil || p.TimeToDepletion == 0 {
+	if !p.IsValid() || p.TimeToDepletion <= 0 {
 		return false
 	}
 	return p.TimeToDepletion < threshold && p.Confidence >= 0.3
@@ -91,10 +105,19 @@ type PredictionEngine struct {
 	// Configuration
 	logWindow     time.Duration // How far back to look in logs
 	sessionWindow time.Duration // Window for session burn rate
+	model         string        // Requested model; empty includes all scopes
 }
 
 // EngineOption configures a PredictionEngine.
 type EngineOption func(*PredictionEngine)
+
+// WithModel limits predictions to general quotas and restrictions applicable
+// to the requested model. An empty model conservatively includes every scope.
+func WithModel(model string) EngineOption {
+	return func(e *PredictionEngine) {
+		e.model = model
+	}
+}
 
 // WithLogScanner sets the log scanner for historical data.
 func WithLogScanner(s logs.Scanner) EngineOption {
@@ -144,31 +167,10 @@ func NewPredictionEngine(opts ...EngineOption) *PredictionEngine {
 // 2. Historical log data (good accuracy)
 // 3. API-reported burn rate (if available in usageInfo)
 func (e *PredictionEngine) Predict(ctx context.Context, usageInfo *usage.UsageInfo) *Prediction {
-	if usageInfo == nil {
-		return &Prediction{
-			Error: "no usage info provided",
-		}
-	}
-
-	pred := &Prediction{
-		Profile:     usageInfo.ProfileName,
-		Provider:    usageInfo.Provider,
-		DataSources: make([]string, 0),
-	}
-
-	// Get current utilization from most constrained window
-	window := usageInfo.MostConstrainedWindow()
+	pred, window := e.currentUsagePrediction(usageInfo)
 	if window == nil {
-		pred.Error = "no usage window available"
 		return pred
 	}
-
-	// Calculate current percent
-	util := window.Utilization
-	if util == 0 && window.UsedPercent > 0 {
-		util = float64(window.UsedPercent) / 100.0
-	}
-	pred.CurrentPercent = util * 100
 
 	// Already at limit?
 	if pred.CurrentPercent >= 100 {
@@ -186,7 +188,7 @@ func (e *PredictionEngine) Predict(ctx context.Context, usageInfo *usage.UsageIn
 
 	// Priority 1: Real-time session data (most accurate, most recent)
 	if e.sessionTracker != nil {
-		if sessionRate := e.sessionTracker.BurnRate(e.sessionWindow); sessionRate != nil && sessionRate.PercentPerHour > 0 {
+		if sessionRate := e.sessionTracker.BurnRate(e.sessionWindow); usablePercentRate(sessionRate) {
 			burnRate = sessionRate
 			pred.DataSources = append(pred.DataSources, "session")
 		}
@@ -196,7 +198,7 @@ func (e *PredictionEngine) Predict(ctx context.Context, usageInfo *usage.UsageIn
 	if burnRate == nil && e.logScanner != nil {
 		if result, err := e.logScanner.Scan(ctx, "", time.Now().Add(-e.logWindow)); err == nil && len(result.Entries) > 0 {
 			logRate := usage.CalculateBurnRate(result.Entries, e.logWindow, nil)
-			if logRate != nil && logRate.PercentPerHour > 0 {
+			if usablePercentRate(logRate) {
 				burnRate = logRate
 				pred.DataSources = append(pred.DataSources, "logs")
 			}
@@ -204,112 +206,108 @@ func (e *PredictionEngine) Predict(ctx context.Context, usageInfo *usage.UsageIn
 	}
 
 	// Priority 3: API-reported burn rate (always has PercentPerHour if set)
-	if burnRate == nil && usageInfo.BurnRate != nil && usageInfo.BurnRate.PercentPerHour > 0 {
+	if burnRate == nil && usablePercentRate(usageInfo.BurnRate) {
 		burnRate = usageInfo.BurnRate
 		pred.DataSources = append(pred.DataSources, "api")
 	}
 
 	// If we have no burn rate data, we can't predict
-	if burnRate == nil || burnRate.PercentPerHour <= 0 {
+	if burnRate == nil {
 		pred.Error = "insufficient data for prediction"
 		return pred
 	}
 
 	pred.BurnRate = burnRate
 
-	// Calculate time to depletion
-	remainingPercent := 100.0 - pred.CurrentPercent
-	hoursUntilDepletion := remainingPercent / burnRate.PercentPerHour
-	pred.TimeToDepletion = time.Duration(hoursUntilDepletion * float64(time.Hour))
-	pred.PredictedTime = time.Now().Add(pred.TimeToDepletion)
-
-	// Determine warning level
-	// We only warn if depletion happens BEFORE the window resets.
-	// If the window resets first, we are safe (quota is restored).
-	if !window.ResetsAt.IsZero() && window.ResetsAt.Before(pred.PredictedTime) {
-		pred.Warning = WarningNone
-	} else if pred.TimeToDepletion > 0 && pred.TimeToDepletion < 10*time.Minute {
-		pred.Warning = WarningImminent
-	} else if pred.TimeToDepletion > 0 && pred.TimeToDepletion < 30*time.Minute {
-		pred.Warning = WarningApproaching
-	} else {
-		pred.Warning = WarningNone
-	}
-
-	// Calculate confidence
-	pred.Confidence = e.calculateConfidence(burnRate, len(pred.DataSources))
-
+	e.forecastAtRate(pred, window, burnRate)
 	return pred
 }
 
 // PredictWithBurnRate creates a prediction using an externally-provided burn rate.
 // Useful when burn rate is already calculated elsewhere.
 func (e *PredictionEngine) PredictWithBurnRate(usageInfo *usage.UsageInfo, burnRate *usage.BurnRateInfo, source string) *Prediction {
-	if usageInfo == nil {
-		return &Prediction{
-			Error: "no usage info provided",
-		}
-	}
-
-	pred := &Prediction{
-		Profile:     usageInfo.ProfileName,
-		Provider:    usageInfo.Provider,
-		DataSources: []string{source},
-		BurnRate:    burnRate,
-	}
-
-	// Get current utilization
-	window := usageInfo.MostConstrainedWindow()
+	pred, window := e.currentUsagePrediction(usageInfo)
 	if window == nil {
-		pred.Error = "no usage window available"
 		return pred
 	}
 
-	util := window.Utilization
-	if util == 0 && window.UsedPercent > 0 {
-		util = float64(window.UsedPercent) / 100.0
-	}
-	pred.CurrentPercent = util * 100
-
-	// Can't predict without burn rate
-	if burnRate == nil || burnRate.PercentPerHour <= 0 {
-		pred.Error = "no burn rate data"
-		return pred
-	}
-
-	// Calculate time to depletion
-	remainingPercent := 100.0 - pred.CurrentPercent
-	if remainingPercent <= 0 {
+	if pred.CurrentPercent >= 100 {
 		pred.Warning = WarningImminent
 		pred.PredictedTime = time.Now()
 		pred.TimeToDepletion = 0
+		pred.DataSources = append(pred.DataSources, "current_usage")
 		pred.Confidence = 1.0 // Certain - already depleted
 		return pred
 	}
 
-	hoursUntilDepletion := remainingPercent / burnRate.PercentPerHour
-	pred.TimeToDepletion = time.Duration(hoursUntilDepletion * float64(time.Hour))
-	pred.PredictedTime = time.Now().Add(pred.TimeToDepletion)
-
-	// Warning level
-	if !window.ResetsAt.IsZero() && window.ResetsAt.Before(pred.PredictedTime) {
-		pred.Warning = WarningNone
-	} else if pred.TimeToDepletion > 0 && pred.TimeToDepletion < 10*time.Minute {
-		pred.Warning = WarningImminent
-	} else if pred.TimeToDepletion > 0 && pred.TimeToDepletion < 30*time.Minute {
-		pred.Warning = WarningApproaching
-	} else {
-		pred.Warning = WarningNone
+	if !usablePercentRate(burnRate) {
+		pred.Error = "no burn rate data"
+		return pred
 	}
+	pred.DataSources = append(pred.DataSources, source)
+	pred.BurnRate = burnRate
 
-	pred.Confidence = e.calculateConfidence(burnRate, 1)
-
+	e.forecastAtRate(pred, window, burnRate)
 	return pred
+}
+
+// currentUsagePrediction preserves a trustworthy measurement even when the
+// caller cannot obtain a burn rate. Degraded or rolled quota cannot establish
+// healthy usage, including when a diagnostic window still has a percentage.
+func (e *PredictionEngine) currentUsagePrediction(info *usage.UsageInfo) (*Prediction, *usage.UsageWindow) {
+	pred := &Prediction{DataSources: make([]string, 0)}
+	if info == nil {
+		pred.Error = "no usage info provided"
+		return pred, nil
+	}
+	pred.Profile = info.ProfileName
+	pred.Provider = info.Provider
+	if !info.NumericQuotaKnown() {
+		pred.Error = "no measured quota available"
+		return pred, nil
+	}
+	window := info.MostConstrainedWindowForModel(e.model)
+	if window == nil {
+		pred.Error = "no usage window available"
+		return pred, nil
+	}
+	pred.CurrentPercent = math.Max(window.Utilization*100, float64(window.UsedPercent))
+	pred.CurrentPercentKnown = true
+	return pred, window
+}
+
+func usablePercentRate(rate *usage.BurnRateInfo) bool {
+	return rate != nil && rate.PercentPerHour > 0 && !math.IsNaN(rate.PercentPerHour) && !math.IsInf(rate.PercentPerHour, 0)
+}
+
+// forecastAtRate only publishes a time within the measured window. A reset
+// ends that measurement's horizon; it is neither depletion nor evidence of
+// how much quota will be available afterward.
+func (e *PredictionEngine) forecastAtRate(pred *Prediction, window *usage.UsageWindow, rate *usage.BurnRateInfo) {
+	nanoseconds := (100 - pred.CurrentPercent) / rate.PercentPerHour * float64(time.Hour)
+	if math.IsNaN(nanoseconds) || math.IsInf(nanoseconds, 0) || nanoseconds < 1 || nanoseconds >= float64(math.MaxInt64) {
+		pred.Error = "depletion time is outside the supported range"
+		return
+	}
+	duration := time.Duration(nanoseconds)
+	predicted := time.Now().Add(duration)
+	if !window.ResetsAt.IsZero() && !predicted.Before(window.ResetsAt) {
+		pred.Error = "quota resets before predicted depletion"
+		return
+	}
+	pred.TimeToDepletion = duration
+	pred.PredictedTime = predicted
+	if duration < 10*time.Minute {
+		pred.Warning = WarningImminent
+	} else if duration < 30*time.Minute {
+		pred.Warning = WarningApproaching
+	}
+	pred.Confidence = e.calculateConfidence(rate, len(pred.DataSources))
 }
 
 // calculateConfidence determines prediction reliability based on data quality.
 func (e *PredictionEngine) calculateConfidence(burnRate *usage.BurnRateInfo, sourceCount int) float64 {
-	if burnRate == nil {
+	if burnRate == nil || math.IsNaN(burnRate.Confidence) || math.IsInf(burnRate.Confidence, 0) || burnRate.Confidence < 0 {
 		return 0
 	}
 
@@ -345,7 +343,7 @@ func MostUrgent(predictions []*Prediction, minConfidence float64) *Prediction {
 	var urgent *Prediction
 
 	for _, p := range predictions {
-		if p == nil || p.Error != "" || p.Confidence < minConfidence {
+		if !p.IsValid() || p.Confidence < minConfidence {
 			continue
 		}
 		if p.TimeToDepletion <= 0 {
@@ -363,7 +361,7 @@ func MostUrgent(predictions []*Prediction, minConfidence float64) *Prediction {
 func FilterByWarning(predictions []*Prediction, minWarning WarningLevel) []*Prediction {
 	var result []*Prediction
 	for _, p := range predictions {
-		if p != nil && p.Warning >= minWarning {
+		if p.IsValid() && p.Warning >= minWarning {
 			result = append(result, p)
 		}
 	}

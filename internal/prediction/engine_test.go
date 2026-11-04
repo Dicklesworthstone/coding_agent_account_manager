@@ -2,6 +2,7 @@ package prediction
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -53,6 +54,7 @@ func TestNewPredictionEngine_WithOptions(t *testing.T) {
 		WithSessionTracker(tracker),
 		WithLogWindow(1*time.Hour),
 		WithSessionWindow(15*time.Minute),
+		WithModel("sonnet"),
 	)
 
 	if e.logScanner != scanner {
@@ -66,6 +68,9 @@ func TestNewPredictionEngine_WithOptions(t *testing.T) {
 	}
 	if e.sessionWindow != 15*time.Minute {
 		t.Errorf("sessionWindow = %v, want 15m", e.sessionWindow)
+	}
+	if e.model != "sonnet" {
+		t.Errorf("model = %q, want sonnet", e.model)
 	}
 }
 
@@ -147,7 +152,7 @@ func TestPredictionEngine_Predict_WithSessionData(t *testing.T) {
 		ProfileName: "test",
 		PrimaryWindow: &usage.UsageWindow{
 			UsedPercent: 50,
-			ResetsAt:    time.Now().Add(4 * time.Hour),
+			ResetsAt:    time.Now().Add(8 * time.Hour),
 		},
 		// Session data won't have PercentPerHour without TokenLimit,
 		// so prediction should fall back to API burn rate
@@ -341,7 +346,8 @@ func TestPredictionEngine_Predict_WarningLevels(t *testing.T) {
 func TestPredictionEngine_Predict_WindowReset(t *testing.T) {
 	e := NewPredictionEngine()
 
-	// Window resets in 1 hour, but at current rate we'd deplete in 5 hours
+	// The current measurement ends in 1 hour. A theoretical 5-hour depletion
+	// is not an ETA for this window or a reason to schedule a rotation.
 	resetTime := time.Now().Add(1 * time.Hour)
 	usageInfo := &usage.UsageInfo{
 		Provider:    "claude",
@@ -357,22 +363,24 @@ func TestPredictionEngine_Predict_WindowReset(t *testing.T) {
 		},
 	}
 
-	pred := e.Predict(context.Background(), usageInfo)
-
-	if pred.Error != "" {
-		t.Fatalf("Unexpected error: %s", pred.Error)
-	}
-
-	// Prediction should NOT be capped at reset time anymore.
-	// It should reflect the theoretical depletion time (5 hours).
-	expectedDepletion := 5 * time.Hour
-	if pred.TimeToDepletion < expectedDepletion-10*time.Minute || pred.TimeToDepletion > expectedDepletion+10*time.Minute {
-		t.Errorf("TimeToDepletion = %v, want ~5h", pred.TimeToDepletion)
-	}
-
-	// Since reset happens (1h) before depletion (5h), warning should be None
-	if pred.Warning != WarningNone {
-		t.Errorf("Warning = %v, want WarningNone", pred.Warning)
+	for name, pred := range map[string]*Prediction{
+		"api":      e.Predict(context.Background(), usageInfo),
+		"external": e.PredictWithBurnRate(usageInfo, usageInfo.BurnRate, "external"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !pred.CurrentPercentKnown || pred.CurrentPercent != 50 {
+				t.Fatalf("reset discarded the current measurement: %+v", pred)
+			}
+			if pred.Error == "" || pred.IsValid() || !pred.PredictedTime.IsZero() || pred.TimeToDepletion != 0 || pred.Confidence != 0 || pred.Warning != WarningNone {
+				t.Fatalf("reset fabricated a depletion forecast: %+v", pred)
+			}
+			if pred.ShouldRotate(24*time.Hour) || MostUrgent([]*Prediction{pred}, 0) != nil || len(FilterByWarning([]*Prediction{pred}, WarningApproaching)) != 0 {
+				t.Fatal("reset-before-depletion result scheduled a rotation or warning")
+			}
+			if alerts := GenerateAlerts([]*Prediction{pred}, DefaultAlertOptions()); len(alerts) != 0 {
+				t.Fatalf("healthy measurement acquired a reset-based alert: %+v", alerts)
+			}
+		})
 	}
 }
 
@@ -421,7 +429,7 @@ func TestPrediction_IsValid(t *testing.T) {
 	}{
 		{
 			name: "valid prediction",
-			pred: &Prediction{DataSources: []string{"session"}},
+			pred: &Prediction{CurrentPercentKnown: true, DataSources: []string{"session"}},
 			want: true,
 		},
 		{
@@ -431,12 +439,27 @@ func TestPrediction_IsValid(t *testing.T) {
 		},
 		{
 			name: "prediction with error",
-			pred: &Prediction{Error: "something went wrong", DataSources: []string{"session"}},
+			pred: &Prediction{CurrentPercentKnown: true, Error: "something went wrong", DataSources: []string{"session"}},
 			want: false,
 		},
 		{
 			name: "prediction with no sources",
-			pred: &Prediction{},
+			pred: &Prediction{CurrentPercentKnown: true},
+			want: false,
+		},
+		{
+			name: "unmeasured percentage",
+			pred: &Prediction{CurrentPercent: 90, DataSources: []string{"session"}},
+			want: false,
+		},
+		{
+			name: "non-finite percentage",
+			pred: &Prediction{CurrentPercentKnown: true, CurrentPercent: math.NaN(), DataSources: []string{"session"}},
+			want: false,
+		},
+		{
+			name: "non-finite confidence",
+			pred: &Prediction{CurrentPercentKnown: true, Confidence: math.Inf(1), DataSources: []string{"session"}},
 			want: false,
 		},
 	}
@@ -460,8 +483,10 @@ func TestPrediction_ShouldRotate(t *testing.T) {
 		{
 			name: "should rotate - below threshold",
 			pred: &Prediction{
-				TimeToDepletion: 5 * time.Minute,
-				Confidence:      0.8,
+				CurrentPercentKnown: true,
+				DataSources:         []string{"api"},
+				TimeToDepletion:     5 * time.Minute,
+				Confidence:          0.8,
 			},
 			threshold: 10 * time.Minute,
 			want:      true,
@@ -469,8 +494,10 @@ func TestPrediction_ShouldRotate(t *testing.T) {
 		{
 			name: "should not rotate - above threshold",
 			pred: &Prediction{
-				TimeToDepletion: 20 * time.Minute,
-				Confidence:      0.8,
+				CurrentPercentKnown: true,
+				DataSources:         []string{"api"},
+				TimeToDepletion:     20 * time.Minute,
+				Confidence:          0.8,
 			},
 			threshold: 10 * time.Minute,
 			want:      false,
@@ -478,8 +505,22 @@ func TestPrediction_ShouldRotate(t *testing.T) {
 		{
 			name: "should not rotate - low confidence",
 			pred: &Prediction{
-				TimeToDepletion: 5 * time.Minute,
-				Confidence:      0.2,
+				CurrentPercentKnown: true,
+				DataSources:         []string{"api"},
+				TimeToDepletion:     5 * time.Minute,
+				Confidence:          0.2,
+			},
+			threshold: 10 * time.Minute,
+			want:      false,
+		},
+		{
+			name: "should not rotate - forecast failed",
+			pred: &Prediction{
+				CurrentPercentKnown: true,
+				DataSources:         []string{"api"},
+				TimeToDepletion:     5 * time.Minute,
+				Confidence:          0.8,
+				Error:               "quota resets before predicted depletion",
 			},
 			threshold: 10 * time.Minute,
 			want:      false,
@@ -564,10 +605,11 @@ func TestPredictionEngine_PredictAll(t *testing.T) {
 
 func TestMostUrgent(t *testing.T) {
 	predictions := []*Prediction{
-		{Profile: "slow", TimeToDepletion: 2 * time.Hour, Confidence: 0.8},
-		{Profile: "fast", TimeToDepletion: 30 * time.Minute, Confidence: 0.7},
-		{Profile: "fastest", TimeToDepletion: 10 * time.Minute, Confidence: 0.9},
-		{Profile: "low_confidence", TimeToDepletion: 5 * time.Minute, Confidence: 0.2},
+		{Profile: "slow", CurrentPercentKnown: true, DataSources: []string{"api"}, TimeToDepletion: 2 * time.Hour, Confidence: 0.8},
+		{Profile: "fast", CurrentPercentKnown: true, DataSources: []string{"api"}, TimeToDepletion: 30 * time.Minute, Confidence: 0.7},
+		{Profile: "fastest", CurrentPercentKnown: true, DataSources: []string{"api"}, TimeToDepletion: 10 * time.Minute, Confidence: 0.9},
+		{Profile: "low_confidence", CurrentPercentKnown: true, DataSources: []string{"api"}, TimeToDepletion: 5 * time.Minute, Confidence: 0.2},
+		{Profile: "unknown", DataSources: []string{"api"}, TimeToDepletion: time.Minute, Confidence: 1},
 		{Profile: "error", Error: "failed"},
 	}
 
@@ -595,9 +637,11 @@ func TestMostUrgent_Empty(t *testing.T) {
 
 func TestFilterByWarning(t *testing.T) {
 	predictions := []*Prediction{
-		{Profile: "none", Warning: WarningNone},
-		{Profile: "approaching", Warning: WarningApproaching},
-		{Profile: "imminent", Warning: WarningImminent},
+		{Profile: "none", CurrentPercentKnown: true, DataSources: []string{"api"}, Warning: WarningNone},
+		{Profile: "approaching", CurrentPercentKnown: true, DataSources: []string{"api"}, Warning: WarningApproaching},
+		{Profile: "imminent", CurrentPercentKnown: true, DataSources: []string{"api"}, Warning: WarningImminent},
+		{Profile: "unknown", Warning: WarningImminent},
+		{Profile: "failed", CurrentPercentKnown: true, DataSources: []string{"api"}, Warning: WarningImminent, Error: "forecast failed"},
 	}
 
 	// Filter for approaching or higher
@@ -635,6 +679,140 @@ func TestPredictionEngine_Predict_InsufficientData(t *testing.T) {
 	}
 	if len(pred.DataSources) != 0 {
 		t.Errorf("DataSources = %v, want empty", pred.DataSources)
+	}
+	if !pred.CurrentPercentKnown || pred.CurrentPercent != 50 || !pred.PredictedTime.IsZero() || pred.TimeToDepletion != 0 || pred.Confidence != 0 {
+		t.Fatalf("missing burn rate discarded a measurement or fabricated a forecast: %+v", pred)
+	}
+}
+
+func TestPredictionEngineWeeklyOnlyMeasurementWithoutRate(t *testing.T) {
+	e := NewPredictionEngine()
+	for _, percent := range []int{0, 20, 95} {
+		info := &usage.UsageInfo{
+			Provider: "claude", ProfileName: "weekly-only",
+			SecondaryWindow: &usage.UsageWindow{UsedPercent: percent, WindowDuration: 7 * 24 * time.Hour},
+		}
+		for name, pred := range map[string]*Prediction{
+			"api":      e.Predict(context.Background(), info),
+			"external": e.PredictWithBurnRate(info, nil, "external"),
+		} {
+			if !pred.CurrentPercentKnown || pred.CurrentPercent != float64(percent) {
+				t.Errorf("%s lost measured %d%% without a session or rate: %+v", name, percent, pred)
+			}
+			if pred.Error == "" || pred.IsValid() || pred.TimeToDepletion != 0 || !pred.PredictedTime.IsZero() || pred.Confidence != 0 || pred.Warning != WarningNone || pred.BurnRate != nil {
+				t.Errorf("%s fabricated a forecast for measured %d%%: %+v", name, percent, pred)
+			}
+		}
+	}
+}
+
+func TestPredictionEngineRejectsUnmeasuredQuota(t *testing.T) {
+	measured := &usage.UsageWindow{UsedPercent: 100}
+	tests := []struct {
+		name string
+		info *usage.UsageInfo
+	}{
+		{"missing", nil},
+		{"no windows", &usage.UsageInfo{Provider: "claude"}},
+		{"scoped only", &usage.UsageInfo{Provider: "claude", ModelWindows: map[string]*usage.UsageWindow{"fable": measured}}},
+		{"error with diagnostic quota", &usage.UsageInfo{Provider: "claude", SecondaryWindow: measured, Error: "unsupported quota kind"}},
+		{"degraded", &usage.UsageInfo{Provider: "claude", SecondaryWindow: measured, QuotaStatus: usage.QuotaDegraded}},
+		{"limit stage", &usage.UsageInfo{Provider: "claude", SecondaryWindow: measured, LimitStage: "unknown"}},
+		{"unmeasured", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{UsedPercent: 100, Unmeasured: true}}},
+		{"rolled cache", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{Rolled: true}}},
+		{"rolled scoped cache", &usage.UsageInfo{Provider: "claude", SecondaryWindow: measured, ScopedWindows: []*usage.UsageWindow{{Label: "Fable", Rolled: true}}}},
+		{"NaN", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{Utilization: math.NaN()}}},
+		{"infinite", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{Utilization: math.Inf(1)}}},
+		{"outside range", &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{UsedPercent: 101}}},
+	}
+	rate := &usage.BurnRateInfo{PercentPerHour: 10, Confidence: 1}
+	e := NewPredictionEngine(WithModel("sonnet"))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, pred := range map[string]*Prediction{
+				"api":      e.Predict(context.Background(), tc.info),
+				"external": e.PredictWithBurnRate(tc.info, rate, "external"),
+			} {
+				if pred.Error == "" || pred.CurrentPercentKnown || pred.IsValid() || pred.Warning != WarningNone || pred.TimeToDepletion != 0 || !pred.PredictedTime.IsZero() || pred.Confidence != 0 {
+					t.Errorf("%s trusted unavailable quota: %+v", name, pred)
+				}
+			}
+		})
+	}
+}
+
+func TestPredictionEngineModelScopeIncludesGeneralQuota(t *testing.T) {
+	tests := []struct {
+		name    string
+		model   string
+		general int
+		want    float64
+	}{
+		{"matching scopes", "sonnet", 20, 40},
+		{"general still constrains", "sonnet", 90, 90},
+		{"unknown duration still constrains", "fable", 20, 100},
+		{"unknown model includes every scope", "", 20, 100},
+	}
+	rate := &usage.BurnRateInfo{PercentPerHour: 10, Confidence: 0.8, SampleSize: 10}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &usage.UsageInfo{
+				Provider: "claude", ProfileName: "scoped", BurnRate: rate,
+				SecondaryWindow: &usage.UsageWindow{UsedPercent: tc.general, WindowDuration: 7 * 24 * time.Hour},
+				ModelWindows:    map[string]*usage.UsageWindow{"fable": {Label: "Fable", UsedPercent: 100}},
+				ScopedWindows: []*usage.UsageWindow{
+					{Label: "Sonnet", UsedPercent: 30, WindowDuration: 7 * 24 * time.Hour},
+					{Label: "Sonnet", UsedPercent: 40, WindowDuration: 5 * time.Hour},
+				},
+			}
+			e := NewPredictionEngine(WithModel(tc.model))
+			for name, pred := range map[string]*Prediction{
+				"api":      e.Predict(context.Background(), info),
+				"external": e.PredictWithBurnRate(info, rate, "external"),
+			} {
+				if !pred.CurrentPercentKnown || pred.CurrentPercent != tc.want || !pred.IsValid() {
+					t.Fatalf("%s lost the applicable quota: %+v", name, pred)
+				}
+				wantDuration := time.Duration((100 - tc.want) / 10 * float64(time.Hour))
+				if pred.TimeToDepletion != wantDuration {
+					t.Errorf("%s forecast uses an unrelated quota: got %v, want %v", name, pred.TimeToDepletion, wantDuration)
+				}
+			}
+		})
+	}
+}
+
+func TestPredictionEnginePreservesStricterNumericMeasurement(t *testing.T) {
+	e := NewPredictionEngine()
+	for _, window := range []*usage.UsageWindow{
+		{Utilization: 1, UsedPercent: 20},
+		{Utilization: 0.2, UsedPercent: 100},
+	} {
+		info := &usage.UsageInfo{Provider: "claude", SecondaryWindow: window}
+		for name, pred := range map[string]*Prediction{
+			"api":      e.Predict(context.Background(), info),
+			"external": e.PredictWithBurnRate(info, nil, "external"),
+		} {
+			if !pred.IsValid() || !pred.CurrentPercentKnown || pred.CurrentPercent != 100 || pred.Warning != WarningImminent || pred.TimeToDepletion != 0 {
+				t.Errorf("%s weakened measured exhaustion: %+v", name, pred)
+			}
+		}
+	}
+}
+
+func TestPredictionEngineRejectsUnusableRate(t *testing.T) {
+	e := NewPredictionEngine()
+	for _, rate := range []float64{0, -1, math.NaN(), math.Inf(1), math.Inf(-1), math.SmallestNonzeroFloat64, math.MaxFloat64} {
+		burnRate := &usage.BurnRateInfo{PercentPerHour: rate, Confidence: 1, SampleSize: 10}
+		info := &usage.UsageInfo{Provider: "claude", SecondaryWindow: &usage.UsageWindow{UsedPercent: 20}, BurnRate: burnRate}
+		for name, pred := range map[string]*Prediction{
+			"api":      e.Predict(context.Background(), info),
+			"external": e.PredictWithBurnRate(info, burnRate, "external"),
+		} {
+			if !pred.CurrentPercentKnown || pred.CurrentPercent != 20 || pred.Error == "" || pred.IsValid() || !pred.PredictedTime.IsZero() || pred.TimeToDepletion != 0 || pred.Confidence != 0 || pred.Warning != WarningNone {
+				t.Errorf("%s manufactured forecast for rate %v: %+v", name, rate, pred)
+			}
+		}
 	}
 }
 

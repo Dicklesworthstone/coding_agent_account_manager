@@ -12,6 +12,8 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -143,6 +145,186 @@ func TestPrecheckOnlyCountsQuotaEligibleProfilesAsReady(t *testing.T) {
 	}
 	if result.Recommended.UsagePercent != 20 {
 		t.Fatalf("absent session hid measured weekly usage: %+v", result.Recommended)
+	}
+	require.Empty(t, result.Recommended.TimeToDepletion)
+	require.Nil(t, result.Forecast)
+	for _, alert := range result.Alerts {
+		require.NotEqual(t, "all_low", alert.Type, "healthy weekly quota was dropped: %+v", alert)
+		require.NotEqual(t, "rotation_recommended", alert.Type, "missing burn rate invented a forecast: %+v", alert)
+	}
+}
+
+func runClaudeQuotaPlannerTest(t *testing.T, model string) PrecheckResult {
+	t.Helper()
+	c := &cobra.Command{}
+	c.Flags().String("format", "json", "")
+	c.Flags().Bool("no-fetch", false, "")
+	c.Flags().Duration("timeout", time.Second, "")
+	c.Flags().String("algorithm", "round_robin", "")
+	c.Flags().String("policy", "availability", "")
+	c.Flags().String("model", model, "")
+	var output bytes.Buffer
+	c.SetOut(&output)
+	c.SetErr(&output)
+	require.NoError(t, runPrecheckCmd(c, []string{"claude"}), "output=%s", output.String())
+	var result PrecheckResult
+	require.NoError(t, json.Unmarshal(output.Bytes(), &result), "output=%s", output.String())
+	return result
+}
+
+func TestPrecheckQuotaWarningsDoNotRequireBurnRates(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ready      string
+		percent    int
+		other      int
+		unreadable bool
+		allLow     bool
+	}{
+		{"weekly zero beside exhaustion", `{"five_hour":null,"seven_day":{"utilization":0}}`, 0, 100, false, false},
+		{"weekly only beside exhaustion", `{"five_hour":{"utilization":null},"seven_day":{"utilization":20}}`, 20, 100, false, false},
+		{"all measured accounts near quota", `{"seven_day":{"utilization":85}}`, 85, 95, false, true},
+		{"unknown account prevents aggregate claim", `{"seven_day":{"utilization":85}}`, 85, 95, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := map[string]string{
+				"a-ready": tc.ready,
+				"z-other": subscriptionQuotaResponse("claude", tc.other),
+			}
+			if tc.unreadable {
+				responses["unreadable"] = ""
+			}
+			setupSubscriptionQuotaProfiles(t, "claude", responses)
+			result := runClaudeQuotaPlannerTest(t, "")
+			require.NotNil(t, result.Recommended)
+			require.Equal(t, "a-ready", result.Recommended.Name)
+			require.Equal(t, tc.percent, result.Recommended.UsagePercent)
+			require.Empty(t, result.Recommended.TimeToDepletion)
+			require.Nil(t, result.Forecast)
+			allLow, otherWarning := false, false
+			for _, alert := range result.Alerts {
+				require.NotEqual(t, "rotation_recommended", alert.Type, "quota facts became burn-rate advice: %+v", alert)
+				require.NotContains(t, alert.Message, "Will hit limit", "unknown rate manufactured an ETA")
+				if alert.Type == "all_low" {
+					allLow = true
+				}
+				if alert.Profile == "z-other" && alert.Type == "imminent" {
+					otherWarning = true
+				}
+				if tc.percent < 70 && alert.Profile == "a-ready" {
+					t.Fatalf("healthy measured account received a quota warning: %+v", alert)
+				}
+			}
+			require.Equal(t, tc.allLow, allLow, "alerts=%+v", result.Alerts)
+			require.True(t, otherWarning, "high measured usage was lost without a forecast: %+v", result.Alerts)
+		})
+	}
+}
+
+func TestPrecheckQuotaAlertsUseRequestedModel(t *testing.T) {
+	const scoped = `{"seven_day":{"utilization":20},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, tc := range []struct {
+		name           string
+		model          string
+		body           string
+		want           string
+		wantScoped     bool
+		wantRestricted bool
+	}{
+		{"unrelated model", "sonnet", scoped, "a-scoped", false, false},
+		{"matching model", "fable", scoped, "b-ready", true, true},
+		{"unknown model remains conservative", "", scoped, "b-ready", true, true},
+		{"general weekly cap still applies", "sonnet", `{"seven_day":{"utilization":100},"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`, "b-ready", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, "claude", map[string]string{
+				"a-scoped": tc.body,
+				"b-ready":  subscriptionQuotaResponse("claude", 50),
+			})
+			result := runClaudeQuotaPlannerTest(t, tc.model)
+			require.NotNil(t, result.Recommended)
+			require.Equal(t, tc.want, result.Recommended.Name)
+			require.Empty(t, result.Recommended.TimeToDepletion)
+			require.Nil(t, result.Forecast)
+			scopedAlert, restricted := false, false
+			for _, alert := range result.Alerts {
+				require.NotEqual(t, "all_low", alert.Type, "the healthy backup disappeared: %+v", result.Alerts)
+				require.NotEqual(t, "rotation_recommended", alert.Type)
+				if alert.Profile != "a-scoped" {
+					continue
+				}
+				if alert.Type == "scoped_limit" {
+					scopedAlert = true
+				}
+				if alert.Type == "imminent" {
+					restricted = true
+				}
+			}
+			require.Equal(t, tc.wantScoped, scopedAlert, "alerts=%+v", result.Alerts)
+			require.Equal(t, tc.wantRestricted, restricted, "alerts=%+v", result.Alerts)
+		})
+	}
+}
+
+func TestPrecheckAggregateIncludesMissingRequestedRows(t *testing.T) {
+	usageMap := map[string]*usage.UsageInfo{
+		"spent":       {Provider: "claude", SecondaryWindow: &usage.UsageWindow{UsedPercent: 100}},
+		"unrequested": {Provider: "claude", SecondaryWindow: &usage.UsageWindow{UsedPercent: 100}},
+	}
+	result := buildPrecheckResult("claude", []string{"spent", "missing"}, nil, usageMap, nil, nil, nil, "smart", "")
+	require.Zero(t, result.Summary.ReadyProfiles)
+	var spentWarning bool
+	for _, alert := range result.Alerts {
+		require.NotEqual(t, "all_low", alert.Type, "missing quota was silently removed from an all-profile claim")
+		require.NotEqual(t, "unrequested", alert.Profile)
+		if alert.Profile == "spent" && alert.Type == "imminent" {
+			spentWarning = true
+		}
+	}
+	require.True(t, spentWarning, "missing data suppressed a known individual restriction")
+}
+
+func TestPrecheckForecastUsesCurrentModelEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		burnRate    bool
+		resetsFirst bool
+		wantETA     bool
+	}{
+		{"unscoped estimate without rate", false, false, false},
+		{"measured rate for requested model", true, false, true},
+		{"reset prevents projected depletion", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &usage.UsageInfo{
+				Provider: "claude", ProfileName: "ready",
+				SecondaryWindow: &usage.UsageWindow{UsedPercent: 20},
+				ModelWindows: map[string]*usage.UsageWindow{
+					"fable": {Label: "Fable", UsedPercent: 100},
+				},
+				EstimatedDepletion:  time.Now().Add(10 * time.Minute),
+				DepletionConfidence: 1,
+			}
+			if tc.burnRate {
+				info.BurnRate = &usage.BurnRateInfo{PercentPerHour: 20, Confidence: 0.9, SampleSize: 10}
+			}
+			if tc.resetsFirst {
+				info.SecondaryWindow.ResetsAt = time.Now().Add(time.Hour)
+			}
+			result := buildPrecheckResult("claude", []string{"ready"},
+				&rotation.Result{Selected: "ready"},
+				map[string]*usage.UsageInfo{"ready": info}, nil, nil, nil, "smart", "sonnet")
+			require.NotNil(t, result.Recommended)
+			if tc.wantETA {
+				require.Equal(t, formatDurationShort(4*time.Hour), result.Recommended.TimeToDepletion)
+				require.NotNil(t, result.Forecast)
+				require.Equal(t, result.Recommended.TimeToDepletion, result.Forecast.NextRotation)
+			} else {
+				require.Empty(t, result.Recommended.TimeToDepletion)
+				require.Nil(t, result.Forecast)
+			}
+			require.Empty(t, result.Alerts, "unrelated model or stale forecast affected the session")
+		})
 	}
 }
 

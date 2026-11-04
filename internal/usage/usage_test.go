@@ -366,10 +366,23 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 		name     string
 		balance  string
 		expected float64
+		absent   bool
+		invalid  bool
 	}{
 		{name: "numeric balance", balance: "12.34", expected: 12.34},
 		{name: "string balance", balance: `"45.67"`, expected: 45.67},
 		{name: "comma balance", balance: `"1,234.50"`, expected: 1234.50},
+		{name: "zero balance", balance: "0", expected: 0},
+		{name: "finite negative balance", balance: "-12.34", expected: -12.34},
+		{name: "null balance", balance: "null", absent: true},
+		{name: "empty string balance", balance: `""`, absent: true},
+		{name: "blank string balance", balance: `"   "`, absent: true},
+		{name: "NaN balance", balance: `"NaN"`, invalid: true},
+		{name: "positive infinite balance", balance: `"+Inf"`, invalid: true},
+		{name: "negative infinite balance", balance: `"-Inf"`, invalid: true},
+		{name: "infinity balance", balance: `"Infinity"`, invalid: true},
+		{name: "negative infinity balance", balance: `"-Infinity"`, invalid: true},
+		{name: "numeric overflow", balance: "1e999", invalid: true},
 	}
 
 	for _, tc := range tests {
@@ -391,16 +404,46 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 			fetcher.baseURL = server.URL
 
 			info, err := fetcher.Fetch(context.Background(), "token")
+			if tc.invalid {
+				if err == nil || info == nil || info.Error == "" || info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() {
+					t.Fatalf("invalid balance accepted as usable quota: info=%+v err=%v", info, err)
+				}
+				if data, marshalErr := json.Marshal(info); marshalErr != nil || !json.Valid(data) {
+					t.Fatalf("invalid balance escaped into usage JSON: %q, %v", data, marshalErr)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Fetch() error = %v", err)
 			}
-			if info.Credits == nil || info.Credits.Balance == nil {
+			if info.Credits == nil || !info.NumericQuotaKnown() {
+				t.Fatalf("valid balance lost credit metadata or measured quota: %+v", info)
+			}
+			if tc.absent {
+				if info.Credits.Balance != nil {
+					t.Fatalf("absent balance manufactured a number: %v", *info.Credits.Balance)
+				}
+				return
+			}
+			if info.Credits.Balance == nil {
 				t.Fatalf("expected credits balance, got nil")
 			}
 			if got := *info.Credits.Balance; got != tc.expected {
 				t.Fatalf("balance = %v, expected %v", got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestCodexBalanceNonFiniteErrorsDoNotRepeatInput(t *testing.T) {
+	for _, raw := range []string{`"NaN"`, `"+Inf"`, `"-Infinity"`} {
+		var balance codexBalance
+		if err := json.Unmarshal([]byte(raw), &balance); err == nil || err.Error() != "credit balance must be finite" {
+			t.Errorf("non-finite balance error must be bounded and omit provider input: %v", err)
+		}
+		if balance.Value != nil {
+			t.Error("non-finite balance retained a numeric value")
+		}
 	}
 }
 
@@ -542,6 +585,43 @@ func TestUsageInfo_MostConstrainedWindow(t *testing.T) {
 				t.Errorf("MostConstrainedWindow().Utilization = %v, expected %v", util, tc.expected)
 			}
 		})
+	}
+}
+
+func TestUsageInfoMostConstrainedWindowForModel(t *testing.T) {
+	weekly := &UsageWindow{UsedPercent: 20, WindowDuration: 7 * 24 * time.Hour}
+	fable := &UsageWindow{Label: "Fable", UsedPercent: 100} // Unknown duration still constrains usage.
+	sonnetSession := &UsageWindow{Label: "Sonnet", Utilization: 0.4, UsedPercent: 10}
+	sonnetWeekly := &UsageWindow{Label: "Sonnet", Utilization: 0.1, UsedPercent: 75}
+	info := &UsageInfo{
+		SecondaryWindow: weekly,
+		ModelWindows:    map[string]*UsageWindow{"fable": fable, "sonnet": sonnetSession},
+		ScopedWindows:   []*UsageWindow{sonnetSession, sonnetWeekly},
+	}
+	for _, tc := range []struct {
+		model string
+		want  *UsageWindow
+	}{
+		{"", fable},
+		{"fable", fable},
+		{"sonnet", sonnetWeekly},
+		{"opus", weekly},
+	} {
+		if got := info.MostConstrainedWindowForModel(tc.model); got != tc.want {
+			t.Errorf("model %q lost a general or overlapping restriction: got %+v, want %+v", tc.model, got, tc.want)
+		}
+	}
+
+	weekly.UsedPercent = 90
+	if got := info.MostConstrainedWindowForModel("sonnet"); got != weekly {
+		t.Errorf("scoped selection hid the general weekly quota: %+v", got)
+	}
+	if got := (&UsageInfo{SecondaryWindow: weekly}).MostConstrainedWindowForModel("sonnet"); got != weekly {
+		t.Errorf("weekly-only account lost its only general measurement: %+v", got)
+	}
+	var missing *UsageInfo
+	if missing.MostConstrainedWindowForModel("sonnet") != nil {
+		t.Error("missing quota manufactured a window")
 	}
 }
 

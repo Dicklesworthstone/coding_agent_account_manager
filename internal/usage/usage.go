@@ -583,6 +583,14 @@ func (u *UsageInfo) TimeUntilReset() time.Duration {
 // MostConstrainedWindow returns the window closest to its limit.
 // Returns nil if no windows are available.
 func (u *UsageInfo) MostConstrainedWindow() *UsageWindow {
+	return u.MostConstrainedWindowForModel("")
+}
+
+// MostConstrainedWindowForModel returns the most used general or applicable
+// model allowance. An empty model conservatively includes every scoped limit.
+// Callers still need NumericQuotaKnown before treating the result as measured
+// available capacity.
+func (u *UsageInfo) MostConstrainedWindowForModel(model string) *UsageWindow {
 	if u == nil {
 		return nil
 	}
@@ -601,7 +609,7 @@ func (u *UsageInfo) MostConstrainedWindow() *UsageWindow {
 		}
 	}
 
-	for _, w := range u.applicableWindows("") {
+	for _, w := range u.applicableWindows(model) {
 		checkWindow(w)
 	}
 

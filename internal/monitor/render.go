@@ -57,7 +57,7 @@ func newAlertRenderer(threshold float64) *AlertRenderer {
 type jsonProfile struct {
 	Provider      string      `json:"provider"`
 	ProfileName   string      `json:"profile_name"`
-	UsagePercent  float64     `json:"usage_percent,omitempty"`
+	UsagePercent  *float64    `json:"usage_percent,omitempty"`
 	Usage         interface{} `json:"usage,omitempty"`
 	Health        string      `json:"health"`
 	PoolStatus    string      `json:"pool_status"`
@@ -128,7 +128,10 @@ func encodeJSONState(state *MonitorState, pretty bool) string {
 		if p == nil {
 			continue
 		}
-		percent := usagePercent(p.Usage)
+		var percent *float64
+		if measured := usagePercent(p.Usage); measured >= 0 {
+			percent = &measured
+		}
 		js.Profiles = append(js.Profiles, jsonProfile{
 			Provider:      p.Provider,
 			ProfileName:   p.ProfileName,

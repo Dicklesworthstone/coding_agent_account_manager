@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -94,6 +95,9 @@ func (b *codexBalance) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return fmt.Errorf("parse balance string %q: %w", s, err)
 		}
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			return fmt.Errorf("credit balance must be finite")
+		}
 		b.Value = &val
 		return nil
 	}
@@ -102,6 +106,9 @@ func (b *codexBalance) UnmarshalJSON(data []byte) error {
 	var val float64
 	if err := json.Unmarshal(data, &val); err != nil {
 		return fmt.Errorf("parse balance number: %w", err)
+	}
+	if math.IsNaN(val) || math.IsInf(val, 0) {
+		return fmt.Errorf("credit balance must be finite")
 	}
 	b.Value = &val
 	return nil

@@ -940,6 +940,25 @@ will permit work then. Refresh usage before selecting an account after a reset.
 The existing recommendation JSON field `switch_in` also describes the next
 reported reset; it is not a guarantee of future availability.
 
+`caam precheck --model` uses the same applicable quotas for its alerts and
+session forecast as for profile selection. Current usage warnings do not
+require a burn rate: a measured weekly-only account at 0% or 20% still prevents
+an incorrect "all profiles low" warning. A missing measurement also prevents
+that aggregate claim without hiding known restrictions on other accounts.
+Depletion times and timed rotation advice require a usable burn rate and a
+projected limit before the reported reset. A cached depletion estimate alone
+does not establish an ETA for the requested model.
+The forecast uses the most constrained applicable window and the available
+percentage burn rate; it does not estimate separate rates for every allowance
+or promise capacity after a reset.
+
+`caam monitor` shows `?` in brief output when a quota read fails or has no usable
+general measurement. Its JSON `usage_percent` is present for real measurements,
+including numeric zero, and omitted for unknown quota; the nested `usage`
+object retains provider details and errors. Consumers should check field
+presence instead of interpreting a missing field as zero. Credit balances
+remain separate metadata and do not establish a quota percentage.
+
 #### Claude quota credentials
 
 Live quota reads for saved vault profiles use `.credentials.json` first, then

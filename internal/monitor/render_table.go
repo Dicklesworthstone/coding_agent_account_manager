@@ -2,8 +2,11 @@ package monitor
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
 
 // Render implements the Renderer interface for TableRenderer.
@@ -57,12 +60,13 @@ func (r *TableRenderer) Render(state *MonitorState) string {
 				indicator = fmt.Sprintf("[%s] ", healthEmoji(p.Health))
 			}
 
-			var line string
+			var line, credits string
 			if reason := usageUnavailable(p.Usage); reason != "" {
 				// The fetch failed or returned no data (e.g. an expired token) —
 				// show why instead of a misleading 0% bar, so logged-in accounts
 				// don't look idle (issue #37).
 				line = fmt.Sprintf("  %s%-20s %s", indicator, truncate(p.ProfileName, 20), reason)
+				credits = creditSummary(p.Usage)
 			} else {
 				percent := usagePercent(p.Usage)
 				bar := progressBar(percent, 20)
@@ -76,6 +80,9 @@ func (r *TableRenderer) Render(state *MonitorState) string {
 				line = fmt.Sprintf("  %s%-20s %s %s | %s", indicator, truncate(p.ProfileName, 20), bar, percentStr, status)
 			}
 			writeLine(&b, innerWidth, line)
+			if credits != "" {
+				writeLine(&b, innerWidth, "    "+credits)
+			}
 		}
 	}
 
@@ -85,6 +92,24 @@ func (r *TableRenderer) Render(state *MonitorState) string {
 	}
 
 	return b.String()
+}
+
+// Credits describe purchasing capacity, not a measured quota percentage.
+func creditSummary(info *usage.UsageInfo) string {
+	if info == nil || info.Credits == nil {
+		return ""
+	}
+	credits := info.Credits
+	if credits.Unlimited {
+		return "Credits: unlimited"
+	}
+	if credits.Balance != nil && !math.IsNaN(*credits.Balance) && !math.IsInf(*credits.Balance, 0) {
+		return fmt.Sprintf("Credit balance: %g", *credits.Balance)
+	}
+	if credits.HasCredits {
+		return "Credits: available"
+	}
+	return ""
 }
 
 func writeBorder(b *strings.Builder, innerWidth int) {

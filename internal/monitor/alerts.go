@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -66,7 +67,7 @@ func evaluateAlert(info *usage.UsageInfo, now time.Time) *Alert {
 }
 
 // usageUnavailable returns a short, human-readable reason when usage could not
-// be fetched/computed for a profile, or "" when real usage data is present. It
+// be fetched/computed for a profile, or "" when usable numeric quota is present. It
 // lets the table explain why a logged-in account shows no usage (e.g. an expired
 // access token that needs re-login) instead of rendering a misleading "0%" bar
 // (issue #37).
@@ -74,28 +75,17 @@ func usageUnavailable(info *usage.UsageInfo) string {
 	if info == nil {
 		return "no usage data"
 	}
-	// Native rows can retain a display window even when another quota is
-	// unknown, or fail before a fetcher has assigned QuotaStatus.
-	if nativeQuotaUnknown(info) || info.QuotaStatus == usage.QuotaDegraded || info.QuotaStatus == usage.QuotaUnavailable {
-		note := info.QuotaNote
-		if note == "" {
-			note = info.Error
-		}
-		if note == "" {
-			note = "numeric quota unavailable"
-		}
-		return "no usage: " + shortUsageError(note)
-	}
-	// Real data present (a usage window, or a credit balance) -> show the number.
-	if info.MostConstrainedWindow() != nil || info.Credits != nil {
+	if usagePercent(info) >= 0 {
 		return ""
 	}
-	if info.Error != "" {
-		// ASCII only: writeLine pads the table by byte length, so a multi-byte
-		// rune here would shift the right border and break box alignment.
-		return "no usage: " + shortUsageError(info.Error)
+	note := info.QuotaNote
+	if note == "" {
+		note = info.Error
 	}
-	return ""
+	if note == "" {
+		note = "numeric quota unavailable"
+	}
+	return "no usage: " + shortUsageError(note)
 }
 
 // shortUsageError condenses common usage-fetch errors into a brief hint that
@@ -119,26 +109,16 @@ func shortUsageError(err string) string {
 	return err
 }
 
-func nativeQuotaUnknown(info *usage.UsageInfo) bool {
-	return (info.Provider == "grok" || info.Provider == "cursor") && !info.NumericQuotaKnown()
-}
-
 func usagePercent(info *usage.UsageInfo) float64 {
-	if info == nil {
-		return 0
-	}
-	// Negative means "not a measurement". Callers must not print it as 0%.
-	// Preserve the historical plain-error path for Claude/Codex.
-	if nativeQuotaUnknown(info) || info.QuotaStatus == usage.QuotaDegraded || info.QuotaStatus == usage.QuotaUnavailable {
+	// A missing, partial, or failed quota read is not a zero measurement,
+	// including failures that occur before a provider sets QuotaStatus.
+	if !info.NumericQuotaKnown() {
 		return -1
 	}
 	window := info.MostConstrainedWindow()
 	if window == nil {
-		return 0
+		return -1
 	}
-	util := window.Utilization
-	if util == 0 && window.UsedPercent > 0 {
-		util = float64(window.UsedPercent) / 100.0
-	}
-	return util * 100
+	// Match the conservative measurement used by quota-based selection.
+	return math.Max(window.Utilization*100, float64(window.UsedPercent))
 }

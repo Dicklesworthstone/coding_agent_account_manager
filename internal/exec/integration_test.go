@@ -142,22 +142,25 @@ func TestIntegration_PredictionAlerts_GeneratesCorrectAlerts(t *testing.T) {
 	// Create predictions at various levels
 	predictions := []*prediction.Prediction{
 		{
-			Provider:       "claude",
-			Profile:        "alice",
-			CurrentPercent: 75,
-			Warning:        prediction.WarningApproaching,
+			Provider:            "claude",
+			Profile:             "alice",
+			CurrentPercentKnown: true,
+			CurrentPercent:      75,
+			Warning:             prediction.WarningApproaching,
 		},
 		{
-			Provider:       "claude",
-			Profile:        "bob",
-			CurrentPercent: 92,
-			Warning:        prediction.WarningImminent,
+			Provider:            "claude",
+			Profile:             "bob",
+			CurrentPercentKnown: true,
+			CurrentPercent:      92,
+			Warning:             prediction.WarningImminent,
 		},
 		{
-			Provider:       "claude",
-			Profile:        "carol",
-			CurrentPercent: 45,
-			Warning:        prediction.WarningNone,
+			Provider:            "claude",
+			Profile:             "carol",
+			CurrentPercentKnown: true,
+			CurrentPercent:      45,
+			Warning:             prediction.WarningNone,
 		},
 	}
 
@@ -201,20 +204,24 @@ func TestIntegration_PredictionAlerts_TimeBasedAlerts(t *testing.T) {
 
 	predictions := []*prediction.Prediction{
 		{
-			Provider:         "claude",
-			Profile:          "alice",
-			CurrentPercent:   60,
-			TimeToDepletion:  15 * time.Minute, // Below rotation threshold
-			Confidence:       0.8,
-			Warning:          prediction.WarningNone,
+			Provider:            "claude",
+			Profile:             "alice",
+			CurrentPercentKnown: true,
+			DataSources:         []string{"session"},
+			CurrentPercent:      60,
+			TimeToDepletion:     15 * time.Minute, // Below rotation threshold
+			Confidence:          0.8,
+			Warning:             prediction.WarningNone,
 		},
 		{
-			Provider:         "claude",
-			Profile:          "bob",
-			CurrentPercent:   50,
-			TimeToDepletion:  2 * time.Hour, // Above rotation threshold
-			Confidence:       0.8,
-			Warning:          prediction.WarningNone,
+			Provider:            "claude",
+			Profile:             "bob",
+			CurrentPercentKnown: true,
+			DataSources:         []string{"session"},
+			CurrentPercent:      50,
+			TimeToDepletion:     2 * time.Hour, // Above rotation threshold
+			Confidence:          0.8,
+			Warning:             prediction.WarningNone,
 		},
 	}
 
@@ -257,16 +264,18 @@ func TestIntegration_PredictionAlerts_AllProfilesLow(t *testing.T) {
 	// All profiles are in warning/critical range
 	predictions := []*prediction.Prediction{
 		{
-			Provider:       "claude",
-			Profile:        "alice",
-			CurrentPercent: 85,
-			Warning:        prediction.WarningApproaching,
+			Provider:            "claude",
+			Profile:             "alice",
+			CurrentPercentKnown: true,
+			CurrentPercent:      85,
+			Warning:             prediction.WarningApproaching,
 		},
 		{
-			Provider:       "claude",
-			Profile:        "bob",
-			CurrentPercent: 90,
-			Warning:        prediction.WarningImminent,
+			Provider:            "claude",
+			Profile:             "bob",
+			CurrentPercentKnown: true,
+			CurrentPercent:      90,
+			Warning:             prediction.WarningImminent,
 		},
 	}
 
