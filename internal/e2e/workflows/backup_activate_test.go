@@ -2,15 +2,235 @@
 package workflows
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
+
+// Each command runs in a fresh process through the existing CLI helper, so
+// verification cannot accidentally rely on an in-memory proof or selected
+// profile from a preceding command. TestMain preserves the prepared isolated
+// HOME in helper processes and blocks provider requests for synthetic tokens.
+func TestE2E_ClaudeIdentityRecoveryActivationCLI(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	caamHome := filepath.Join(root, "caam")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("CAAM_HOME", caamHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "xdg-data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg-config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "xdg-cache"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "xdg-state"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	write := func(path string, data []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credential := func(token string, expires time.Time) []byte {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{
+			"accessToken": "SYNTHETIC-ACCESS-" + token, "refreshToken": "SYNTHETIC-REFRESH-" + token,
+			"expiresAt": expires.UnixMilli(), "subscriptionType": "team",
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	proof := func(credentials []byte, org string) []byte {
+		t.Helper()
+		fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(map[string]any{"claude_identity": identity.ClaudeIdentityBinding{
+			Identity: identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: org,
+				Organization: org, Email: "same@example.test", Verified: true},
+			CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	vaultRoot := filepath.Join(caamHome, "data", "vault", "claude")
+	source := filepath.Join(vaultRoot, "_backup_historical")
+	team := credential("TEAM", time.Now().Add(24*time.Hour))
+	personal := credential("PERSONAL", time.Now().Add(24*time.Hour))
+	personalState := []byte(`{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal-org","emailAddress":"same@example.test"},"numStartups":23}`)
+	write(filepath.Join(source, ".credentials.json"), team)
+	write(filepath.Join(source, "meta.json"), proof(team, "team-org"))
+	write(filepath.Join(source, ".claude.json"), personalState)
+	write(filepath.Join(source, "historical-evidence.json"), []byte(`{"preserve":"historical recovery evidence"}`))
+	write(filepath.Join(vaultRoot, "personal", ".credentials.json"), personal)
+	write(filepath.Join(vaultRoot, "personal", "meta.json"), proof(personal, "personal-org"))
+	write(filepath.Join(vaultRoot, "personal", ".claude.json"), personalState)
+	legacy := filepath.Join(vaultRoot, "legacy-expired")
+	write(filepath.Join(legacy, ".credentials.json"), credential("LEGACY-EXPIRED", time.Unix(1, 0)))
+	write(filepath.Join(legacy, "meta.json"), []byte(`{"identity":"same@example.test"}`))
+	write(filepath.Join(legacy, ".claude.json"), personalState)
+	liveCredential := filepath.Join(home, ".claude", ".credentials.json")
+	liveState := filepath.Join(home, ".claude.json")
+	write(liveCredential, personal)
+	write(filepath.Join(home, ".claude", identity.ClaudeIdentityCacheFile), proof(personal, "personal-org"))
+	write(liveState, personalState)
+
+	before, beforeInfo := make(map[string][]byte), make(map[string]os.FileInfo)
+	for _, name := range []string{".credentials.json", "meta.json", ".claude.json", "historical-evidence.json"} {
+		var err error
+		before[name], err = os.ReadFile(filepath.Join(source, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeInfo[name], err = os.Stat(filepath.Join(source, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCLI := func(wantSuccess bool, args ...string) []byte {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, executable, append([]string{"-test.run=^TestCLIHelper$", "--"}, args...)...)
+		command.Env = append(os.Environ(), "GO_WANT_CLI_HELPER=1")
+		var stdout, stderr bytes.Buffer
+		command.Stdout, command.Stderr = &stdout, &stderr
+		err := command.Run()
+		if (err == nil) != wantSuccess {
+			t.Fatalf("CLI %s success=%t, want %t; process error: %v", strings.Join(args, " "), err == nil, wantSuccess, err)
+		}
+		if !wantSuccess {
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+				t.Fatalf("CLI did not return an ordinary failure exit status: %v", err)
+			}
+		}
+		for _, output := range []string{stdout.String(), stderr.String()} {
+			if strings.Contains(output, "SYNTHETIC-ACCESS-") || strings.Contains(output, "SYNTHETIC-REFRESH-") || strings.Contains(output, "credential_fingerprint") {
+				t.Fatal("CLI exposed credential material in process output")
+			}
+		}
+		return stdout.Bytes()
+	}
+	var copied authfile.ClaudeProfileIdentityResult
+	if err := json.Unmarshal(runCLI(true, "verify", "identity", "claude", "_backup_historical", "--copy-to", "recovered", "--json"), &copied); err != nil || copied.CopiedTo != "recovered" || copied.Source != "cache" || copied.Identity == nil || copied.Identity.OrganizationID != "team-org" {
+		t.Fatalf("recovery CLI did not report the cached verified Team identity: %v", err)
+	}
+	var activation struct {
+		Success  bool               `json:"success"`
+		Profile  string             `json:"profile"`
+		Identity *identity.Identity `json:"identity"`
+		Error    string             `json:"error"`
+	}
+	if err := json.Unmarshal(runCLI(true, "activate", "claude", "recovered", "--json"), &activation); err != nil || !activation.Success || activation.Profile != "recovered" || activation.Identity == nil || activation.Identity.OrganizationID != "team-org" {
+		t.Fatalf("activation CLI did not select the recovered Team identity: %v", err)
+	}
+	if current, err := os.ReadFile(liveCredential); err != nil || !bytes.Equal(current, team) {
+		t.Fatal("activation CLI did not install the exact recovered credential")
+	}
+	assertSelection := func() {
+		t.Helper()
+		var listing struct {
+			Profiles []struct {
+				Name     string             `json:"name"`
+				Active   bool               `json:"active"`
+				Identity *identity.Identity `json:"identity"`
+			} `json:"profiles"`
+		}
+		if err := json.Unmarshal(runCLI(true, "ls", "claude", "--json"), &listing); err != nil {
+			t.Fatalf("listing CLI emitted invalid JSON: %v", err)
+		}
+		active := 0
+		for _, entry := range listing.Profiles {
+			if entry.Active {
+				active++
+				if entry.Name != "recovered" || entry.Identity == nil || entry.Identity.OrganizationID != "team-org" {
+					t.Fatal("listing CLI marked the wrong organization active")
+				}
+			}
+		}
+		if active != 1 {
+			t.Fatalf("listing CLI marked %d profiles active, want one", active)
+		}
+	}
+	assertSelection()
+	// Model an older Claude session rewriting the shared file after switching.
+	write(liveState, personalState)
+	assertSelection()
+	// Model a restart after metadata proof publication but before saved-label
+	// repair. Each invocation is a new process; the trusted proof permits the
+	// repair to resume while the stale label contributes no ownership claim.
+	recoveredState := filepath.Join(vaultRoot, "recovered", ".claude.json")
+	write(recoveredState, personalState)
+	var repaired authfile.ClaudeProfileIdentityResult
+	if err := json.Unmarshal(runCLI(true, "verify", "identity", "claude", "recovered", "--repair", "--json"), &repaired); err != nil || !repaired.Repaired || repaired.Source != "cache" || repaired.Identity == nil || repaired.Identity.OrganizationID != "team-org" {
+		t.Fatalf("CLI could not resume saved-label repair after restart: %v", err)
+	}
+	repairedInfo, err := os.Stat(recoveredState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(runCLI(true, "verify", "identity", "claude", "recovered", "--repair", "--json"), &repaired); err != nil || repaired.Repaired || repaired.Source != "cache" {
+		t.Fatalf("repeated CLI repair was not idempotent: %v", err)
+	}
+	if after, err := os.Stat(recoveredState); err != nil || !os.SameFile(repairedInfo, after) || !repairedInfo.ModTime().Equal(after.ModTime()) {
+		t.Fatal("repeated CLI repair rewrote the canonical saved label")
+	}
+	runCLI(false, "verify", "identity", "claude", "_backup_historical", "--copy-to", "recovered", "--json")
+	activation.Success, activation.Error = false, ""
+	if err := json.Unmarshal(runCLI(false, "activate", "claude", "legacy-expired", "--force", "--json"), &activation); err != nil || activation.Success || activation.Error == "" {
+		t.Fatalf("legacy unverified activation did not report a structured failure: %v", err)
+	}
+	if current, err := os.ReadFile(liveCredential); err != nil || !bytes.Equal(current, team) {
+		t.Fatal("failed legacy activation replaced the live credential")
+	}
+	if current, err := os.ReadFile(liveState); err != nil || !bytes.Equal(current, personalState) {
+		t.Fatal("failed legacy activation changed concurrent session metadata")
+	}
+	conflicting := filepath.Join(vaultRoot, "_backup_conflicting")
+	write(filepath.Join(conflicting, ".credentials.json"), team)
+	write(filepath.Join(conflicting, "meta.json"), proof(team, "team-org"))
+	write(filepath.Join(conflicting, identity.ClaudeIdentityCacheFile), proof(team, "personal-org"))
+	var conflict authfile.ClaudeProfileIdentityResult
+	if err := json.Unmarshal(runCLI(false, "verify", "identity", "claude", "_backup_conflicting", "--copy-to", "conflicting-copy", "--json"), &conflict); err != nil || conflict.State != "conflict" || conflict.CopiedTo != "" {
+		t.Fatalf("CLI copied contradictory ownership evidence: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(vaultRoot, "conflicting-copy")); !os.IsNotExist(err) {
+		t.Fatal("conflicting recovery produced a destination profile")
+	}
+	for name, expected := range before {
+		current, err := os.ReadFile(filepath.Join(source, name))
+		if err != nil || !bytes.Equal(current, expected) {
+			t.Fatalf("workflow changed original recovery bytes: %s", name)
+		}
+		after, err := os.Stat(filepath.Join(source, name))
+		if err != nil || !os.SameFile(beforeInfo[name], after) || beforeInfo[name].Mode() != after.Mode() || !beforeInfo[name].ModTime().Equal(after.ModTime()) {
+			t.Fatalf("workflow changed original recovery file identity: %s", name)
+		}
+	}
+}
 
 // =============================================================================
 // E2E Test: Complete Backup-Activate-Switch Workflow

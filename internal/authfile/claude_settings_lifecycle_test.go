@@ -2,6 +2,7 @@ package authfile
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func writeClaudeSettingsTestFile(t *testing.T, path, body string) {
@@ -137,6 +139,21 @@ func TestClaudeCredentialPreflightAcceptsSupportedSources(t *testing.T) {
 			vault := NewVault(filepath.Join(home, "vault"))
 			snapshot := vault.BackupPath("claude", "target", tt.filename)
 			writeClaudeSettingsTestFile(t, snapshot, tt.body)
+			if tt.filename == claudeCredentialsFile {
+				setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+					tt.body: {AccountID: "verified-target", OrganizationID: "verified-target-org"},
+				})
+				if tt.name == "expired OAuth remains locally restorable" {
+					// The token was verified before it expired. An expired,
+					// unfamiliar grant is not evidence of an account identity.
+					issue132WriteProof(t, filepath.Join(filepath.Dir(snapshot), "meta.json"),
+						issue132Proof(t, []byte(tt.body), "verified-target", "verified-target-org"))
+					vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+						t.Fatal("previously verified expired credentials should remain restorable offline")
+						return nil, identity.ErrClaudeIdentityUnavailable
+					}
+				}
+			}
 			if err := vault.ValidateProfileCredentials(fileSet, "target"); err != nil {
 				t.Fatalf("ValidateProfileCredentials() = %v", err)
 			}
@@ -190,6 +207,11 @@ func TestClaudeCredentiallessLiveStateCannotCreateProfile(t *testing.T) {
 
 func TestClaudeSettingsVaultMultiProfileLifecycle(t *testing.T) {
 	vault, fileSet, live := claudeSettingsFixture(t, `{}`, `{}`)
+	setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+		`{"claudeAiOauth":{"accessToken":"alice-at","refreshToken":"alice-rt"}}`: {AccountID: "verified-alice", OrganizationID: "verified-alice-org"},
+		`{"claudeAiOauth":{"accessToken":"bob-at","refreshToken":"bob-rt"}}`:     {AccountID: "verified-bob", OrganizationID: "verified-bob-org"},
+		`{"claudeAiOauth":{"accessToken":"oauth-at","refreshToken":"oauth-rt"}}`: {AccountID: "verified-oauth", OrganizationID: "verified-oauth-org"},
+	})
 	accounts := map[string]string{
 		"alice": `"apiKeyHelper":"alice-helper","awsAuthRefresh":"alice-sso","forceLoginOrgUUID":"alice-org"`,
 		"bob":   `"env":{"ANTHROPIC_AUTH_TOKEN":"bob-token","ANTHROPIC_BASE_URL":"https://bob.invalid","AWS_PROFILE":"bob"},"awsCredentialExport":"bob-export"`,
@@ -414,8 +436,9 @@ func TestClaudeLegacyMCPRoundTripAndLogout(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := readJSONMap(t, legacy)
-		if got["oauthAccount"] != nil {
-			t.Fatal("unverified legacy account label was published as token ownership")
+		account, ok := got["oauthAccount"].(map[string]interface{})
+		if !ok || account["accountUuid"] != "verified-bob" || account["organizationUuid"] != "verified-bob-org" {
+			t.Fatal("verified token identity did not replace the unverified legacy account label")
 		}
 		if got := readFixtureFile(t, fileSet.Files[0].Path); got != `{"claudeAiOauth":{"accessToken":"bob-at","refreshToken":"bob-rt"}}` {
 			t.Fatal("requested account credentials did not switch")

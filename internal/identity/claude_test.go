@@ -70,6 +70,57 @@ func TestInspectClaudeIdentityBindingSeparatesMissingAndBrokenProof(t *testing.T
 	}
 }
 
+func TestClaudeIdentitySourcesDoNotHideContradictoryEvidence(t *testing.T) {
+	credential := []byte(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-current","refreshToken":"SYNTHETIC-refresh"}}`)
+	previous := []byte(`{"claudeAiOauth":{"accessToken":"SYNTHETIC-previous","refreshToken":"SYNTHETIC-refresh"}}`)
+	encode := func(data []byte, account, organization string) []byte {
+		t.Helper()
+		fingerprint, err := ClaudeCredentialFingerprint(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata, err := json.Marshal(map[string]any{"claude_identity": ClaudeIdentityBinding{
+			Identity:              Identity{Provider: "claude", AccountID: account, OrganizationID: organization, Email: "shared@example.test"},
+			CredentialFingerprint: fingerprint, VerifiedAt: time.Unix(1700000000, 0).UTC(),
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return metadata
+	}
+	team := encode(credential, "account", "team")
+	for _, test := range []struct {
+		name, state     string
+		metadata, cache []byte
+		bad             bool
+	}{
+		{"same owner", ClaudeIdentityVerified, team, team, false},
+		{"different organization", "conflict", team, encode(credential, "account", "personal"), true},
+		{"different account", "conflict", team, encode(credential, "other", "team"), true},
+		{"stale conflicting cache", "conflict", team, encode(previous, "account", "personal"), true},
+		{"changed primary cannot inherit cache", ClaudeIdentityCredentialChanged, encode(previous, "account", "team"), team, false},
+		{"legacy with exact cache", ClaudeIdentityVerified, []byte(`{"identity":"label@example.test"}`), team, false},
+		{"valid primary cannot hide malformed cache", ClaudeIdentityInvalidMetadata, team, []byte(`{"claude_identity":{}}`), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := InspectClaudeIdentitySources(test.metadata, test.cache, credential)
+			if result.State != test.state || (err != nil) != test.bad || test.bad && result.Binding != nil {
+				t.Fatalf("unexpected assessment state=%s error=%v", result.State, err)
+			}
+			dir := t.TempDir()
+			for name, data := range map[string][]byte{".credentials.json": credential, "meta.json": test.metadata, ClaudeIdentityCacheFile: test.cache} {
+				if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			binding, err := ReadClaudeIdentityBinding(filepath.Join(dir, ".credentials.json"))
+			if (err != nil) != test.bad || (binding != nil) != (test.state == ClaudeIdentityVerified) {
+				t.Fatalf("file-backed reader ignored the combined evidence: %v", err)
+			}
+		})
+	}
+}
+
 func TestExtractFromClaudeCredentials_AllFields(t *testing.T) {
 	exp := time.Now().Add(90 * time.Minute).UTC()
 	cred := map[string]interface{}{
@@ -919,7 +970,7 @@ func TestSavedClaudeBindingCannotBeReplacedByCopiedNativeCache(t *testing.T) {
 	}
 	writeProof("meta.json", oldCredentials, "personal")
 	writeProof(ClaudeIdentityCacheFile, newCredentials, "team")
-	if binding, err := ReadClaudeIdentityBindingForCredentials(credentialsPath, newCredentials); err != nil || binding != nil {
+	if binding, err := ReadClaudeIdentityBindingForCredentials(credentialsPath, newCredentials); err == nil || binding != nil {
 		t.Fatalf("copied cache bypassed the saved profile's expected owner: binding=%v, err=%v", binding != nil, err)
 	}
 	id, err := ExtractFromClaudeCredentials(credentialsPath)

@@ -90,6 +90,51 @@ func TestHasAuthFilesReadOnlyFileSources(t *testing.T) {
 	}
 }
 
+func TestClaudeProtectedActivationNeverRepairsRecoveryEvidence(t *testing.T) {
+	for _, entry := range []string{"switch", "restore"} {
+		for _, name := range []string{"_original", "_backup_historical"} {
+			t.Run(entry+"/"+name, func(t *testing.T) {
+				f := newClaudeRotationFixture(t)
+				f.writeProfile(name, aliceTeamGen1, aliceSettings(19))
+				writeFixtureFile(t, f.profileFile(name, "meta.json"), `{"type":"system","identity":"old-label@example.test"}`)
+				f.writeLive(aliceGen1, aliceSettings(20))
+				before := make(map[string][]byte)
+				infos := make(map[string]os.FileInfo)
+				for _, file := range []string{claudeCredentialsFile, claudeSettingsFile, "meta.json"} {
+					path := f.profileFile(name, file)
+					before[file] = readBytes(t, path)
+					var err error
+					infos[file], err = os.Stat(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				for attempt := 0; attempt < 2; attempt++ {
+					var err error
+					if entry == "switch" {
+						_, err = f.vault.Switch(f.fileSet, name, SwitchOptions{BackupMode: "never"})
+					} else {
+						err = f.vault.Restore(f.fileSet, name)
+					}
+					if err != nil {
+						t.Fatalf("verified recovery activation failed: %v", err)
+					}
+					if readFixtureFile(t, f.liveCreds) != aliceTeamGen1 {
+						t.Fatal("recovery activation did not install the selected token")
+					}
+					for file, expected := range before {
+						info, err := os.Stat(f.profileFile(name, file))
+						if err != nil || !bytes.Equal(readBytes(t, f.profileFile(name, file)), expected) ||
+							!os.SameFile(info, infos[file]) || info.Mode() != infos[file].Mode() || !info.ModTime().Equal(infos[file].ModTime()) {
+							t.Fatalf("activation repaired protected recovery evidence in %s: %v", file, err)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestSwitchPreservesRotatedCodexCredential(t *testing.T) {
 	old := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	newer := old.Add(time.Hour)
@@ -754,6 +799,10 @@ func TestSwitchReadsKeychainWithoutMirroringBeforeStaleGuard(t *testing.T) {
 
 func TestSwitchRestoreFailureNamesRecoveryCopy(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		aliceGen2: {AccountID: rotAliceUUID, OrganizationID: rotAliceOrg},
+		bobGen1:   {AccountID: rotBobUUID, OrganizationID: rotAliceOrg},
+	})
 	f.storeToken(aliceGen2)
 	writeFixtureFile(t, f.statePath, aliceSettings(9))
 	writeSwitchProfile(t, f.vault, "claude", "bob", map[string]string{

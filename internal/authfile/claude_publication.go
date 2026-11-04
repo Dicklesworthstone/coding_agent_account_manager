@@ -2,13 +2,44 @@ package authfile
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
+
+// Check the identity actually installed before reporting success. Native
+// sessions do not take CAAM's lock and can rewrite shared metadata even while
+// the authoritative keychain is being published. Such a write is left intact
+// and reported; a later guarded activation can reconcile it. This check cannot
+// prevent another process from writing after the command has returned.
+func checkClaudeActivation(fileSet AuthFileSet, selected switchState) error {
+	if fileSet.Tool != "claude" || selected.credentialName != claudeCredentialsFile {
+		return nil
+	}
+	current, err := readSwitchState(fileSet, "")
+	if err != nil || !current.sameCredential(selected) || !current.sameAccount(selected) {
+		return fmt.Errorf("claude credentials or verified identity changed during activation; concurrent authentication was left untouched")
+	}
+	if claudeFileSetPath(fileSet, claudeSettingsFile) == "" {
+		return nil
+	}
+	var settings struct {
+		Account struct {
+			Account      string `json:"accountUuid"`
+			Organization string `json:"organizationUuid"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(current.files[claudeSettingsFile], &settings) != nil ||
+		!identity.ClaudeSameAccount(&identity.Identity{AccountID: settings.Account.Account, OrganizationID: settings.Account.Organization}, &selected.claudeIdentity.Identity) {
+		return fmt.Errorf("claude shared account metadata changed during activation; stop concurrent Claude sessions and retry")
+	}
+	return nil
+}
 
 // A present OAuth snapshot is part of the same recoverable operation as mixed
 // settings, not a subsequent unguarded copy. The initial disk bytes and the

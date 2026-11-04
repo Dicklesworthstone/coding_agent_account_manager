@@ -1593,7 +1593,7 @@ func TestImportAuthCarriesVerifiedOrganizationOffline(t *testing.T) {
 }
 
 func TestImportAuthRejectsBrokenSavedProofAndDiscardsStaleNativeProof(t *testing.T) {
-	for _, scenario := range []string{"no proof", "stale native proof", "changed access only", "saved proof mismatch", "invalid saved proof", "invalid native proof"} {
+	for _, scenario := range []string{"no proof", "stale native proof", "changed access only", "saved proof mismatch", "invalid saved proof", "invalid native proof", "saved conflicting secondary proof", "saved malformed secondary proof"} {
 		t.Run(scenario, func(t *testing.T) {
 			_, prof := claudeLifecycleFixture(t)
 			source := filepath.Join(t.TempDir(), ".credentials.json")
@@ -1615,6 +1615,12 @@ func TestImportAuthRejectsBrokenSavedProofAndDiscardsStaleNativeProof(t *testing
 			case "invalid saved proof":
 				writeClaudeLifecycleJSON(t, meta, `{"claude_identity":`)
 			case "invalid native proof":
+				writeClaudeLifecycleJSON(t, sourceCache, `{"claude_identity":`)
+			case "saved conflicting secondary proof":
+				writeClaudeImportTestBinding(t, meta, team, "team-org")
+				writeClaudeImportTestBinding(t, sourceCache, team, "personal-org")
+			case "saved malformed secondary proof":
+				writeClaudeImportTestBinding(t, meta, team, "team-org")
 				writeClaudeLifecycleJSON(t, sourceCache, `{"claude_identity":`)
 			}
 			target := claudeXDGCredentialsPathForProfile(prof)
@@ -1653,7 +1659,7 @@ func TestImportAuthRejectsBrokenSavedProofAndDiscardsStaleNativeProof(t *testing
 }
 
 func TestCapturedClaudeImportRejectsSourceReplacementBeforeWrites(t *testing.T) {
-	for _, changed := range []string{"credentials", "binding", "identical replacement", "previously absent metadata"} {
+	for _, changed := range []string{"credentials", "binding", "identical replacement", "previously absent metadata", "secondary binding with verified primary"} {
 		t.Run(changed, func(t *testing.T) {
 			_, prof := claudeLifecycleFixture(t)
 			source := filepath.Join(t.TempDir(), ".credentials.json")
@@ -1661,6 +1667,9 @@ func TestCapturedClaudeImportRejectsSourceReplacementBeforeWrites(t *testing.T) 
 			writeClaudeLifecycleJSON(t, source, string(credentials))
 			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
 			writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			if changed == "secondary binding with verified primary" {
+				writeClaudeImportTestBinding(t, filepath.Join(filepath.Dir(source), "meta.json"), credentials, "team-org")
+			}
 			captured, err := captureClaudeImportSource(source, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -1668,7 +1677,7 @@ func TestCapturedClaudeImportRejectsSourceReplacementBeforeWrites(t *testing.T) 
 			switch changed {
 			case "credentials":
 				writeClaudeLifecycleJSON(t, source, string(claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))))
-			case "binding":
+			case "binding", "secondary binding with verified primary":
 				writeClaudeImportTestBinding(t, cache, credentials, "personal-org")
 			case "identical replacement":
 				replacement := source + ".replacement"

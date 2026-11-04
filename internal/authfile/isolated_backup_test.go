@@ -203,9 +203,35 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 		}
 	}
 
+	// Preserving an unverifiable credential does not make it safe to activate.
+	// The expired fixture has no provider proof yet, so activation must leave
+	// the current live login and settings intact.
+	if _, err := vault.Switch(ClaudeAuthFiles(), "saved", SwitchOptions{BackupMode: "always"}); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("unverified saved login was allowed to activate: %v", err)
+	}
+	if err := before.unchanged(); err != nil {
+		t.Fatalf("refused activation touched the live credential: %v", err)
+	}
+	for path, want := range map[string][]byte{liveSettings: settingsBefore, livePolicy: policyBefore} {
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("refused activation changed live settings: %s: %v", path, err)
+		}
+	}
+
+	// Recover a prior provider proof for this exact expired token generation.
+	// Its account and organization are independent of the saved name and the
+	// unverified labels originally observed in the isolated source.
+	binding := isolatedClaudeTeamBinding(t, files[".credentials.json"])
+	cache, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putIsolatedTestFile(t, vault.BackupPath("claude", "saved", identity.ClaudeIdentityCacheFile), string(cache))
+
 	// Activation uses the ordinary native destination fileset, not recorded
-	// original_paths. It must select the captured credential, omit unverified
-	// labels, and preserve the source.
+	// original_paths. It must install the captured token and its verified
+	// identity while preserving the isolated source.
 	if _, err := vault.Switch(ClaudeAuthFiles(), "saved", SwitchOptions{BackupMode: "always"}); err != nil {
 		t.Fatal(err)
 	}
@@ -214,8 +240,22 @@ func TestBackupIsolatedClaudePreservesLiveLoginAndActivates(t *testing.T) {
 		t.Fatalf("saved login was not activated: %v", err)
 	}
 	got, err = os.ReadFile(liveSettings)
-	if err != nil || bytes.Contains(got, []byte("oauthAccount")) || bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("live@example.test")) {
-		t.Fatalf("activation published an unverified identity: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		OAuthAccount struct {
+			AccountID      string `json:"accountUuid"`
+			OrganizationID string `json:"organizationUuid"`
+			Email          string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(got, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.OAuthAccount.AccountID != binding.Identity.AccountID || state.OAuthAccount.OrganizationID != binding.Identity.OrganizationID ||
+		state.OAuthAccount.Email != binding.Identity.Email || bytes.Contains(got, []byte("live@example.test")) {
+		t.Fatal("activation did not install the exact-token verified identity")
 	}
 	assertIsolatedUnchanged(t, root, files)
 }

@@ -20,6 +20,10 @@ func TestClaudeRestorePublicationFailureRestoresIncomingOAuthAndSettings(t *test
 				settings := filepath.Join(filepath.Dir(f.credPath), "settings.json")
 				f.fileSet.Files = append(f.fileSet.Files, AuthFileSpec{Path: settings})
 				outgoing := keychainCreds("outgoing")
+				setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+					outgoing:                  {AccountID: "outgoing", OrganizationID: "outgoing-org"},
+					keychainCreds("incoming"): {AccountID: "incoming", OrganizationID: "incoming-org"},
+				})
 				state := keychainState("outgoing@example.invalid")
 				const policy = `{"permissions":{"allow":["Read"],"defaultMode":"auto"},"autoMode":{"allow":["tests"]},"mcpServers":{"local":{}},"hooks":{"Stop":[]},"apiKeyHelper":"outgoing-helper"}`
 				f.storeToken(outgoing)
@@ -120,6 +124,54 @@ func TestClaudeFinalPublicationCheckNeverReplaysAnOldMirror(t *testing.T) {
 	}
 	if got, ok := f.storedToken(); !ok || got != keychainCreds("native-new-login") {
 		t.Fatal("final check replayed the old file over the native keychain login")
+	}
+}
+
+func TestClaudeSwitchDetectsNativeLabelRewriteDuringKeychainPublication(t *testing.T) {
+	f := newKeychainFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	outgoing, incoming := keychainCreds("previous-owner"), keychainCreds("selected-owner")
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		outgoing: {AccountID: "shared-account", OrganizationID: "personal", Email: "shared@example.test"},
+		incoming: {AccountID: "shared-account", OrganizationID: "team", Email: "shared@example.test"},
+	})
+	f.storeToken(outgoing)
+	publicationWrite(t, f.credPath, outgoing)
+	publicationWrite(t, f.statePath, `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal"}}`)
+	publicationWrite(t, f.vault.BackupPath("claude", "team", claudeCredentialsFile), incoming)
+	t.Setenv("CAAM_TEST_PUBLICATION_BACKEND", os.Getenv("CAAM_KEYCHAIN_BIN"))
+	t.Setenv("CAAM_TEST_NATIVE_STATE", f.statePath)
+	wrapper := filepath.Join(t.TempDir(), "native-label-writer")
+	const script = `#!/bin/sh
+if [ "$1" = "add-generic-password" ]; then
+  printf '%s' '{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal"},"numStartups":81}' > "$CAAM_TEST_NATIVE_STATE"
+fi
+exec "$CAAM_TEST_PUBLICATION_BACKEND" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_KEYCHAIN_BIN", wrapper)
+	result, err := f.vault.Switch(f.fileSet, "team", SwitchOptions{})
+	if err == nil || !strings.Contains(err.Error(), "shared account metadata changed") || !result.RestoreStarted || result.AutoBackup == "" {
+		t.Fatalf("native metadata rewrite was reported as a successful switch: %+v, %v", result, err)
+	}
+	if string(publicationRead(t, f.statePath)) != `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal"},"numStartups":81}` {
+		t.Fatal("failure overwrote the concurrent native state")
+	}
+	if string(publicationRead(t, f.vault.BackupPath("claude", result.AutoBackup, claudeCredentialsFile))) != outgoing {
+		t.Fatal("failed publication lost the outgoing recovery credential")
+	}
+	// The stale shared label must not change which credential is actually
+	// active. Removing the interfering writer permits a guarded retry.
+	active, err := f.vault.ActiveProfile(f.fileSet)
+	if err != nil || active != "team" {
+		t.Fatalf("native label changed token-based selection: %q, %v", active, err)
+	}
+	t.Setenv("CAAM_KEYCHAIN_BIN", os.Getenv("CAAM_TEST_PUBLICATION_BACKEND"))
+	if _, err := f.vault.Switch(f.fileSet, "team", SwitchOptions{}); err != nil {
+		t.Fatalf("retry failed to reconcile the shared label: %v", err)
 	}
 }
 

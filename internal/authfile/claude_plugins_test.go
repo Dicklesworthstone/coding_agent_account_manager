@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // claudeSettingsFixture builds a vault with a claude profile whose snapshot
@@ -50,7 +52,11 @@ func claudeSettingsFixture(t *testing.T, vaultSettings, liveSettings string) (*V
 			{Tool: "claude", Path: livePath, Required: false},
 		},
 	}
-	return NewVault(vaultDir), fileSet, livePath
+	vault := NewVault(vaultDir)
+	setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+		`{"claudeAiOauth":{"accessToken":"bob-at","refreshToken":"bob-rt"}}`: {AccountID: "verified-bob", OrganizationID: "verified-bob-org"},
+	})
+	return vault, fileSet, livePath
 }
 
 func readJSONMap(t *testing.T, path string) map[string]interface{} {

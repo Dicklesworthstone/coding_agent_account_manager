@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
@@ -26,6 +27,9 @@ const claudeIdentityUnknownWarning = "Claude account and organization could not 
 type ClaudeProfileIdentityOptions struct {
 	Online bool
 	Repair bool
+	// CopyTo publishes a verified copy under a new user label. The source,
+	// including a protected recovery snapshot, is never modified.
+	CopyTo string
 }
 
 // ClaudeProfileIdentityResult describes only a saved vault profile. No native
@@ -39,6 +43,7 @@ type ClaudeProfileIdentityResult struct {
 	RecordedIdentity *identity.Identity `json:"recorded_identity,omitempty"`
 	VerifiedAt       *time.Time         `json:"verified_at,omitempty"`
 	Repaired         bool               `json:"repaired"`
+	CopiedTo         string             `json:"copied_to,omitempty"`
 	Detail           string             `json:"detail,omitempty"`
 }
 
@@ -47,6 +52,11 @@ type ClaudeProfileIdentityResult struct {
 // before its proof can be replaced. Metadata repair never changes tokens.
 func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts ClaudeProfileIdentityOptions) (ClaudeProfileIdentityResult, error) {
 	result := ClaudeProfileIdentityResult{Provider: "claude", Profile: profile, State: identity.ClaudeIdentityUnknown, Source: "none"}
+	if opts.Repair && opts.CopyTo != "" {
+		err := errors.New("identity repair and copying are separate operations")
+		result.Detail = err.Error()
+		return result, err
+	}
 	if opts.Repair && IsSystemProfile(profile) {
 		err := fmt.Errorf("%w: recovery snapshots cannot be repaired", errProtectedSystemProfile)
 		result.Detail = err.Error()
@@ -55,6 +65,11 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 	operation := func() error {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if opts.CopyTo != "" {
+			if _, err := v.claudeIdentityCopyDestination(opts.CopyTo); err != nil {
+				return err
+			}
 		}
 		dir, err := v.existingProfileDir("claude", profile)
 		if err != nil {
@@ -66,12 +81,8 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 		}
 		defer snapshot.directory.Close()
 		credentials := snapshot.files[claudeCredentialsFile].data
-		assessment, err := identity.InspectClaudeIdentityBinding(snapshot.files["meta.json"].data, credentials)
-		if err == nil && assessment.State == identity.ClaudeIdentityUnknown {
-			// The same precedence is used by identity extraction: a saved owner
-			// is authoritative, while a cache can establish an unbound profile.
-			assessment, err = identity.InspectClaudeIdentityBinding(snapshot.files[identity.ClaudeIdentityCacheFile].data, credentials)
-		}
+		assessment, err := identity.InspectClaudeIdentitySources(snapshot.files["meta.json"].data,
+			snapshot.files[identity.ClaudeIdentityCacheFile].data, credentials)
 		result.State, result.RecordedIdentity = assessment.State, assessment.RecordedIdentity
 		if err != nil {
 			return err
@@ -79,7 +90,7 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 		binding := assessment.Binding
 		if credentials == nil && assessment.State == identity.ClaudeIdentityUnknown {
 			result.Detail = "saved profile has no modern Claude OAuth credential to verify"
-			if opts.Online || opts.Repair {
+			if opts.Online || opts.Repair || opts.CopyTo != "" {
 				return errors.New(result.Detail)
 			}
 			return nil
@@ -88,7 +99,7 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 			result.State = "invalid_credentials"
 			return err
 		}
-		if opts.Online || opts.Repair && binding == nil {
+		if opts.Online || (opts.Repair || opts.CopyTo != "") && binding == nil {
 			verify := v.ClaudeIdentityVerifier
 			if verify == nil {
 				verify = func(ctx context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
@@ -117,6 +128,9 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 		} else if binding != nil {
 			result.Source = "cache"
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := snapshot.check(true); err != nil {
 			result.State = "source_changed"
 			return err
@@ -136,10 +150,44 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 			return errors.New("saved Claude credentials belong to a different account or organization; recorded ownership was preserved")
 		}
 		result.State = identity.ClaudeIdentityVerified
+		if opts.Repair || opts.CopyTo != "" {
+			// Diagnostics may report a fresh provider answer even while other
+			// saved copies disagree. Mutations must preserve that unresolved
+			// evidence instead of publishing a profile activation would reject.
+			if _, err := v.findClaudeCredentialBinding(credentials, assessment.RecordedBinding, binding); err != nil {
+				if errors.Is(err, ErrInvalidCredentials) {
+					result.State = "conflict"
+				}
+				return err
+			}
+		}
+		if opts.CopyTo != "" {
+			err := v.copyClaudeIdentitySnapshot(ctx, snapshot, profile, opts.CopyTo, binding)
+			if errors.Is(err, ErrInvalidCredentials) {
+				result.State = "conflict"
+			}
+			var published *SnapshotPublishedError
+			if err == nil || errors.As(err, &published) {
+				result.CopiedTo = strings.TrimSpace(opts.CopyTo)
+			}
+			return err
+		}
 		if !opts.Repair {
 			return nil
 		}
-		verifySource := func() error { return snapshot.check(false) }
+		verifySource := func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := snapshot.check(false); err != nil {
+				return err
+			}
+			_, err := v.findClaudeCredentialBinding(credentials, nil, binding)
+			if errors.Is(err, ErrInvalidCredentials) {
+				result.State = "conflict"
+			}
+			return err
+		}
 		metadata, err := claudesettings.PrepareIdentityMetadata(filepath.Join(dir, "meta.json"),
 			filepath.Join(dir, claudeCredentialsFile), snapshot.files["meta.json"].data, credentials, binding, verifySource)
 		if err != nil {
@@ -157,7 +205,7 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 		return nil
 	}
 	var err error
-	if opts.Repair {
+	if opts.Repair || opts.CopyTo != "" {
 		err = v.WithMutationLock(operation)
 	} else {
 		err = operation()
@@ -166,6 +214,113 @@ func (v *Vault) ClaudeProfileIdentity(ctx context.Context, profile string, opts 
 		result.Detail = err.Error()
 	}
 	return result, err
+}
+
+func (v *Vault) claudeIdentityCopyDestination(profile string) (string, error) {
+	dir, err := v.safeProfileDir("claude", profile)
+	if err != nil {
+		return "", err
+	}
+	if IsSystemProfile(profile) {
+		return "", fmt.Errorf("%w: choose a new user profile label for the verified copy", errProtectedSystemProfile)
+	}
+	if _, err := os.Lstat(dir); err == nil {
+		return "", fmt.Errorf("verified copy destination already exists; choose a new profile label: %w", os.ErrExist)
+	} else if !os.IsNotExist(err) {
+		return "", errors.New("cannot inspect verified copy destination")
+	}
+	return dir, nil
+}
+
+// copyClaudeIdentitySnapshot promotes only the captured, verified OAuth grant.
+// Other historical auth artifacts remain in the immutable source; they must not
+// be silently combined with the grant being recovered. Publication uses the
+// same durable, no-replace directory transaction as isolated profile backup.
+func (v *Vault) copyClaudeIdentitySnapshot(ctx context.Context, source *claudeProfileIdentitySnapshot, sourceProfile, target string, binding *identity.ClaudeIdentityBinding) error {
+	credentials := source.files[claudeCredentialsFile].data
+	if binding == nil || !binding.MatchesCredentials(credentials) {
+		return errors.New("a verified Claude credential is required for copying")
+	}
+	destination, err := v.claudeIdentityCopyDestination(target)
+	if err != nil {
+		return err
+	}
+	parent, err := inspectIsolatedSourceDir(filepath.Dir(destination))
+	if err != nil {
+		return err
+	}
+	work, err := os.MkdirTemp(parent.path, vaultBackupPrefix+"identity-copy-*")
+	if err != nil {
+		return fmt.Errorf("prepare verified identity copy: %w", err)
+	}
+	workDir, err := inspectIsolatedSourceDir(work)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if parent.unchanged() == nil && workDir.unchanged() == nil {
+			_ = os.RemoveAll(work)
+		}
+	}()
+	stage := filepath.Join(work, "prepared")
+	if err := os.Mkdir(stage, 0700); err != nil {
+		return err
+	}
+	metadata := make(map[string]interface{})
+	if data := source.files["meta.json"].data; data != nil {
+		var original map[string]json.RawMessage
+		if json.Unmarshal(data, &original) != nil || original == nil {
+			return errors.New("invalid saved Claude identity metadata")
+		}
+		// Retain operator preferences using the same allowlist as backup.
+		// Historical paths, recovery markers, caches and unknown auth fields
+		// remain solely in the unchanged source snapshot.
+		for _, key := range []string{"description", "tags", "notes", "alias", "aliases", "browser", "browser_command", "browser_profile", "browser_profile_dir", "browser_profile_name"} {
+			if value, exists := original[key]; exists {
+				metadata[key] = value
+			}
+		}
+	}
+	addClaudeIdentityMetadata(metadata, binding)
+	metadata["tool"], metadata["profile"] = "claude", strings.TrimSpace(target)
+	metadata["type"], metadata["created_by"] = "user", "identity-copy"
+	metadata["copied_from"], metadata["copied_at"] = strings.TrimSpace(sourceProfile), time.Now().UTC().Format(time.RFC3339Nano)
+	metadata["files"] = 2
+	meta, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return errors.New("cannot prepare verified copy metadata")
+	}
+	// A recovery file can contain old OAuth tokens, API keys, helpers and
+	// account caches alongside its label. The copy contains only the owner
+	// of the verified modern grant; all historical settings stay recoverable
+	// from the protected source instead of selecting a second login.
+	settings, err := claudesettings.WithOAuthAccount(nil, claudeOAuthAccount(binding))
+	if err != nil {
+		return err
+	}
+	for _, file := range []struct {
+		name string
+		data []byte
+	}{{claudeCredentialsFile, credentials}, {claudeSettingsFile, settings}, {"meta.json", meta}} {
+		if err := writeSwitchFile(filepath.Join(stage, file.name), file.data, true); err != nil {
+			return fmt.Errorf("stage verified copy %s: %w", file.name, err)
+		}
+	}
+	return publishIsolatedBackupDurably(stage, destination, parent, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := source.check(true); err != nil {
+			return err
+		}
+		if _, err := v.findClaudeCredentialBinding(credentials, nil, binding); err != nil {
+			return err
+		}
+		if err := parent.unchanged(); err != nil {
+			return err
+		}
+		return publishBackupSnapshot(stage, destination, "", nil, renameBackupNoReplace)
+	})
 }
 
 type claudeIdentityFile struct {
@@ -272,18 +427,21 @@ func (s *switchState) setClaudeIdentity(binding *identity.ClaudeIdentityBinding)
 }
 
 func readStoredClaudeBinding(profileDir string) (*identity.ClaudeIdentityBinding, error) {
-	path := filepath.Join(profileDir, "meta.json")
-	data, err := claudesettings.Read(path)
-	if err != nil || data == nil {
+	metadata, err := claudesettings.Read(filepath.Join(profileDir, "meta.json"))
+	if err != nil {
 		return nil, err
 	}
-	var meta struct {
-		Binding *identity.ClaudeIdentityBinding `json:"claude_identity"`
+	cache, err := claudesettings.Read(filepath.Join(profileDir, identity.ClaudeIdentityCacheFile))
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, fmt.Errorf("invalid Claude identity metadata")
+	// Retain the expected owner even when its original token generation is
+	// no longer present. Labels cannot establish or replace this evidence.
+	assessment, err := identity.InspectClaudeIdentitySources(metadata, cache, nil)
+	if err != nil {
+		return nil, err
 	}
-	return meta.Binding, nil
+	return assessment.RecordedBinding, nil
 }
 
 // verifyClaudeState is called only at mutation boundaries. Cached proofs and
@@ -301,27 +459,26 @@ func (v *Vault) verifyClaudeState(fileSet AuthFileSet, profileDir string, state 
 			return "", err
 		}
 	}
-	if state.claudeIdentity != nil {
-		if stored != nil && !identity.ClaudeSameAccount(&stored.Identity, &state.claudeIdentity.Identity) {
-			return "", fmt.Errorf("%w: Claude tokens do not belong to the saved account and organization", ErrInvalidCredentials)
+	proven := state.claudeIdentity
+	if proven == nil && profileDir != "" {
+		// A protected recovery snapshot remains immutable after activation;
+		// its exact token proof may exist only in native state on a restart.
+		// Read without mirroring and reuse only the actual live token pair,
+		// then apply the same saved-owner and conflicting-copy checks below.
+		live, err := readSwitchState(fileSet, "")
+		if err != nil {
+			return "", fmt.Errorf("read native Claude identity proof: %w", err)
 		}
-		return "", nil
+		if live.claudeIdentity != nil && live.claudeIdentity.MatchesCredentials(state.credential) {
+			proven = live.claudeIdentity
+		}
 	}
-	// Reuse only a proof of these exact tokens, never an email or a refresh
-	// token alone. This also works when the live cache was not persisted.
-	profiles, err := v.List("claude")
+	proven, err := v.findClaudeCredentialBinding(state.credential, stored, proven)
 	if err != nil {
 		return "", err
 	}
-	for _, name := range profiles {
-		binding, err := readStoredClaudeBinding(v.ProfilePath("claude", name))
-		if err != nil || binding == nil || !binding.MatchesCredentials(state.credential) {
-			continue
-		}
-		if stored != nil && !identity.ClaudeSameAccount(&stored.Identity, &binding.Identity) {
-			return "", fmt.Errorf("%w: Claude tokens do not belong to the saved account and organization", ErrInvalidCredentials)
-		}
-		state.setClaudeIdentity(binding)
+	if proven != nil {
+		state.setClaudeIdentity(proven)
 		return "", nil
 	}
 	verify := v.ClaudeIdentityVerifier
@@ -332,10 +489,13 @@ func (v *Vault) verifyClaudeState(fileSet AuthFileSet, profileDir string, state 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	binding, verifyErr := verify(ctx, state.credential)
+	binding, verifyErr := verify(ctx, bytes.Clone(state.credential))
 	if verifyErr != nil || binding == nil || !binding.MatchesCredentials(state.credential) {
 		if stored != nil {
 			return "", fmt.Errorf("%w: saved Claude credentials changed since identity verification; verify the selected account before activation", ErrInvalidCredentials)
+		}
+		if profileDir != "" {
+			return "", fmt.Errorf("%w: saved Claude account and organization could not be verified; use caam verify identity claude <profile> --online before activation", ErrInvalidCredentials)
 		}
 		return claudeIdentityUnknownWarning, nil
 	}
@@ -344,6 +504,53 @@ func (v *Vault) verifyClaudeState(fileSet AuthFileSet, profileDir string, state 
 	}
 	state.setClaudeIdentity(binding)
 	return "", nil
+}
+
+// A native proof can change after supplying evidence for an unbound saved
+// profile. Equal credentials never resolve contradictory verified owners.
+func checkClaudeCredentialIdentityAgreement(a, b switchState) error {
+	if a.claudeIdentity != nil && b.claudeIdentity != nil && a.sameCredential(b) &&
+		!identity.ClaudeSameAccount(&a.claudeIdentity.Identity, &b.claudeIdentity.Identity) {
+		return fmt.Errorf("%w: the same Claude token pair has conflicting verified account or organization bindings", ErrInvalidCredentials)
+	}
+	return nil
+}
+
+// findClaudeCredentialBinding is the shared, offline consistency check for
+// activation and identity publication. Only exact token pairs can supply proof;
+// neither email nor a refresh token alone can associate a saved account.
+func (v *Vault) findClaudeCredentialBinding(credentials []byte, stored, proven *identity.ClaudeIdentityBinding) (*identity.ClaudeIdentityBinding, error) {
+	profiles, err := v.List("claude")
+	if err != nil {
+		return nil, err
+	}
+	selectedFingerprint, selectedErr := identity.ClaudeCredentialFingerprint(credentials)
+	for _, name := range profiles {
+		dir := v.ProfilePath("claude", name)
+		binding, err := readStoredClaudeBinding(dir)
+		if err != nil {
+			// An unrelated broken profile must not disable every account, but
+			// do not hide contradictory evidence for the exact selected pair.
+			otherCredentials, readErr := claudesettings.Read(filepath.Join(dir, claudeCredentialsFile))
+			fingerprint, fingerprintErr := identity.ClaudeCredentialFingerprint(otherCredentials)
+			if readErr == nil && fingerprintErr == nil && selectedErr == nil && fingerprint == selectedFingerprint {
+				return nil, fmt.Errorf("%w: saved copies of these Claude credentials contain invalid or conflicting identity bindings", ErrInvalidCredentials)
+			}
+			continue
+		}
+		if binding == nil || !binding.MatchesCredentials(credentials) {
+			continue
+		}
+		if stored != nil && !identity.ClaudeSameAccount(&stored.Identity, &binding.Identity) ||
+			proven != nil && !identity.ClaudeSameAccount(&proven.Identity, &binding.Identity) {
+			return nil, fmt.Errorf("%w: Claude tokens do not belong to the saved account and organization", ErrInvalidCredentials)
+		}
+		proven = binding
+	}
+	if proven != nil && stored != nil && !identity.ClaudeSameAccount(&stored.Identity, &proven.Identity) {
+		return nil, fmt.Errorf("%w: Claude tokens do not belong to the saved account and organization", ErrInvalidCredentials)
+	}
+	return proven, nil
 }
 
 func claudeOAuthAccount(binding *identity.ClaudeIdentityBinding) json.RawMessage {
@@ -440,15 +647,21 @@ func (v *Vault) persistClaudeKeptIdentity(fileSet AuthFileSet, profileDir string
 			if err != nil || !sameClaudeIdentitySources(source.state.files, current.files) {
 				return fmt.Errorf("claude credentials changed during identity publication; retry")
 			}
+			if err := checkClaudeCredentialIdentityAgreement(source.state, current); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	savedCredential := filepath.Join(profileDir, claudeCredentialsFile)
-	update, err := claudesettings.PrepareIdentityMetadata(metaPath, savedCredential, metadata, incoming.credential, incoming.claudeIdentity, verify)
-	if err != nil {
-		return err
+	var updates []*claudesettings.Update
+	if !IsSystemProfile(filepath.Base(profileDir)) {
+		update, err := claudesettings.PrepareIdentityMetadata(metaPath, savedCredential, metadata, incoming.credential, incoming.claudeIdentity, verify)
+		if err != nil {
+			return err
+		}
+		updates = append(updates, update)
 	}
-	updates := []*claudesettings.Update{update}
 	liveCredential := resolveLiveParent(claudeFileSetPath(fileSet, claudeCredentialsFile))
 	if live.claudeIdentity != nil {
 		path := filepath.Join(filepath.Dir(liveCredential), identity.ClaudeIdentityCacheFile)
@@ -471,6 +684,9 @@ func (v *Vault) persistClaudeKeptIdentity(fileSet AuthFileSet, profileDir string
 			{filepath.Join(profileDir, claudeSettingsFile), incoming.files[claudeSettingsFile], incoming.claudeIdentity},
 			{resolveLiveParent(statePath), live.files[claudeSettingsFile], live.claudeIdentity},
 		} {
+			if state.path == filepath.Join(profileDir, claudeSettingsFile) && IsSystemProfile(filepath.Base(profileDir)) {
+				continue // Keep the historical recovery label byte-for-byte.
+			}
 			update, err := claudesettings.PrepareOAuthAccount(state.path, state.before, claudeOAuthAccount(state.binding), verify)
 			if err != nil {
 				return err

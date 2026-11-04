@@ -264,6 +264,10 @@ func TestRestoreRejectsCredentiallessProfileBeforeKeychainMirror(t *testing.T) {
 // snapshot is back in the keychain.
 func TestRestorePushesTokenToKeychain(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-alice"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+		keychainCreds("at-bob"):   {AccountID: "account-bob", OrganizationID: "org-bob", Email: "bob@example.com"},
+	})
 
 	// Two accounts backed up while each was live.
 	f.storeToken(keychainCreds("at-alice"))
@@ -300,6 +304,9 @@ func TestRestorePushesTokenToKeychain(t *testing.T) {
 // keychain still holds the previous account is exactly the bug.
 func TestRestoreFailsWhenKeychainRefuses(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-alice"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-alice"))
 	writeFixtureFile(t, f.statePath, keychainState("alice@example.com"))
 	if err := f.vault.Backup(f.fileSet, "alice"); err != nil {
@@ -352,6 +359,9 @@ func TestClearAuthFilesRemovesKeychainItem(t *testing.T) {
 // login keychain, everything falls back to files exactly as before.
 func TestBridgeIsInertWhenDisabled(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-file"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-keychain"))
 	t.Setenv("CAAM_KEYCHAIN", "0")
 

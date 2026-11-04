@@ -63,6 +63,7 @@ const (
 type ClaudeIdentityAssessment struct {
 	State            string                 `json:"state"`
 	Binding          *ClaudeIdentityBinding `json:"-"`
+	RecordedBinding  *ClaudeIdentityBinding `json:"-"`
 	RecordedIdentity *Identity              `json:"recorded_identity,omitempty"`
 }
 
@@ -98,6 +99,9 @@ func InspectClaudeIdentityBinding(metadata, credentials []byte) (ClaudeIdentityA
 	recorded := binding.Identity
 	recorded.Verified = false
 	result.RecordedIdentity = &recorded
+	expected := binding
+	expected.Identity = recorded
+	result.RecordedBinding = &expected
 	if !binding.MatchesCredentials(credentials) {
 		result.State = ClaudeIdentityCredentialChanged
 		return result, nil
@@ -106,6 +110,33 @@ func InspectClaudeIdentityBinding(metadata, credentials []byte) (ClaudeIdentityA
 	result.State = ClaudeIdentityVerified
 	result.Binding = &binding
 	return result, nil
+}
+
+// InspectClaudeIdentitySources checks all saved ownership evidence before
+// selecting a proof. A native cache cannot override a profile's recorded owner,
+// and a valid primary record must not hide a conflicting secondary record.
+// Different token generations for the same owner still require the primary
+// record to be reverified; labels never resolve conflicting UUIDs.
+func InspectClaudeIdentitySources(metadata, cache, credentials []byte) (ClaudeIdentityAssessment, error) {
+	primary, err := InspectClaudeIdentityBinding(metadata, credentials)
+	if err != nil {
+		return primary, err
+	}
+	secondary, err := InspectClaudeIdentityBinding(cache, credentials)
+	if err != nil {
+		primary.State = ClaudeIdentityInvalidMetadata
+		primary.Binding = nil
+		return primary, err
+	}
+	if ClaudeIdentityConflicts(primary.RecordedIdentity, secondary.RecordedIdentity) {
+		primary.State = "conflict"
+		primary.Binding = nil
+		return primary, errors.New("conflicting Claude account or organization bindings; recorded ownership was preserved")
+	}
+	if primary.State == ClaudeIdentityUnknown {
+		return secondary, nil
+	}
+	return primary, nil
 }
 
 // ClaudeSameAccount requires the account AND organization UUIDs. Email and
@@ -162,17 +193,8 @@ func (b *ClaudeIdentityBinding) MatchesCredentials(credentials []byte) bool {
 // bytes, making it usable by callers that already hold a credential snapshot.
 // An absent or stale binding is not proof of ownership and returns nil.
 func DecodeClaudeIdentityBinding(metadata, credentials []byte) (*ClaudeIdentityBinding, error) {
-	var envelope struct {
-		Binding *ClaudeIdentityBinding `json:"claude_identity"`
-	}
-	if len(metadata) > MaxClaudeIdentityBytes || json.Unmarshal(metadata, &envelope) != nil {
-		return nil, errors.New("invalid Claude identity metadata")
-	}
-	if !envelope.Binding.MatchesCredentials(credentials) {
-		return nil, nil
-	}
-	envelope.Binding.Identity.Verified = true
-	return envelope.Binding, nil
+	assessment, err := InspectClaudeIdentityBinding(metadata, credentials)
+	return assessment.Binding, err
 }
 
 // ReadClaudeIdentityBinding reads an exact-token binding without contacting the
@@ -200,7 +222,8 @@ func readClaudeIdentityBinding(credentialsPath string, credentials []byte) (*Cla
 	dir := filepath.Dir(credentialsPath)
 	// A saved profile's metadata defines its expected owner. A copied native
 	// cache must not relabel that profile after its token file was replaced.
-	for _, name := range []string{"meta.json", ClaudeIdentityCacheFile} {
+	var sources [2][]byte
+	for index, name := range []string{"meta.json", ClaudeIdentityCacheFile} {
 		f, err := os.Open(filepath.Join(dir, name))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -213,21 +236,10 @@ func readClaudeIdentityBinding(credentialsPath string, credentials []byte) (*Cla
 		if readErr != nil || closeErr != nil {
 			return nil, true, errors.New("cannot read Claude identity metadata")
 		}
-		binding, err := DecodeClaudeIdentityBinding(data, credentials)
-		if err != nil {
-			return nil, true, err
-		}
-		if binding != nil {
-			return binding, true, nil
-		}
-		var envelope map[string]json.RawMessage
-		if json.Unmarshal(data, &envelope) == nil {
-			if raw, ok := envelope["claude_identity"]; ok && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-				return nil, true, nil
-			}
-		}
+		sources[index] = data
 	}
-	return nil, false, nil
+	assessment, err := InspectClaudeIdentitySources(sources[0], sources[1], credentials)
+	return assessment.Binding, assessment.State != ClaudeIdentityUnknown, err
 }
 
 // VerifyClaudeCredentials makes a single bounded request for the captured access

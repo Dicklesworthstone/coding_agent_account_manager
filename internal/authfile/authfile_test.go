@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func TestNewVault(t *testing.T) {
@@ -194,6 +196,9 @@ func TestClaudeExplicitConfigBackupAndSettingsLifecycle(t *testing.T) {
 	}
 	settingsPath := filepath.Join(canonical, "settings.json")
 	writeFixtureFile(t, settingsPath, `{"apiKeyHelper":"outgoing-helper","permissions":{"deny":["latest-policy"]}}`)
+	setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+		canonicalData[".credentials.json"]: {AccountID: "verified-canonical", OrganizationID: "verified-canonical-org"},
+	})
 	if err := vault.Restore(files, "canonical"); err != nil {
 		t.Fatal(err)
 	}

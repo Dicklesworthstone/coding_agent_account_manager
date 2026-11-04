@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -394,6 +395,18 @@ func setupSubscriptionQuotaProfiles(t *testing.T, provider string, responses map
 			body = fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, name, "synthetic-refresh-"+name, time.Now().Add(time.Hour).UnixMilli())
 		}
 		writeNativeTestCredential(t, filepath.Join(vault.ProfilePath(provider, name), credentialFile), body)
+		if provider == "claude" {
+			// These exact synthetic grants were previously verified. Quota
+			// availability cannot establish identity, and a substituted pair
+			// must not inherit this fixture's saved proof.
+			binding := claudeCLIIdentityBinding(t, []byte(body), "quota-org-"+name, "Quota fixture")
+			binding.Identity.AccountID = "quota-account-" + name
+			metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeNativeTestCredential(t, vault.BackupPath("claude", name, "meta.json"), string(metadata))
+		}
 	}
 	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
 		wantURL := usage.ClaudeUsageURL

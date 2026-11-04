@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 )
 
@@ -104,6 +105,10 @@ func TestClaudeAuthSourceTransitionsPreservePolicyWithoutOutgoingFallbacks(t *te
 				{Path: credentials, Required: true}, {Path: legacy}, {Path: secondary}, {Path: settings}, {Path: desktop},
 			}}
 			v := NewVault(t.TempDir())
+			setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+				keychainCreds("selected-oauth"): {AccountID: "selected-oauth", OrganizationID: "selected-org"},
+				keychainCreds("outgoing"):       {AccountID: "outgoing", OrganizationID: "outgoing-org"},
+			})
 			const policy = `"permissions":{"allow":["Read"],"defaultMode":"auto"},"autoMode":{"allow":["tests"]},"mcpServers":{"current":{"command":"server"}},"hooks":{"Stop":[]},"model":"latest","effortLevel":"high"`
 			authSourceTestWrite(t, credentials, keychainCreds("outgoing"))
 			authSourceTestWrite(t, secondary, `{"apiKey":"outgoing-secondary"}`)

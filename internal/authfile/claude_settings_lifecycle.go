@@ -148,7 +148,11 @@ func prepareClaudeSettingsRestoreIdentity(fileSet AuthFileSet, profileDir string
 		// Keyed like the batch destinations, which resolve parent symlinks.
 		liveState = resolveLiveParent(liveState)
 	}
-	for _, path := range []string{liveState, filepath.Join(profileDir, claudeSettingsFile), filepath.Join(profileDir, "meta.json")} {
+	identityPaths := []string{liveState, filepath.Join(profileDir, claudeSettingsFile), filepath.Join(profileDir, "meta.json"), filepath.Join(profileDir, identity.ClaudeIdentityCacheFile)}
+	if credential := claudeFileSetPath(fileSet, claudeCredentialsFile); credential != "" {
+		identityPaths = append(identityPaths, filepath.Join(filepath.Dir(resolveLiveParent(credential)), identity.ClaudeIdentityCacheFile))
+	}
+	for _, path := range identityPaths {
 		if path == "" {
 			continue
 		}
@@ -323,8 +327,9 @@ func prepareClaudeSettingsRestoreIdentity(fileSet AuthFileSet, profileDir string
 		plan.update = batch
 		result[spec.Path] = plan
 	}
-	if selected != nil && selected.claudeIdentity != nil {
-		// Persist a first-time verification with the saved generation so the
+	if selected != nil && selected.claudeIdentity != nil && !IsSystemProfile(filepath.Base(profileDir)) {
+		// Recovery snapshots are immutable evidence, even when activated.
+		// Persist a first-time verification with a user profile's generation so the
 		// next activation and post-restart matching can remain offline. These
 		// updates follow native publication preparation; all source documents
 		// are still guarded until the same recoverable batch installs them.

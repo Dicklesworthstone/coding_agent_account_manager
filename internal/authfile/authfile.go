@@ -557,14 +557,35 @@ func (v *Vault) backup(fileSet AuthFileSet, profile string, overwrite bool) erro
 	if err != nil {
 		return fmt.Errorf("capture %s credentials: %w", tool, err)
 	}
+	capturedSource := captured
 	if _, err := v.verifyClaudeState(fileSet, "", &captured); err != nil {
 		return err
 	}
+	var savedClaude *switchState
+	var savedClaudeIdentity *claudeProfileIdentitySnapshot
 	if previous != nil && tool == "claude" && captured.credentialName == claudeCredentialsFile {
+		savedClaudeIdentity, err = captureClaudeProfileIdentity(profileDir)
+		if err != nil {
+			return err
+		}
+		defer savedClaudeIdentity.directory.Close()
 		saved, err := readSwitchState(fileSet, profileDir)
 		if err != nil {
 			return err
 		}
+		// The existing label is not ownership evidence. Verify an older
+		// profile's captured token before permitting a new token generation
+		// to replace it, even when both labels contain the same email.
+		if _, err := v.verifyClaudeState(fileSet, profileDir, &saved); err != nil {
+			return err
+		}
+		if captured.claudeIdentity == nil {
+			captured.setClaudeIdentity(saved.claudeIdentity)
+		}
+		if err := checkClaudeCredentialIdentityAgreement(captured, saved); err != nil {
+			return err
+		}
+		savedClaude = &saved
 		expected, err := readStoredClaudeBinding(profileDir)
 		if err != nil {
 			return err
@@ -676,9 +697,26 @@ func (v *Vault) backup(fileSet AuthFileSet, profile string, overwrite bool) erro
 	if err != nil || !sameSwitchFiles(captured.files, current.files) {
 		return fmt.Errorf("native %s files changed during backup; retry after the CLI finishes writing", tool)
 	}
+	if tool == "claude" && captured.credentialName == claudeCredentialsFile && !sameClaudeSelectionIdentity(capturedSource, current) {
+		return fmt.Errorf("native Claude identity evidence changed during backup; retry")
+	}
 	currentParent, err := os.Lstat(toolDir)
 	if err != nil || !os.SameFile(parent, currentParent) {
 		return fmt.Errorf("vault provider directory changed during backup; retry")
+	}
+	if savedClaude != nil {
+		if err := savedClaudeIdentity.check(true); err != nil {
+			return err
+		}
+		current, err := readSwitchState(fileSet, profileDir)
+		if err != nil || !sameSwitchFiles(savedClaude.files, current.files) {
+			return fmt.Errorf("saved Claude profile changed during backup; retry")
+		}
+		expected, err := readStoredClaudeBinding(profileDir)
+		if err != nil || expected != nil && (captured.claudeIdentity == nil ||
+			!identity.ClaudeSameAccount(&expected.Identity, &captured.claudeIdentity.Identity)) {
+			return fmt.Errorf("saved Claude ownership changed during backup; retry")
+		}
 	}
 	rename := os.Rename
 	if !overwrite {
@@ -1280,10 +1318,18 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 		return err
 	}
 	var liveClaude *switchState
+	var selectedIdentity *claudeProfileIdentitySnapshot
 	if fileSet.Tool == "claude" {
 		incoming, err := readSwitchState(fileSet, profileDir)
 		if err != nil {
 			return err
+		}
+		if incoming.credentialName == claudeCredentialsFile {
+			selectedIdentity, err = captureClaudeProfileIdentity(profileDir)
+			if err != nil {
+				return err
+			}
+			defer selectedIdentity.directory.Close()
 		}
 		if selected != nil {
 			if !sameSwitchFiles(selected.files, incoming.files) {
@@ -1293,9 +1339,22 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 		} else if _, err := v.verifyClaudeState(fileSet, profileDir, &incoming); err != nil {
 			return err
 		}
+		if selectedIdentity != nil {
+			if err := selectedIdentity.check(true); err != nil {
+				return err
+			}
+			expected, err := readStoredClaudeBinding(profileDir)
+			if err != nil || expected != nil && (incoming.claudeIdentity == nil ||
+				!identity.ClaudeSameAccount(&expected.Identity, &incoming.claudeIdentity.Identity)) {
+				return fmt.Errorf("%w: selected Claude ownership changed before activation", ErrInvalidCredentials)
+			}
+		}
 		selected = &incoming
 		live, err := readSwitchState(fileSet, "")
 		if err != nil {
+			return err
+		}
+		if err := checkClaudeCredentialIdentityAgreement(incoming, live); err != nil {
 			return err
 		}
 		if live.claudeIdentity == nil {
@@ -1313,7 +1372,13 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 			if err != nil || !sameSwitchFiles(incoming.files, current.files) {
 				return fmt.Errorf("incoming Claude profile changed during identity verification")
 			}
-			return v.persistClaudeKeptIdentity(fileSet, profileDir, incoming, live)
+			if err := selectedIdentity.check(true); err != nil {
+				return err
+			}
+			if err := v.persistClaudeKeptIdentity(fileSet, profileDir, incoming, live); err != nil {
+				return err
+			}
+			return checkClaudeActivation(fileSet, live)
 		}
 		liveClaude = &live
 	}
@@ -1342,6 +1407,11 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 	// target with no settings snapshot, removing outgoing auth but not policy.
 	if liveClaude != nil {
 		if err := liveClaude.checkUnchanged(fileSet); err != nil {
+			return err
+		}
+	}
+	if selectedIdentity != nil {
+		if err := selectedIdentity.check(true); err != nil {
 			return err
 		}
 	}
@@ -1459,6 +1529,11 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 	// back in the login keychain (issue #98).
 	if err := pushClaudeKeychain(fileSet); err != nil {
 		return err
+	}
+	if selected != nil {
+		if err := checkClaudeActivation(fileSet, *selected); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1619,8 +1694,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 			return "", err
 		}
 		if live.credentialName == claudeCredentialsFile {
-			owner, _, err := v.switchOwner(fileSet, live)
-			return owner, err
+			return v.currentProfile(fileSet, live)
 		}
 	}
 	// Best-effort: on macOS the live token is in the keychain, so without the

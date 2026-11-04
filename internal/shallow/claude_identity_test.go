@@ -141,6 +141,58 @@ func TestShallowClaudeSeedDropsUnverifiedLabelAndRejectsSavedSubstitution(t *tes
 	}
 }
 
+func TestShallowClaudeCreateRejectsContradictorySecondaryIdentity(t *testing.T) {
+	for _, scenario := range []string{"different organization", "malformed secondary"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			mgr, _ := onboardingEnv(t, `{}`)
+			dir := t.TempDir()
+			source := shallowIdentityCredential(t, dir, "same-grant", "team", "meta.json")
+			cache := filepath.Join(dir, identity.ClaudeIdentityCacheFile)
+			if scenario == "different organization" {
+				shallowIdentityCredential(t, dir, "same-grant", "personal", identity.ClaudeIdentityCacheFile)
+			} else {
+				writeFile(t, cache, `{"claude_identity":`)
+			}
+			before := make(map[string]string)
+			for _, path := range []string{source, cache, filepath.Join(dir, "meta.json")} {
+				before[path] = readFile(t, path)
+			}
+			if _, err := mgr.Create("selected", CreateOptions{CredentialSource: source}); err == nil {
+				t.Fatal("shallow creation erased contradictory secondary ownership evidence")
+			}
+			if _, err := os.Lstat(filepath.Join(mgr.baseDir, "selected")); !os.IsNotExist(err) {
+				t.Fatal("rejected ownership published a shallow profile")
+			}
+			for path, expected := range before {
+				if readFile(t, path) != expected {
+					t.Fatal("rejected creation changed source ownership evidence")
+				}
+			}
+		})
+	}
+}
+
+func TestShallowClaudeSeedGuardsSecondaryIdentityAfterVerifiedPrimary(t *testing.T) {
+	for _, initiallyPresent := range []bool{false, true} {
+		t.Run(map[bool]string{false: "absent", true: "present"}[initiallyPresent], func(t *testing.T) {
+			dir := t.TempDir()
+			source := shallowIdentityCredential(t, dir, "same-grant", "team", "meta.json")
+			if initiallyPresent {
+				shallowIdentityCredential(t, dir, "same-grant", "team", identity.ClaudeIdentityCacheFile)
+			}
+			seed, err := captureClaudeCredentialSeed(source)
+			if err != nil || seed.binding == nil || seed.binding.Identity.OrganizationID != "team" {
+				t.Fatalf("capture verified source: %v", err)
+			}
+			shallowIdentityCredential(t, dir, "same-grant", "personal", identity.ClaudeIdentityCacheFile)
+			if err := seed.checkUnchanged(); err == nil {
+				t.Fatal("a secondary ownership record changed without invalidating the captured source")
+			}
+		})
+	}
+}
+
 func TestShallowClaudeIdentityRepairDetachesHostCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("link creation requires privileges on Windows")

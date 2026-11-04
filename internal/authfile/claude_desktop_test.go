@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // writeJSON is a small helper for these tests.
@@ -79,6 +81,10 @@ func TestClaudeDesktopBackupRestoreRoundTrip(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 
 	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+		`{"claudeAiOauth":{"accessToken":"A-TOKEN","refreshToken":"A-TOKEN"}}`: {AccountID: "account-alice", OrganizationID: "org-alice"},
+		`{"claudeAiOauth":{"accessToken":"B-TOKEN","refreshToken":"B-TOKEN"}}`: {AccountID: "account-bob", OrganizationID: "org-bob"},
+	})
 	fs := ClaudeAuthFiles()
 
 	// Required primary credential must exist for backup to succeed.

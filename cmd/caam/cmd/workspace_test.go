@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 func TestWorkspaceCommand(t *testing.T) {
@@ -167,6 +169,23 @@ func TestSwitchWorkspace(t *testing.T) {
 	writeNativeTestCredential(t, codexPath, codexLive)
 	writeRobotCredentialProfile(t, "claude", "work-claude", map[string]string{".credentials.json": claudeTarget})
 	writeRobotCredentialProfile(t, "codex", "work-codex", map[string]string{"auth.json": codexTarget})
+	for _, source := range []struct {
+		path        string
+		credentials string
+		account     string
+		org         string
+	}{
+		{filepath.Dir(claudePath), claudeLive, "original-account", "original-org"},
+		{vault.ProfilePath("claude", "work-claude"), claudeTarget, "work-account", "work-org"},
+	} {
+		binding := claudeCLIIdentityBinding(t, []byte(source.credentials), source.org, "Workspace fixture")
+		binding.Identity.AccountID = source.account
+		data, err := json.Marshal(map[string]any{"claude_identity": binding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeNativeTestCredential(t, filepath.Join(source.path, identity.ClaudeIdentityCacheFile), string(data))
+	}
 	cfg := config.DefaultConfig()
 	cfg.CreateWorkspace("work", map[string]string{
 		"claude": "work-claude",

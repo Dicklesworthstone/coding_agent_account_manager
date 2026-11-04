@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/stealth"
@@ -31,6 +32,7 @@ type activateOutput struct {
 	ResnapshottedProfile string                  `json:"resnapshotted_profile,omitempty"`
 	KeptLive             bool                    `json:"kept_live,omitempty"`
 	Warnings             []string                `json:"warnings,omitempty"`
+	Identity             *identity.Identity      `json:"identity,omitempty"`
 	Refreshed            bool                    `json:"refreshed,omitempty"`
 	Rotation             *activateRotationResult `json:"rotation,omitempty"`
 	CodexDaemon          *codexDaemonWarning     `json:"codex_daemon,omitempty"`
@@ -76,7 +78,14 @@ are available (configured in config.yaml):
   round_robin - Sequential rotation through profiles
   random      - Random selection
 
-After activating, just run the tool normally - it will use the new account.`,
+Claude OAuth profiles without an exact saved identity proof are verified online
+before activation. If verification fails, activation stops without changing the
+selected account. Profile names are labels; the verified account and organization
+UUIDs identify the credentials. Already-running Claude sessions may retain their
+own login and can rewrite shared metadata; use isolated profiles for concurrent
+accounts.
+
+After activating, run a new tool session to use the selected account.`,
 	Args: cobra.RangeArgs(1, 2),
 	RunE: runActivate,
 }
@@ -347,6 +356,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	output.ResnapshottedProfile = switched.ResnapshottedProfile
 	output.KeptLive = switched.KeptLive
 	output.Warnings = switched.Warnings
+	output.Identity = switched.Identity
 	if !jsonOutput {
 		printSwitchPreservation(cmd.OutOrStdout(), tool, switched)
 	}
@@ -379,6 +389,9 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Activated %s profile '%s'\n", tool, profileName)
+	if output.Identity != nil {
+		fmt.Fprintf(cmd.OutOrStdout(), "  Verified account: %s; organization: %s (%s)\n", output.Identity.AccountID, output.Identity.Organization, output.Identity.OrganizationID)
+	}
 	fmt.Printf("  Run '%s' to start using this account\n", tool)
 	printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 	return nil

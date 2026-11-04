@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -603,4 +604,176 @@ func TestActivateClaudeRejectsMismatchedAccessTokenBeforeChangingLive(t *testing
 	}
 	assertBackupTreeUnchanged(t, filepath.Dir(fileSet.Files[0].Path), liveBefore)
 	assertBackupTreeUnchanged(t, vault.BasePath(), vaultBefore)
+}
+
+func TestActivateClaudeLegacyProfileRequiresProviderIdentity(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusUnauthorized} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			files, credentials := setupClaudeOrganizationProfiles(t)
+			writeNativeTestCredential(t, vault.BackupPath("claude", "team", "meta.json"), `{"identity":"shared@example.test","description":"legacy Team label"}`)
+			writeNativeTestCredential(t, files.Files[0].Path, string(credentials["personal"]))
+			writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","organizationUuid":"org-personal"}}`)
+			writeNativeTestCredential(t, filepath.Join(vault.BasePath(), ".caam-mutation.lock"), "")
+			before, err := captureBackupTree(vault.BasePath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBefore, err := captureBackupTree(filepath.Dir(files.Files[0].Path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			oldTransport := http.DefaultTransport
+			http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != http.MethodGet || req.URL.String() != "https://api.anthropic.com/api/oauth/profile" ||
+					req.Header.Get("Authorization") != "Bearer SYNTHETIC-team-access" {
+					t.Fatal("identity request did not verify the selected saved credential")
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"error":"SYNTHETIC-private-response"}`)), Header: make(http.Header)}, nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = oldTransport })
+			// Force can bypass a cooldown, never missing ownership evidence.
+			output, err := runActivateJSONCommand(t, "claude", "team", "--force")
+			if err == nil || output.Success || calls != 1 || !strings.Contains(output.Error, "could not be verified") {
+				t.Fatalf("legacy profile was activated without a provider identity: %+v, %v; calls=%d", output, err, calls)
+			}
+			assertBackupTreeUnchanged(t, vault.BasePath(), before)
+			assertBackupTreeUnchanged(t, filepath.Dir(files.Files[0].Path), liveBefore)
+		})
+	}
+}
+
+func TestActivateClaudeLegacyProfileVerifiesOnceAndKeepsLabel(t *testing.T) {
+	files, credentials := setupClaudeOrganizationProfiles(t)
+	// A deliberately misleading name stays a label; the provider's UUIDs
+	// determine the selected identity and the CLI exposes them explicitly.
+	const label = "personal-looking-label"
+	if err := os.Rename(vault.ProfilePath("claude", "team"), vault.ProfilePath("claude", label)); err != nil {
+		t.Fatal(err)
+	}
+	writeNativeTestCredential(t, vault.BackupPath("claude", label, "meta.json"), `{"identity":"shared@example.test","description":"keep operator label"}`)
+	writeNativeTestCredential(t, files.Files[0].Path, string(credentials["personal"]))
+	writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","organizationUuid":"org-personal"},"numStartups":42}`)
+	calls := 0
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if req.URL.String() != "https://api.anthropic.com/api/oauth/profile" || req.Header.Get("Authorization") != "Bearer SYNTHETIC-team-access" {
+			t.Fatal("provider request used a different account's token")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"account":{"uuid":"shared-account-id","email":"shared@example.test"},"organization":{"uuid":"org-team","name":"Team"}}`)), Header: make(http.Header)}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	output, err := runActivateJSONCommand(t, "claude", label)
+	if err != nil || !output.Success || output.Profile != label || output.Identity == nil || !output.Identity.Verified || output.Identity.OrganizationID != "org-team" || calls != 1 {
+		t.Fatalf("legacy activation failed to expose the verified owner: %+v, %v; calls=%d", output, err, calls)
+	}
+	requireSwitchCredential(t, files.Files[0].Path, string(credentials["team"]))
+	requireClaudeSavedOrganization(t, label, "shared-account-id", "org-team", "shared@example.test", credentials["team"])
+	// A restarted command can rely on the exact persisted pair, including
+	// after another Claude session restores a stale shared organization label.
+	vault = authfile.NewVault(vault.BasePath())
+	writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","organizationUuid":"org-personal"},"numStartups":43}`)
+	output, err = runActivateJSONCommand(t, "claude", label)
+	if err != nil || !output.Success || output.Identity == nil || output.Identity.OrganizationID != "org-team" || calls != 1 {
+		t.Fatalf("repeated activation lost the proven identity or required network: %+v, %v; calls=%d", output, err, calls)
+	}
+	listed := runLsJSON(t, []string{"claude"})
+	for _, row := range listed["profiles"].([]any) {
+		profile := row.(map[string]any)
+		if profile["active"] != (profile["name"] == label) {
+			t.Fatal("real listing selected a stale shared label after legacy verification")
+		}
+	}
+}
+
+func TestActivateClaudeRefusesSourceChangesDuringLegacyVerification(t *testing.T) {
+	for _, changed := range []string{"saved-credentials", "saved-binding", "live-settings"} {
+		t.Run(changed, func(t *testing.T) {
+			files, credentials := setupClaudeOrganizationProfiles(t)
+			writeNativeTestCredential(t, vault.BackupPath("claude", "team", "meta.json"), `{"identity":"shared@example.test"}`)
+			writeNativeTestCredential(t, files.Files[0].Path, string(credentials["personal"]))
+			writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"organizationUuid":"org-personal"}}`)
+			vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				if !bytes.Equal(data, credentials["team"]) {
+					t.Fatal("unexpected provider credential")
+				}
+				switch changed {
+				case "saved-credentials":
+					writeNativeTestCredential(t, vault.BackupPath("claude", "team", ".credentials.json"), string(credentials["personal"]))
+				case "saved-binding":
+					proof := claudeCLIIdentityBinding(t, data, "org-personal", "Personal")
+					metadata, err := json.Marshal(map[string]any{"claude_identity": proof})
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeNativeTestCredential(t, vault.BackupPath("claude", "team", "meta.json"), string(metadata))
+				case "live-settings":
+					// The target is verified first. A live metadata write at this
+					// point is captured afterward, so it is safely normalized.
+					writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"organizationUuid":"org-unrelated"},"numStartups":91}`)
+				}
+				return claudeCLIIdentityBinding(t, data, "org-team", "Team"), nil
+			}
+			output, err := runActivateJSONCommand(t, "claude", "team")
+			if changed == "live-settings" {
+				if err != nil || !output.Success || output.Identity == nil || output.Identity.OrganizationID != "org-team" {
+					t.Fatalf("captured stale native label blocked a verified activation: %+v, %v", output, err)
+				}
+				requireSwitchCredential(t, files.Files[0].Path, string(credentials["team"]))
+			} else {
+				if err == nil || output.Success {
+					t.Fatalf("concurrent saved source change was activated: %+v, %v", output, err)
+				}
+				requireSwitchCredential(t, files.Files[0].Path, string(credentials["personal"]))
+			}
+		})
+	}
+}
+
+func TestBackupClaudeReverifiesLegacyOwnerBeforeOverwrite(t *testing.T) {
+	for _, organization := range []string{"org-team", "org-personal"} {
+		t.Run(organization, func(t *testing.T) {
+			files, credentials := setupClaudeOrganizationProfiles(t)
+			writeNativeTestCredential(t, vault.BackupPath("claude", "team", "meta.json"), `{"identity":"shared@example.test","description":"legacy Team"}`)
+			const rotated = `{"claudeAiOauth":{"accessToken":"SYNTHETIC-rotated-access","refreshToken":"SYNTHETIC-rotated-refresh","expiresAt":4102444800000}}`
+			writeNativeTestCredential(t, files.Files[0].Path, rotated)
+			writeNativeTestCredential(t, files.Files[1].Path, `{"oauthAccount":{"emailAddress":"shared@example.test","organizationUuid":"org-team"}}`)
+			verifiedLegacy := false
+			vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				if bytes.Equal(data, credentials["team"]) {
+					verifiedLegacy = true
+					return claudeCLIIdentityBinding(t, data, "org-team", "Team"), nil
+				}
+				if string(data) != rotated {
+					t.Fatal("backup verified the wrong captured source")
+				}
+				return claudeCLIIdentityBinding(t, data, organization, "Shared email"), nil
+			}
+			command := &cobra.Command{Use: backupCmd.Use, Args: backupCmd.Args, RunE: runBackup, SilenceErrors: true, SilenceUsage: true}
+			command.Flags().Bool("json", false, "")
+			var stdout bytes.Buffer
+			command.SetOut(&stdout)
+			command.SetErr(&stdout)
+			command.SetArgs([]string{"claude", "team", "--json"})
+			err := command.Execute()
+			var result backupOutput
+			if json.Unmarshal(stdout.Bytes(), &result) != nil || !verifiedLegacy || strings.Contains(stdout.String(), "SYNTHETIC-") {
+				t.Fatal("backup skipped the legacy owner's verification or exposed credentials")
+			}
+			if organization == "org-team" {
+				if err != nil || !result.Success {
+					t.Fatalf("verified same-owner refresh was not backed up: %v", err)
+				}
+				requireClaudeSavedOrganization(t, "team", "shared-account-id", "org-team", "shared@example.test", []byte(rotated))
+			} else {
+				if err == nil || result.Success {
+					t.Fatal("shared email allowed a different organization's grant to replace a legacy profile")
+				}
+				requireSwitchCredential(t, vault.BackupPath("claude", "team", ".credentials.json"), string(credentials["team"]))
+			}
+			requireSwitchCredential(t, files.Files[0].Path, rotated)
+		})
+	}
 }

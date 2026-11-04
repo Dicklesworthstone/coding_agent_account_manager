@@ -585,6 +585,7 @@ Inspect or repair a suspect **saved vault profile without activating it**:
 caam verify identity claude work-team                  # offline cached proof
 caam verify identity claude work-team --online --json  # check this saved token
 caam verify identity claude work-team --repair         # persist proof and correct labels
+caam verify identity claude _backup_20261103 --online --copy-to recovered-team
 ```
 
 Repair uses an exact cached proof when available, including for an expired
@@ -595,19 +596,45 @@ explicitly. Repair updates only the selected profile's identity metadata and
 description and tags. It leaves native sessions and keychains untouched. A
 token that verifies as a different recorded account or organization is reported
 as a conflict and cannot be rebound by repair. Concurrent source changes abort
-publication, and automatic recovery snapshots remain immutable. Passive
+publication, and automatic recovery snapshots remain immutable, including when
+activated. Passive
 `caam validate` and `caam verify` also report broken saved identity bindings
 without calling the provider or assuming that another login is required.
 
-If verification is unavailable or the access token has expired, CAAM can
-preserve an unverified grant or explicitly activate a legacy snapshot, but
-omits its unverified `oauthAccount` label and reports a warning. Existing
-legacy labels appear as `[unverified]` in the organization column. Exact
-credential matches remain usable; email alone cannot authorize a match
-after token rotation or an overwrite of a named profile. Replaced tokens in
-an already bound profile are rejected unless verification confirms the same
-account and organization. Automatic backups and keepalive synchronization
-follow the same ownership checks.
+Legacy Claude OAuth profiles are verified automatically before activation.
+An exact saved proof can be reused offline, including after token expiry;
+otherwise the selected token must pass provider verification. Unavailable,
+expired, rejected or conflicting unverified credentials stop activation before
+the live login is changed. `--force` only overrides a cooldown, not this identity
+check. A backup can still preserve an unverified grant with its unsupported
+account label omitted, but that snapshot cannot be activated until verified.
+Overwriting a legacy named profile requires proving that both credential
+generations belong to the same account and organization.
+
+Profile names are operator labels, not proof of ownership. Activation reports
+the verified account and organization, and JSON output includes `identity`.
+Existing legacy labels appear as `[unverified]` in the organization column.
+Listing remains offline and uses exact credentials or verified UUIDs. Duplicate
+named profiles holding the same tokens are ambiguous rather than resolved by
+alphabetical order. Conflicting primary metadata, native caches or saved copies
+of the same token are refused and reported without exposing credentials.
+
+`--copy-to <new-label>` provides non-destructive recovery. It verifies the saved
+modern OAuth grant, then atomically creates a new user profile without replacing
+an existing destination. The copy contains the exact credential bytes, a clean
+verified `oauthAccount`, operator labels and source provenance. Other historical
+authentication artifacts and state stay in the original snapshot. Neither
+`--copy-to` nor `--repair` can rebind a recorded account or organization; ambiguous
+evidence must be resolved independently. In-place repair of `_original` and
+automatic recovery profiles remains prohibited. Repeated copying to the same
+destination fails rather than overwriting it.
+
+Concurrent Claude sessions can still rewrite shared files after CAAM returns.
+Such labels cannot change CAAM's token-based account selection. Activation checks
+for credential and identity changes before publication and checks the installed
+identity again before reporting success. A detected concurrent change stops the
+operation and preserves the other writer's files; stop the conflicting session
+and retry. Use isolated profiles when multiple accounts must run concurrently.
 
 The first-use `_original` snapshot and automatic recovery snapshots preserve
 the captured credential bytes. Correcting or omitting unsupported account

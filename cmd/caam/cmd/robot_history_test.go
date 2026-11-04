@@ -22,6 +22,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/spf13/cobra"
@@ -1076,8 +1077,24 @@ func TestRobotCredentialActivateSwitchesUsableCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setupRobotCredentialEnv(t)
 			livePath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
-			writeNativeTestCredential(t, livePath, `{"claudeAiOauth":{"accessToken":"SYNTHETIC-CURRENT-ACCESS"}}`)
+			const liveCredential = `{"claudeAiOauth":{"accessToken":"SYNTHETIC-CURRENT-ACCESS"}}`
+			writeNativeTestCredential(t, livePath, liveCredential)
 			writeRobotCredentialProfile(t, "claude", "candidate", tc.files)
+			// Activation accepts these exact previously verified grants even
+			// when expired; syntax or a renewable token alone proves no owner.
+			for _, proof := range []struct {
+				path, credentials, organization string
+			}{
+				{vault.BackupPath("claude", "candidate", "meta.json"), tc.files[".credentials.json"], "candidate-org"},
+				{filepath.Join(filepath.Dir(livePath), identity.ClaudeIdentityCacheFile), liveCredential, "current-org"},
+			} {
+				binding := claudeCLIIdentityBinding(t, []byte(proof.credentials), proof.organization, "Robot fixture")
+				metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeNativeTestCredential(t, proof.path, string(metadata))
+			}
 			out, err := runRobotCredentialCommand(t, robotActCmd, "activate", "claude", "candidate")
 			if err != nil || !out.Success || out.Error != nil {
 				t.Fatalf("usable credential activation failed: %+v, error=%v", out, err)

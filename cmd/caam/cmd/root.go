@@ -1259,6 +1259,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 type lsOutput struct {
 	Profiles []lsProfile `json:"profiles"`
 	Count    int         `json:"count"`
+	Warnings []string    `json:"warnings,omitempty"`
 
 	// IsolatedOnly lists isolated profiles (caam profile add) that have no
 	// vault profile of the same name, so they are not rows above. They run
@@ -1398,6 +1399,22 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 	// Collect profiles for JSON output
 	var output lsOutput
+	recordSelectionError := func(tool string, err error) {
+		if tool != "claude" || err == nil {
+			return
+		}
+		// Do not echo keychain/transport diagnostics. Listing remains useful
+		// when native authentication changes, but it must explain why no
+		// active marker can be assigned safely.
+		warning := "Claude credentials or identity changed or could not be read consistently; no profile was marked active. Retry after Claude finishes updating its authentication files."
+		if errors.Is(err, authfile.ErrInvalidCredentials) {
+			warning = "Claude credentials have conflicting or invalid verified identity bindings; no profile was marked active. Run caam verify identity claude <profile> --online for the affected profiles."
+		}
+		output.Warnings = append(output.Warnings, warning)
+		if !jsonOutput {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+		}
+	}
 
 	// Every row is a vault profile; note which also exist as isolated
 	// profiles, and collect the isolated ones with no vault row (issue #110).
@@ -1447,7 +1464,8 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 		// Check which is active
 		fileSet := tools[tool]()
-		activeProfile, _ := vault.ActiveProfile(fileSet)
+		activeProfile, selectionErr := vault.ActiveProfile(fileSet)
+		recordSelectionError(tool, selectionErr)
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
@@ -1555,7 +1573,8 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 	for tool, profiles := range allProfiles {
 		fileSet := tools[tool]()
-		activeProfile, _ := vault.ActiveProfile(fileSet)
+		activeProfile, selectionErr := vault.ActiveProfile(fileSet)
+		recordSelectionError(tool, selectionErr)
 
 		if !jsonOutput {
 			fmt.Printf("%s:\n", tool)

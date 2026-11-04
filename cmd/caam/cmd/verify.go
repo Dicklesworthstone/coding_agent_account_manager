@@ -97,16 +97,26 @@ The default check is offline. --online requests fresh provider verification.
 needed, and corrects the saved account labels. Credentials are never activated
 or replaced. A different recorded account or organization cannot be rebound.
 
+--copy-to creates a new user profile from the verified saved OAuth credential.
+It can recover protected snapshots without changing their original evidence.
+Existing destinations are never replaced. Profile names are labels, not proof
+of account ownership; inspect the reported account and organization UUIDs.
+The copy includes the exact modern OAuth credential and its verified identity;
+historical settings and other credentials remain in the source snapshot.
+
 Examples:
   caam verify identity claude work
   caam verify identity claude work --online --json
-  caam verify identity claude work --repair`,
+  caam verify identity claude work --repair
+  caam verify identity claude _backup_20261103 --online --copy-to recovered-work`,
 		Args: cobra.ExactArgs(2),
 		RunE: runVerifyIdentity,
 	}
 	command.Flags().Bool("online", false, "verify the saved access token with the provider")
 	command.Flags().Bool("repair", false, "repair saved identity metadata using cached or provider verification")
+	command.Flags().String("copy-to", "", "create a verified copy under a new user profile label; preserve the source")
 	command.Flags().Bool("json", false, "output as JSON")
+	command.MarkFlagsMutuallyExclusive("repair", "copy-to")
 	return command
 }
 
@@ -119,8 +129,12 @@ func runVerifyIdentity(cmd *cobra.Command, args []string) error {
 	}
 	online, _ := cmd.Flags().GetBool("online")
 	repair, _ := cmd.Flags().GetBool("repair")
+	copyTo, _ := cmd.Flags().GetString("copy-to")
+	if cmd.Flags().Changed("copy-to") && strings.TrimSpace(copyTo) == "" {
+		return fmt.Errorf("--copy-to requires a new user profile label")
+	}
 	jsonOutput, _ := cmd.Flags().GetBool("json")
-	result, verificationErr := vault.ClaudeProfileIdentity(cmd.Context(), args[1], authfile.ClaudeProfileIdentityOptions{Online: online, Repair: repair})
+	result, verificationErr := vault.ClaudeProfileIdentity(cmd.Context(), args[1], authfile.ClaudeProfileIdentityOptions{Online: online, Repair: repair, CopyTo: copyTo})
 	if jsonOutput {
 		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
 			return err
@@ -137,6 +151,9 @@ func runVerifyIdentity(cmd *cobra.Command, args []string) error {
 		}
 		if result.Repaired {
 			fmt.Fprintln(cmd.OutOrStdout(), "Saved identity metadata repaired.")
+		}
+		if result.CopiedTo != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "Verified copy saved as claude/%s; original snapshot preserved.\n", result.CopiedTo)
 		}
 		if result.Detail != "" {
 			fmt.Fprintln(cmd.OutOrStdout(), result.Detail)

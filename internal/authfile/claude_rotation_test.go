@@ -411,6 +411,198 @@ func TestActiveProfileDoesNotReuseProofAfterConcurrentTokenReplacement(t *testin
 	}
 }
 
+func TestActiveProfileRejectsConflictingExactClaudeOwners(t *testing.T) {
+	for _, field := range []string{"account_id", "organization_id"} {
+		for _, liveProof := range []bool{false, true} {
+			for _, conflictingName := range []string{"another-label", "_backup_conflicting"} {
+				t.Run(fmt.Sprintf("%s/live-proof=%t/%s", field, liveProof, conflictingName), func(t *testing.T) {
+					f := newClaudeRotationFixture(t)
+					f.writeProfile("a-first-label", aliceGen1, aliceSettings(1))
+					f.writeProfile(conflictingName, aliceGen1, aliceSettings(1))
+					f.writeLive(aliceGen1, aliceSettings(3))
+					if !liveProof {
+						writeFixtureFile(t, filepath.Join(filepath.Dir(f.liveCreds), identity.ClaudeIdentityCacheFile), `{}`)
+					}
+					metadata := readJSONMap(t, f.profileFile(conflictingName, "meta.json"))
+					binding := metadata["claude_identity"].(map[string]interface{})
+					binding["identity"].(map[string]interface{})[field] = "different-stable-id"
+					data, err := json.Marshal(metadata)
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeFixtureFile(t, f.profileFile(conflictingName, "meta.json"), string(data))
+					for _, selectProfile := range []func(AuthFileSet) (string, error){f.vault.ActiveProfile, f.vault.CurrentProfile} {
+						if name, err := selectProfile(f.fileSet); name != "" || !errors.Is(err, ErrInvalidCredentials) {
+							t.Fatalf("conflicting exact-token proofs selected %q: %v", name, err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestActiveProfileRejectsAmbiguousExactClaudeLabels(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("personal-label", aliceGen1, aliceSettings(1))
+	f.writeProfile("work-label", aliceGen1, aliceSettings(1))
+	f.writeProfile("_backup_same-token", aliceGen1, aliceSettings(1))
+	f.writeLive(aliceGen1, aliceSettings(3))
+	for _, selectProfile := range []func(AuthFileSet) (string, error){f.vault.ActiveProfile, f.vault.CurrentProfile} {
+		if name, err := selectProfile(f.fileSet); name != "" || err != nil {
+			t.Fatalf("a profile label resolved duplicate credentials: %q, %v", name, err)
+		}
+	}
+}
+
+func TestProfileSelectionDoesNotSkipBrokenOwnershipForExactClaudeToken(t *testing.T) {
+	for _, broken := range []string{"conflicting-cache", "malformed-binding", "unreadable-optional"} {
+		for _, sameToken := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/same-token=%t", broken, sameToken), func(t *testing.T) {
+				f := newClaudeRotationFixture(t)
+				f.writeProfile("a-valid", aliceGen1, aliceSettings(1))
+				other := bobGen1
+				if sameToken {
+					other = aliceGen1
+				}
+				f.writeProfile("z-broken", other, "")
+				f.writeLive(aliceGen1, aliceSettings(3))
+				switch broken {
+				case "malformed-binding":
+					writeFixtureFile(t, f.profileFile("z-broken", "meta.json"), `{"claude_identity":{"identity":{"email":"shared@example.test"}}}`)
+				case "unreadable-optional":
+					// A bad later artifact must not hide the already captured
+					// token pair before readSwitchState has identified it.
+					if err := os.Mkdir(f.profileFile("z-broken", claudeSettingsFile), 0700); err != nil {
+						t.Fatal(err)
+					}
+				case "conflicting-cache":
+					metadata := readJSONMap(t, f.profileFile("z-broken", "meta.json"))
+					binding := metadata["claude_identity"].(map[string]interface{})
+					binding["identity"].(map[string]interface{})["organization_id"] = "conflicting-organization"
+					data, err := json.Marshal(metadata)
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeFixtureFile(t, f.profileFile("z-broken", identity.ClaudeIdentityCacheFile), string(data))
+				}
+				for _, selectProfile := range []func(AuthFileSet) (string, error){f.vault.ActiveProfile, f.vault.CurrentProfile} {
+					name, err := selectProfile(f.fileSet)
+					if sameToken {
+						if name != "" || !errors.Is(err, ErrInvalidCredentials) {
+							t.Fatalf("broken ownership for matching tokens was ignored: %q, %v", name, err)
+						}
+					} else if err != nil || name != "a-valid" {
+						t.Fatalf("unrelated broken profile blocked active owner: %q, %v", name, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProfileSelectionRechecksConcurrentClaudeAuthentication(t *testing.T) {
+	for _, method := range []string{"active", "current"} {
+		for _, changed := range []string{"credential", "shared-label"} {
+			t.Run(method+"/"+changed, func(t *testing.T) {
+				f := newKeychainFixture(t)
+				t.Setenv("CLAUDE_CONFIG_DIR", "")
+				f.storeToken(aliceGen1)
+				writeFixtureFile(t, f.statePath, aliceSettings(1))
+				writeSwitchProfile(t, f.vault, "claude", "selected-label", map[string]string{
+					claudeCredentialsFile: aliceGen1, claudeSettingsFile: aliceSettings(1),
+				})
+				replacement, destination := aliceTeamGen1, filepath.Join(f.items, "Claude_Code_credentials.secret")
+				if changed == "shared-label" {
+					replacement, destination = bobSettings(99), f.statePath
+				}
+				replacementPath := filepath.Join(t.TempDir(), "replacement.json")
+				writeFixtureFile(t, replacementPath, replacement)
+				t.Setenv("CAAM_TEST_SECURITY_READER", os.Getenv("CAAM_KEYCHAIN_BIN"))
+				t.Setenv("CAAM_TEST_IDENTITY_REPLACEMENT", replacementPath)
+				t.Setenv("CAAM_TEST_IDENTITY_DESTINATION", destination)
+				t.Setenv("CAAM_TEST_IDENTITY_READ_MARK", filepath.Join(t.TempDir(), "read-completed"))
+				wrapper := filepath.Join(t.TempDir(), "security-concurrent-login")
+				// The real selection entry point receives the first native
+				// credential, then a separate native writer changes state before
+				// the vault scan completes. No timing sleeps or helper-only seam.
+				script := `#!/bin/sh
+if [ "$1" = find-generic-password ] && [ ! -f "$CAAM_TEST_IDENTITY_READ_MARK" ]; then
+  "$CAAM_TEST_SECURITY_READER" "$@" || exit $?
+  cp "$CAAM_TEST_IDENTITY_REPLACEMENT" "$CAAM_TEST_IDENTITY_DESTINATION" || exit $?
+  : > "$CAAM_TEST_IDENTITY_READ_MARK"
+  exit 0
+fi
+exec "$CAAM_TEST_SECURITY_READER" "$@"
+`
+				if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CAAM_KEYCHAIN_BIN", wrapper)
+				selectProfile := f.vault.ActiveProfile
+				if method == "current" {
+					selectProfile = f.vault.CurrentProfile
+				}
+				name, err := selectProfile(f.fileSet)
+				if changed == "credential" {
+					if err == nil || name != "" || !strings.Contains(err.Error(), "changed during profile selection") {
+						t.Fatalf("native login change selected stale profile %q: %v", name, err)
+					}
+				} else if err != nil || name != "selected-label" {
+					t.Fatalf("shared label rewrite changed credential selection to %q: %v", name, err)
+				}
+				if _, err := os.Stat(f.credPath); !os.IsNotExist(err) {
+					t.Fatalf("read-only selection created a credential mirror: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestActiveProfileDuringConcurrentSharedClaudeMetadataWrites(t *testing.T) {
+	f := newClaudeRotationFixture(t)
+	f.writeProfile("personal", aliceGen1, aliceSettings(1))
+	f.writeProfile("team", aliceTeamGen1, aliceSettings(1))
+	f.writeLive(aliceTeamGen1, aliceSettings(2))
+	settingsPath := f.liveSettings
+	stop := make(chan struct{})
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				finished <- nil
+				return
+			default:
+			}
+			err := os.WriteFile(settingsPath+".native-update", []byte(bobSettings(i)), 0600)
+			if err == nil {
+				err = os.Rename(settingsPath+".native-update", settingsPath)
+			}
+			if i == 0 {
+				close(started)
+			}
+			if err != nil {
+				finished <- err
+				return
+			}
+		}
+	}()
+	<-started
+	defer func() {
+		close(stop)
+		if err := <-finished; err != nil {
+			t.Fatal(err)
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		if name, err := f.vault.ActiveProfile(f.fileSet); err != nil || name != "team" {
+			t.Fatalf("concurrent shared metadata selected %q: %v", name, err)
+		}
+	}
+}
+
 func TestActiveProfileIdentityIgnoresSharedMachineUserID(t *testing.T) {
 	// Claude Code's top-level userID is per-installation: every account that
 	// logs in on one machine carries the same value. Two different accounts

@@ -67,8 +67,9 @@ the opaque refresh token.
 | Exact saved/live credentials | Recognize the matching snapshot offline; identity can remain unknown |
 | Matching token-bound account and organization | Match different verified generations and preserve a newer same-account credential |
 | Email or unverified `.claude.json` alone | Display a marked legacy hint; never authorize a cross-generation match or overwrite |
-| Provider unavailable or access token expired, no existing binding | Preserve or explicitly activate the grant with unverified labels omitted and a warning |
+| Provider unavailable or access token expired, no existing binding | Preserve the grant with unverified labels omitted; refuse activation until ownership can be verified |
 | Tokens replaced in a profile with an existing binding | Refuse activation unless verification confirms the recorded account and organization |
+| Conflicting recorded account or organization UUIDs | Refuse selection, repair and copying; never resolve the conflict with a label or first match |
 
 Successful verification corrects stale `oauthAccount` labels in a new backup
 or in the settings prepared for activation. Backup leaves its native source
@@ -76,14 +77,18 @@ unchanged. A named saved account cannot silently become another organization;
 unsaved credentials can instead be preserved under a separate automatic backup.
 Keepalive synchronizes strictly newer credentials only into a verified matching
 user snapshot, and binds the new generation before it can be treated as that
-profile's identity. `_original` and automatic recovery snapshots retain the
-captured credential bytes even when their account labels must be corrected or
-omitted; preserving a grant does not assert its current usability.
+profile's identity. `_original` and automatic recovery snapshots are immutable
+after creation, including during activation. `verify identity --copy-to` can
+publish a verified modern OAuth grant under a new user label while leaving all
+original evidence intact. Preserving or verifying a grant does not assert its
+current usability.
 
 Isolated profile imports carry a matching binding with the exact captured
 credentials into a private `.caam-identity.json`, including after access-token
 expiry, without contacting the provider. A saved `meta.json` binding that no
 longer matches blocks import; a stale native cache contributes no identity.
+Both metadata records are checked and guarded, so a valid primary proof cannot
+hide contradictory secondary evidence.
 The imported `.claude.json` account block is corrected or omitted while unrelated
 session state is retained. Source credentials, keychain authority when selected,
 and the metadata used for the decision are rechecked during the recoverable

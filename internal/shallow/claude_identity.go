@@ -39,31 +39,30 @@ func captureClaudeCredentialSeed(source string) (*claudeCredentialSeed, error) {
 		return nil, err
 	}
 	seed := &claudeCredentialSeed{credentials: credentials, inputs: map[string][]byte{source: credentials}}
-	for _, name := range claudeIdentityFiles {
+	var metadata [2][]byte
+	for index, name := range claudeIdentityFiles {
 		path := filepath.Join(filepath.Dir(source), name)
 		data, err := claudesettings.Read(path)
 		if err != nil {
 			return nil, fmt.Errorf("read Claude source identity: %w", err)
 		}
 		seed.inputs[path] = data
-		if data == nil {
-			continue
-		}
-		assessment, err := identity.InspectClaudeIdentityBinding(data, credentials)
-		if err != nil {
-			return nil, err
-		}
-		if assessment.State == identity.ClaudeIdentityVerified {
-			seed.binding = assessment.Binding
-			break
-		}
-		if assessment.State == identity.ClaudeIdentityCredentialChanged {
-			if name == "meta.json" {
-				return nil, fmt.Errorf("saved Claude identity does not match the selected credentials; verify the source profile before copying it")
-			}
-			break
-		}
+		metadata[index] = data
 	}
+	// A verified primary record must not conceal a contradictory secondary
+	// owner. Both present and absent records remain guarded through creation.
+	assessment, err := identity.InspectClaudeIdentitySources(metadata[0], metadata[1], credentials)
+	if err != nil {
+		return nil, err
+	}
+	primary, err := identity.InspectClaudeIdentityBinding(metadata[0], credentials)
+	if err != nil {
+		return nil, err
+	}
+	if primary.State == identity.ClaudeIdentityCredentialChanged {
+		return nil, fmt.Errorf("saved Claude identity does not match the selected credentials; verify the source profile before copying it")
+	}
+	seed.binding = assessment.Binding
 	return seed, seed.checkUnchanged()
 }
 

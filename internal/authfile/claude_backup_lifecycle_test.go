@@ -21,6 +21,9 @@ func TestClaudeBackupReplacesObsoleteAuthenticationSources(t *testing.T) {
 	t.Setenv("HOME", home)
 	files := ClaudeAuthFiles()
 	v := NewVault(t.TempDir())
+	setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+		keychainCreds("old-oauth"): {AccountID: "original-account", OrganizationID: "original-org"},
+	})
 	credentials := filepath.Join(home, ".claude", ".credentials.json")
 	settings := filepath.Join(home, ".claude", "settings.json")
 	secondary := claudeFileSetPath(files, "auth.json")

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/spf13/cobra"
@@ -90,6 +91,17 @@ func TestBackupFromProfilePublishesUsableVaultWithoutTouchingLive(t *testing.T) 
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	activationBefore, err := captureBackupTree(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Switch(authfile.ClaudeAuthFiles(), "saved", authfile.SwitchOptions{BackupMode: "always"}); !errors.Is(err, authfile.ErrInvalidCredentials) {
+		t.Fatalf("unverified imported login was allowed to activate: %v", err)
+	}
+	assertBackupTreeUnchanged(t, home, activationBefore)
+	// The expired imported token needs its prior provider proof before use.
+	// The fixture proof deliberately disagrees with its old untrusted label.
+	binding := cacheSyntheticImportedClaudeIdentity(t, v, "saved")
 	if _, err := v.Switch(authfile.ClaudeAuthFiles(), "saved", authfile.SwitchOptions{BackupMode: "always"}); err != nil {
 		t.Fatalf("imported vault entry cannot be activated: %v", err)
 	}
@@ -97,8 +109,49 @@ func TestBackupFromProfilePublishesUsableVaultWithoutTouchingLive(t *testing.T) 
 	if err != nil || !bytes.Contains(activated, []byte("new-access")) {
 		t.Fatalf("wrong activated credential: %v", err)
 	}
+	requireImportedClaudeIdentity(t, filepath.Join(home, ".claude.json"), binding)
 	assertBackupTreeUnchanged(t, liveRoot, before)
 	assertBackupTreeUnchanged(t, sourceRoot, sourceBefore)
+}
+
+// cacheSyntheticImportedClaudeIdentity models a historical provider check of
+// setupProfileBackupCommand's exact expired token pair. It never derives an
+// owner from the imported profile's name, settings, or credentials' label fields.
+func cacheSyntheticImportedClaudeIdentity(t *testing.T, v *authfile.Vault, profile string) *identity.ClaudeIdentityBinding {
+	t.Helper()
+	credentials := []byte(`{"claudeAiOauth":{"accessToken":"new-access","refreshToken":"new-refresh","expiresAt":1600000000000}}`)
+	binding := claudeCLIIdentityBinding(t, credentials, "verified-import-org", "Verified import")
+	binding.Identity.AccountID, binding.Identity.Email = "verified-import-account", "verified@example.test"
+	data, err := json.Marshal(map[string]any{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(v.BackupPath("claude", profile, identity.ClaudeIdentityCacheFile), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+func requireImportedClaudeIdentity(t *testing.T, path string, binding *identity.ClaudeIdentityBinding) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		OAuthAccount struct {
+			AccountID      string `json:"accountUuid"`
+			OrganizationID string `json:"organizationUuid"`
+			Email          string `json:"emailAddress"`
+		} `json:"oauthAccount"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.OAuthAccount.AccountID != binding.Identity.AccountID || state.OAuthAccount.OrganizationID != binding.Identity.OrganizationID ||
+		state.OAuthAccount.Email != binding.Identity.Email || bytes.Contains(data, []byte("new@example.test")) || bytes.Contains(data, []byte("ignored-xdg")) {
+		t.Fatal("activation did not install the token's verified account and organization")
+	}
 }
 
 type backupTreeEntry struct {
@@ -467,6 +520,15 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 				home := t.TempDir()
 				t.Setenv("HOME", home)
 				t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+				activationBefore, err := captureBackupTree(home)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := v.Switch(authfile.ClaudeAuthFiles(), "saved", authfile.SwitchOptions{BackupMode: "always"}); !errors.Is(err, authfile.ErrInvalidCredentials) {
+					t.Fatalf("unverified legacy login was allowed to activate: %v", err)
+				}
+				assertBackupTreeUnchanged(t, home, activationBefore)
+				binding := cacheSyntheticImportedClaudeIdentity(t, v, "saved")
 				if _, err := v.Switch(authfile.ClaudeAuthFiles(), "saved", authfile.SwitchOptions{BackupMode: "always"}); err != nil {
 					t.Fatalf("legacy vault snapshot cannot activate: %v", err)
 				}
@@ -474,10 +536,7 @@ func TestLegacyClaudeBackupUsesExecutionSourceAndActivates(t *testing.T) {
 				if err != nil || !bytes.Contains(got, []byte("new-access")) {
 					t.Fatalf("wrong activated credential: %v", err)
 				}
-				got, err = os.ReadFile(filepath.Join(home, ".claude.json"))
-				if err != nil || bytes.Contains(got, []byte("oauthAccount")) || bytes.Contains(got, []byte("new@example.test")) || bytes.Contains(got, []byte("ignored-xdg")) {
-					t.Fatalf("offline activation asserted an unverified identity: %v", err)
-				}
+				requireImportedClaudeIdentity(t, filepath.Join(home, ".claude.json"), binding)
 				assertBackupTreeUnchanged(t, root, sourceBefore)
 				assertBackupTreeUnchanged(t, filepath.Dir(live), liveBefore)
 				assertBackupTreeUnchanged(t, nativeState, stateBefore)

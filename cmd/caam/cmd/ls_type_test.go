@@ -53,15 +53,19 @@ func setupProfileTypes(t *testing.T) {
 
 func runLsJSON(t *testing.T, args []string) map[string]any {
 	t.Helper()
-	cmd := &cobra.Command{RunE: runLs}
+	cmd := &cobra.Command{Use: lsCmd.Use, Args: lsCmd.Args, RunE: runLs, SilenceUsage: true, SilenceErrors: true}
 	cmd.Flags().Bool("no-color", false, "")
 	cmd.Flags().Bool("json", false, "")
 	cmd.Flags().String("tag", "", "")
-	_ = cmd.Flags().Set("json", "true")
+	cmd.SetArgs(append(append([]string{}, args...), "--json"))
 	var buf bytes.Buffer
 	cmd.SetOut(&buf)
-	if err := runLs(cmd, args); err != nil {
-		t.Fatalf("runLs: %v", err)
+	cmd.SetErr(&buf)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("ls command: %v", err)
+	}
+	if strings.Contains(buf.String(), "SYNTHETIC-") || strings.Contains(buf.String(), "credential_fingerprint") {
+		t.Fatal("listing exposed credential material")
 	}
 	var out map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
@@ -284,6 +288,99 @@ func TestLsClaudeOrganizationsUseBoundIdentityAndPersistAcrossRestart(t *testing
 				}
 				if verificationCalls != 0 {
 					t.Fatal("listing attempted online identity verification")
+				}
+			}
+		})
+	}
+}
+
+func TestLsClaudeKeepsSelectedOrganizationAfterActivationAndNativeMetadataRewrite(t *testing.T) {
+	fileSet, credentials := setupClaudeOrganizationProfiles(t)
+	writeNativeTestCredential(t, fileSet.Files[0].Path, string(credentials["personal"]))
+	writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal"}}`)
+	writeNativeTestCredential(t, filepath.Join(os.Getenv("CAAM_HOME"), "config.yaml"), "version: 1\nanalytics:\n  enabled: false\n")
+	vault.ClaudeIdentityVerifier = func(context.Context, []byte) (*identity.ClaudeIdentityBinding, error) {
+		return nil, identity.ErrClaudeIdentityUnavailable
+	}
+	activated, err := runActivateJSONCommand(t, "claude", "team")
+	if err != nil || !activated.Success || activated.KeptLive {
+		t.Fatalf("actual activation failed to select Team: %+v, %v", activated, err)
+	}
+	requireSwitchCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+	for _, stale := range []string{
+		`{"numStartups":42,"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal","organizationName":"Stale personal label"}}`,
+		`{"numStartups":43,"oauthAccount":{"accountUuid":"another-account-id","emailAddress":"shared@example.test","organizationUuid":"org-other","organizationName":"Stale other account"}}`,
+	} {
+		writeNativeTestCredential(t, fileSet.Files[1].Path, stale)
+		for _, args := range [][]string{{"claude"}, nil} {
+			out := runLsJSON(t, args)
+			for _, value := range out["profiles"].([]any) {
+				row := value.(map[string]any)
+				name := row["name"].(string)
+				if row["active"] != (name == "team") {
+					t.Fatalf("stale native metadata changed active profile: %s", name)
+				}
+				if name == "personal" || name == "team" {
+					id := row["identity"].(map[string]any)
+					if id["account_id"] != "shared-account-id" || id["organization_id"] != "org-"+name || id["identity_verified"] != true || strings.Contains(fmt.Sprint(id["organization"]), "Stale") {
+						t.Fatalf("listing replaced verified ownership with shared labels for %s", name)
+					}
+				}
+			}
+		}
+		// Read-only listing must not fight with the native writer or replace
+		// either token generation just to make its display metadata agree.
+		requireSwitchCredential(t, fileSet.Files[0].Path, string(credentials["team"]))
+		requireSwitchCredential(t, fileSet.Files[1].Path, stale)
+	}
+}
+
+func TestLsClaudeRefusesAmbiguousOrConflictingExactTokenProfiles(t *testing.T) {
+	for _, scenario := range []string{"duplicate-labels", "account-conflict", "organization-conflict", "token-substitution"} {
+		t.Run(scenario, func(t *testing.T) {
+			fileSet, credentials := setupClaudeOrganizationProfiles(t)
+			live := credentials["team"]
+			if scenario == "token-substitution" {
+				var document map[string]any
+				if err := json.Unmarshal(live, &document); err != nil {
+					t.Fatal(err)
+				}
+				document["claudeAiOauth"].(map[string]any)["accessToken"] = "SYNTHETIC-substituted-access"
+				var err error
+				live, err = json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeNativeTestCredential(t, vault.BackupPath("claude", "team", ".credentials.json"), string(live))
+			} else {
+				binding := claudeCLIIdentityBinding(t, live, "org-team", "Team")
+				if scenario == "account-conflict" {
+					binding.Identity.AccountID = "another-account-id"
+				}
+				if scenario == "organization-conflict" {
+					binding.Identity.OrganizationID = "org-personal"
+				}
+				metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeNativeTestCredential(t, vault.BackupPath("claude", "z-copy", ".credentials.json"), string(live))
+				writeNativeTestCredential(t, vault.BackupPath("claude", "z-copy", "meta.json"), string(metadata))
+			}
+			writeNativeTestCredential(t, fileSet.Files[0].Path, string(live))
+			writeNativeTestCredential(t, fileSet.Files[1].Path, `{"oauthAccount":{"accountUuid":"shared-account-id","emailAddress":"shared@example.test","organizationUuid":"org-personal"}}`)
+			for _, args := range [][]string{{"claude"}, nil} {
+				out := runLsJSON(t, args)
+				for _, value := range out["profiles"].([]any) {
+					if row := value.(map[string]any); row["active"] != false {
+						t.Fatalf("%s gave an ambiguous or conflicting profile an active marker", scenario)
+					}
+				}
+				if strings.Contains(scenario, "conflict") {
+					warnings, ok := out["warnings"].([]any)
+					if !ok || len(warnings) != 1 || !strings.Contains(fmt.Sprint(warnings[0]), "conflicting") || !strings.Contains(fmt.Sprint(warnings[0]), "verify identity") {
+						t.Fatal("listing silently discarded a verified identity conflict")
+					}
 				}
 			}
 		})

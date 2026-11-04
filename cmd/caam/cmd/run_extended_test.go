@@ -709,8 +709,17 @@ func setupHeadlessRun(t *testing.T, settings, mode string) (*cobra.Command, *byt
 	fileSet := authfile.ClaudeAuthFiles()
 	authPath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
 	require.NoError(t, os.MkdirAll(filepath.Dir(authPath), 0700))
+	knownCredentials := make(map[string]*identity.ClaudeIdentityBinding)
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		binding, ok := knownCredentials[string(data)]
+		if !ok {
+			return nil, errors.New("unknown headless-run fixture credential")
+		}
+		return binding, nil
+	}
 	for _, name := range []string{"a-ready", "m-other", "z-active"} {
 		data := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, name, "synthetic-refresh-"+name, time.Now().Add(time.Hour).UnixMilli())
+		knownCredentials[data] = claudeCLIIdentityBinding(t, []byte(data), "org-"+name, "Test "+name)
 		require.NoError(t, os.WriteFile(authPath, []byte(data), 0600))
 		require.NoError(t, vault.Backup(fileSet, name))
 	}

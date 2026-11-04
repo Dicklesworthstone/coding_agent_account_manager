@@ -874,6 +874,9 @@ func TestCaptureDiscoveryRestoresClaudeNullProjectRevocation(t *testing.T) {
 		t.Fatal("discovery did not preserve the captured project revocation")
 	}
 	writeFixtureFile(t, filepath.Join(live, claudeCredentialsFile), keychainCreds("synthetic-other-access"))
+	setClaudeFixtureIdentities(t, v, map[string]identity.Identity{
+		credential: {AccountID: "verified-selected", OrganizationID: "verified-selected-org"},
+	})
 	if err := v.Restore(set, result.Profile); err != nil {
 		t.Fatalf("restore null-project revocation: %v", err)
 	}

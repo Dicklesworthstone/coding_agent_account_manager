@@ -773,24 +773,29 @@ func captureClaudeImportSource(sourcePath string, native *authfile.AuthFileSet) 
 	if hasAuth, err := claudeDocumentBytesHaveAuth(".credentials.json", source.credentials); err != nil || !hasAuth {
 		return nil, fmt.Errorf("claude import source does not contain usable OAuth credentials")
 	}
-	for _, name := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
+	var identityMetadata [2][]byte
+	for index, name := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
 		metadata, err := readClaudeImportFile(filepath.Join(filepath.Dir(path), name), 1<<20)
 		if err != nil {
 			return nil, err
 		}
 		source.files = append(source.files, metadata)
-		assessment, err := identity.InspectClaudeIdentityBinding(metadata.data, source.credentials)
-		if err != nil {
-			return nil, fmt.Errorf("cannot import Claude identity metadata: %w", err)
-		}
-		if name == "meta.json" && assessment.State == identity.ClaudeIdentityCredentialChanged {
-			return nil, fmt.Errorf("saved Claude credential no longer matches its verified account and organization; repair it before importing")
-		}
-		if assessment.Binding != nil {
-			source.binding = assessment.Binding
-			break
-		}
+		identityMetadata[index] = metadata.data
 	}
+	// Capture both ownership records before choosing a proof. Importing a
+	// valid primary record must not erase conflicting secondary evidence.
+	assessment, err := identity.InspectClaudeIdentitySources(identityMetadata[0], identityMetadata[1], source.credentials)
+	if err != nil {
+		return nil, fmt.Errorf("cannot import Claude identity metadata: %w", err)
+	}
+	primary, err := identity.InspectClaudeIdentityBinding(identityMetadata[0], source.credentials)
+	if err != nil {
+		return nil, fmt.Errorf("cannot import Claude identity metadata: %w", err)
+	}
+	if primary.State == identity.ClaudeIdentityCredentialChanged {
+		return nil, fmt.Errorf("saved Claude credential no longer matches its verified account and organization; repair it before importing")
+	}
+	source.binding = assessment.Binding
 	return source, source.checkUnchanged(context.Background())
 }
 
