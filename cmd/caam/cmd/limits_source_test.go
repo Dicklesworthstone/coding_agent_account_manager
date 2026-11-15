@@ -2,20 +2,265 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
+
+type limitsCountingLogScanner struct{ scans atomic.Int32 }
+
+func (s *limitsCountingLogScanner) Scan(_ context.Context, _ string, since time.Time) (*logs.ScanResult, error) {
+	s.scans.Add(1)
+	now := time.Now()
+	return &logs.ScanResult{Since: since, Until: now, Entries: []*logs.LogEntry{
+		{Timestamp: now.Add(-3 * time.Hour), TotalTokens: 1000},
+		{Timestamp: now.Add(-2 * time.Hour), TotalTokens: 1000},
+		{Timestamp: now.Add(-time.Hour), TotalTokens: 1000},
+	}}, nil
+}
+
+func (*limitsCountingLogScanner) LogDir() string { return "" }
+
+func limitsSourceFixture(t *testing.T) *namespaceFixture {
+	t.Helper()
+	f := newNamespaceFixture(t)
+	f.vaultDir, f.lookup.VaultDir = getVaultDir(), getVaultDir()
+	oldProfiles := profileStore
+	profileStore = f.store
+	t.Cleanup(func() { profileStore = oldProfiles })
+	t.Setenv("CAAM_SHALLOW_HOMES_DIR", f.shallow.BaseDir())
+	return f
+}
+
+// Create a listed profile without requiring it to hold a usable credential.
+func limitsSourceCredentialPath(t *testing.T, f *namespaceFixture, provider, source, name string) string {
+	t.Helper()
+	var path string
+	switch source {
+	case credNamespaceVault:
+		file := "auth.json"
+		if provider == "claude" {
+			file = ".credentials.json"
+		}
+		path = filepath.Join(f.vaultDir, provider, name, file)
+	case credNamespaceIsolated:
+		p, err := f.store.Create(provider, name, "oauth")
+		if err != nil {
+			t.Fatal(err)
+		}
+		path = filepath.Join(p.CodexHomePath(), "auth.json")
+		if provider == "claude" {
+			path = filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json")
+		}
+	case credNamespaceShallow:
+		if _, err := f.shallow.Create(name, shallow.CreateOptions{Provider: provider}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		path, err = f.shallow.CredentialPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unexpected fixture source %q", source)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// Issue #139: batching inside MultiProfileFetcher is ineffective when limits
+// invokes it separately for every profile in the selected namespace.
+func TestLimitsNamespaceScansLogsOnce(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		for _, source := range credNamespaces {
+			t.Run(provider+"/"+source, func(t *testing.T) {
+				responses := make(map[string]string)
+				for i := 0; i < 13; i++ {
+					responses[fmt.Sprintf("seat-%02d", i)] = subscriptionQuotaResponse(provider, i*5)
+				}
+				responses["seat-12"] = "" // A failed API read must keep its diagnostic row.
+				setupSubscriptionQuotaProfiles(t, provider, responses)
+				f := limitsSourceFixture(t)
+				credential := func(token string) string {
+					if provider == "claude" {
+						return fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"expiresAt":4102444800000}}`, token)
+					}
+					return fmt.Sprintf(`{"access_token":%q}`, token)
+				}
+				for name := range responses {
+					path := limitsSourceCredentialPath(t, f, provider, source, name)
+					writeQuotaSelectionFile(t, path, credential(name))
+					if source != credNamespaceVault {
+						// The same name in another namespace belongs to another login.
+						other := limitsSourceCredentialPath(t, f, provider, credNamespaceVault, name)
+						writeQuotaSelectionFile(t, other, credential("ignored-"+name))
+					}
+				}
+				for _, name := range []string{"missing", "malformed"} {
+					path := limitsSourceCredentialPath(t, f, provider, source, name)
+					if name == "malformed" {
+						writeQuotaSelectionFile(t, path, "{")
+					}
+					otherSource := credNamespaceVault
+					if source == credNamespaceVault {
+						otherSource = credNamespaceIsolated
+					}
+					other := limitsSourceCredentialPath(t, f, provider, otherSource, name)
+					writeQuotaSelectionFile(t, other, credential("ignored-"+name))
+				}
+				transport := http.DefaultTransport
+				var requests atomic.Int32
+				http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					return transport.RoundTrip(req)
+				})
+				scanner := &limitsCountingLogScanner{}
+				fetcher := usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))
+				for invocation, profileName := range []string{"", "seat-00"} {
+					cmd := quotaAdviceCommand("", "", false)
+					for flag, value := range map[string]string{"source": source, "profile": profileName} {
+						if err := cmd.Flags().Set(flag, value); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					if err := runLimitsWithFetcher(cmd, []string{provider}, fetcher); err != nil {
+						t.Fatal(err)
+					}
+					var rows []usage.ProfileUsage
+					if err := json.Unmarshal(output.Bytes(), &rows); err != nil {
+						t.Fatal(err)
+					}
+					wantRows := 13
+					if profileName != "" {
+						wantRows = 1
+					}
+					if len(rows) != wantRows || scanner.scans.Load() != int32(invocation+1) || requests.Load() != int32(13+invocation) {
+						t.Fatalf("profile=%q: rows=%d scans=%d requests=%d; want %d rows, %d scans, %d requests",
+							profileName, len(rows), scanner.scans.Load(), requests.Load(), wantRows, invocation+1, 13+invocation)
+					}
+					seen := make(map[string]bool)
+					for _, row := range rows {
+						if _, ok := responses[row.ProfileName]; !ok || seen[row.ProfileName] || row.Provider != provider || row.Usage == nil || row.Usage.ProfileName != row.ProfileName {
+							t.Fatalf("lost profile identity or returned an unusable credential: %+v", row)
+						}
+						seen[row.ProfileName] = true
+						if rate := row.Usage.BurnRate; rate == nil || rate.SampleSize != 3 || rate.TokensPerHour != 1500 {
+							t.Fatalf("%s lost the shared burn-rate data: %+v", row.ProfileName, rate)
+						}
+						if row.ProfileName == "seat-12" {
+							if !strings.Contains(row.Usage.Error, "503") {
+								t.Fatalf("API failure lost its diagnostic: %+v", row.Usage)
+							}
+						} else {
+							i, err := strconv.Atoi(strings.TrimPrefix(row.ProfileName, "seat-"))
+							if err != nil || row.Usage.Error != "" || row.Usage.SecondaryWindow == nil || row.Usage.SecondaryWindow.UsedPercent != i*5 {
+								t.Fatalf("%s read another profile's quota: %+v", row.ProfileName, row.Usage)
+							}
+						}
+						if profileName != "" && (row.ProfileName != profileName || row.CredentialSource == nil || row.CredentialSource.Namespace != source) {
+							t.Fatalf("named profile selection changed: %+v", row)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLimitsCachedNamespacesDoNotFetchOrScan(t *testing.T) {
+	for _, source := range append([]string{""}, credNamespaces...) {
+		t.Run("source="+source, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, "claude", nil)
+			f := limitsSourceFixture(t)
+			ns := source
+			if ns == "" {
+				ns = credNamespaceVault
+			}
+			for i := 0; i < 13; i++ {
+				name := fmt.Sprintf("seat-%02d", i)
+				limitsSourceCredentialPath(t, f, "claude", ns, name)
+				path := f.lookup.claudeJSONPath(ns, "claude", name)
+				cache := fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":%d,"accountUuid":%q,"utilization":%s}}`,
+					time.Now().UnixMilli(), name, subscriptionQuotaResponse("claude", i*5))
+				writeQuotaSelectionFile(t, path, cache)
+			}
+			var requests atomic.Int32
+			http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return nil, fmt.Errorf("offline limits attempted an API request")
+			})
+			scanner := &limitsCountingLogScanner{}
+			cmd := quotaAdviceCommand("", "", true)
+			if err := cmd.Flags().Set("source", source); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			if err := runLimitsWithFetcher(cmd, []string{"claude"}, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))); err != nil {
+				t.Fatal(err)
+			}
+			var rows []usage.ProfileUsage
+			if err := json.Unmarshal(output.Bytes(), &rows); err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 13 || scanner.scans.Load() != 0 || requests.Load() != 0 {
+				t.Fatalf("offline rows=%d scans=%d requests=%d; want 13, 0, 0", len(rows), scanner.scans.Load(), requests.Load())
+			}
+			for i, row := range rows {
+				if row.ProfileName != fmt.Sprintf("seat-%02d", i) || row.Usage == nil || row.Usage.Error != "" || row.Usage.Source != usage.SourceCache || row.Usage.SecondaryWindow == nil || row.Usage.SecondaryWindow.UsedPercent != i*5 || row.Usage.BurnRate != nil {
+					t.Fatalf("cached profile required credentials or lost its snapshot: %+v", row)
+				}
+			}
+		})
+	}
+}
+
+func TestLimitsNamespaceWithoutUsableCredentialsDoesNotScan(t *testing.T) {
+	for _, source := range credNamespaces {
+		t.Run(source, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, "codex", nil)
+			f := limitsSourceFixture(t)
+			scanner := &limitsCountingLogScanner{}
+			for _, populated := range []bool{false, true} {
+				if populated {
+					limitsSourceCredentialPath(t, f, "codex", source, "missing")
+					path := limitsSourceCredentialPath(t, f, "codex", source, "malformed")
+					writeQuotaSelectionFile(t, path, "{")
+				}
+				cmd := quotaAdviceCommand("", "", false)
+				if err := cmd.Flags().Set("source", source); err != nil {
+					t.Fatal(err)
+				}
+				var output bytes.Buffer
+				cmd.SetOut(&output)
+				if err := runLimitsWithFetcher(cmd, []string{"codex"}, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))); err != nil {
+					t.Fatal(err)
+				}
+				if strings.TrimSpace(output.String()) != "[]" || scanner.scans.Load() != 0 {
+					t.Fatalf("empty namespace fetched usage: output=%s scans=%d", output.String(), scanner.scans.Load())
+				}
+			}
+		})
+	}
+}
 
 func TestCachedVaultUsageFollowsActiveClaudeConfigDirectory(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)

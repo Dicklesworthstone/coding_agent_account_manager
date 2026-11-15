@@ -132,6 +132,16 @@ func init() {
 }
 
 func runLimits(cmd *cobra.Command, args []string) error {
+	// Initialize log scanners for burn rate calculation.
+	scanner := logs.NewMultiScanner()
+	scanner.Register("claude", logs.NewClaudeScanner())
+	scanner.Register("codex", logs.NewCodexScanner())
+	scanner.Register("gemini", logs.NewGeminiScanner())
+
+	return runLimitsWithFetcher(cmd, args, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner)))
+}
+
+func runLimitsWithFetcher(cmd *cobra.Command, args []string, fetcher *usage.MultiProfileFetcher) error {
 	profileArg, _ := cmd.Flags().GetString("profile")
 	format, _ := cmd.Flags().GetString("format")
 	showBest, _ := cmd.Flags().GetBool("best")
@@ -225,14 +235,6 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	now := time.Now()
 	var sourceNotes []string
 
-	// Initialize log scanners for burn rate calculation
-	scanner := logs.NewMultiScanner()
-	scanner.Register("claude", logs.NewClaudeScanner())
-	scanner.Register("codex", logs.NewCodexScanner())
-	scanner.Register("gemini", logs.NewGeminiScanner())
-
-	fetcher := usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))
-
 	allResults := make([]usage.ProfileUsage, 0)
 
 	for _, provider := range providers {
@@ -287,6 +289,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 				}
 				continue
 			}
+			credentials := make(map[string]string, len(names))
 			for _, name := range names {
 				if cached {
 					// An offline read needs no credential at all — that is
@@ -298,7 +301,12 @@ func runLimits(cmd *cobra.Command, args []string) error {
 				if !c.Found() {
 					continue
 				}
-				allResults = append(allResults, fetcher.FetchAllProfiles(ctx, provider, map[string]string{name: c.Token})...)
+				credentials[name] = c.Token
+			}
+			if len(credentials) > 0 {
+				// Fetch the namespace as one batch so every profile shares the
+				// provider's burn-rate log scan (issue #139).
+				allResults = append(allResults, fetcher.FetchAllProfiles(ctx, provider, credentials)...)
 			}
 			continue
 		}
