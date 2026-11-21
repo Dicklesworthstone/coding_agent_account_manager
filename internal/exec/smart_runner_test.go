@@ -945,26 +945,32 @@ func TestSmartRunner_RetryAfterOutputDelaysHandoff(t *testing.T) {
 		{"split header arrives during backoff", 40 * time.Millisecond, []string{"HTTP 429 Too Many Requests\n", "Retry-Af", "ter: 60\n"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sr, livePath, credentials := newSmartRetryRunner(t, []string{"alice", "bob"}, smartRetryPolicy(3, tc.backoff))
-			called := false
-			sr.loginHandler = &smartSwitchLoginHandler{
-				LoginHandler: handoff.GetHandler("codex"),
-				trigger: func() error {
-					called = true
-					sr.loginDone <- loginResult{success: true}
-					return nil
-				},
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			done := make(chan struct{})
-			sr.monitorOutput(ctx, &smartRetryOutputController{output: tc.output}, done, nil)
-			<-done
-			sr.wg.Wait()
-			if called || sr.handoffAttempts != 0 || sr.getState() != HandoffFailed || sr.detector.RetryAfter().IsZero() {
-				t.Fatal("complete Retry-After output did not delay the handoff until cancellation")
-			}
-			assertSmartSwitchFile(t, livePath, credentials["alice"])
+			synctest.Test(t, func(t *testing.T) {
+				sr, livePath, credentials := newSmartRetryRunner(t, []string{"alice", "bob"}, smartRetryPolicy(3, tc.backoff))
+				called := false
+				sr.loginHandler = &smartSwitchLoginHandler{
+					LoginHandler: handoff.GetHandler("codex"),
+					trigger: func() error {
+						called = true
+						sr.loginDone <- loginResult{success: true}
+						return nil
+					},
+				}
+				start := time.Now()
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				defer cancel()
+				done := make(chan struct{})
+				sr.monitorOutput(ctx, &smartRetryOutputController{output: tc.output}, done, nil)
+				<-done
+				sr.wg.Wait()
+				if elapsed := time.Since(start); elapsed != 100*time.Millisecond {
+					t.Fatalf("handoff elapsed %v, want full 100ms context deadline before cancellation", elapsed)
+				}
+				if called || sr.handoffAttempts != 0 || sr.getState() != HandoffFailed || sr.detector.RetryAfter().IsZero() {
+					t.Fatal("complete Retry-After output did not delay the handoff until cancellation")
+				}
+				assertSmartSwitchFile(t, livePath, credentials["alice"])
+			})
 		})
 	}
 }
