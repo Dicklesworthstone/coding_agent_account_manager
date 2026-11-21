@@ -931,6 +931,9 @@ func checkAuthFiles() []CheckResult {
 	if result := checkClaudeKeychain(); result != nil {
 		results = append(results, *result)
 	}
+	if result := checkAgyKeychain(); result != nil {
+		results = append(results, *result)
+	}
 
 	for tool, getFileSet := range tools {
 		fileSet := getFileSet()
@@ -1103,6 +1106,42 @@ func checkClaudeKeychain() *CheckResult {
 		check.Status = "fail"
 		check.Message = "the login keychain refused access"
 		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.claude/.credentials.json"
+	default:
+		check.Status = "fail"
+		check.Message = err.Error()
+	}
+	return check
+}
+
+// checkAgyKeychain reports on the macOS login-keychain bridge for Antigravity
+// CLI (agy). On macOS desktop sessions agy stores its OAuth token under
+// service "gemini" / account "antigravity" rather than on disk (issue #140).
+func checkAgyKeychain() *CheckResult {
+	if !keychain.Enabled() || os.Getenv("GEMINI_HOME") != "" {
+		return nil
+	}
+	check := &CheckResult{Name: "agy keychain"}
+	switch _, err := keychain.ReadAgy(); {
+	case err == nil:
+		check.Status = "pass"
+		check.Message = fmt.Sprintf("%q/%q readable in the login keychain", keychain.AgyService, keychain.AgyAccount)
+	case errors.Is(err, keychain.ErrNoKeychain):
+		return nil
+	case errors.Is(err, keychain.ErrNotFound):
+		// Stay quiet unless agy is actually installed and has no on-disk token.
+		if _, lookErr := osexec.LookPath("agy"); lookErr != nil {
+			return nil
+		}
+		if _, statErr := os.Stat(filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token")); statErr == nil {
+			return nil
+		}
+		check.Status = "warn"
+		check.Message = "no Antigravity item in the login keychain"
+		check.Details = "agy stores its OAuth token in the login keychain on macOS; log in with 'agy' before 'caam backup agy <profile>'"
+	case errors.Is(err, keychain.ErrDenied):
+		check.Status = "fail"
+		check.Message = "the login keychain refused access"
+		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.gemini/antigravity-cli/antigravity-oauth-token"
 	default:
 		check.Status = "fail"
 		check.Message = err.Error()

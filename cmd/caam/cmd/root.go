@@ -27,6 +27,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
@@ -1862,11 +1863,50 @@ Examples:
 				fmt.Printf("  [%s] %s%s\n", exists, spec.Path, required)
 				fmt.Printf("         %s\n", spec.Description)
 			}
+			if status, label, desc := toolKeychainPathStatus(tool); status != "" {
+				fmt.Printf("  [%s] %s\n", status, label)
+				fmt.Printf("         %s\n", desc)
+			}
 			fmt.Println()
 		}
 
 		return nil
 	},
+}
+
+func toolKeychainPathStatus(tool string) (status, label, desc string) {
+	if !keychain.Enabled() {
+		return "", "", ""
+	}
+	switch tool {
+	case "claude":
+		if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
+			return "", "", ""
+		}
+		_, err := keychain.ReadClaude()
+		switch {
+		case err == nil:
+			return "exists", fmt.Sprintf("macOS login keychain (service %q)", keychain.ClaudeService),
+				"Claude Code OAuth token (authoritative on macOS; mirrored to ~/.claude/.credentials.json)"
+		case errors.Is(err, keychain.ErrDenied):
+			return "denied", fmt.Sprintf("macOS login keychain (service %q)", keychain.ClaudeService),
+				"Keychain access denied; unlock login keychain or set CAAM_KEYCHAIN=0"
+		}
+	case "agy":
+		if os.Getenv("GEMINI_HOME") != "" {
+			return "", "", ""
+		}
+		_, err := keychain.ReadAgy()
+		switch {
+		case err == nil:
+			return "exists", fmt.Sprintf("macOS login keychain (service %q, account %q)", keychain.AgyService, keychain.AgyAccount),
+				"Antigravity CLI OAuth token (authoritative on macOS desktop; mirrored to antigravity-oauth-token)"
+		case errors.Is(err, keychain.ErrDenied):
+			return "denied", fmt.Sprintf("macOS login keychain (service %q, account %q)", keychain.AgyService, keychain.AgyAccount),
+				"Keychain access denied; unlock login keychain or set CAAM_KEYCHAIN=0"
+		}
+	}
+	return "", "", ""
 }
 
 // clearCmd removes auth files (logout).

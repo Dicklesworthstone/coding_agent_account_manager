@@ -1402,6 +1402,9 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 	if err := pullClaudeKeychain(fileSet); err != nil {
 		return err
 	}
+	if err := pullAgyKeychain(fileSet); err != nil {
+		return err
+	}
 
 	// Apply validated settings before credential swaps. This also handles a
 	// target with no settings snapshot, removing outgoing auth but not policy.
@@ -1528,6 +1531,10 @@ func (v *Vault) restoreWithClaudeIdentity(fileSet AuthFileSet, profile string, s
 	// The restored file only becomes the account Claude Code uses once it is
 	// back in the login keychain (issue #98).
 	if err := pushClaudeKeychain(fileSet); err != nil {
+		return err
+	}
+	// On macOS, desktop agy reads its OAuth token from the login keychain (issue #140).
+	if err := pushAgyKeychain(fileSet); err != nil {
 		return err
 	}
 	if selected != nil {
@@ -1701,6 +1708,7 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	// mirror the hash comparison below has nothing to compare (issue #98).
 	// A refused keychain leaves detection where it was before the bridge.
 	_ = pullClaudeKeychain(fileSet)
+	_ = pullAgyKeychain(fileSet)
 	if (fileSet.Tool == "claude" || fileSet.Tool == "cursor") && validateCredentialFiles(fileSet, "") != nil {
 		return "", nil
 	}
@@ -1839,10 +1847,11 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 // HasAuthFiles checks if the tool currently has auth files present.
 func HasAuthFiles(fileSet AuthFileSet) bool {
-	// Best-effort mirror: a macOS Claude login lives in the keychain, and
+	// Best-effort mirror: a macOS Claude/agy login lives in the keychain, and
 	// reporting "not logged in" for it would send callers down the login path
-	// (issue #98).
+	// (issues #98, #140).
 	_ = pullClaudeKeychain(fileSet)
+	_ = pullAgyKeychain(fileSet)
 	if fileSet.Tool == "claude" || fileSet.Tool == "cursor" {
 		return validateCredentialFiles(fileSet, "") == nil
 	}
@@ -1901,8 +1910,11 @@ func ClearAuthFiles(fileSet AuthFileSet) error {
 	}
 
 	// Removing the mirror is not a logout while the keychain still holds the
-	// token Claude Code prefers (issue #98).
-	return clearClaudeKeychain(fileSet)
+	// token the CLI prefers (issues #98, #140).
+	if err := clearClaudeKeychain(fileSet); err != nil {
+		return err
+	}
+	return clearAgyKeychain(fileSet)
 }
 
 // --- Claude Desktop OAuth token cache (macOS) -------------------------------

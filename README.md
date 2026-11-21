@@ -422,6 +422,18 @@ Use the same `--base` or `CAAM_SHALLOW_HOMES_DIR` override as your usual
 launcher, if you have one. Linux and other providers retain their existing
 layouts.
 
+> **macOS Keychain note (#138):** Because macOS Claude shallow profiles withhold
+> `Library/Keychains` to prevent Claude Code from reading the host login
+> Keychain, tools launched inside a shallow Claude session that rely on the
+> default macOS Keychain (`security default-keychain`, `gh` with keyring
+> storage, `git`'s `osxkeychain` credential helper, and interactive Claude
+> `/login`) have no default keychain unless your real
+> `~/Library/Preferences/com.apple.security.plist` pins absolute keychain paths.
+> Do **not** click "Reset To Defaults" if macOS prompts during `/login`. Instead,
+> seed Claude shallow credentials with
+> `caam shallow-profile create <name> --from-vault claude/<profile>`, and use
+> `GH_TOKEN` / SSH remotes for `gh` and `git` inside shallow Claude sessions.
+
 **Worked example — 3-way Claude orchestration on a VPS:**
 
 ```bash
@@ -527,7 +539,7 @@ launch. `--print-env` stays read-only.
 |------|--------------|---------------|
 | **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + (macOS) `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
-| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
+| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ (macOS) login Keychain service `gemini` / account `antigravity`, `+ ~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 

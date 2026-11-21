@@ -17,11 +17,13 @@
 //   - ~/.gemini/antigravity-cli/settings.json holds the default model
 //     (e.g. "Gemini 3.1 Pro (High)") and telemetry preference.
 //
-// Keyring finding (Linux): agy does NOT use the OS keyring (libsecret) on Linux.
-// `secret-tool` is not required and no antigravity/agy keyring entry exists; the
-// antigravity-oauth-token file is the sole, authoritative credential store. On
-// platforms that use an OS keychain, agy still writes this token file, so caam
-// treats the file as authoritative across platforms.
+// Keyring behavior:
+//   - On Linux over SSH (and in containers/WSL/missing D-Bus), agy falls back
+//     to the on-disk token file ~/.gemini/antigravity-cli/antigravity-oauth-token.
+//   - On macOS desktop sessions, agy stores its credential in the login Keychain
+//     via go-keyring (service "gemini", account "antigravity", prefixed with
+//     "go-keyring-base64:") and does not write the token file. caam bridges that
+//     Keychain item to/from the token file when GEMINI_HOME is unset (issue #140).
 //
 // Auth file swapping (PRIMARY use case for caam):
 //   - Backup the antigravity-oauth-token + google_accounts.json + oauth_creds.json
@@ -37,6 +39,7 @@ package agy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,6 +48,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
@@ -412,6 +416,30 @@ func (p *Provider) DetectExistingAuth() (*provider.AuthDetection, error) {
 				locCopy := authLoc
 				mostRecent = &locCopy
 			}
+		}
+	}
+
+	if os.Getenv("GEMINI_HOME") == "" && keychain.Enabled() {
+		kcLoc := provider.AuthLocation{
+			Path:        fmt.Sprintf("keychain:%s/%s", keychain.AgyService, keychain.AgyAccount),
+			Description: "Antigravity CLI OAuth token (macOS login keychain)",
+		}
+		blob, err := keychain.ReadAgy()
+		switch {
+		case err == nil:
+			kcLoc.Exists = true
+			kcLoc.IsValid = true
+			kcLoc.FileSize = int64(len(blob))
+			detection.Locations = append(detection.Locations, kcLoc)
+			detection.Found = true
+			locCopy := kcLoc
+			mostRecent = &locCopy
+		case errors.Is(err, keychain.ErrNoKeychain) || errors.Is(err, keychain.ErrNotFound):
+			// No keychain item present; fall back to on-disk detection.
+		default:
+			kcLoc.Exists = true
+			kcLoc.ValidationError = err.Error()
+			detection.Locations = append(detection.Locations, kcLoc)
 		}
 	}
 

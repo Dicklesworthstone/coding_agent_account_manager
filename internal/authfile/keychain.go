@@ -169,6 +169,82 @@ func clearClaudeKeychain(fileSet AuthFileSet) error {
 	return nil
 }
 
+const agyTokenFile = "antigravity-oauth-token"
+
+// agyKeychainPath returns the Antigravity token path the macOS login keychain
+// should be bridged to, or "" when the bridge does not apply (issue #140).
+// Explicit GEMINI_HOME overrides (isolated or shallow profiles) stay file-backed
+// and never mirror or overwrite the host login keychain.
+func agyKeychainPath(fileSet AuthFileSet) string {
+	if fileSet.Tool != "agy" || os.Getenv("GEMINI_HOME") != "" || !keychain.Enabled() {
+		return ""
+	}
+	var tokenPath string
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) == agyTokenFile {
+			tokenPath = spec.Path
+			break
+		}
+	}
+	if tokenPath == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	if filepath.Clean(tokenPath) != filepath.Join(home, ".gemini", "antigravity-cli", agyTokenFile) {
+		return ""
+	}
+	return tokenPath
+}
+
+// pullAgyKeychain refreshes the live ~/.gemini/antigravity-cli/antigravity-oauth-token
+// mirror from the macOS login keychain before file-based reads.
+func pullAgyKeychain(fileSet AuthFileSet) error {
+	tokenPath := agyKeychainPath(fileSet)
+	if tokenPath == "" {
+		return nil
+	}
+	if _, err := keychain.EnsureAgyMirror(tokenPath); err != nil {
+		if errors.Is(err, keychain.ErrNoKeychain) || errors.Is(err, keychain.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("read Antigravity credentials from the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
+// pushAgyKeychain writes the restored antigravity-oauth-token back into the
+// macOS login keychain so desktop agy uses the activated profile (issue #140).
+func pushAgyKeychain(fileSet AuthFileSet) error {
+	tokenPath := agyKeychainPath(fileSet)
+	if tokenPath == "" {
+		return nil
+	}
+	if !fileExists(tokenPath) {
+		return nil
+	}
+	if err := keychain.PushAgyMirror(tokenPath); err != nil {
+		if errors.Is(err, keychain.ErrNoKeychain) {
+			return nil
+		}
+		return fmt.Errorf("write Antigravity credentials to the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
+// clearAgyKeychain removes the Antigravity item from the login keychain on logout.
+func clearAgyKeychain(fileSet AuthFileSet) error {
+	if agyKeychainPath(fileSet) == "" {
+		return nil
+	}
+	if err := keychain.DeleteAgy(); err != nil {
+		return fmt.Errorf("remove Antigravity credentials from the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
 func fileExists(path string) bool {
 	if path == "" {
 		return false

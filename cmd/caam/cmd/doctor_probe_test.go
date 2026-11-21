@@ -23,10 +23,12 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	cursorprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
 
 func TestDoctorValidatesIsolatedCursorCredentials(t *testing.T) {
@@ -528,5 +530,37 @@ func TestHeldAccountsCheck(t *testing.T) {
 	r, ok = heldAccountsCheck(accounts, path, now)
 	if !ok || r.Status != "warn" || !strings.Contains(r.Message, "all 2 accounts") {
 		t.Fatalf("all held: %+v", r)
+	}
+}
+
+func TestAgyKeychainDoctorAndPathsStatus(t *testing.T) {
+	items := testutil.FakeKeychain(t)
+	t.Setenv("GEMINI_HOME", "")
+
+	encoded := "go-keyring-base64:" + base64.StdEncoding.EncodeToString([]byte(`{"auth_method":"oauth","token":"SYNTHETIC"}`))
+	testutil.FakeKeychainStore(t, items, keychain.AgyService, keychain.AgyAccount, encoded)
+
+	if check := checkAgyKeychain(); check == nil || check.Status != "pass" || !strings.Contains(check.Message, keychain.AgyService) {
+		t.Fatalf("checkAgyKeychain() readable = %+v, want pass", check)
+	}
+	if status, label, _ := toolKeychainPathStatus("agy"); status != "exists" || !strings.Contains(label, keychain.AgyAccount) {
+		t.Fatalf("toolKeychainPathStatus(agy) readable = (%q, %q), want exists", status, label)
+	}
+
+	t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+	if check := checkAgyKeychain(); check == nil || check.Status != "fail" {
+		t.Fatalf("checkAgyKeychain() locked = %+v, want fail", check)
+	}
+	if status, _, _ := toolKeychainPathStatus("agy"); status != "denied" {
+		t.Fatalf("toolKeychainPathStatus(agy) locked = %q, want denied", status)
+	}
+
+	// Explicit GEMINI_HOME disables the host keychain bridge.
+	t.Setenv("GEMINI_HOME", filepath.Join(t.TempDir(), ".gemini"))
+	if check := checkAgyKeychain(); check != nil {
+		t.Fatalf("checkAgyKeychain() with GEMINI_HOME = %+v, want nil", check)
+	}
+	if status, _, _ := toolKeychainPathStatus("agy"); status != "" {
+		t.Fatalf("toolKeychainPathStatus(agy) with GEMINI_HOME = %q, want empty", status)
 	}
 }

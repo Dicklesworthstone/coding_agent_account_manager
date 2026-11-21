@@ -2,10 +2,15 @@ package authfile
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
 
 // NOTE: every fixture in this file is SYNTHETIC. No test reads, writes, or
@@ -226,6 +231,112 @@ func TestAgy_ProfileIdentity(t *testing.T) {
 	}
 	if got := v.ProfileIdentity("agy", "work"); got != "work@example.com" {
 		t.Errorf("ProfileIdentity() = %q, want work@example.com", got)
+	}
+}
+
+func TestAgy_KeychainBackupSwitchRestoreClear(t *testing.T) {
+	items := testutil.FakeKeychain(t)
+	home := filepath.Join(t.TempDir(), "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("GEMINI_HOME", "")
+
+	tokenWork := `{"auth_method":"oauth","token":"SYNTHETIC-WORK-KEYCHAIN-TOKEN"}`
+	tokenPersonal := `{"auth_method":"oauth","token":"SYNTHETIC-PERSONAL-KEYCHAIN-TOKEN"}`
+	encodedWork := "go-keyring-base64:" + base64.StdEncoding.EncodeToString([]byte(tokenWork))
+	testutil.FakeKeychainStore(t, items, keychain.AgyService, keychain.AgyAccount, encodedWork)
+
+	fs := AntigravityAuthFiles()
+	v := NewVault(t.TempDir())
+
+	// Read-only detection finds the keychain login without writing a disk mirror.
+	if !HasAuthFilesReadOnly(fs) {
+		t.Fatal("HasAuthFilesReadOnly() = false for keychain-only agy login")
+	}
+	tokenPath := filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("HasAuthFilesReadOnly() created an on-disk mirror: %v", err)
+	}
+
+	// Backup captures the decoded keychain credential even with no on-disk token file.
+	if err := v.Backup(fs, "work"); err != nil {
+		t.Fatalf("Backup(work): %v", err)
+	}
+	savedWork, err := os.ReadFile(v.BackupPath("agy", "work", "antigravity-oauth-token"))
+	if err != nil || string(savedWork) != tokenWork {
+		t.Fatalf("vault work token = %q (err=%v), want %q", savedWork, err, tokenWork)
+	}
+
+	// Simulate signing in as a second account in the keychain and backing it up.
+	encodedPersonal := "go-keyring-base64:" + base64.StdEncoding.EncodeToString([]byte(tokenPersonal))
+	testutil.FakeKeychainStore(t, items, keychain.AgyService, keychain.AgyAccount, encodedPersonal)
+	if err := v.Backup(fs, "personal"); err != nil {
+		t.Fatalf("Backup(personal): %v", err)
+	}
+
+	active, err := v.ActiveProfile(fs)
+	if err != nil || active != "personal" {
+		t.Fatalf("ActiveProfile() = (%q, %v), want personal", active, err)
+	}
+
+	// Switch back to work: both disk mirror and macOS keychain item must update.
+	if _, err := v.Switch(fs, "work", SwitchOptions{BackupMode: "smart"}); err != nil {
+		t.Fatalf("Switch(work): %v", err)
+	}
+	rawKC, ok := testutil.FakeKeychainRead(t, items, keychain.AgyService)
+	if !ok || !strings.HasPrefix(rawKC, "go-keyring-base64:") {
+		t.Fatalf("keychain item after Switch = %q (present=%v), want go-keyring-base64:", rawKC, ok)
+	}
+	decodedKC, err := keychain.ReadAgy()
+	if err != nil || string(decodedKC) != tokenWork {
+		t.Fatalf("ReadAgy() after Switch = (%q, %v), want %q", decodedKC, err, tokenWork)
+	}
+	active, err = v.ActiveProfile(fs)
+	if err != nil || active != "work" {
+		t.Fatalf("ActiveProfile() after Switch = (%q, %v), want work", active, err)
+	}
+
+	// Logout clears both the mirror and the keychain item.
+	if err := ClearAuthFiles(fs); err != nil {
+		t.Fatalf("ClearAuthFiles(): %v", err)
+	}
+	if _, ok := testutil.FakeKeychainRead(t, items, keychain.AgyService); ok {
+		t.Fatal("ClearAuthFiles() left agy item in keychain")
+	}
+	if HasAuthFiles(fs) {
+		t.Fatal("HasAuthFiles() = true after ClearAuthFiles")
+	}
+}
+
+func TestAgy_KeychainRespectsGeminiHomeOverrideAndLockedKeychain(t *testing.T) {
+	items := testutil.FakeKeychain(t)
+	home := filepath.Join(t.TempDir(), "home")
+	override := filepath.Join(t.TempDir(), "isolated-gemini")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	testutil.FakeKeychainStore(t, items, keychain.AgyService, keychain.AgyAccount,
+		"go-keyring-base64:"+base64.StdEncoding.EncodeToString([]byte(agyFakeToken)))
+
+	// Explicit GEMINI_HOME (shallow/isolated profile) must ignore the host keychain.
+	t.Setenv("GEMINI_HOME", override)
+	v := NewVault(t.TempDir())
+	if HasAuthFilesReadOnly(AntigravityAuthFiles()) {
+		t.Fatal("GEMINI_HOME override leaked host keychain login")
+	}
+	if err := v.Backup(AntigravityAuthFiles(), "isolated"); err == nil {
+		t.Fatal("Backup with GEMINI_HOME override backed up host keychain")
+	}
+
+	// Locked keychain must fail Backup loudly instead of silently reporting no auth.
+	t.Setenv("GEMINI_HOME", "")
+	t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+	err := v.Backup(AntigravityAuthFiles(), "locked")
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "keychain") {
+		t.Fatalf("Backup against locked keychain = %v, want keychain error", err)
 	}
 }
 

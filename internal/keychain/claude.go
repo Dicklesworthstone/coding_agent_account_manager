@@ -165,7 +165,7 @@ func writeSecretFile(path string, data []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("keychain: create %s: %w", dir, err)
 	}
-	f, err := os.CreateTemp(dir, ".credentials.json.tmp.*")
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("keychain: create temp file in %s: %w", dir, err)
 	}

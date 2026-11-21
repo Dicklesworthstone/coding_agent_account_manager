@@ -601,6 +601,14 @@ func GeminiCredentialExpiry(key string, raw json.RawMessage) (time.Time, error) 
 // keychain mirror, migrating filenames, or changing native settings. It applies
 // the same credential validation as restore, not an online provider check.
 func HasAuthFilesReadOnly(fileSet AuthFileSet) bool {
+	if fileSet.Tool == "agy" && agyKeychainPath(fileSet) != "" {
+		live, err := readSwitchState(fileSet, "")
+		if err != nil {
+			return false
+		}
+		_, err = inspectDiscovery(fileSet, live)
+		return err == nil
+	}
 	if fileSet.Tool != "claude" {
 		// Cursor's validator preserves its native metadata-only fallback, but
 		// only when the authoritative auth.json is genuinely absent.
@@ -836,6 +844,17 @@ func readSwitchStateLimited(fileSet AuthFileSet, profileDir string, maxFileBytes
 			state.files[claudeCredentialsFile] = data
 		} else if !errors.Is(err, keychain.ErrNoKeychain) && !errors.Is(err, keychain.ErrNotFound) {
 			return state, fmt.Errorf("read outgoing Claude keychain: %w", err)
+		}
+	}
+	if profileDir == "" && agyKeychainPath(fileSet) != "" {
+		data, err := keychain.ReadAgy()
+		if err == nil {
+			if maxFileBytes > 0 && int64(len(data)) > maxFileBytes {
+				return state, fmt.Errorf("%w: Antigravity keychain credential exceeds discovery size limit", ErrInvalidCredentials)
+			}
+			state.files[agyTokenFile] = data
+		} else if !errors.Is(err, keychain.ErrNoKeychain) && !errors.Is(err, keychain.ErrNotFound) {
+			return state, fmt.Errorf("read outgoing Antigravity keychain: %w", err)
 		}
 	}
 	state.identify(fileSet)
