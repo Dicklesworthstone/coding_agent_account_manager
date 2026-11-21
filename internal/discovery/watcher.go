@@ -396,6 +396,15 @@ func (w *Watcher) refreshWatches(run *watchRun) {
 	for dir, previous := range run.dirs {
 		if info, ok := wanted[dir]; !ok || !os.SameFile(previous, info) {
 			_ = run.source.Remove(dir)
+			// On kqueue (macOS/BSD), fsnotify removes a renamed directory watch
+			// before our Remove(dir) call, leaving stale child-file vnode fds
+			// behind so a later Add(dir) reuses the old file descriptor instead
+			// of watching the replacement file.
+			for watched := range w.paths {
+				if filepath.Dir(watched) == dir {
+					_ = run.source.Remove(watched)
+				}
+			}
 			delete(run.dirs, dir)
 		}
 	}
@@ -423,7 +432,7 @@ func (w *Watcher) reconcile(run *watchRun, now time.Time) {
 	// The login keychain can change without touching any mirrored auth file.
 	if keychain.Enabled() {
 		for _, fileSet := range w.fileSets {
-			if fileSet.Tool == "claude" && run.pending[fileSet.Tool] == nil {
+			if (fileSet.Tool == "claude" || fileSet.Tool == "agy") && run.pending[fileSet.Tool] == nil {
 				run.pending[fileSet.Tool] = &pendingDiscovery{changedAt: now}
 			}
 		}

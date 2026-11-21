@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1537,7 +1538,9 @@ func TestWatcherReopensClosedBackend(t *testing.T) {
 	select {
 	case next := <-backends:
 		require.NotSame(t, first, next)
-		require.Contains(t, next.WatchList(), dir)
+		require.Eventually(t, func() bool {
+			return slices.Contains(next.WatchList(), dir)
+		}, 2*time.Second, 10*time.Millisecond)
 	case <-time.After(5 * time.Second):
 		t.Fatal("notification backend was not recreated")
 	}

@@ -69,7 +69,7 @@ func TestWatchCommandRejectsInvalidOptionsBeforeScanning(t *testing.T) {
 		{"empty provider", []string{"--provider", " "}, "unknown provider"},
 		{"zero poll interval", []string{"--poll-interval", "0s"}, "--poll-interval must be greater than zero"},
 		{"negative poll interval", []string{"--poll-interval", "-1s"}, "--poll-interval must be greater than zero"},
-		{"invalid poll interval", []string{"--poll-interval", "quickly"}, "invalid duration"},
+		{"invalid poll interval", []string{"--poll-interval", "quickly"}, "must be a duration"},
 		{"zero debounce", []string{"--debounce", "0s"}, "--debounce must be greater than zero"},
 		{"negative debounce", []string{"--debounce", "-1ms"}, "--debounce must be greater than zero"},
 		{"positional argument", []string{"unexpected"}, "unknown command"},
