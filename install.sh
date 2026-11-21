@@ -214,11 +214,12 @@ die() {
     exit "${2:-$EXIT_ERROR}"
 }
 
-# Spinner for long operations
+# Spinner for long operations. gum spin launches an external executable, so
+# shell functions and builtins run directly in this shell instead.
 spin() {
     local msg="$1"
     shift
-    if [ "$HAS_GUM" = true ] && [ "$IS_TTY" = true ]; then
+    if [ "$HAS_GUM" = true ] && [ "$IS_TTY" = true ] && [ "$(type -t "$1" 2>/dev/null || true)" = "file" ]; then
         gum spin --spinner dot --title "$msg" -- "$@"
     else
         info "$msg"
@@ -1441,21 +1442,13 @@ try_binary_install() {
 
     local archive_path="$tmp_dir/archive${ext}"
 
-    # Use spin for download if gum available
-    if [ "$HAS_GUM" = true ]; then
-        if ! spin "Downloading $asset_name" download_file "$download_url" "$archive_path" "false"; then
-            error "Download failed from: $download_url"
-            BINARY_DOWNLOAD_FAILED=true
-            error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-            return 1
-        fi
-    else
-        if ! download_file "$download_url" "$archive_path" "false"; then
-            error "Download failed from: $download_url"
-            BINARY_DOWNLOAD_FAILED=true
-            error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-            return 1
-        fi
+    # download_file is a Bash function; invoke it directly rather than passing
+    # it to gum spin (which can only exec external binaries, issue #137).
+    if ! download_file "$download_url" "$archive_path" "false"; then
+        error "Download failed from: $download_url"
+        BINARY_DOWNLOAD_FAILED=true
+        error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+        return 1
     fi
 
     if ! verify_release_assets "$release_json" "$version" "$asset_name" "$archive_path" "$tmp_dir"; then

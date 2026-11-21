@@ -1566,3 +1566,139 @@ func TestTemporaryCleanupErrorsPreserveInstallStatus(t *testing.T) {
 		})
 	}
 }
+
+// TestInteractiveGumDownloadDoesNotPassShellFunctionToGum guards against issue #137:
+// gum spin executes an external process and cannot invoke Bash shell functions
+// like download_file. Verify both the main binary-install path and spin() itself
+// using a real executable gum stand-in that dispatches via exec without parent
+// shell functions.
+func TestInteractiveGumDownloadDoesNotPassShellFunctionToGum(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.Mkdir(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gumTrace := filepath.Join(dir, "gum-trace")
+	gumScript := `#!/bin/sh
+if [ "$1" = "style" ]; then
+    shift
+    while [ "$#" -gt 1 ]; do shift; done
+    printf '%s\n' "$1"
+    exit 0
+fi
+if [ "$1" = "spin" ]; then
+    printf 'spin\n' >> "$GUM_TRACE"
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    [ "$1" = "--" ] && shift
+    exec "$@"
+fi
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gum"), []byte(gumScript), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("spin falls back for shell functions", func(t *testing.T) {
+		marker := filepath.Join(dir, "fn-ran")
+		setup := `
+HAS_GUM=true
+IS_TTY=true
+USE_COLOR=false
+helper_fn() { printf 'ok:%s\n' "$1" > "$FN_MARKER"; }
+`
+		pathEnv := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+		stdout, stderr, code := runInstallFunc(t, []string{
+			"PATH=" + pathEnv, "GUM_TRACE=" + gumTrace, "FN_MARKER=" + marker,
+		}, setup, `spin "Running helper" helper_fn arg1`, "")
+		if code != 0 {
+			t.Fatalf("spin(shell function) failed: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+		}
+		if got, err := os.ReadFile(marker); err != nil || string(got) != "ok:arg1\n" {
+			t.Fatalf("helper_fn marker=%q err=%v", got, err)
+		}
+		if trace, err := os.ReadFile(gumTrace); err == nil && len(trace) > 0 {
+			t.Fatalf("spin invoked gum spin for a Bash function: %q", trace)
+		}
+	})
+
+	t.Run("binary install with gum enabled succeeds without source fallback", func(t *testing.T) {
+		installed := filepath.Join(dir, "installed")
+		if err := os.Mkdir(installed, 0700); err != nil {
+			t.Fatal(err)
+		}
+		program := []byte("#!/bin/sh\nprintf 'caam v0.1.25\\n'\n")
+		var archive bytes.Buffer
+		gw := gzip.NewWriter(&archive)
+		tw := tar.NewWriter(gw)
+		if err := tw.WriteHeader(&tar.Header{Name: "caam", Mode: 0755, Size: int64(len(program))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(program); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		archivePath := filepath.Join(dir, "caam.tar.gz")
+		if err := os.WriteFile(archivePath, archive.Bytes(), 0600); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(archive.Bytes())
+		assetName := "caam_0.1.25_linux_amd64.tar.gz"
+		assetURL := "https://example.test/" + assetName
+		release, err := json.Marshal(map[string]any{
+			"tag_name": "v0.1.25",
+			"assets": []map[string]string{
+				{"name": assetName, "browser_download_url": assetURL},
+				{"name": "SHA256SUMS", "browser_download_url": "https://example.test/SHA256SUMS"},
+				{"name": "SHA256SUMS.minisig", "browser_download_url": "https://example.test/SHA256SUMS.minisig"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fallbackMarker := filepath.Join(dir, "fallback")
+		pathEnv := binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+		setup := `
+VERIFY_AFTER_INSTALL=true
+detect_terminal_features() { USE_COLOR=true; HAS_GUM=true; IS_TTY=true; }
+detect_platform() { printf 'linux_amd64\n'; }
+get_release() { printf '%s' "$RELEASE_JSON"; }
+get_installed_version() { :; }
+try_go_install() { printf 'fallback\n' > "$FALLBACK_MARKER"; return 1; }
+download_file() {
+    case "$1" in
+        "$ASSET_URL") cp "$FIXTURE_ARCHIVE" "$2" ;;
+        */SHA256SUMS) printf '%s  %s\n' "$FIXTURE_SUM" "$FIXTURE_ASSET" > "$2" ;;
+        */SHA256SUMS.minisig) printf 'sig\n' > "$2" ;;
+        *) return 1 ;;
+    esac
+}
+minisign() { [ "$#" -eq 7 ]; }
+`
+		stdout, stderr, code := runInstallFunc(t, []string{
+			"PATH=" + pathEnv,
+			"GUM_TRACE=" + gumTrace,
+			"INSTALL_DIR=" + installed,
+			"RELEASE_JSON=" + string(release),
+			"FIXTURE_ARCHIVE=" + archivePath,
+			"FIXTURE_SUM=" + hex.EncodeToString(sum[:]),
+			"FIXTURE_ASSET=" + assetName,
+			"ASSET_URL=" + assetURL,
+			"FALLBACK_MARKER=" + fallbackMarker,
+		}, setup, `main`, "")
+		if code != 0 {
+			t.Fatalf("interactive gum install failed: exit=%d stdout=%s stderr=%s", code, stdout, stderr)
+		}
+		if _, err := os.Stat(fallbackMarker); !os.IsNotExist(err) {
+			t.Fatalf("interactive gum install fell back to source build")
+		}
+		got, err := os.ReadFile(filepath.Join(installed, "caam"))
+		if err != nil || !bytes.Equal(got, program) {
+			t.Fatalf("installed binary mismatch: err=%v", err)
+		}
+	})
+}
