@@ -1056,7 +1056,7 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 
 	for _, e := range entries {
 		name := e.Name()
-		if skip[name] {
+		if skip[name] || (runtime.GOOS == "windows" && isWindowsReservedName(name)) {
 			continue
 		}
 		src := filepath.Join(m.realHome, name)
@@ -1075,6 +1075,25 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 		}
 	}
 	return nil
+}
+
+// isWindowsReservedName reports whether name is a reserved Windows DOS device
+// name (CON, PRN, AUX, NUL, COM1..COM9, LPT1..LPT9, optionally with an
+// extension). Such entries can appear in %USERPROFILE% from POSIX tools, but
+// Win32 file APIs map them to device objects and fail when symlinking/removing.
+func isWindowsReservedName(name string) bool {
+	stem := strings.TrimRight(name, ". ")
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
+	}
+	switch strings.ToUpper(stem) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
 }
 
 // populateInnerSymlinks creates per-entry symlinks inside a real directory
@@ -1118,7 +1137,7 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if skip[name] {
+		if skip[name] || (runtime.GOOS == "windows" && isWindowsReservedName(name)) {
 			continue
 		}
 		src := filepath.Join(srcDir, name)

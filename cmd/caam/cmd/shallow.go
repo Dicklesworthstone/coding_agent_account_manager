@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
+	caamexec "github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	providerapi "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/spf13/cobra"
@@ -1133,9 +1133,16 @@ func runShallowSpawn(cmd *cobra.Command, args []string) (runErr error) {
 	}
 	envSlice := providerapi.MergeEnvironment(os.Environ(), changes, explicit)
 
-	// On Unix, exec the target so signals/exit propagate naturally and we
-	// don't add a stray caam process to the tree.
-	return spawnExec(binPath, rest, envSlice)
+	// On Unix, exec the target so signals/exit propagate naturally without a
+	// stray caam process; on Windows, run as a child process and propagate its
+	// exit code without Cobra usage noise.
+	err = spawnExec(binPath, rest, envSlice)
+	var exitErr *caamexec.ExitCodeError
+	if errors.As(err, &exitErr) {
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+	}
+	return err
 }
 
 // parseShallowTokenFD deliberately never quotes input in errors. The flag
@@ -1191,8 +1198,6 @@ func injectCodexEffort(argv []string, effort string) ([]string, error) {
 	return out, nil
 }
 
-// spawnExec replaces the current process image with the target on Unix.
-// Wrapped in a function so tests can inject a fake.
-var spawnExec = func(binPath string, args []string, env []string) error {
-	return syscall.Exec(binPath, args, env)
-}
+// spawnExec launches the target command (syscall.Exec on Unix; child process
+// execution on Windows). Wrapped in a function so tests can inject a fake.
+var spawnExec = defaultSpawnExec

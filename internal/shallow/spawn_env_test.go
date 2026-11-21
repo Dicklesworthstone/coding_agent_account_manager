@@ -52,3 +52,16 @@ func TestSpawnEnvScrubsEveryProviderHome(t *testing.T) {
 		})
 	}
 }
+
+func TestIsWindowsReservedName(t *testing.T) {
+	for _, reserved := range []string{"nul", "NUL", "Nul.txt", "CON", "prn.log", "AUX", "com1", "COM9.dat", "lpt1", "LPT9"} {
+		if !isWindowsReservedName(reserved) {
+			t.Errorf("isWindowsReservedName(%q) = false, want true", reserved)
+		}
+	}
+	for _, normal := range []string{"null", ".bashrc", "config.toml", "com10", "lpt0", "console", "auxiliary"} {
+		if isWindowsReservedName(normal) {
+			t.Errorf("isWindowsReservedName(%q) = true, want false", normal)
+		}
+	}
+}
