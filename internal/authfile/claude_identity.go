@@ -245,6 +245,10 @@ func (v *Vault) copyClaudeIdentitySnapshot(ctx context.Context, source *claudePr
 	if err != nil {
 		return err
 	}
+	ancestor, err := existingIsolatedBackupAncestor(filepath.Dir(destination))
+	if err != nil {
+		return err
+	}
 	parent, err := inspectIsolatedSourceDir(filepath.Dir(destination))
 	if err != nil {
 		return err
@@ -306,7 +310,7 @@ func (v *Vault) copyClaudeIdentitySnapshot(ctx context.Context, source *claudePr
 			return fmt.Errorf("stage verified copy %s: %w", file.name, err)
 		}
 	}
-	return publishIsolatedBackupDurably(stage, destination, parent, func() error {
+	return publishIsolatedBackupDurably(stage, destination, ancestor, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

@@ -1413,3 +1413,37 @@ func TestClaudeSyncSourceGuardProtectsStagingAndRollsBackPublication(t *testing.
 		})
 	}
 }
+
+func TestClaudeRecoveryIdentityCopySucceedsThroughSymlinkedVault(t *testing.T) {
+	realRoot := t.TempDir()
+	realVault := filepath.Join(realRoot, "real-vault")
+	if err := os.MkdirAll(filepath.Join(realVault, "claude"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	linkRoot := filepath.Join(t.TempDir(), "vault-link")
+	if err := os.Symlink(realVault, linkRoot); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	v := NewVault(linkRoot)
+	v.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		return issue132Proof(t, data, "account-symlink", "org-symlink"), nil
+	}
+	backupDir := v.ProfilePath("claude", "_backup_symlink")
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(backupDir, claudeCredentialsFile), aliceGen1)
+	writeFixtureFile(t, filepath.Join(backupDir, claudeSettingsFile), aliceSettings(1))
+
+	result, err := v.ClaudeProfileIdentity(context.Background(), "_backup_symlink", ClaudeProfileIdentityOptions{
+		Online: true,
+		CopyTo: "recovered-symlink",
+	})
+	if err != nil || result.CopiedTo != "recovered-symlink" || result.Identity == nil || result.Identity.OrganizationID != "org-symlink" {
+		t.Fatalf("symlinked vault copy = %+v, %v", result, err)
+	}
+	if got := readFixtureFile(t, v.BackupPath("claude", "recovered-symlink", claudeCredentialsFile)); got != aliceGen1 {
+		t.Fatalf("copied credentials = %q, want %q", got, aliceGen1)
+	}
+}
