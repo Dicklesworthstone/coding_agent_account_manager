@@ -329,7 +329,7 @@ func TestSourceTarballRefHonorsRequestedVersion(t *testing.T) {
 func TestTryGoInstallRefusesRequestedTagCheckoutFailure(t *testing.T) {
 	tmp := t.TempDir()
 	setup := `
-ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+ensure_go() { SOURCE_GO_VERSION=1.26.11; }
 make_tmp_dir() { printf -v "$1" '%s' "$TEST_TMP"; }
 git() {
     if [ "$1" = "clone" ]; then
@@ -352,7 +352,7 @@ func TestTryGoInstallTarballFallbackUsesRequestedTag(t *testing.T) {
 	tmp := t.TempDir()
 	capture := filepath.Join(t.TempDir(), "url")
 	setup := `
-ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+ensure_go() { SOURCE_GO_VERSION=1.26.11; }
 make_tmp_dir() { printf -v "$1" '%s' "$TEST_TMP"; }
 git() { return 1; }
 download_file() {
@@ -381,9 +381,9 @@ func TestEnsureGoRequiresPinnedSourceBuildFloor(t *testing.T) {
 		version string
 		ok      bool
 	}{
-		{"1.26.8", false},
 		{"1.26.9", false},
-		{"1.26.10", true},
+		{"1.26.10", false},
+		{"1.26.11", true},
 		{"1.27.0", true},
 	} {
 		t.Run(tc.version, func(t *testing.T) {
@@ -396,7 +396,7 @@ uname() { printf 'Linux\n'; }
 			if (code == 0) != tc.ok {
 				t.Fatalf("ensure_go(go%s) exit=%d stdout=%q stderr=%q", tc.version, code, out, stderr)
 			}
-			if !tc.ok && !strings.Contains(out+stderr, "1.26.10") {
+			if !tc.ok && !strings.Contains(out+stderr, "1.26.11") {
 				t.Fatalf("old toolchain diagnostic did not name the required floor: stdout=%s stderr=%s", out, stderr)
 			}
 		})
@@ -414,7 +414,7 @@ func TestPinnedGoToolchainStaysAligned(t *testing.T) {
 		return string(data)
 	}
 
-	const want = "1.26.10"
+	const want = "1.26.11"
 	checks := []struct {
 		path, needle string
 	}{
@@ -1410,7 +1410,7 @@ select_release_asset() {
     printf 'v0.1.24\nhttps://example.test/binary.tar.gz\ncaam_0.1.24_linux_amd64.tar.gz\n'
 }
 verify_release_assets() { [ "$TEST_FAILURE" != verify ]; }
-ensure_go() { SOURCE_GO_VERSION=1.26.10; }
+ensure_go() { SOURCE_GO_VERSION=1.26.11; }
 mktemp() {
     [ "$TEST_FAILURE" != mktemp ] || return 1
     command mktemp "$@"
@@ -1517,10 +1517,10 @@ func TestGoBootstrapTemporaryDirectoryCleanup(t *testing.T) {
 GO_READY=false
 IS_TTY=false
 USE_COLOR=false
-go() { if [ "$GO_READY" = true ]; then printf 'go version go1.26.10 darwin/arm64\n'; else printf 'go version go1.26.9 darwin/arm64\n'; fi; }
+go() { if [ "$GO_READY" = true ]; then printf 'go version go1.26.11 darwin/arm64\n'; else printf 'go version go1.26.10 darwin/arm64\n'; fi; }
 brew() { return 1; }
 uname() { printf 'Darwin\n'; }
-fetch_latest_go_pkg() { printf 'go1.26.10\nhttps://example.test/go.pkg\n%s\n' "$PKG_SUM"; }
+fetch_latest_go_pkg() { printf 'go1.26.11\nhttps://example.test/go.pkg\n%s\n' "$PKG_SUM"; }
 curl() {
     [ "$TEST_FAILURE" != download ] || return 1
     if [ "$TEST_FAILURE" = interrupt ]; then kill -TERM "$$"; return 1; fi
@@ -1533,7 +1533,7 @@ sudo() { [ "$TEST_FAILURE" != install ] || return 1; GO_READY=true; }
 			sum := sha256.Sum256([]byte("verified-pkg"))
 			stdout, stderr, code := runInstallFunc(t, []string{
 				"TMPDIR=" + tmp, "TEST_FAILURE=" + failure, "PKG_SUM=" + hex.EncodeToString(sum[:]),
-			}, setup, `if ensure_go; then [ "$SOURCE_GO_VERSION" = 1.26.10 ]; else exit 1; fi`, "")
+			}, setup, `if ensure_go; then [ "$SOURCE_GO_VERSION" = 1.26.11 ]; else exit 1; fi`, "")
 			wantCode := 1
 			if failure == "" {
 				wantCode = 0

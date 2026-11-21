@@ -1293,7 +1293,7 @@ is_tty() {
 
 ensure_go() {
     # Keep source builds aligned with go.mod's pinned release toolchain.
-    local min_version="1.26.10"
+    local min_version="1.26.11"
     local go_version=""
 
     if command -v go >/dev/null 2>&1; then
@@ -1528,7 +1528,7 @@ try_go_install() {
     info "Attempting to build from source with go build..."
 
     if ! ensure_go; then
-        error "Go 1.26.10 or later is required for building from source."
+        error "Go 1.26.11 or later is required for building from source."
         error ""
         error "Install Go:"
         error "  macOS:         brew install go"
@@ -1609,7 +1609,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.26.10+ is installed: go version"
+            error "  1. Ensure Go 1.26.11+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
@@ -1619,7 +1619,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.26.10+ is installed: go version"
+            error "  1. Ensure Go 1.26.11+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
