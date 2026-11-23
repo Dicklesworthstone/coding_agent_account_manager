@@ -58,3 +58,33 @@
   - `internal/installscript` `TestInstallerTemporaryDirectoryLifecycle`: fails under the full parallel run at base
     and with the update; passes when run alone.
 - `govulncheck ./...`: no vulnerabilities, before and after.
+
+---
+
+# Dependency Upgrade Log: web/dashboard
+
+**Date:** 2026-11-22  |  **Project:** coding_agent_account_manager `web/dashboard`  |  **Language:** TypeScript (Next.js, pnpm)
+
+## Why
+`pnpm audit` on the lockfile reported 37 advisories (5 critical, 10 high, 20 moderate, 2 low), including
+next < 16.3.6 (next/og ImageResponse remote code execution), tinypool <= 2.1.0 via vitest, brace-expansion and
+source-map-js.
+
+## Updated
+- Step 1 (minor/patch): `next` 16.3.4 -> 16.4.6, `eslint-config-next` 16.3.4 -> 16.4.6, `react`/`react-dom`
+  19.2.3 -> 19.3.1, `@types/react` -> ^19.3.0, `@types/react-dom` -> ^19.3.0, `tailwindcss` and
+  `@tailwindcss/postcss` -> ^4.3.5, `@playwright/test` -> ^1.65.1, plus `pnpm update` within the existing ranges.
+  Audit after this step: 5 (3 moderate, 2 critical), all through vitest.
+- Step 2 (major, dev-only): `vitest` ^3.2.7 -> ^4.1.12. Audit after this step: no known vulnerabilities.
+
+## Held (majors, not needed for the audit)
+eslint 10, typescript 7, @types/node 26, jsdom 31, @testing-library/jest-dom 8, @vitejs/plugin-react 6,
+framer-motion 14, lucide-react 1.x, vitest 5 (needs @types/node >= 22).
+
+## Verification (each step)
+- `pnpm run typecheck`, `pnpm run lint`: clean before and after.
+- `pnpm run test`: 52/52 with `NODE_OPTIONS=--no-experimental-webstorage`, before and after. Run as-is on Node 26,
+  27 tests fail before and after with `Cannot read properties of undefined (reading 'clear')`: Node 25+ defines a
+  global `localStorage` that shadows jsdom's.
+- `pnpm run build`: 7 static routes before and after; client JS in `.next/static` 744,197 -> 745,764 bytes (+0.2%).
+- Playwright e2e (`test:e2e`) needs a live caam API and was not run.
