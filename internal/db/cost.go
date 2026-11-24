@@ -9,16 +9,16 @@ import (
 
 // WrapSession represents a recorded wrap session.
 type WrapSession struct {
-	ID                int
-	Provider          string
-	ProfileName       string
-	StartedAt         time.Time
-	EndedAt           time.Time
-	DurationSeconds   int
-	ExitCode          int
-	RateLimitHit      bool
+	ID                 int
+	Provider           string
+	ProfileName        string
+	StartedAt          time.Time
+	EndedAt            time.Time
+	DurationSeconds    int
+	ExitCode           int
+	RateLimitHit       bool
 	EstimatedCostCents int
-	Notes             string
+	Notes              string
 }
 
 // CostRate represents the cost rate configuration for a provider.

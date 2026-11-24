@@ -116,8 +116,8 @@ func TestSSHError(t *testing.T) {
 
 	t.Run("IsNetworkError", func(t *testing.T) {
 		err := &SSHError{
-			Machine:    machine,
-			Operation:  "connect",
+			Machine:   machine,
+			Operation: "connect",
 			Underlying: &net.OpError{
 				Op:  "dial",
 				Err: errors.New("connection refused"),
@@ -315,9 +315,9 @@ func TestConnectivityResult(t *testing.T) {
 
 func TestPosixJoin(t *testing.T) {
 	tests := []struct {
-		name   string
-		elems  []string
-		want   string
+		name  string
+		elems []string
+		want  string
 	}{
 		{"empty", []string{}, ""},
 		{"single", []string{"foo"}, "foo"},

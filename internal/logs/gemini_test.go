@@ -256,10 +256,10 @@ func TestGeminiScannerImplementsScanner(t *testing.T) {
 
 func TestAsInt64(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    any
-		wantVal  int64
-		wantOK   bool
+		name    string
+		input   any
+		wantVal int64
+		wantOK  bool
 	}{
 		{
 			name:    "float64 positive",
@@ -368,15 +368,15 @@ func TestAsMap(t *testing.T) {
 
 func TestExtractInt64(t *testing.T) {
 	data := map[string]any{
-		"present":   int64(100),
-		"float":     float64(200.5),
-		"string":    "300",
-		"non_int":   "not a number",
+		"present": int64(100),
+		"float":   float64(200.5),
+		"string":  "300",
+		"non_int": "not a number",
 	}
 
 	tests := []struct {
-		key     string
-		want    int64
+		key  string
+		want int64
 	}{
 		{"present", 100},
 		{"float", 200},
@@ -401,11 +401,11 @@ func TestGeminiScanner_ParseTokenFields(t *testing.T) {
 	scanner := NewGeminiScannerWithDir("/ignored")
 
 	tests := []struct {
-		name         string
-		input        string
-		wantInput    int64
-		wantOutput   int64
-		wantTotal    int64
+		name       string
+		input      string
+		wantInput  int64
+		wantOutput int64
+		wantTotal  int64
 	}{
 		{
 			name:       "prompt_tokens and completion_tokens",
@@ -464,9 +464,9 @@ func TestGeminiScanner_ParseEntryType(t *testing.T) {
 	scanner := NewGeminiScannerWithDir("/ignored")
 
 	tests := []struct {
-		name      string
-		input     string
-		wantType  string
+		name     string
+		input    string
+		wantType string
 	}{
 		{
 			name:     "event field",

@@ -61,13 +61,13 @@ func (n *TerminalNotifier) Notify(alert *Alert) error {
 
 	// Format: [LEVEL] Title: Message (Profile)
 	line := fmt.Sprintf("%s%s %s%s: %s", colorCode, prefix, title, resetCode, message)
-	
+
 	if alert.Profile != "" {
 		line += fmt.Sprintf(" (%s)", alert.Profile)
 	}
-	
+
 	fmt.Fprintln(n.writer, line)
-	
+
 	if alert.Action != "" {
 		fmt.Fprintf(n.writer, "       Action: %s\n", alert.Action)
 	}

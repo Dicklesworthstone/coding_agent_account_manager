@@ -42,21 +42,21 @@ type Peer struct {
 	OS           string   `json:"OS"`
 
 	// Additional optional fields that may appear in newer tailscale versions.
-	UserID      *int64  `json:"UserID,omitempty"`
-	PublicKey   *string `json:"PublicKey,omitempty"`
-	ExitNode    *bool   `json:"ExitNode,omitempty"`
-	Active      *bool   `json:"Active,omitempty"`
-	LastSeen    *string `json:"LastSeen,omitempty"`
-	LastWrite   *string `json:"LastWrite,omitempty"`
+	UserID        *int64  `json:"UserID,omitempty"`
+	PublicKey     *string `json:"PublicKey,omitempty"`
+	ExitNode      *bool   `json:"ExitNode,omitempty"`
+	Active        *bool   `json:"Active,omitempty"`
+	LastSeen      *string `json:"LastSeen,omitempty"`
+	LastWrite     *string `json:"LastWrite,omitempty"`
 	LastHandshake *string `json:"LastHandshake,omitempty"`
 }
 
 // VersionInfo contains tailscale CLI version information.
 type VersionInfo struct {
-	CLIVersion   string // Version from 'tailscale version'
-	Short        string // Short version (e.g., "1.56.1")
-	Long         string // Full version string
-	Commit       string // Git commit if available
+	CLIVersion    string // Version from 'tailscale version'
+	Short         string // Short version (e.g., "1.56.1")
+	Long          string // Full version string
+	Commit        string // Git commit if available
 	StatusVersion string // Version from status JSON (may differ)
 }
 

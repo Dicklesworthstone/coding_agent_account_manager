@@ -12,11 +12,11 @@ import (
 
 // PaneFixture represents a test fixture for pane discovery.
 type PaneFixture struct {
-	Name          string
-	Content       string
-	Tool          string
-	Override      *regexp.Regexp
-	ShouldMatch   bool
+	Name           string
+	Content        string
+	Tool           string
+	Override       *regexp.Regexp
+	ShouldMatch    bool
 	ExpectedReason string
 }
 
@@ -32,16 +32,16 @@ var claudeRateLimitFixtures = []PaneFixture{
 You've hit your limit · resets 3:00 PM
 
 Rate limit reached. Please wait or upgrade to continue.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 	{
 		Name: "claude_rate_limit_with_ansi",
 		Content: "\x1b[31mYou've hit your limit\x1b[0m · resets 3:00 PM\n" +
 			"\x1b[90mRate limit reached\x1b[0m",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 	{
@@ -52,8 +52,8 @@ Rate limit reached. Please wait or upgrade to continue.`,
 
 You have reached your daily usage limit.
 Please try again later or upgrade your plan.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 	{
@@ -61,16 +61,16 @@ Please try again later or upgrade your plan.`,
 		Content: `error: too many requests
 Please wait a moment before trying again.
 Claude Code session closed.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 	{
 		Name: "claude_429_error",
 		Content: `HTTP 429: Too Many Requests
 Claude API rate limit exceeded. Retry after 60s.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 }
@@ -87,8 +87,8 @@ var claudeToolMarkerFixtures = []PaneFixture{
 > How can I help you today?
 
 I'm ready to assist with your coding tasks.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -98,8 +98,8 @@ I'm ready to assist with your coding tasks.`,
 Claude is analyzing your request. This may take a moment.
 
 > What would you like me to help you with?`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -108,8 +108,8 @@ Claude is analyzing your request. This may take a moment.
 Version 3.5 Sonnet
 
 Enter /help for available commands.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -117,8 +117,8 @@ Enter /help for available commands.`,
 		Content: `Starting claude code...
 Connecting to Anthropic API...
 Session ready.`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -127,8 +127,8 @@ Session ready.`,
 			"║          Claude Code Session           ║\n" +
 			"╚════════════════════════════════════════╝\n" +
 			"Ready for input.",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -138,8 +138,8 @@ Browser didn't open? Use the url below:
 https://claude.ai/oauth/authorize?code=true&client_id=abc
 
 Paste code here if prompted >`,
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 }
@@ -155,8 +155,8 @@ var codexToolMarkerFixtures = []PaneFixture{
 Powered by OpenAI
 
 Type your request or /help for commands.`,
-		Tool:          "codex",
-		ShouldMatch:   true,
+		Tool:           "codex",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -164,8 +164,8 @@ Type your request or /help for commands.`,
 		Content: `OpenAI Codex
 Connected to GPT-4 model.
 Ready for code generation.`,
-		Tool:          "codex",
-		ShouldMatch:   true,
+		Tool:           "codex",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -173,8 +173,8 @@ Ready for code generation.`,
 		Content: `OpenAI API rate limit reached.
 Too many requests in the last hour.
 Please wait before trying again.`,
-		Tool:          "codex",
-		ShouldMatch:   true,
+		Tool:           "codex",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 }
@@ -190,8 +190,8 @@ var geminiToolMarkerFixtures = []PaneFixture{
 Google AI Platform
 
 Ready for conversation.`,
-		Tool:          "gemini",
-		ShouldMatch:   true,
+		Tool:           "gemini",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -199,8 +199,8 @@ Ready for conversation.`,
 		Content: `Powered by Google AI
 Model: Gemini Pro 1.5
 Enter your query:`,
-		Tool:          "gemini",
-		ShouldMatch:   true,
+		Tool:           "gemini",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -208,8 +208,8 @@ Enter your query:`,
 		Content: `RESOURCE_EXHAUSTED: Quota exceeded
 You have exceeded your API quota for the day.
 Please try again tomorrow or upgrade your plan.`,
-		Tool:          "gemini",
-		ShouldMatch:   true,
+		Tool:           "gemini",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 }
@@ -226,8 +226,8 @@ user@hostname ~ % ls -la
 total 48
 drwxr-xr-x  12 user  staff   384 Jan 20 10:00 .
 drwxr-xr-x   6 user  staff   192 Jan 15 14:30 ..`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -237,8 +237,8 @@ On branch main
 Your branch is up to date with 'origin/main'.
 
 nothing to commit, working tree clean`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -253,8 +253,8 @@ nothing to commit, working tree clean`,
 ~
 ~
 -- INSERT -- 1,1 All`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -262,8 +262,8 @@ nothing to commit, working tree clean`,
 		Content: `  PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+  Command
  1234 user       20   0  512M  128M  64M S  5.0  1.5   0:01.23 /usr/bin/code
  5678 user       20   0  256M   64M  32M S  2.0  0.8   0:00.45 node server.js`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -272,8 +272,8 @@ nothing to commit, working tree clean`,
 npm WARN deprecated har-validator@5.1.5: this library is no longer supported
 
 added 245 packages, and audited 246 packages in 3s`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -281,8 +281,8 @@ added 245 packages, and audited 246 packages in 3s`,
 		Content: `CONTAINER ID   IMAGE          COMMAND       CREATED        STATUS        PORTS     NAMES
 a1b2c3d4e5f6   postgres:15    "docker..."   2 hours ago    Up 2 hours    5432/tcp  mydb
 f6e5d4c3b2a1   redis:latest   "docker..."   3 hours ago    Up 3 hours    6379/tcp  cache`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -293,8 +293,8 @@ Type "help", "copyright", "credits" or "license" for more information.
 >>> np.array([1, 2, 3])
 array([1, 2, 3])
 >>>`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -305,8 +305,8 @@ array([1, 2, 3])
 --- PASS: TestCalculator (0.00s)
 PASS
 ok      example.com/myapp    0.003s`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -321,8 +321,8 @@ SYNOPSIS
 
 DESCRIPTION
        List information about the FILEs.`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
@@ -334,16 +334,16 @@ DESCRIPTION
 
 Last login: Mon Jan 20 09:00:00 2026 from 192.168.1.100
 ubuntu@server:~$`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
 		Name: "tmux_status",
 		Content: `[0] 0:bash* 1:vim- 2:htop
                                         "hostname" 10:30 20-Jan-26`,
-		Tool:          "claude",
-		ShouldMatch:   false,
+		Tool:           "claude",
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 }
@@ -358,8 +358,8 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 		Content: "\x1b[38;2;255;100;100mClaude\x1b[0m \x1b[38;5;208mCode\x1b[0m \x1b[1;4;31msession\x1b[0m\n" +
 			"\x1b[?25l\x1b[2J\x1b[H\x1b[?25h" + // cursor hide/show, clear screen, home
 			"Ready for input.",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -367,8 +367,8 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 		Content: "\x1b]0;Claude Code - Terminal\x07" + // OSC window title
 			"\x1b]52;c;dGVzdA==\x07" + // OSC clipboard
 			"Claude Code session ready.",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -380,8 +380,8 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 			"│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  │\n" +
 			"└─────────────────────────────┘\n" +
 			"Type /help for commands.",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -390,8 +390,8 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 			"│  ✨ Claude Code ✨           │\n" +
 			"╰──────────────────────────────╯\n" +
 			"Welcome! How can I help?",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "tool_marker",
 	},
 	{
@@ -399,8 +399,8 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 		Content: "\x1b[31m⚠️  You've hit your limit\x1b[0m\n" +
 			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
 			"Please wait or upgrade your plan.",
-		Tool:          "claude",
-		ShouldMatch:   true,
+		Tool:           "claude",
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 }
@@ -411,43 +411,43 @@ var ansiAndBoxDrawingFixtures = []PaneFixture{
 
 var overrideFixtures = []PaneFixture{
 	{
-		Name:          "override_matches_custom_pattern",
-		Content:       "my-custom-session-marker-12345",
-		Tool:          "claude",
-		Override:      regexp.MustCompile(`custom-session-marker-\d+`),
-		ShouldMatch:   true,
+		Name:           "override_matches_custom_pattern",
+		Content:        "my-custom-session-marker-12345",
+		Tool:           "claude",
+		Override:       regexp.MustCompile(`custom-session-marker-\d+`),
+		ShouldMatch:    true,
 		ExpectedReason: "override",
 	},
 	{
-		Name:          "override_no_match",
-		Content:       "some generic bash prompt content",
-		Tool:          "claude",
-		Override:      regexp.MustCompile(`custom-session-marker-\d+`),
-		ShouldMatch:   false,
+		Name:           "override_no_match",
+		Content:        "some generic bash prompt content",
+		Tool:           "claude",
+		Override:       regexp.MustCompile(`custom-session-marker-\d+`),
+		ShouldMatch:    false,
 		ExpectedReason: "override_no_match",
 	},
 	{
-		Name:          "override_case_insensitive",
-		Content:       "MY-PROJECT-SESSION active",
-		Tool:          "claude",
-		Override:      regexp.MustCompile(`(?i)my-project-session`),
-		ShouldMatch:   true,
+		Name:           "override_case_insensitive",
+		Content:        "MY-PROJECT-SESSION active",
+		Tool:           "claude",
+		Override:       regexp.MustCompile(`(?i)my-project-session`),
+		ShouldMatch:    true,
 		ExpectedReason: "override",
 	},
 	{
-		Name:          "override_multiword_whitespace",
-		Content:       "session   marker   active",
-		Tool:          "claude",
-		Override:      regexp.MustCompile(`session\s+marker\s+active`),
-		ShouldMatch:   true,
+		Name:           "override_multiword_whitespace",
+		Content:        "session   marker   active",
+		Tool:           "claude",
+		Override:       regexp.MustCompile(`session\s+marker\s+active`),
+		ShouldMatch:    true,
 		ExpectedReason: "override",
 	},
 	{
-		Name:          "override_ignores_tool_markers",
-		Content:       "Claude Code session", // Would normally match tool_marker
-		Tool:          "claude",
-		Override:      regexp.MustCompile(`^never-matches$`),
-		ShouldMatch:   false,
+		Name:           "override_ignores_tool_markers",
+		Content:        "Claude Code session", // Would normally match tool_marker
+		Tool:           "claude",
+		Override:       regexp.MustCompile(`^never-matches$`),
+		ShouldMatch:    false,
 		ExpectedReason: "override_no_match", // Override takes precedence
 	},
 }
@@ -458,31 +458,31 @@ var overrideFixtures = []PaneFixture{
 
 var crossToolFixtures = []PaneFixture{
 	{
-		Name:          "claude_content_codex_tool",
-		Content:       "Claude Code session ready",
-		Tool:          "codex", // Looking for Codex, not Claude
-		ShouldMatch:   false,
+		Name:           "claude_content_codex_tool",
+		Content:        "Claude Code session ready",
+		Tool:           "codex", // Looking for Codex, not Claude
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
-		Name:          "codex_content_claude_tool",
-		Content:       "Codex CLI v2.0.0 - OpenAI",
-		Tool:          "claude", // Looking for Claude, not Codex
-		ShouldMatch:   false,
+		Name:           "codex_content_claude_tool",
+		Content:        "Codex CLI v2.0.0 - OpenAI",
+		Tool:           "claude", // Looking for Claude, not Codex
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
-		Name:          "gemini_content_claude_tool",
-		Content:       "Gemini Pro - Google AI Platform",
-		Tool:          "claude", // Looking for Claude, not Gemini
-		ShouldMatch:   false,
+		Name:           "gemini_content_claude_tool",
+		Content:        "Gemini Pro - Google AI Platform",
+		Tool:           "claude", // Looking for Claude, not Gemini
+		ShouldMatch:    false,
 		ExpectedReason: "no_match",
 	},
 	{
-		Name:          "rate_limit_matches_any_tool",
-		Content:       "You've hit your limit - please wait",
-		Tool:          "codex", // Rate limit matches regardless of tool
-		ShouldMatch:   true,
+		Name:           "rate_limit_matches_any_tool",
+		Content:        "You've hit your limit - please wait",
+		Tool:           "codex", // Rate limit matches regardless of tool
+		ShouldMatch:    true,
 		ExpectedReason: "rate_limit",
 	},
 }

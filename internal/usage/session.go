@@ -441,16 +441,16 @@ func (t *SessionTracker) Snapshot() []TokenEntry {
 
 // Stats returns a summary of session tracking statistics.
 type SessionStats struct {
-	TotalEntries  int           `json:"total_entries"`
-	TotalTokens   int64         `json:"total_tokens"`
-	InputTokens   int64         `json:"input_tokens"`
-	OutputTokens  int64         `json:"output_tokens"`
-	CacheTokens   int64         `json:"cache_tokens"`
-	WindowSize    time.Duration `json:"window_size"`
-	OldestEntry   time.Time     `json:"oldest_entry,omitempty"`
-	NewestEntry   time.Time     `json:"newest_entry,omitempty"`
-	ByModel       map[string]int64 `json:"by_model,omitempty"`
-	BySource      map[string]int64 `json:"by_source,omitempty"`
+	TotalEntries int              `json:"total_entries"`
+	TotalTokens  int64            `json:"total_tokens"`
+	InputTokens  int64            `json:"input_tokens"`
+	OutputTokens int64            `json:"output_tokens"`
+	CacheTokens  int64            `json:"cache_tokens"`
+	WindowSize   time.Duration    `json:"window_size"`
+	OldestEntry  time.Time        `json:"oldest_entry,omitempty"`
+	NewestEntry  time.Time        `json:"newest_entry,omitempty"`
+	ByModel      map[string]int64 `json:"by_model,omitempty"`
+	BySource     map[string]int64 `json:"by_source,omitempty"`
 }
 
 // Stats returns current session statistics.

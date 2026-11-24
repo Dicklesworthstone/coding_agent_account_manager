@@ -86,7 +86,7 @@ func TestDecayPenalty(t *testing.T) {
 			if !tt.expectTimeUpdate {
 				expectedTime = tt.lastUpdated
 			}
-			
+
 			if !h.PenaltyUpdatedAt.Equal(expectedTime) {
 				t.Errorf("expected updated time %v, got %v", expectedTime, h.PenaltyUpdatedAt)
 			}

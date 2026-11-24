@@ -87,16 +87,16 @@ func BenchmarkJWTParsingLargeClaims(b *testing.B) {
 // BenchmarkJWTClaimExtraction focuses on the claim extraction overhead.
 func BenchmarkJWTClaimExtraction(b *testing.B) {
 	claims := map[string]interface{}{
-		"email":             "user@example.com",
+		"email":              "user@example.com",
 		"preferred_username": "testuser",
-		"organization":      "acme-corp",
-		"org":               "acme",
-		"org_name":          "ACME Corporation",
-		"plan_type":         "enterprise",
-		"subscription_type": "max",
-		"account_id":        "acc_123",
-		"user_id":           "usr_456",
-		"exp":               time.Now().Add(time.Hour).Unix(),
+		"organization":       "acme-corp",
+		"org":                "acme",
+		"org_name":           "ACME Corporation",
+		"plan_type":          "enterprise",
+		"subscription_type":  "max",
+		"account_id":         "acc_123",
+		"user_id":            "usr_456",
+		"exp":                time.Now().Add(time.Hour).Unix(),
 	}
 	token := buildTestJWT(claims)
 

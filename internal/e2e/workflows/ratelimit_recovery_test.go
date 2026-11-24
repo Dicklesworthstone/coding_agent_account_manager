@@ -86,7 +86,7 @@ func TestE2E_RateLimitRecoveryWorkflow(t *testing.T) {
 	// checking that "ActiveCooldown" returns nothing for a past time is a DB unit test.
 	// Here we want E2E workflow.
 	// We can manually clear it to simulate expiry.
-	
+
 	_, err = db.ClearCooldown("codex", "p1")
 	if err != nil {
 		t.Fatalf("ClearCooldown failed: %v", err)
@@ -97,13 +97,13 @@ func TestE2E_RateLimitRecoveryWorkflow(t *testing.T) {
 	// Depending on RNG/Recency, it might be picked.
 	// Reset recency to ensure fairness
 	selector.SetAvoidRecent(0)
-	
+
 	// We force select logic to consider p1 valid
 	result, err = selector.Select("codex", profiles, "")
 	if err != nil {
 		t.Fatalf("Select failed: %v", err)
 	}
-	
+
 	// Check if p1 is at least in alternatives with a positive score
 	p1Available := false
 	for _, alt := range result.Alternatives {

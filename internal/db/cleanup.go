@@ -143,12 +143,12 @@ func (d *DB) CleanupDryRun(cfg CleanupConfig) (*CleanupResult, error) {
 
 // DatabaseStats returns statistics about the database.
 type DatabaseStats struct {
-	Path             string
-	SizeBytes        int64
-	ActivityLogCount int
+	Path              string
+	SizeBytes         int64
+	ActivityLogCount  int
 	ProfileStatsCount int
-	OldestEntry      time.Time
-	NewestEntry      time.Time
+	OldestEntry       time.Time
+	NewestEntry       time.Time
 }
 
 // Stats returns statistics about the database.

@@ -63,10 +63,10 @@ func TestE2E_MultiMachineSyncWorkflow(t *testing.T) {
 	}
 
 	h.LogInfo("Freshness comparison result", map[string]interface{}{
-		"local_expiry":    localFreshness.ExpiresAt.Format(time.RFC3339),
-		"remote_expiry":   remoteFreshness.ExpiresAt.Format(time.RFC3339),
+		"local_expiry":     localFreshness.ExpiresAt.Format(time.RFC3339),
+		"remote_expiry":    remoteFreshness.ExpiresAt.Format(time.RFC3339),
 		"local_is_fresher": localIsFresher,
-		"direction":       "push",
+		"direction":        "push",
 	})
 	h.EndStep("compare_freshness")
 
@@ -115,10 +115,10 @@ func TestE2E_MultiMachineSyncWorkflow(t *testing.T) {
 	}
 
 	h.LogInfo("Freshness comparison result", map[string]interface{}{
-		"local_expiry":     localFreshness.ExpiresAt.Format(time.RFC3339),
-		"remote_expiry":    remoteFreshness.ExpiresAt.Format(time.RFC3339),
+		"local_expiry":      localFreshness.ExpiresAt.Format(time.RFC3339),
+		"remote_expiry":     remoteFreshness.ExpiresAt.Format(time.RFC3339),
 		"remote_is_fresher": remoteIsFresher,
-		"direction":        "pull",
+		"direction":         "pull",
 	})
 	h.EndStep("compare_freshness_pull")
 

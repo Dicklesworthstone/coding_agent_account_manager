@@ -23,17 +23,17 @@ import (
 
 // WezTermPane represents a mock WezTerm pane for test fixtures.
 type WezTermPane struct {
-	PaneID      int    `json:"pane_id"`
-	WindowID    int    `json:"window_id"`
-	TabID       int    `json:"tab_id"`
-	Title       string `json:"title"`
-	CWD         string `json:"cwd,omitempty"`
-	CursorX     int    `json:"cursor_x"`
-	CursorY     int    `json:"cursor_y"`
-	IsActive    bool   `json:"is_active"`
-	IsZoomed    bool   `json:"is_zoomed"`
-	Domain      string `json:"domain,omitempty"`
-	Workspace   string `json:"workspace,omitempty"`
+	PaneID    int    `json:"pane_id"`
+	WindowID  int    `json:"window_id"`
+	TabID     int    `json:"tab_id"`
+	Title     string `json:"title"`
+	CWD       string `json:"cwd,omitempty"`
+	CursorX   int    `json:"cursor_x"`
+	CursorY   int    `json:"cursor_y"`
+	IsActive  bool   `json:"is_active"`
+	IsZoomed  bool   `json:"is_zoomed"`
+	Domain    string `json:"domain,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
 }
 
 // SendTextCall represents a captured send-text call for assertions.
@@ -593,8 +593,14 @@ func (h *WezTermMockHarness) ReadSendTextLog() []SendTextCall {
 // =============================================================================
 
 // FuncListPanes returns a function suitable for weztermListPanesFunc.
-func (h *WezTermMockHarness) FuncListPanes() func() ([]struct{ ID int; Title string }, error) {
-	return func() ([]struct{ ID int; Title string }, error) {
+func (h *WezTermMockHarness) FuncListPanes() func() ([]struct {
+	ID    int
+	Title string
+}, error) {
+	return func() ([]struct {
+		ID    int
+		Title string
+	}, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 
@@ -604,9 +610,15 @@ func (h *WezTermMockHarness) FuncListPanes() func() ([]struct{ ID int; Title str
 			return nil, h.listError
 		}
 
-		result := make([]struct{ ID int; Title string }, len(h.panes))
+		result := make([]struct {
+			ID    int
+			Title string
+		}, len(h.panes))
 		for i, p := range h.panes {
-			result[i] = struct{ ID int; Title string }{ID: p.PaneID, Title: p.Title}
+			result[i] = struct {
+				ID    int
+				Title string
+			}{ID: p.PaneID, Title: p.Title}
 		}
 		return result, nil
 	}

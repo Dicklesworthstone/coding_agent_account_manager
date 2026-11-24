@@ -115,9 +115,9 @@ func TestSpinnerOptionsFromEnv(t *testing.T) {
 
 func TestNewSpinner(t *testing.T) {
 	tests := []struct {
-		name     string
-		opts     SpinnerOptions
-		checkFn  func(t *testing.T, s *Spinner)
+		name    string
+		opts    SpinnerOptions
+		checkFn func(t *testing.T, s *Spinner)
 	}{
 		{
 			name: "default spinner with message",
@@ -184,34 +184,34 @@ func TestNewSpinner(t *testing.T) {
 
 func TestNewSpinnerWithTheme(t *testing.T) {
 	tests := []struct {
-		name        string
-		themeOpts   ThemeOptions
-		message     string
-		expectAnim  bool
+		name       string
+		themeOpts  ThemeOptions
+		message    string
+		expectAnim bool
 	}{
 		{
-			name:        "default theme",
-			themeOpts:   DefaultThemeOptions(),
-			message:     "Loading...",
-			expectAnim:  true,
+			name:       "default theme",
+			themeOpts:  DefaultThemeOptions(),
+			message:    "Loading...",
+			expectAnim: true,
 		},
 		{
-			name:        "NoColor theme",
-			themeOpts:   ThemeOptions{NoColor: true},
-			message:     "Loading...",
-			expectAnim:  true,
+			name:       "NoColor theme",
+			themeOpts:  ThemeOptions{NoColor: true},
+			message:    "Loading...",
+			expectAnim: true,
 		},
 		{
-			name:        "Reduced motion theme",
-			themeOpts:   ThemeOptions{ReducedMotion: true},
-			message:     "Loading...",
-			expectAnim:  false,
+			name:       "Reduced motion theme",
+			themeOpts:  ThemeOptions{ReducedMotion: true},
+			message:    "Loading...",
+			expectAnim: false,
 		},
 		{
-			name:        "high contrast theme",
-			themeOpts:   ThemeOptions{Contrast: ContrastHigh},
-			message:     "Processing...",
-			expectAnim:  true,
+			name:       "high contrast theme",
+			themeOpts:  ThemeOptions{Contrast: ContrastHigh},
+			message:    "Processing...",
+			expectAnim: true,
 		},
 	}
 
@@ -247,7 +247,7 @@ func TestSpinnerView(t *testing.T) {
 				Message: "Loading...",
 				NoColor: true,
 			},
-			contains: []string{"Loading..."},
+			contains:   []string{"Loading..."},
 			notContain: []string{"[...]"},
 		},
 		{

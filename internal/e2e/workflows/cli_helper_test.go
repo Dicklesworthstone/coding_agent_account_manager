@@ -43,7 +43,7 @@ func TestCLIHelper(t *testing.T) {
 	}
 
 	os.Args = args
-	
+
 	// Execute and exit with appropriate code
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)

@@ -647,16 +647,16 @@ type BaselineMetrics struct {
 
 // PerformanceComparison represents the result of comparing against a baseline.
 type PerformanceComparison struct {
-	TestName      string                   `json:"test_name"`
-	BaselineDate  time.Time                `json:"baseline_date"`
-	CurrentTimeMs int64                    `json:"current_time_ms"`
-	BaselineMs    int64                    `json:"baseline_ms"`
-	DeltaMs       int64                    `json:"delta_ms"`
-	DeltaPercent  float64                  `json:"delta_percent"`
-	Regressions   []MetricRegression       `json:"regressions,omitempty"`
-	Improvements  []MetricRegression       `json:"improvements,omitempty"`
-	Threshold     float64                  `json:"threshold_percent"`
-	IsRegression  bool                     `json:"is_regression"`
+	TestName      string             `json:"test_name"`
+	BaselineDate  time.Time          `json:"baseline_date"`
+	CurrentTimeMs int64              `json:"current_time_ms"`
+	BaselineMs    int64              `json:"baseline_ms"`
+	DeltaMs       int64              `json:"delta_ms"`
+	DeltaPercent  float64            `json:"delta_percent"`
+	Regressions   []MetricRegression `json:"regressions,omitempty"`
+	Improvements  []MetricRegression `json:"improvements,omitempty"`
+	Threshold     float64            `json:"threshold_percent"`
+	IsRegression  bool               `json:"is_regression"`
 }
 
 // MetricRegression represents a single metric that regressed or improved.

@@ -73,31 +73,31 @@ func PenaltyForError(err error) float64 {
 	if isTimeoutError(msg) {
 		return 0.2
 	}
-	
+
 	// Default penalty for other errors
 	return 0.1
 }
 
 func isAuthError(msg string) bool {
-	return strings.Contains(msg, "401") || 
-		strings.Contains(msg, "403") || 
-		strings.Contains(msg, "unauthorized") || 
+	return strings.Contains(msg, "401") ||
+		strings.Contains(msg, "403") ||
+		strings.Contains(msg, "unauthorized") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "authentication failed") ||
 		strings.Contains(msg, "invalid token")
 }
 
 func isRateLimitError(msg string) bool {
-	return strings.Contains(msg, "429") || 
-		strings.Contains(msg, "rate limit") || 
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate limit") ||
 		strings.Contains(msg, "too many requests") ||
 		strings.Contains(msg, "quota exceeded")
 }
 
 func isServerError(msg string) bool {
-	return strings.Contains(msg, "500") || 
-		strings.Contains(msg, "502") || 
-		strings.Contains(msg, "503") || 
+	return strings.Contains(msg, "500") ||
+		strings.Contains(msg, "502") ||
+		strings.Contains(msg, "503") ||
 		strings.Contains(msg, "504") ||
 		strings.Contains(msg, "internal server error") ||
 		strings.Contains(msg, "bad gateway") ||
@@ -105,7 +105,7 @@ func isServerError(msg string) bool {
 }
 
 func isTimeoutError(msg string) bool {
-	return strings.Contains(msg, "timeout") || 
+	return strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "context deadline")
 }

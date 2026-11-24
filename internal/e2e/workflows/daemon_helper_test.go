@@ -22,11 +22,11 @@ func TestDaemonHelper(t *testing.T) {
 	// cobra uses os.Args[1:] by default.
 	// But we can set args on the root command if we had access to it.
 	// cmd.Execute() uses rootCmd.
-	
+
 	// Since we can't modify rootCmd args easily from here without exposing it,
 	// we will rely on os.Args being set by the caller?
 	// No, the caller calls the test binary.
-	
+
 	// We can set os.Args manually.
 	if extraArgs := os.Getenv("CAAM_DAEMON_ARGS"); extraArgs != "" {
 		// Simple splitting by space (doesn't handle quotes but enough for our tests)
@@ -35,7 +35,7 @@ func TestDaemonHelper(t *testing.T) {
 	} else {
 		os.Args = []string{"caam", "daemon", "start", "--fg", "--verbose"}
 	}
-	
+
 	if os.Getenv("MOCK_REFRESH_CLAUDE") == "1" {
 		refresh.RefreshClaudeToken = func(ctx context.Context, refreshToken string) (*refresh.TokenResponse, error) {
 			return &refresh.TokenResponse{
@@ -44,7 +44,7 @@ func TestDaemonHelper(t *testing.T) {
 			}, nil
 		}
 	}
-	
+
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}

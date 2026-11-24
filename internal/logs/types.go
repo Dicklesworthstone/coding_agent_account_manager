@@ -99,7 +99,7 @@ type ModelTokenUsage struct {
 
 // DailyUsage represents aggregated usage for a single date.
 type DailyUsage struct {
-	Date    string                 // "YYYY-MM-DD"
+	Date    string // "YYYY-MM-DD"
 	Usage   *TokenUsage
 	ByModel map[string]*ModelTokenUsage
 }

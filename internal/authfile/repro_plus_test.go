@@ -1,8 +1,8 @@
 package authfile
 
 import (
-	"path/filepath"
 	"os"
+	"path/filepath"
 	"testing"
 )
 

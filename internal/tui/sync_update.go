@@ -45,16 +45,16 @@ type syncTestResultMsg struct {
 
 // syncStartedMsg is sent when a sync operation starts.
 type syncStartedMsg struct {
-	machineID string
+	machineID   string
 	machineName string
 }
 
 // syncCompletedMsg is sent when a sync operation completes.
 type syncCompletedMsg struct {
-	machineID string
+	machineID   string
 	machineName string
-	stats   sync.SyncStats
-	err       error
+	stats       sync.SyncStats
+	err         error
 }
 
 // loadSyncState loads the sync state from disk.

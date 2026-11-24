@@ -10,41 +10,41 @@ func TestBreadcrumb_View(t *testing.T) {
 	theme := NewTheme(ThemeOptionsFromEnv())
 
 	tests := []struct {
-		name        string
-		path        []string
-		width       int
-		wantPath    string
-		wantBack    string
+		name         string
+		path         []string
+		width        int
+		wantPath     string
+		wantBack     string
 		wantNotEmpty bool
 	}{
 		{
-			name:        "home and usage",
-			path:        []string{"Profiles", "Usage"},
-			width:       80,
-			wantPath:    "Profiles > Usage",
-			wantBack:    "[Esc] Back",
+			name:         "home and usage",
+			path:         []string{"Profiles", "Usage"},
+			width:        80,
+			wantPath:     "Profiles > Usage",
+			wantBack:     "[Esc] Back",
 			wantNotEmpty: true,
 		},
 		{
-			name:        "home and sync",
-			path:        []string{"Profiles", "Sync"},
-			width:       80,
-			wantPath:    "Profiles > Sync",
-			wantBack:    "[Esc] Back",
+			name:         "home and sync",
+			path:         []string{"Profiles", "Sync"},
+			width:        80,
+			wantPath:     "Profiles > Sync",
+			wantBack:     "[Esc] Back",
 			wantNotEmpty: true,
 		},
 		{
-			name:        "empty path",
-			path:        []string{},
-			width:       80,
+			name:         "empty path",
+			path:         []string{},
+			width:        80,
 			wantNotEmpty: false,
 		},
 		{
-			name:        "single item",
-			path:        []string{"Home"},
-			width:       80,
-			wantPath:    "Home",
-			wantBack:    "[Esc] Back",
+			name:         "single item",
+			path:         []string{"Home"},
+			width:        80,
+			wantPath:     "Home",
+			wantBack:     "[Esc] Back",
 			wantNotEmpty: true,
 		},
 	}

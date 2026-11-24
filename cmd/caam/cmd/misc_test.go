@@ -475,7 +475,6 @@ func TestOpenCommand(t *testing.T) {
 	}
 }
 
-
 // TestCollectSessions tests session collection function.
 func TestCollectSessions(t *testing.T) {
 	// Note: This uses global profileStore which may not be initialized
@@ -720,4 +719,3 @@ func TestDependencySpecFields(t *testing.T) {
 		})
 	}
 }
-

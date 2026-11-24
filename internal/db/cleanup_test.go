@@ -29,7 +29,7 @@ func TestDB_Cleanup(t *testing.T) {
 
 	// Insert some old and new activity logs
 	now := time.Now()
-	old := now.AddDate(0, 0, -100) // 100 days ago
+	old := now.AddDate(0, 0, -100)   // 100 days ago
 	recent := now.AddDate(0, 0, -10) // 10 days ago
 
 	// Old event

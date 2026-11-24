@@ -22,14 +22,14 @@ import (
 
 // TraceReport is the full report from a trace-login session.
 type TraceReport struct {
-	Timestamp   string          `json:"timestamp"`
-	Agent       string          `json:"agent"`
-	Duration    string          `json:"duration"`
-	Before      FileSnapshot    `json:"before"`
-	After       FileSnapshot    `json:"after"`
-	Changes     TraceChanges    `json:"changes"`
-	WatchRules  []WatchRule     `json:"watch_rules"`
-	Summary     TraceSummary    `json:"summary"`
+	Timestamp  string       `json:"timestamp"`
+	Agent      string       `json:"agent"`
+	Duration   string       `json:"duration"`
+	Before     FileSnapshot `json:"before"`
+	After      FileSnapshot `json:"after"`
+	Changes    TraceChanges `json:"changes"`
+	WatchRules []WatchRule  `json:"watch_rules"`
+	Summary    TraceSummary `json:"summary"`
 }
 
 // FileSnapshot represents a point-in-time snapshot of files.
@@ -40,11 +40,11 @@ type FileSnapshot struct {
 
 // FileInfo contains metadata about a single file.
 type FileInfo struct {
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	ModTime  string `json:"mod_time"`
-	Hash     string `json:"hash"`
-	IsDir    bool   `json:"is_dir"`
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"mod_time"`
+	Hash    string `json:"hash"`
+	IsDir   bool   `json:"is_dir"`
 }
 
 // TraceChanges categorizes file changes between snapshots.

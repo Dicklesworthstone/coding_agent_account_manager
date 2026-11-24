@@ -27,20 +27,20 @@ func NewWezTermClient() *WezTermClient {
 
 // Pane represents a WezTerm pane.
 type Pane struct {
-	PaneID       int    `json:"pane_id"`
-	WindowID     int    `json:"window_id"`
-	TabID        int    `json:"tab_id"`
-	WorkspaceID  string `json:"workspace,omitempty"`
-	Domain       string `json:"domain,omitempty"`
-	Title        string `json:"title"`
-	CWD          string `json:"cwd,omitempty"`
-	CursorX      int    `json:"cursor_x"`
-	CursorY      int    `json:"cursor_y"`
-	IsActive     bool   `json:"is_active"`
-	IsZoomed     bool   `json:"is_zoomed"`
-	Rows         int    `json:"size,omitempty"`
-	Cols         int    `json:"cols,omitempty"`
-	ForegroundPID int   `json:"foreground_process_id,omitempty"`
+	PaneID        int    `json:"pane_id"`
+	WindowID      int    `json:"window_id"`
+	TabID         int    `json:"tab_id"`
+	WorkspaceID   string `json:"workspace,omitempty"`
+	Domain        string `json:"domain,omitempty"`
+	Title         string `json:"title"`
+	CWD           string `json:"cwd,omitempty"`
+	CursorX       int    `json:"cursor_x"`
+	CursorY       int    `json:"cursor_y"`
+	IsActive      bool   `json:"is_active"`
+	IsZoomed      bool   `json:"is_zoomed"`
+	Rows          int    `json:"size,omitempty"`
+	Cols          int    `json:"cols,omitempty"`
+	ForegroundPID int    `json:"foreground_process_id,omitempty"`
 }
 
 // ListPanes returns all panes across all windows.
