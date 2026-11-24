@@ -10,6 +10,19 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_account_manager>
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-24
+
+Dependency and security maintenance. caam's own behaviour is unchanged from 0.1.26.
+
+### Security
+
+- **Local web dashboard dependencies updated; `pnpm audit` is clean (`c33efd0`).** The dashboard lockfile carried 37 advisories, 5 of them critical: `next` < 16.3.6 (remote code execution in `next/og` `ImageResponse`) and `tinypool` <= 2.1.0 through `vitest`, plus `brace-expansion` and `source-map-js`. `next` and `eslint-config-next` 16.3.4 → 16.4.6, `react`/`react-dom` 19.2.3 → 19.3.1, Tailwind 4.3.5, Playwright 1.65.1, and the dev-only `vitest` ^3.2.7 → ^4.1.12. The dashboard in `web/dashboard` runs from source; it is not part of the release binaries.
+
+### Changed
+
+- **`modernc.org/sqlite` v1.62.0 → v1.63.0 (`f97787e`).** Indirect modules refreshed: `dlclark/regexp2/v2` v2.2.1 → v2.13.2, `xo/terminfo` → v1.3.1 and `charmbracelet/x/exp/slice` → v0.1.0; `golang.org/x/exp` is no longer required. `modernc.org/libc` v1.80.1 and `modernc.org/memory` v1.12.1 stay at the exact versions this sqlite release is generated against, and `chromedp` v0.14.2 with its `cdproto` stays pinned (v0.17 redesigned the API the browser OAuth flow is built on). `govulncheck ./...` reports no vulnerabilities.
+- **Source formatting (`1d3ebef`).** `gofmt` applied to 30 files whose formatting had drifted; no code changes.
+
 ## [0.1.26] - 2026-11-20
 
 ### Security
@@ -732,7 +745,9 @@ Everything on `main` since 0.1.18.
 ---
 
 <!-- Link definitions -->
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.26...v0.1.27
+[0.1.26]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.24...v0.1.25
 [v0.1.10]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.5...v0.1.10
 [v0.1.5]: https://github.com/Dicklesworthstone/coding_agent_account_manager/compare/v0.1.4...v0.1.5
